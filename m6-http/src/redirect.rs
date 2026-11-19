@@ -31,15 +31,24 @@
 //!
 //! So this is now the same `Http11Listener` as `:443`, bound without TLS, and
 //! the redirect is what it should always have been: a response code.
+use crate::config;
 use crate::forward::HttpRequest;
-use crate::http11::{Http11Listener, RequestOutcome};
-use crate::poller::{Poller, Token};
+use crate::http11::{HitHeaders, Http11Listener, RequestHead, RequestOutcome};
+use crate::http2::RequestRef;
+use m6_core::event::Timeouts;
+use m6_core::log::{info, warn};
+use m6_core::platform::process::raise_fd_limit;
+use m6_core::platform::Signals;
+use m6_core::platform::{Events, Interest, Poll, Token};
 use std::io::ErrorKind;
-use tracing::{info, warn};
+use std::time::Duration;
 
-const TOKEN_LISTENER: Token = Token(0);
-const TOKEN_CONN: Token = Token(1);
-const POLL_TIMEOUT_MS: i32 = 1_000;
+const TOKEN_LISTENER: Token = Token(usize::MAX);
+const TOKEN_SIGNAL: Token = Token(usize::MAX - 1);
+/// The operational log's stdout, registered while it holds bytes a full
+/// destination would not take.
+const TOKEN_LOG: Token = Token(usize::MAX - 2);
+const POLL_TIMEOUT_MS: u64 = 1_000;
 
 /// Percent-safe: the request target is echoed back into `Location` verbatim,
 /// so anything that could terminate the header or inject one is rejected
@@ -59,7 +68,7 @@ fn host_is_safe(h: &str) -> bool {
 const ALLOW: &str = "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS";
 
 fn ready(status: u16, headers: Vec<(String, String)>) -> RequestOutcome {
-    RequestOutcome::Ready(status, headers, Vec::new(), String::new())
+    RequestOutcome::Ready(status, headers, Vec::new(), String::new(), None)
 }
 
 /// The whole of the redirect: one status, one header.
@@ -67,12 +76,28 @@ fn ready(status: u16, headers: Vec<(String, String)>) -> RequestOutcome {
 /// Two request targets are not resources and so have nothing to redirect to.
 /// Both used to be answered with 400, which says the request was malformed
 /// when it was not.
-fn redirect_for(req: &HttpRequest) -> RequestOutcome {
+fn redirect_for(req: &HttpRequest, config: &config::Config) -> RequestOutcome {
+    redirect_head(
+        &req.method,
+        &req.path,
+        req.query.as_deref(),
+        &req.headers[..],
+        config,
+    )
+}
+
+fn redirect_head(
+    method: &str,
+    path: &str,
+    query: Option<&str>,
+    headers: &(impl m6_core::http::HeaderSource + ?Sized),
+    config: &config::Config,
+) -> RequestOutcome {
     // RFC 9110 9.3.6: CONNECT establishes a tunnel through a proxy. This is an
     // origin server and will not be one, so the method is refused -- 405, the
     // answer for a method this resource does not support, with `Allow` naming
     // the ones it does (RFC 9110 15.5.6 requires that field).
-    if req.method.eq_ignore_ascii_case("CONNECT") {
+    if method.eq_ignore_ascii_case("CONNECT") {
         return ready(
             405,
             vec![
@@ -85,7 +110,7 @@ fn redirect_for(req: &HttpRequest) -> RequestOutcome {
     // RFC 9110 9.3.7: `OPTIONS *` asks about the server rather than any
     // resource, so there is no target to send anywhere. Answering for the
     // server is the whole point of the form.
-    if req.method.eq_ignore_ascii_case("OPTIONS") && req.path == "*" {
+    if method.eq_ignore_ascii_case("OPTIONS") && path == "*" {
         return ready(
             200,
             vec![
@@ -95,18 +120,42 @@ fn redirect_for(req: &HttpRequest) -> RequestOutcome {
         );
     }
 
-    let host = m6_core::headers::get(&req.headers[..], "host")
+    let host = m6_core::headers::get(headers, "host")
         .map(str::trim)
         .unwrap_or("");
+
+    // An unsafe Host is a malformed request, and the canonical answer does not
+    // need the Host, so it is refused before the policy looks at it.
+    if !host.is_empty() && !host_is_safe(host) {
+        return ready(400, vec![("Content-Length".into(), "0".into())]);
+    }
+
+    // A Host this node does not serve, or no Host at all, goes to the site's
+    // canonical name. This is the same decision the serving listener makes, so
+    // a name that serves on 443 keeps its usual upgrade and every other name
+    // gets one canonical answer from either port.
+    if let Some(location) = config.server.unmatched_host_redirect(
+        if host.is_empty() { None } else { Some(host) },
+        path,
+        query,
+    ) {
+        return ready(
+            301,
+            vec![
+                ("Location".into(), location),
+                ("Content-Length".into(), "0".into()),
+            ],
+        );
+    }
 
     // The query is part of the target and must survive the hop. It did not:
     // `req.path` is the path alone, so `http://example.com/x?v=1` redirected to
     // `https://example.com/x` and every query parameter on an http:// link was
     // silently dropped -- a versioned asset URL, a tracking parameter, a form
     // GET. Found by a test written for the OPTIONS/CONNECT work above.
-    let target = match req.query.as_deref() {
-        Some(q) => format!("{}?{}", req.path, q),
-        None => req.path.clone(),
+    let target = match query {
+        Some(q) => format!("{}?{}", path, q),
+        None => path.to_string(),
     };
     let target = target.as_str();
 
@@ -126,48 +175,165 @@ fn redirect_for(req: &HttpRequest) -> RequestOutcome {
     )
 }
 
-pub fn run(bind: &str) -> anyhow::Result<()> {
-    // `main` blocks the shutdown signals as its first statement, which makes
-    // them deliverable only to core's sigwait thread. Redirect mode returned
-    // before ever installing that thread, so SIGTERM was blocked and nothing
-    // was listening for it: the process could not be stopped by anything short
-    // of SIGKILL. Found by a conformance run that could not reclaim its port.
-    //
-    // No wake fd and no socket: this loop parks in `poll` with a one second
-    // timeout and re-checks the flag each time round, so it needs neither.
-    let shutdown =
-        m6_core::signal::ShutdownHandle::install(m6_core::signal::Service::new("m6-http-redirect"));
+pub fn run(bind: &str, config: &config::Config) -> anyhow::Result<()> {
+    // `main` blocks the shutdown signals as its first statement. The descriptor
+    // opens before the socket exists, so a caller that waits for the port and
+    // then sends SIGTERM finds the handler armed. A stop that arrives while the
+    // mask is blocked and no descriptor is open is discarded on macOS, and the
+    // listener would then ignore the stop that followed its own bind.
+    let mut signals = Signals::new()?;
+    let mut lifecycle = m6_core::signal::Lifecycle::new("m6-http-redirect", None);
+    lifecycle.started();
 
-    let mut listener = Http11Listener::bind_plain(bind)?;
-    let poller = Poller::new()?;
-    poller.add(listener.raw_fd(), TOKEN_LISTENER)?;
+    let ceiling = raise_fd_limit()?;
+    let mut listener = Http11Listener::bind_plain(
+        bind,
+        crate::http11::DEFAULT_MAX_REQUESTS_PER_CONN,
+        crate::http11::INITIAL_CONNECTIONS,
+        ceiling,
+    )?;
+    let mut poll = Poll::new()?;
+    poll.registry()
+        .register_fd(listener.raw_fd(), TOKEN_LISTENER, Interest::READABLE)?;
+    poll.registry()
+        .register_fd(signals.raw_fd(), TOKEN_SIGNAL, Interest::READABLE)?;
+
+    // The read timeout, as a deadline rather than a per-pass sweep. The
+    // one-second poll cap only bounds the wait until the earliest deadline.
+    let mut read_timeouts = Timeouts::new(
+        crate::http11::INITIAL_CONNECTIONS,
+        Duration::from_secs(crate::http11::READ_TIMEOUT_SECS),
+    );
+    let mut on_head = |_: &mut (), head: &RequestHead<'_>, _: &[u8], _: &str| {
+        redirect_head(head.method, head.path, head.query, head.headers, config)
+    };
+    let mut on_owned = |_: &mut (), req: RequestRef<'_>, _: &str| match req {
+        RequestRef::Owned(req) => redirect_for(req, config),
+        RequestRef::H2(req) => {
+            let owned = req.into_owned();
+            redirect_for(&owned, config)
+        }
+    };
+    // The redirect listener has no route table, so it decides nothing from a
+    // head before the body; `redirect_for` answers every method it accepts.
+    let mut on_head_early =
+        |_: &mut (), _: &RequestHead<'_>, _: &str| -> Option<RequestOutcome> { None };
+    let hit = HitHeaders {
+        alt_svc: std::sync::Arc::from(&[] as &[u8]),
+        describedby: None,
+    };
 
     info!(bind = %bind, "HTTP->HTTPS redirect listener started");
 
-    let mut ev_buf = [Token(0); 64];
+    let mut events = Events::with_capacity(64);
+    let mut accepting = true;
+    let mut last_log_tick = m6_core::platform::now();
     loop {
-        // The timeout also drives the connection sweep inside `drive_all` when
-        // nothing else is happening, so a stalled client is still reaped on an
-        // otherwise silent listener.
-        if let Err(e) = poller.wait(&mut ev_buf, POLL_TIMEOUT_MS) {
-            if e.kind() == ErrorKind::Interrupted {
+        let now = m6_core::platform::now();
+        match poll.poll(
+            &mut events,
+            Some(read_timeouts.timeout(now, Duration::from_millis(POLL_TIMEOUT_MS))),
+        ) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => {
+                warn!(error = %e, "redirect: poll error");
                 continue;
             }
-            warn!(error = %e, "redirect: poller error");
-            continue;
+        }
+        let now = m6_core::platform::now();
+
+        for ev in &events {
+            match ev.token() {
+                TOKEN_LISTENER => loop {
+                    let Some(taken) = listener.take_slot() else {
+                        poll.registry().deregister_fd(listener.raw_fd()).ok();
+                        accepting = false;
+                        break;
+                    };
+                    let key = taken.key;
+                    let mut conn = match listener.accept_one() {
+                        Some(c) => c,
+                        None => {
+                            listener.free_slot(key);
+                            break;
+                        }
+                    };
+                    conn.set_token(Token(key));
+                    conn.set_interest(Interest::READABLE);
+                    if let Err(e) =
+                        poll.registry()
+                            .register_fd(conn.raw_fd(), Token(key), Interest::READABLE)
+                    {
+                        warn!(error = %e, "redirect: register connection");
+                        listener.free_slot(key);
+                        continue;
+                    }
+                    read_timeouts.touch(Token(key), now);
+                    *listener.slot_mut(key) = conn;
+                },
+                TOKEN_SIGNAL => {
+                    let mut stop = false;
+                    while let Some(sig) = signals.read() {
+                        if lifecycle.on_signal(sig) == m6_core::signal::Action::Stop {
+                            stop = true;
+                        }
+                    }
+                    if stop {
+                        lifecycle.complete();
+                        // `stop` takes both Sinks before it finishes, so its
+                        // own failure has to be written to stderr here: the
+                        // caller's error line has no destination left.
+                        if let Err(e) = m6_core::log::stop() {
+                            eprintln!("log stop failed: {e}");
+                            return Err(e.into());
+                        }
+                        return Ok(());
+                    }
+                }
+                TOKEN_LOG => m6_core::log::flush(),
+                Token(k) => {
+                    let drive = listener.drive_one(
+                        k,
+                        &mut (),
+                        &mut on_head,
+                        &mut on_owned,
+                        &mut on_head_early,
+                        &hit,
+                        poll.registry(),
+                    );
+                    if drive.restarted {
+                        read_timeouts.touch(Token(k), now);
+                    }
+                    if drive.done {
+                        listener.close_one(k, poll.registry());
+                        read_timeouts.clear(Token(k));
+                    }
+                }
+            }
         }
 
-        listener.accept_pending(&poller, TOKEN_CONN);
-        listener.drive_all(
-            |req, _client_ip| redirect_for(req),
-            // No URL backends here, so no pending response can ever arrive.
-            |_resp, _ctx| (500, Vec::new(), Vec::new(), String::new()),
-            &poller,
-        );
+        // A full stdout holds its bytes in the Sink. Watch it for writability
+        // only while it does, so the loop never waits on the log.
+        if let Err(e) = m6_core::log::watch(poll.registry(), TOKEN_LOG) {
+            m6_core::log::error!(error = %e, "log descriptor registration failed");
+        }
 
-        if m6_core::signal::is_shutdown() {
-            shutdown.complete();
-            return Ok(());
+        // The accounting tick: flush the log buffers once a second.
+        if now.duration_since(last_log_tick) >= Duration::from_secs(1) {
+            m6_core::log::tick(m6_core::platform::wall());
+            last_log_tick = now;
+        }
+
+        // Close connections idle past the read deadline.
+        while let Some(Token(k)) = read_timeouts.expired(m6_core::platform::now()) {
+            listener.close_one(k, poll.registry());
+        }
+        // A slot came free while the table was full: accept again.
+        if !accepting && !listener.is_full() {
+            poll.registry()
+                .register_fd(listener.raw_fd(), TOKEN_LISTENER, Interest::READABLE)?;
+            accepting = true;
         }
     }
 }
@@ -176,18 +342,52 @@ pub fn run(bind: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    fn request(method: &str, target: &str) -> HttpRequest {
-        let raw = format!("{method} {target} HTTP/1.1\r\nHost: example.com\r\n\r\n");
+    /// A redirect-mode config, through the real loader. Redirect mode skips the
+    /// TLS files, so the temporary directory needs only the two TOML files.
+    fn cfg(served: &[&str], target: Option<&str>) -> config::Config {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("site.toml"),
+            "[site]\nname = \"Test\"\ndomain = \"example.com\"\n",
+        )
+        .unwrap();
+        let hosts = served
+            .iter()
+            .map(|s| format!("\"{s}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut system = format!(
+            "[node]\nname = \"test\"\n\n[server]\nredirect_bind = \"127.0.0.1:80\"\nserved_hosts = [{hosts}]\n"
+        );
+        if let Some(target) = target {
+            system.push_str(&format!("redirect_unmatched_to = \"{target}\"\n"));
+        }
+        std::fs::write(dir.path().join("system.toml"), system).unwrap();
+        config::load(dir.path(), &dir.path().join("system.toml")).unwrap()
+    }
+
+    fn request_host(method: &str, target: &str, host: &str) -> HttpRequest {
+        let (version, host_line) = if host.is_empty() {
+            ("HTTP/1.0", String::new())
+        } else {
+            ("HTTP/1.1", format!("Host: {host}\r\n"))
+        };
+        let raw = format!("{method} {target} {version}\r\n{host_line}\r\n");
         match m6_core::h1::parse_request(raw.as_bytes()) {
             m6_core::h1::ParseResult::Complete(r) => r,
             _ => panic!("fixture did not parse: {raw:?}"),
         }
     }
 
+    fn request(method: &str, target: &str) -> HttpRequest {
+        request_host(method, target, "example.com")
+    }
+
     fn status_of(outcome: &RequestOutcome) -> u16 {
         match outcome {
             RequestOutcome::Ready(s, ..) => *s,
             RequestOutcome::Pending { .. } => panic!("a redirect is never pending"),
+            RequestOutcome::Cached { .. } => panic!("a redirect is never cached"),
         }
     }
 
@@ -198,6 +398,7 @@ mod tests {
                 .find(|(k, _)| k.eq_ignore_ascii_case(name))
                 .map(|(_, v)| v.clone()),
             RequestOutcome::Pending { .. } => None,
+            RequestOutcome::Cached { .. } => None,
         }
     }
 
@@ -206,7 +407,7 @@ mod tests {
     /// malformed" for a request that is not.
     #[test]
     fn options_asterisk_is_answered_for_the_server() {
-        let out = redirect_for(&request("OPTIONS", "*"));
+        let out = redirect_for(&request("OPTIONS", "*"), &cfg(&[], None));
         assert_eq!(status_of(&out), 200);
         assert_eq!(header_of(&out, "allow").as_deref(), Some(ALLOW));
     }
@@ -216,7 +417,7 @@ mod tests {
     /// called malformed.
     #[test]
     fn connect_is_refused_as_a_method_not_as_a_bad_request() {
-        let out = redirect_for(&request("CONNECT", "example.com:443"));
+        let out = redirect_for(&request("CONNECT", "example.com:443"), &cfg(&[], None));
         assert_eq!(status_of(&out), 405);
         assert_eq!(header_of(&out, "allow").as_deref(), Some(ALLOW));
     }
@@ -226,14 +427,17 @@ mod tests {
     /// not the one in the target.
     #[test]
     fn ordinary_targets_still_redirect() {
-        let out = redirect_for(&request("GET", "/capabilities?v=1"));
+        let out = redirect_for(&request("GET", "/capabilities?v=1"), &cfg(&[], None));
         assert_eq!(status_of(&out), 301);
         assert_eq!(
             header_of(&out, "location").as_deref(),
             Some("https://example.com/capabilities?v=1")
         );
 
-        let out = redirect_for(&request("GET", "http://elsewhere.example/x"));
+        let out = redirect_for(
+            &request("GET", "http://elsewhere.example/x"),
+            &cfg(&[], None),
+        );
         assert_eq!(
             header_of(&out, "location").as_deref(),
             Some("https://example.com/x"),
@@ -259,5 +463,62 @@ mod tests {
         assert!(!host_is_safe(""));
         assert!(host_is_safe("example.com"));
         assert!(host_is_safe("example.com:8443"));
+    }
+
+    /// A name the node serves keeps the plain-HTTP upgrade it has always had,
+    /// so the canonical policy does not take the node's own name off HTTPS.
+    #[test]
+    fn a_served_host_keeps_its_https_upgrade() {
+        let c = cfg(&["example.com"], Some("canonical.example"));
+        let out = redirect_for(&request("GET", "/capabilities?v=1"), &c);
+        assert_eq!(status_of(&out), 301);
+        assert_eq!(
+            header_of(&out, "location").as_deref(),
+            Some("https://example.com/capabilities?v=1")
+        );
+    }
+
+    /// A name the node does not serve goes to the site's canonical name, with
+    /// the path and query kept, and the Location never carries the request's
+    /// own Host.
+    #[test]
+    fn an_unserved_host_goes_to_the_canonical_name() {
+        let c = cfg(&["example.com"], Some("canonical.example"));
+        let out = redirect_for(
+            &request_host("GET", "/capabilities?a=1", "other.example"),
+            &c,
+        );
+        assert_eq!(status_of(&out), 301);
+        assert_eq!(
+            header_of(&out, "location").as_deref(),
+            Some("https://canonical.example/capabilities?a=1")
+        );
+    }
+
+    /// No Host at all is outside the list, so a redirector sends it to the
+    /// canonical name instead of the 400 it answers with the policy off.
+    #[test]
+    fn an_empty_host_goes_to_the_canonical_name() {
+        let c = cfg(&["example.com"], Some("canonical.example"));
+        let out = redirect_for(&request_host("GET", "/", ""), &c);
+        assert_eq!(status_of(&out), 301);
+        assert_eq!(
+            header_of(&out, "location").as_deref(),
+            Some("https://canonical.example/")
+        );
+        let out = redirect_for(&request_host("GET", "/", ""), &cfg(&[], None));
+        assert_eq!(status_of(&out), 400);
+    }
+
+    /// The policy is off with no target, so every request keeps the echo.
+    #[test]
+    fn the_policy_is_off_without_a_target() {
+        let c = cfg(&["example.com"], None);
+        let out = redirect_for(&request_host("GET", "/x", "other.example"), &c);
+        assert_eq!(status_of(&out), 301);
+        assert_eq!(
+            header_of(&out, "location").as_deref(),
+            Some("https://other.example/x")
+        );
     }
 }

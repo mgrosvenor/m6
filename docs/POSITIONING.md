@@ -28,7 +28,8 @@ Table 1 states both.
 | 2.2 µs | a cache hit inside m6, on its own timer | `BENCHMARKS.md` section 6 |
 | 225.7 µs and 259.2 µs | an HTTP/2 cache-hit *p50* (median) end to end, two runs | `BENCHMARKS.md` Table 3 |
 
-*Table 1: the two cache-hit figures, and what each measures.* Take from it that 2.2 µs is what the cache costs and 225.7 µs is what a client on the same host sees, so quoting one as the other is the error to avoid.
+**Table 1: the two cache-hit figures, and what each measures.**
+Take from it that 2.2 µs is what the cache costs and 225.7 µs is what a client on the same host sees, so quoting one as the other is the error to avoid.
 
 The 225.7 µs and 259.2 µs figures were measured on the 4 vCPU virtual private server in `BENCHMARKS.md` Table 2, over loopback, at concurrency 2, with *TLS* (Transport Layer Security) 1.3.
 The 2.2 µs figure is m6's internal timer, and `BENCHMARKS.md` records no machine or date for it.
@@ -74,7 +75,8 @@ The figures are indicative of scale.
 | Pingora | experimental | yes | Pingora documentation |
 | m6-http | yes, `Arc<Bytes>`, no lock | yes | this repository and `BENCHMARKS.md` |
 
-*Table 2: the servers m6-http is compared against, by capability.* Take from it that m6-http is the only row that holds a general-purpose response cache and TLS termination in one process.
+**Table 2: the servers m6-http is compared against, by capability.**
+Take from it that m6-http is the only row that holds a general-purpose response cache and TLS termination in one process.
 
 `docs/m6-architecture.md` section 1.3 gives the full argument for why a cache hit must not cross a process boundary, and what that boundary costs.
 Section 5 turns the comparison into where m6 wins and where it does not.

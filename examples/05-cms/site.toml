@@ -1,0 +1,133 @@
+[site]
+name   = "My Site"
+domain = "localhost"
+
+[server]
+# m6-http validates the request method before routing, cache lookup or backend
+# dispatch, and the default is GET, HEAD, POST only: anything else is answered
+# 405 with an `Allow` header and never reaches a backend.
+#
+# This example's renderer registers PATCH and DELETE routes, so they have to be
+# declared here too. Without this line every PATCH and DELETE request was answered
+# 405 by the edge while the handler behind it was registered and working, which
+# looks exactly like a missing route and is not one.
+allowed_methods = ["GET", "HEAD", "POST", "PATCH", "DELETE"]
+
+[errors]
+mode             = "internal"
+verbose_fallback = true
+
+[log]
+level  = "info"
+
+[[backend]]
+name    = "m6-html"
+sockets = "/tmp/m6/m6-html*.sock"
+
+[[backend]]
+name    = "m6-file"
+sockets = "/tmp/m6/m6-file*.sock"
+
+[[backend]]
+name    = "m6-auth"
+sockets = "/tmp/m6/m6-auth*.sock"
+
+[[backend]]
+name    = "m6-auth-check"
+sockets = "/tmp/m6/check-m6-auth*.sock"
+
+[[backend]]
+name    = "render-cms"
+sockets = "/tmp/m6/render-cms*.sock"
+
+# ── Public routes — no auth, fully cached ─────────────────────
+
+[[route]]
+path    = "/"
+backend = "m6-html"
+
+[[route]]
+path    = "/about"
+backend = "m6-html"
+
+[[route]]
+path    = "/blog"
+backend = "m6-html"
+
+[[route]]
+path    = "/blog/{stem}"
+backend = "m6-html"
+
+[[route]]
+path    = "/assets/{*relpath}"
+backend = "m6-file"
+
+[[route]]
+path    = "/_errors"
+backend = "m6-html"
+
+# ── Contact — public ──────────────────────────────────────────
+
+[[route]]
+path    = "/contact"
+backend = "render-cms"
+
+# ── Auth endpoints — public ────────────────────────────────────
+
+[[route]]
+path    = "/login"
+backend = "m6-html"
+
+[[route]]
+path    = "/auth/login"
+backend = "m6-auth"
+
+[[route]]
+path    = "/auth/logout"
+backend = "m6-auth"
+
+[[route]]
+path    = "/auth/refresh"
+backend = "m6-auth"
+
+# ── CMS — all protected, never cached ─────────────────────────
+
+[[route]]
+path    = "/cms"
+backend = "render-cms"
+require = "group:editors"
+
+[[route]]
+path    = "/cms/edit/{stem}"
+backend = "render-cms"
+require = "group:editors"
+
+[[route]]
+path    = "/cms/new"
+backend = "render-cms"
+require = "group:editors"
+
+[[route]]
+path    = "/api/drafts"
+backend = "render-cms"
+require = "group:editors"
+
+[[route]]
+path    = "/api/drafts/{stem}"
+backend = "render-cms"
+require = "group:editors"
+
+[[route]]
+path    = "/api/publish/{stem}"
+backend = "render-cms"
+require = "group:editors"
+
+[[route]]
+path    = "/api/unpublish/{stem}"
+backend = "render-cms"
+require = "group:editors"
+
+[[route]]
+path    = "/api/posts/{stem}"
+backend = "render-cms"
+require = "group:editors"

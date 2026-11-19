@@ -5,9 +5,14 @@
 //! and report the child's stderr when the thing being waited for will never
 //! happen because the child is dead.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 use std::net::TcpStream;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const POLL: Duration = Duration::from_millis(25);
 
@@ -55,12 +60,12 @@ pub fn until(timeout: Duration, ready: impl FnMut() -> bool) -> bool {
 }
 
 fn poll_until(timeout: Duration, mut ready: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + timeout;
+    let deadline = crate::platform::now() + timeout;
     loop {
         if ready() {
             return true;
         }
-        if Instant::now() >= deadline {
+        if crate::platform::now() >= deadline {
             return false;
         }
         std::thread::sleep(POLL);

@@ -47,6 +47,8 @@ Section 2 opens the database those types describe.
 ```rust
 pub fn open(path: &Path) -> Result<Self>;
 
+pub fn no_busy_wait(&self) -> Result<()>;
+
 pub fn close(self) -> std::result::Result<(), Box<(Connection, rusqlite::Error)>>;
 ```
 
@@ -64,6 +66,11 @@ Take from it that the journal mode and the busy timeout make concurrent access w
 
 **Table 2: the three pragmas `Db::open` sets, and why each one matters.**
 The busy timeout is in milliseconds, so 5000 is 5 s.
+
+The 5-second wait suits a process that runs one command at a time.
+`Db::no_busy_wait` sets the connection's timeout to zero, and `m6-auth-server` calls it after its start-time open, so a statement that meets another process's lock returns `SQLITE_BUSY` at once and its event loop retries the request.
+`m6-auth-cli` and a renderer keep the 5-second wait.
+`m6-auth.md` section 9 gives the server's retry.
 
 `Db::open` runs `CREATE TABLE IF NOT EXISTS` for each table in the schema.
 It creates a missing table and leaves an existing one untouched, and the crate records no schema version and holds no migration list.
@@ -110,7 +117,7 @@ Take from it that the three reads return `None` for an absent name, and the writ
 | `user_delete` | `(&self, username: &str) -> Result<()>` | deletes the row and returns `UserNotFound` when no row matched, and the foreign keys delete its memberships, refresh-token rows and API-token rows, but not the tokens already issued, which stay valid until `exp` (see section 5.2) |
 | `user_set_password` | `(&self, username: &str, password: &str) -> Result<()>` | replaces the hash with a new one at cost 12 |
 | `user_set_roles` | `(&self, username: &str, roles: &[&str]) -> Result<()>` | replaces the whole role list, and an empty slice clears every role |
-| `user_verify_password` | `(&self, username: &str, password: &str) -> Result<Option<User>>` | returns the user on a matching password, and `None` for a wrong password or an unknown user, and an unknown user returns without running bcrypt, so response time reveals whether a username exists |
+| `user_verify_password` | `(&self, username: &str, password: &str) -> Result<Option<User>>` | returns the user on a matching password, and `None` for a wrong password or an unknown user, and verifies an unknown user against a fixed dummy hash of the same cost, so response time does not reveal whether a username exists |
 
 **Table 3: the eight user operations, their signatures and what each one does.**
 `user_verify_password` is the login primitive, and `m6-auth-server` calls it on `POST /auth/login`.
@@ -164,7 +171,7 @@ Section 5.1 gives refresh tokens, section 5.2 API tokens, and section 5.3 the en
 **A refresh token is a long-lived JWT whose row lets the server revoke it.**
 
 `m6-auth-server` stores the hash when a login succeeds, verifies it on refresh, and revokes it on logout.
-Table 5 gives the four operations.
+Table 5 gives the five operations.
 Take from it that verification answers with the user id, and an expired row answers `None`.
 
 | method | signature | what it does |
@@ -173,12 +180,14 @@ Take from it that verification answers with the user id, and an expired row answ
 | `refresh_token_verify` | `(&self, token_hash: &str) -> Result<Option<String>>` | returns the user id when the row exists and `expires_at` is in the future |
 | `refresh_token_revoke` | `(&self, token_hash: &str) -> Result<()>` | deletes the row, and an absent hash is not an error |
 | `refresh_tokens_revoke_all` | `(&self, user_id: &str) -> Result<()>` | deletes every refresh-token row for one user |
+| `sessions_revoke_all` | `(&self) -> Result<usize>` | deletes every refresh-token row, for the key-rotation step, and returns the count |
 
-**Table 5: the four refresh-token operations, their signatures and what each one does.**
+**Table 5: the five refresh-token operations, their signatures and what each one does.**
 The hash is the key, so the table never holds a usable token.
 
 `refresh_token_verify` compares `expires_at` with the current Unix time and leaves an expired row in place.
 `user_delete` reaches the same rows through the cascade in section 7.
+`sessions_revoke_all` is the interim rotation step: the auth generation, the new epoch and list key, and the cache acknowledgement arrive with the token-rules step.
 
 ### 5.2. API tokens
 
@@ -229,7 +238,7 @@ Take from it that the engine picks its algorithm from the key it is given, and t
 |---|---|
 | `JwtEngine::new(private_pem, public_pem, issuer)` | reads a *PEM* (Privacy-Enhanced Mail) key pair and picks `ES256` (*ECDSA*, Elliptic Curve Digital Signature Algorithm, on P-256) for an elliptic-curve private key or `RS256` (*RSA*, Rivest-Shamir-Adleman, with SHA-256) for an RSA one |
 | `encode_access`, `encode_refresh` | sign a token from the matching claims type |
-| `decode_access`, `decode_refresh` | verify the signature, the issuer and `exp`, and return the claims |
+| `decode_access` | verify the signature, the issuer and `exp`, and return the claims |
 | `AccessClaims` | `iss`, `sub` (the user id), `exp`, `iat`, `username`, `groups`, `roles` |
 | `RefreshClaims` | `iss`, `sub`, `exp`, `iat`, `username`, and `type` set to `refresh` |
 | `hash_token(token)` | the lowercase hex SHA-256 (*Secure Hash Algorithm*, 256-bit) of the token string |
@@ -241,7 +250,7 @@ The claims types are the JSON bodies of the tokens, and `hash_token` is what kee
 
 `JwtEngine::new` tries the elliptic-curve parser first and the RSA parser second.
 The private-key error names both attempts, and a public-key error names the type it failed on.
-`decode_access` and `decode_refresh` use the engine's algorithm and issuer and the library's default check of `exp`, so a token from another issuer or an expired token fails.
+`decode_access` uses the engine's algorithm and issuer and the library's default check of `exp`, so a token from another issuer or an expired token fails.
 
 `hash_token` returns a plain SHA-256 digest, which suits a signed token with high entropy.
 
@@ -270,16 +279,30 @@ pub enum AuthError {
     #[error("api token not found: {0}")]
     ApiTokenNotFound(String),
 
+    #[error("roles column for user {0} is not valid JSON: {1}")]
+    Roles(String, serde_json::Error),
+
     #[error("database error: {0}")]
     Db(#[from] rusqlite::Error),
+
+    #[error("opening the database: {0}")]
+    Open(#[from] m6_core::sqlite::SqliteError),
 
     #[error("password hashing error: {0}")]
     Bcrypt(#[from] bcrypt::BcryptError),
 }
 ```
 
-Table 8 gives the seven variants and the calls that return each.
-Take from it that five variants name a row, and the other two wrap a failure from a dependency.
+`AuthError::is_busy` reports whether a `Db` error is SQLite's `SQLITE_BUSY` or `SQLITE_LOCKED`, the two codes that mean a lock and that a caller can retry.
+
+```rust
+impl AuthError {
+    pub fn is_busy(&self) -> bool;
+}
+```
+
+Table 8 gives the nine variants and the calls that return each.
+Take from it that six variants name a row, and the other three wrap a failure from a dependency.
 
 | variant | meaning | returned by |
 |---|---|---|
@@ -288,14 +311,16 @@ Take from it that five variants name a row, and the other two wrap a failure fro
 | `GroupNotFound` | no group has that name | `group_delete`, a membership call naming an unknown group |
 | `GroupExists` | the group name is taken | `group_create` |
 | `ApiTokenNotFound` | no API token has that id | `api_token_revoke` |
+| `Roles` | a user's `roles` column is not valid JSON | `user_get`, `user_get_by_id`, `user_list`, `group_members`, `user_verify_password` |
 | `Db` | SQLite returned an error | any call that reads or writes |
+| `Open` | opening the database failed | `Db::open` |
 | `Bcrypt` | the password hash or check failed | `user_create`, `user_set_password`, `user_verify_password` |
 
-**Table 8: the seven `AuthError` variants, what each one means and which calls return it.**
-The first five are answers about a row, and the last two carry a dependency's own error through `#[from]`.
+**Table 8: the nine `AuthError` variants, what each one means and which calls return it.**
+The first six are answers about a row, and the last three carry a dependency's own error through `#[from]`.
 
 `AuthError` implements `std::error::Error` through `thiserror`, so a caller converts it with one `map_err`, as section 8 does.
-The `Db` and `Bcrypt` variants convert with `?` inside the crate, so a dependency failure needs no wrapping at each call site.
+The `Db`, `Open` and `Bcrypt` variants convert with `?` inside the crate, so a dependency failure needs no wrapping at each call site.
 The five fallible `jwt` functions return `anyhow::Result`, so a caller that uses both APIs handles `AuthError` from `Db` and `anyhow::Error` from the token engine.
 
 The rows these errors name live in five tables, and section 7 gives them.
@@ -373,34 +398,35 @@ m6-auth = { path = "../../../m6/m6-auth" }
 `m6` is not published to a registry, so a path dependency needs a checkout in that position, and a git dependency pinned to a revision is the alternative.
 Section 9 of `m6-app-anatomy.md` gives both forms and what each one costs.
 
-A per-thread initialiser receives the configuration map and opens one `Db` per worker.
+A service opens one `Db` at start, keeps it in `main`, and passes it to the request arms.
 
 ```rust
 use m6_auth::{AuthError, Db};
 use m6_core::prelude::*;
 use std::path::Path;
 
-struct Worker {
+struct State {
     db: Db,
 }
 
-fn open_worker(config: &Map<String, Value>, _global: &()) -> Result<Worker> {
-    let path = config
+fn open_state(site: &Site) -> anyhow::Result<State> {
+    let path = site
+        .user_config()
         .get("auth_db")
         .and_then(Value::as_str)
-        .ok_or_else(|| Error::BadRequest("missing auth_db".to_string()))?;
-    let db = Db::open(Path::new(path)).map_err(|e| Error::Other(e.into()))?;
-    Ok(Worker { db })
+        .ok_or_else(|| anyhow::anyhow!("the config has no auth_db"))?;
+    let db = Db::open(Path::new(path))?;
+    Ok(State { db })
 }
 
-fn show_form(req: &Request, _global: &(), _worker: &mut Worker) -> Result<Response> {
+fn show_form(req: &Request) -> Result<Response> {
     Response::render("templates/signup.html", req)
 }
 
-fn signup(req: &Request, _global: &(), worker: &mut Worker) -> Result<Response> {
+fn signup(req: &Request, state: &mut State) -> Result<Response> {
     let username = req.field("username")?;
     let password = req.field("password")?;
-    match worker.db.user_create(&username, &password, &["user"]) {
+    match state.db.user_create(&username, &password, &["user"]) {
         Ok(_) => Ok(Response::redirect("/login?registered=1")),
         Err(AuthError::UserExists(_)) => Response::render_with(
             "templates/signup.html",
@@ -411,19 +437,33 @@ fn signup(req: &Request, _global: &(), worker: &mut Worker) -> Result<Response> 
     }
 }
 
-fn main() -> Result<()> {
-    App::with_thread_state(open_worker)
-        .on_destroy_thread(|worker| {
-            let _ = worker.db.close();
-        })
-        .route_get("/signup", show_form)
-        .route_post("/signup", signup)
-        .run()
+fn main() -> anyhow::Result<()> {
+    let site = Site::load(
+        "render-signup",
+        &[
+            CodeRoute { pattern: "/signup", method: RouteMethod::Get },
+            CodeRoute { pattern: "/signup", method: RouteMethod::Post },
+        ],
+        &[],
+        &TeraFactory,
+    );
+    let mut state = match open_state(&site) {
+        Ok(state) => state,
+        Err(e) => {
+            eprintln!("render-signup: {e}");
+            std::process::exit(2);
+        }
+    };
+    // The loop from `m6-app-anatomy.md` section 2 follows here, with the arms
+    // `Handled::Code(0, req) => show_form(&req)` and
+    // `Handled::Code(1, req) => signup(&req, &mut state)`.
+    let _ = state;
+    Ok(())
 }
 ```
 
-`auth_db` comes from the renderer's configuration map, so the database path stays out of the tracked configuration.
-Core merges the file named by `secrets_file` into that map, and the key is read with `config.get("auth_db")`.
+`auth_db` comes from the service's configuration map, so the database path stays out of the tracked configuration.
+Core merges the file named by `secrets_file` into that map, and the key is read with `site.user_config().get("auth_db")`.
 
 ```toml
 # render-signup.toml
@@ -433,19 +473,21 @@ secrets_file = "/etc/m6/render-signup.secrets.toml"
 auth_db = "/srv/example.com/data/auth.db"
 ```
 
-The key is absolute because a per-thread initialiser receives no site directory to resolve a relative path against.
-`m6-auth-server` and `m6-auth-cli` resolve a relative `[storage] path` against the configuration file's directory, so the renderer has to name the same file the server opened.
-`m6-app-anatomy.md` section 5.3 gives the two state tiers and what each initialiser receives.
+The key is absolute because `m6-auth-server`'s `[storage] path` is absolute, so the renderer names the same file.
+`m6_core::config::secret_path("auth_db", value)` gives it the same check.
+`m6-app-anatomy.md` section 5.3 gives where state lives and why a plain value in `main` needs no lock.
 
-A shared handle is the other option: `m6-auth-server` keeps one `Db` in a `Mutex` under `App::with_global`, because `Db` is `Send` and not `Sync`.
-A renderer that writes rarely can use the per-worker shape above, which needs no lock.
+`m6-auth-server` opens one `Db` at start and keeps it for the life of the process, and a database that cannot be opened stops it with exit 2.
 
 The processes above share one file, and section 9 gives the rules that keep that safe.
 
 ## 9. Concurrent access
 
 **One database file serves every process that links this crate, and `Db::open` sets the pragmas that make that safe.**
-Table 2 gives the pragmas, and section 8 gives how a worker holds its handle.
+Table 2 gives the pragmas, and section 8 gives where the service holds its one handle.
+
+A process's lock does not hold every request in `m6-auth-server`: its loop retries the locked statement and answers 503 after a second.
+`m6-auth.md` section 9 gives the retry.
 
 The crate keeps no copy of user data in memory.
 Every call reads or writes SQLite, so a user created by `m6-auth-cli` or a renderer is visible to the server's next query.
@@ -467,7 +509,7 @@ Take from it that the server and the CLI have their own references, and the life
 |---|---|
 | `m6-auth.md` | the auth service: configuration, HTTP endpoints, rate limiting and the token lifetimes |
 | `m6-auth-cli.md` | the command line that uses these operations |
-| `m6-app-anatomy.md` | the app lifecycle, the state tiers and how a renderer links core from another repository |
+| `m6-app-anatomy.md` | the service lifecycle, where state lives and how a renderer links core from another repository |
 | `../README.md` | where this document sits in the documentation table |
 
 **Table 10: further reading, and what each document owns.**

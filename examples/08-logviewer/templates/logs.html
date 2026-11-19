@@ -1,0 +1,43 @@
+{% extends "templates/base.html" %}
+{% block title %}Logs — {{ site_name }}{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="/assets/logs.css">
+{% endblock %}
+
+{% block content %}
+<div id="logviewer">
+  <div class="lv-toolbar">
+    <h2>Live Logs</h2>
+    <div class="lv-controls">
+      <label>Process:
+        <select id="lv-process">
+          <option value="m6-http">m6-http</option>
+          <option value="m6-html">m6-html</option>
+          <option value="m6-file">m6-file</option>
+        </select>
+      </label>
+      <label>
+        <input type="checkbox" id="lv-autoscroll" checked> Auto-scroll
+      </label>
+      <button id="lv-clear">Clear</button>
+    </div>
+  </div>
+
+  <table id="lv-table">
+    <thead>
+      <tr>
+        <th class="col-time">Time</th>
+        <th class="col-level">Level</th>
+        <th class="col-target">Target</th>
+        <th class="col-msg">Message</th>
+      </tr>
+    </thead>
+    <tbody id="lv-body"></tbody>
+  </table>
+
+  <div id="lv-status">Connecting…</div>
+</div>
+
+<script src="/assets/logs.js"></script>
+{% endblock %}

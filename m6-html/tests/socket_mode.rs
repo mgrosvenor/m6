@@ -1,8 +1,7 @@
 //! `[server] socket_mode`, checked on the socket rather than in the config.
 //!
-//! `App` set no mode at all, so its five services took whatever the umask gave
-//! them, typically `0o755`. m6-file and m6-auth-server each set `0o666` by
-//! hand. Neither was a decision anybody made: both worked because `/run/m6` is
+//! A service used to take whatever the umask gave it, typically `0o755`.
+//! m6-file and m6-auth-server each set `0o666` by hand. Neither was a decision anybody made: both worked because `/run/m6` is
 //! `0750` and owned by `m6`, so the directory was doing all the enforcing.
 //!
 //! What is asserted here is that the configured mode reaches the file. A
@@ -12,7 +11,6 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
 
 use m6_core::testkit::{binary, Service};
 
@@ -25,7 +23,7 @@ fn fixtures_dir() -> PathBuf {
 /// Spawn `m6-html` with `body` as the whole of its `[server]` section and
 /// return the mode the socket ended up with.
 fn socket_mode_for(id: &str, server_section: &str) -> u32 {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let config = dir.path().join("m6-html.conf");
     std::fs::write(
         &config,
@@ -49,7 +47,8 @@ fn socket_mode_for(id: &str, server_section: &str) -> u32 {
             .arg(&config)
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
-    svc.wait_for_path(&socket_path, Duration::from_secs(10));
+    svc.wait_for_path(&socket_path, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
 
     let mode = std::fs::metadata(&socket_path)
         .expect("socket metadata")
@@ -67,8 +66,8 @@ fn the_default_socket_mode_is_0660() {
     let mode = socket_mode_for("dflt", "");
     assert_eq!(
         mode, 0o660,
-        "expected 0660, got {mode:04o}; an App socket used to take whatever \
-         the umask gave it"
+        "expected 0660, got {mode:04o}; a socket used to take whatever the \
+         umask gave it"
     );
 }
 
@@ -84,7 +83,7 @@ fn a_configured_socket_mode_is_applied() {
 /// socket open at a mode nobody chose.
 #[test]
 fn a_nonsense_socket_mode_stops_the_service() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let config = dir.path().join("m6-html.conf");
     std::fs::write(&config, "[server]\nsocket_mode = \"rw-rw----\"\n").expect("write config");
     let socket_path = dir.path().join("bad.sock");

@@ -1,0 +1,33 @@
+[Unit]
+Description=m6-html renderer
+Documentation=https://github.com/mgrosvenor/m6
+After=network.target
+
+[Service]
+Type=simple
+User=m6
+Group=m6
+
+RuntimeDirectory=m6
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+
+ExecStart=/usr/local/bin/m6-html \
+    /var/www/my-blog \
+    /var/www/my-blog/configs/m6-html.conf
+
+Restart=on-failure
+RestartSec=2
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=m6-html
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/m6
+ReadOnlyPaths=/var/www/my-blog /etc/m6
+
+[Install]
+WantedBy=multi-user.target

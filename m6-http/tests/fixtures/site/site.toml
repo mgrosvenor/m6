@@ -8,8 +8,7 @@ tls_cert = "cert.pem"
 tls_key  = "key.pem"
 
 [log]
-level  = "warn"
-format = "json"
+level = "warn"
 
 [errors]
 mode = "internal"

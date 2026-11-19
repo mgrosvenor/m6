@@ -1,0 +1,29 @@
+[Unit]
+Description=m6-file renderer
+After=network.target
+
+[Service]
+Type=simple
+User=m6
+Group=m6
+RuntimeDirectory=m6
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+
+ExecStart=/usr/local/bin/m6-file \
+    /var/www/my-blog \
+    /var/www/my-blog/configs/m6-file.conf
+
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=m6-file
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/m6
+ReadOnlyPaths=/var/www/my-blog
+
+[Install]
+WantedBy=multi-user.target

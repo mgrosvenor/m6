@@ -5,13 +5,17 @@
 //! waste CPU without shrinking it. No suite requests a woff2 file, so the
 //! mistake would go unnoticed.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
-use m6_core::testkit::{binary, wait, Service};
+use m6_core::testkit::{binary, read_response_event, wait, Service, RESPONSE_BOUND};
 
 /// A running `m6-file`, its socket, and the directory both live in.
 ///
@@ -38,7 +42,7 @@ fn config_path() -> PathBuf {
 /// socket file before the server calls `listen`, so the file existing proves
 /// nothing.
 fn spawn_server(id: &str) -> (Server, PathBuf) {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let socket_path = dir.path().join(format!("{id}.sock"));
 
     let mut svc = Service::spawn(
@@ -48,9 +52,9 @@ fn spawn_server(id: &str) -> (Server, PathBuf) {
             .arg(config_path())
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
-    svc.wait_for_path(&socket_path, Duration::from_secs(10));
+    svc.wait_for_path(&socket_path, m6_core::testkit::STARTUP_BOUND);
     assert!(
-        wait::for_unix(&socket_path, Duration::from_secs(10)),
+        wait::for_unix(&socket_path, m6_core::testkit::STARTUP_BOUND),
         "m6-file created {} but never accepted a connection",
         socket_path.display()
     );
@@ -68,13 +72,10 @@ fn spawn_server(id: &str) -> (Server, PathBuf) {
 fn raw_request(socket_path: &Path, request: &str) -> Vec<u8> {
     let mut stream = UnixStream::connect(socket_path)
         .unwrap_or_else(|e| panic!("connect to {:?}: {}", socket_path, e));
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
     stream.write_all(request.as_bytes()).unwrap();
 
     let method = request.split(' ').next().unwrap_or("");
-    m6_core::testkit::read_one(&mut stream, method).expect("read one response")
+    read_response_event(stream, method, RESPONSE_BOUND).expect("read one response")
 }
 
 /// Split a raw response into its header block and body bytes.

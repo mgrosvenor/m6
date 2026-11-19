@@ -1,0 +1,108 @@
+# Cache site config — local dev
+# Used by all 5 cache node instances (ports 9002–9006).
+# All requests are proxied upstream to the local origin H2C instance on port 9000.
+#
+# Cache nodes do not enforce auth themselves — they proxy auth headers through
+# to the origin, which validates them. This is safe because:
+#   - Cache nodes are on a private WireGuard network (production)
+#   - CMS routes are always forwarded to origin
+#   - The origin is the only place that checks JWTs and writes state
+
+[site]
+name   = "My Blog"
+domain = "localhost"
+
+[errors]
+mode = "internal"
+
+[log]
+level  = "info"
+
+# ── Backend — origin H2C (local dev) ──────────────────────────────────────────
+
+[[backend]]
+name = "origin"
+url  = "h2c://127.0.0.1:9000"
+
+# ── Public routes ──────────────────────────────────────────────────────────────
+
+[[route]]
+path    = "/"
+backend = "origin"
+
+[[route]]
+path    = "/about"
+backend = "origin"
+
+[[route]]
+path    = "/blog"
+backend = "origin"
+
+[[route]]
+path    = "/blog/{stem}"
+backend = "origin"
+
+[[route]]
+path    = "/assets/{*relpath}"
+backend = "origin"
+
+[[route]]
+path    = "/_errors"
+backend = "origin"
+
+[[route]]
+path    = "/contact"
+backend = "origin"
+
+# ── Auth ───────────────────────────────────────────────────────────────────────
+
+[[route]]
+path    = "/login"
+backend = "origin"
+
+[[route]]
+path    = "/auth/login"
+backend = "origin"
+
+[[route]]
+path    = "/auth/logout"
+backend = "origin"
+
+[[route]]
+path    = "/auth/refresh"
+backend = "origin"
+
+# ── CMS — always forwarded to origin ────────────────────────────
+# Auth is enforced by the origin. Cache nodes pass all headers through.
+
+[[route]]
+path    = "/cms"
+backend = "origin"
+
+[[route]]
+path    = "/cms/edit/{stem}"
+backend = "origin"
+
+[[route]]
+path    = "/cms/new"
+backend = "origin"
+
+[[route]]
+path    = "/api/drafts"
+backend = "origin"
+
+[[route]]
+path    = "/api/drafts/{stem}"
+backend = "origin"
+
+[[route]]
+path    = "/api/publish/{stem}"
+backend = "origin"
+
+[[route]]
+path    = "/api/unpublish/{stem}"
+backend = "origin"
+
+[[route]]
+path    = "/api/posts/{stem}"
+backend = "origin"

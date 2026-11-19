@@ -1,7 +1,6 @@
-/// m6-md — convert a directory of Markdown files into a single JSON params file.
+/// m6-md: convert a directory of Markdown files into a single JSON params file.
 ///
-/// Usage: m6-md <input-dir> --output <output-file> [--log-level <level>]
-///              [--watch] [--touch <path>]
+/// Usage: m6-md <input-dir> --output <file> [--log-level <level>] [--version] [--version-full]
 ///
 /// Each *.md file may begin with a TOML frontmatter block delimited by +++.
 /// Files beginning with _ are skipped (drafts/partials convention).
@@ -9,8 +8,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use m6_core::log::{info, warn};
 use serde_json::{json, Map, Value};
-use tracing::{debug, info, warn};
 
 // ── Markdown rendering ────────────────────────────────────────────────────────
 
@@ -93,7 +92,7 @@ fn toml_to_json(v: toml::Value) -> Value {
 fn file_mtime_iso(path: &Path) -> String {
     let mtime = std::fs::metadata(path)
         .and_then(|m| m.modified())
-        .unwrap_or_else(|_| std::time::SystemTime::now());
+        .unwrap_or_else(|_| m6_core::platform::wall());
     m6_core::util::iso_date_from(mtime)
 }
 
@@ -150,25 +149,16 @@ struct Cli {
     input_dir: PathBuf,
     output: PathBuf,
     log_level: String,
-    watch: bool,
-    touch: Option<PathBuf>,
 }
 
 fn parse_args(args: &[String]) -> Result<Cli> {
     let mut input_dir = None;
     let mut output = None;
     let mut log_level = "info".to_string();
-    let mut watch = false;
-    let mut touch = None;
     let mut i = 1usize;
 
     while i < args.len() {
         match args[i].as_str() {
-            // Its own parser, so the flag is added here too.
-            "--version" | "-V" => {
-                println!("m6-md {}", env!("CARGO_PKG_VERSION"));
-                std::process::exit(0);
-            }
             "--output" => {
                 i += 1;
                 if i >= args.len() {
@@ -182,16 +172,6 @@ fn parse_args(args: &[String]) -> Result<Cli> {
                     bail!("--log-level requires a value");
                 }
                 log_level = args[i].clone();
-            }
-            "--watch" => {
-                watch = true;
-            }
-            "--touch" => {
-                i += 1;
-                if i >= args.len() {
-                    bail!("--touch requires a value");
-                }
-                touch = Some(PathBuf::from(&args[i]));
             }
             arg if arg.starts_with("--") => bail!("unknown flag: {arg}"),
             _ => {
@@ -208,23 +188,29 @@ fn parse_args(args: &[String]) -> Result<Cli> {
     let input_dir = input_dir.ok_or_else(|| anyhow::anyhow!("required: <input-dir>"))?;
     let output = output.ok_or_else(|| anyhow::anyhow!("required: --output <file>"))?;
 
+    m6_core::log::parse_level(&log_level)
+        .map_err(|e| anyhow::anyhow!("--log-level {log_level:?}: {e}"))?;
+
     Ok(Cli {
         input_dir,
         output,
         log_level,
-        watch,
-        touch,
     })
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+/// The global allocator: mimalloc, which also counts calls when the
+/// `count-allocations` feature turns on m6-core's `alloc-count`. The counting
+/// is not compiled in a plain build.
+#[global_allocator]
+static ALLOC: m6_core::alloc::M6Alloc = m6_core::alloc::M6Alloc;
+
 fn main() {
-    // Block SIGTERM and SIGINT before anything else, including logging.
-    // The mask is inherited only by threads created after this point, and
-    // tracing-appender's writer thread would otherwise take the signal at its
-    // default disposition and kill the process. See m6_core::signal.
-    m6_core::signal::block();
+    // `--version` and `--version-full` answer before the input directory is
+    // required.
+    m6_core::version_flags!(m6_core::build_info::linked());
+
     let args: Vec<String> = std::env::args().collect();
     std::process::exit(run(args));
 }
@@ -234,138 +220,66 @@ fn run(args: Vec<String>) -> i32 {
         Ok(c) => c,
         Err(e) => {
             eprintln!("usage error: {e}");
-            eprintln!("Usage: m6-md <input-dir> --output <file> [--log-level <level>] [--watch] [--touch <path>]");
+            eprintln!("Usage: m6-md <input-dir> --output <file> [--log-level <level>] [--version] [--version-full]");
             return 2;
         }
     };
 
     // Init logging
-    let filter = tracing_subscriber::EnvFilter::try_new(&cli.log_level)
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(filter)
-        .init();
+    let level = match m6_core::log::parse_level(&cli.log_level) {
+        Ok(level) => level,
+        Err(e) => {
+            eprintln!("usage error: --log-level {e}");
+            return 2;
+        }
+    };
+    if let Err(e) = m6_core::log::init(level) {
+        eprintln!("logging init error: {e}");
+        return 1;
+    }
 
-    // First pass — always run once.
-    if let Err(e) = process(&cli) {
+    // The build tool has no config file: its invocation is its config, so the
+    // record carries the identity, the flags, the platform facts and the count.
+    {
+        let argv = args.clone();
+        let mut trace = m6_core::startup::ConfigTrace::new();
+        let flags = [
+            m6_core::startup::FlagDecl {
+                name: "--output",
+                takes_value: true,
+                setting: None,
+                secret: false,
+            },
+            m6_core::startup::FlagDecl {
+                name: "--log-level",
+                takes_value: true,
+                setting: None,
+                secret: false,
+            },
+        ];
+        let invocation = m6_core::startup::Invocation::read(&argv, &flags, &[], &mut trace);
+        m6_core::startup::Record::new("m6-md", argv)
+            .invocation(invocation, trace)
+            .emit();
+    }
+
+    // Run the one pass, then write everything buffered before this tool exits.
+    let result = process(&cli);
+    m6_core::startup::shutdown(if result.is_ok() {
+        "pass complete"
+    } else {
+        "pass failed"
+    });
+    if let Err(e) = m6_core::log::stop() {
+        eprintln!("logging stop error: {e}");
+        return 1;
+    }
+    if let Err(e) = result {
         eprintln!("error: {e:#}");
         return 1;
     }
 
-    if !cli.watch {
-        return 0;
-    }
-
-    // ── Watch mode ────────────────────────────────────────────────────────────
-
-    // Signal handling lives in m6-core, like every other m6 tool.
-    //
-    // This used the ctrlc crate and kept two flags, an Arc<AtomicBool> and a
-    // static, set together and read only through the static. It also had no
-    // second-signal exit, so it did not match what m6-architecture.md §7.3,
-    // "why startup and shutdown belong to core", specifies for every service:
-    // first signal clean, second immediate.
-    // No socket and no custom wake: m6-md watches the filesystem and parks in
-    // a channel recv, which the shutdown flag is re-checked around.
-    let shutdown = m6_core::signal::ShutdownHandle::install(m6_core::signal::Service::new("m6-md"));
-
-    let (tx, rx) = std::sync::mpsc::channel();
-
-    let mut watcher = match notify::recommended_watcher(move |res| {
-        if let Ok(event) = res {
-            let _ = tx.send(event);
-        }
-    }) {
-        Ok(w) => w,
-        Err(e) => {
-            eprintln!("error: could not create file watcher: {e}");
-            return 1;
-        }
-    };
-
-    use notify::Watcher;
-    if let Err(e) = watcher.watch(&cli.input_dir, notify::RecursiveMode::NonRecursive) {
-        eprintln!("error: could not watch {}: {e}", cli.input_dir.display());
-        return 1;
-    }
-
-    info!(dir = %cli.input_dir.display(), "watching for .md changes");
-
-    loop {
-        if m6_core::signal::is_shutdown() {
-            info!("shutting down");
-            break;
-        }
-
-        // Block up to 200ms waiting for an event.
-        let first = match rx.recv_timeout(std::time::Duration::from_millis(200)) {
-            Ok(ev) => ev,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        };
-
-        // Check if the first event is for a .md file.
-        if !event_affects_md(&first) {
-            // Drain and discard any further pending events.
-            drain_channel(&rx);
-            continue;
-        }
-
-        // Burst-drain: collect any additional events that arrive within 50ms
-        // (handles editors that do delete+create / rename swap writes).
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        drain_channel(&rx);
-
-        if m6_core::signal::is_shutdown() {
-            break;
-        }
-
-        debug!("md change detected, regenerating");
-        match process(&cli) {
-            Ok(()) => {
-                if let Some(ref touch_path) = cli.touch {
-                    if let Err(e) = touch_file(touch_path) {
-                        warn!(path = %touch_path.display(), error = %e, "touch failed");
-                    } else {
-                        debug!(path = %touch_path.display(), "touched");
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "regeneration failed, will retry on next change");
-            }
-        }
-    }
-
-    shutdown.complete();
     0
-}
-
-/// Return true if any path in the event has a `.md` extension.
-fn event_affects_md(event: &notify::Event) -> bool {
-    use notify::EventKind::*;
-    matches!(event.kind, Create(_) | Modify(_) | Remove(_))
-        && event
-            .paths
-            .iter()
-            .any(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
-}
-
-/// Drain all pending events from the channel (non-blocking).
-fn drain_channel(rx: &std::sync::mpsc::Receiver<notify::Event>) {
-    while rx.try_recv().is_ok() {}
-}
-
-/// Touch a file: open for writing (creates if missing), updating its mtime.
-fn touch_file(path: &Path) -> Result<()> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .map(|_| ())
-        .with_context(|| format!("touching {}", path.display()))
 }
 
 fn process(cli: &Cli) -> Result<()> {
@@ -452,4 +366,61 @@ fn process(cli: &Cli) -> Result<()> {
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn parse_err(args: &[&str]) -> String {
+        match parse_args(&argv(args)) {
+            Ok(_) => panic!("expected a parse error"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn watch_and_touch_are_refused() {
+        let err = parse_err(&["m6-md", "in", "--output", "o.json", "--watch"]);
+        assert!(err.contains("unknown flag: --watch"), "got: {err}");
+
+        let err = parse_err(&["m6-md", "in", "--output", "o.json", "--touch", "x"]);
+        assert!(err.contains("unknown flag: --touch"), "got: {err}");
+    }
+
+    #[test]
+    fn an_unknown_log_level_is_a_usage_error() {
+        let level = "info,=bad==";
+        assert!(
+            m6_core::log::parse_level(level).is_err(),
+            "{level:?} should be a level the logger refuses"
+        );
+        let err = parse_err(&["m6-md", "in", "--output", "o.json", "--log-level", level]);
+        assert!(err.contains("--log-level"), "got: {err}");
+    }
+
+    #[test]
+    fn a_valid_run_writes_the_output() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("post.md"),
+            "+++\ntitle = \"t\"\ndate = \"2026-01-01\"\n+++\nbody\n",
+        )
+        .unwrap();
+        let out = dir.path().join("out.json");
+        let rc = run(argv(&[
+            "m6-md",
+            &dir.path().to_string_lossy(),
+            "--output",
+            &out.to_string_lossy(),
+        ]));
+        assert_eq!(rc, 0);
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(written["documents"][0]["stem"].as_str(), Some("post"));
+    }
 }

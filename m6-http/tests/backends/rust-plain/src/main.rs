@@ -10,8 +10,8 @@
 //! # This file is the control, and that is its main job
 //!
 //! Its pair, `rust-m6core`, does exactly the same thing with the socket
-//! lifecycle, thread pool, signal handling and content handling supplied by
-//! `m6-core` instead of written out. Same language, same compiler, same payload,
+//! lifecycle, request framing, signal handling and content handling supplied
+//! by `m6-core` instead of written out. Same language, same compiler, same payload,
 //! so the difference between the two is precisely what linking the library
 //! costs. It has **no dependencies at all** for that reason: anything linked
 //! here that the pair does not link would show up in the delta and be misread as
@@ -24,23 +24,30 @@
 //!
 //! # Why a thread pool and not a thread per connection
 //!
-//! Protocol §7 names the reference model: a fixed thread pool with a bounded
-//! queue, pool size the CPU count, queue depth pool times eight, and a full
-//! queue answered `503` immediately rather than queued without limit.
+//! Protocol §7 permits threads, processes or an event loop, and names one
+//! process with one event loop as the reference model. `rust-m6core` is that
+//! model; this control keeps a fixed thread pool with a bounded queue, pool
+//! size the CPU count, queue depth pool times eight, and a full queue answered
+//! `503` immediately rather than queued without limit.
 //!
 //! The first version of this file spawned a thread per connection instead, which
-//! the protocol permits. It was measurably wrong for the job this file has:
+//! the protocol also permits. It was measurably wrong for the job this file has:
 //! against its `rust-m6core` pair on the build host it was **72% slower**,
 //! 17,608 rps against 30,270, because it paid a thread creation on every
-//! request while core answered from a warm pool. That difference was being
-//! reported as `m6-core`'s overhead when it was nothing of the kind, and a
-//! control that differs from its subject in two ways measures neither.
+//! request while the other half answered from a warm set of workers. That
+//! difference was being reported as `m6-core`'s overhead when it was nothing of
+//! the kind.
 //!
-//! So both halves of the pair now use the same concurrency model and the delta
-//! is the library, which is what §5.3 of the examples doc claims it is.
+//! So both halves serve connections from a warm set of workers, and the pair
+//! differs in the concurrency model the protocol permits each of them.
 //!
 //! Standard library only: `std::os::unix`, `std::net` is not even needed.
 //! `docs/m6-backend-protocol.md` §9 is the checklist this implements.
+
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
 
 use std::collections::VecDeque;
 use std::fs;
@@ -84,14 +91,6 @@ fn main() -> ExitCode {
         }
     };
 
-    let listener = match bind(&sock_path) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("cannot listen on {sock_path}: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
     // Shutdown, spec §8.2: stop accepting, finish what is in flight, remove the
     // socket, exit 0. A second signal exits immediately.
     //
@@ -100,28 +99,54 @@ fn main() -> ExitCode {
     // listening fd so the blocked `accept` returns. `rust-m6core` gets all of
     // this from core.
     //
-    // The fd is published BEFORE the handlers are installed: a SIGTERM arriving
-    // between the two would otherwise find -1 and leave the process blocked in
-    // accept forever. That is not hypothetical, it is what the first version of
-    // this file did, and the shared conformance test for clean shutdown is what
-    // found it.
-    LISTEN_FD.store(listener.as_raw_fd(), Ordering::SeqCst);
+    // The handlers go in BEFORE the socket exists. Its existence is how a
+    // caller knows the backend is ready (spec §8.1), so a caller that waits for
+    // it and then sends SIGTERM must find a handler installed. Installing after
+    // `bind` leaves a window in which the socket exists and SIGTERM still has
+    // its default disposition, so the process is killed instead of shutting
+    // down.
     install_signal_handlers();
 
-    // Protocol §7's reference model: fixed pool, bounded queue, 503 when full.
+    let listener = match bind(&sock_path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("cannot listen on {sock_path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // The fd is published after the bind, so the handler has something to close
+    // and a blocked `accept` returns at once. Before the first accept the flag
+    // is checked: a stop that arrived between installing the handler and this
+    // line skips the loop instead of blocking in `accept` on a live socket. A
+    // stop that arrives after the check closes the fd, so `accept` returns an
+    // error and the loop breaks.
+    LISTEN_FD.store(listener.as_raw_fd(), Ordering::SeqCst);
+
+    // Protocol §7 permits a fixed pool; this file keeps one: bounded queue, 503 when full.
     let workers = thread::available_parallelism().map_or(4, |n| n.get());
     let pool = Pool::new(workers, workers * 8, Arc::clone(&status_body));
 
-    for conn in listener.incoming() {
-        if SIGNALLED.load(Ordering::SeqCst) {
-            break;
-        }
-        match conn {
-            Ok(stream) => pool.submit(stream),
-            Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(_) => break, // the listener was shut down by the signal handler
+    if !SIGNALLED.load(Ordering::SeqCst) {
+        for conn in listener.incoming() {
+            if SIGNALLED.load(Ordering::SeqCst) {
+                break;
+            }
+            match conn {
+                Ok(stream) => pool.submit(stream),
+                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => break, // the listener was shut down by the signal handler
+            }
         }
     }
+    // The handler closed the listening descriptor to wake `accept`, but
+    // `listener` still believes it owns that number. Dropping it would close
+    // the number a second time, and std detects that as an IO-safety violation
+    // and aborts: "owned file descriptor already closed". A debug build aborts
+    // here, and a release build happens not to. Forget the owner so the
+    // descriptor is closed exactly once, by the handler. A stop that arrived
+    // before the fd was published left it open, which the process exit closes.
+    std::mem::forget(listener);
     // Finish what is in flight before removing the socket (spec §8.2).
     pool.shutdown();
     // Removing the socket is what withdraws this member from the pool. Left
@@ -183,7 +208,7 @@ fn install_signal_handlers() {
     }
 }
 
-/// A fixed thread pool with a bounded queue, protocol §7's reference model.
+/// A fixed thread pool with a bounded queue, the shape the protocol permits alongside one event loop.
 ///
 /// Hand-written because this example links nothing: a channel crate would be the
 /// obvious way and would also put a dependency into the control half of a

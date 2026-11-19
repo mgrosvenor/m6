@@ -1,0 +1,146 @@
+{% extends "templates/base.html" %}
+{% block title %}Bench — {{ site_name }}{% endblock %}
+
+{% block head %}
+<style>
+  #bench-controls {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    margin-bottom: 1.2rem;
+    flex-wrap: wrap;
+  }
+  #bench-controls label {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.9rem;
+  }
+  #bench-controls input[type=number] {
+    width: 5rem;
+    padding: 0.25rem 0.4rem;
+    border: 1px solid #ccc;
+    border-radius: 3px;
+    font-size: 0.9rem;
+  }
+  #bench-run, #bench-stop, #bench-export {
+    padding: 0.4rem 1.1rem;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.9rem;
+  }
+  #bench-run    { background: #0a7; color: #fff; }
+  #bench-stop   { background: #c0392b; color: #fff; }
+  #bench-export { background: #457b9d; color: #fff; }
+  #bench-run:disabled, #bench-stop:disabled, #bench-export:disabled { opacity: 0.35; cursor: default; }
+
+  @media print {
+    @page { size: A4 landscape; margin: 12mm; }
+    nav, #bench-controls, #bench-status, .bench-hint,
+    #bench-zoom-overlay, #bench-stop, #bench-export { display: none !important; }
+    #bench-cdfs { display: grid !important; grid-template-columns: 1fr 1fr; gap: 8mm; }
+    #bench-cdfs svg { width: 100%; height: auto; break-inside: avoid; }
+    #bench-tbl  { display: table !important; font-size: 0.75rem; margin-top: 6mm; }
+    #print-header { display: block !important; }
+    body { max-width: none; padding: 0; }
+  }
+  #print-header {
+    display: none;
+    font-size: 0.8rem;
+    color: #555;
+    margin-bottom: 4mm;
+  }
+  #bench-status {
+    font-size: 0.85rem;
+    color: #555;
+    min-height: 1.4em;
+  }
+  #bench-cdfs {
+    display: none;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    margin: 1rem 0;
+  }
+  #bench-cdfs svg { width: 100%; height: auto; cursor: zoom-in; }
+  #bench-zoom-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.65);
+    z-index: 9999;
+    align-items: center;
+    justify-content: center;
+    cursor: zoom-out;
+  }
+  #bench-zoom-overlay.active { display: flex; }
+  #bench-zoom-overlay svg {
+    max-width: 90vw;
+    max-height: 88vh;
+    width: 900px;
+    height: auto;
+    border-radius: 6px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+  }
+  #bench-tbl   { display: none; border-collapse: collapse; width: 100%; font-size: 0.85rem; margin-top: 0.5rem; }
+  #bench-tbl th, #bench-tbl td { padding: 0.35rem 0.7rem; border: 1px solid #ddd; text-align: right; }
+  #bench-tbl th { background: #f4f4f4; font-weight: 600; }
+  #bench-tbl td:first-child, #bench-tbl th:first-child { text-align: left; }
+  .ph3 { color: #0a7; font-weight: 600; }
+  .ph2 { color: #059; font-weight: 600; }
+  .ph1 { color: #a60; font-weight: 600; }
+  .bench-hint {
+    font-size: 0.8rem;
+    color: #777;
+    margin-top: 0.6rem;
+    line-height: 1.5;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<h2>In-Browser Benchmark</h2>
+
+<div id="bench-controls">
+  <button id="bench-run">Run</button>
+  <button id="bench-stop" disabled>Stop</button>
+  <button id="bench-export" disabled>Export PDF</button>
+  <label>Iterations:
+    <input type="number" id="bench-n" value="200" min="20" step="10">
+  </label>
+</div>
+
+<div id="print-header"></div>
+<div id="bench-status"></div>
+
+<div id="bench-cdfs"></div>
+<div id="bench-zoom-overlay"></div>
+
+<table id="bench-tbl">
+  <thead>
+    <tr>
+      <th>Suite</th>
+      <th>Proto</th>
+      <th>p50 (ms)</th>
+      <th>p99 (ms)</th>
+      <th>min (ms)</th>
+      <th>max (ms)</th>
+      <th>avg (ms)</th>
+      <th>n</th>
+    </tr>
+  </thead>
+  <tbody id="bench-tbody"></tbody>
+</table>
+
+<p class="bench-hint">
+  Each iteration uses <code>fetch(…, { cache: 'no-store' })</code> to bypass the browser cache
+  while leaving the m6-http server-side cache intact.
+  Timings are in ms; <code>performance.now()</code> is typically quantised to 1 ms in
+  non-isolated pages — the detected resolution is shown in the status bar and a
+  half-bucket midpoint correction is applied to each sample.<br>
+  Protocol is detected via the <a href="https://developer.mozilla.org/en-US/docs/Web/API/PerformanceResourceTiming/nextHopProtocol" target="_blank">Resource Timing API</a>.<br>
+  To benchmark H2 instead of H3: open <code>about:networking</code> → <em>Alt-Svc</em> → clear all entries, then reload.
+</p>
+
+<script src="/assets/bench.js"></script>
+{% endblock %}

@@ -257,21 +257,21 @@ mod tests {
     fn active_means_still_being_hit() {
         let json = r#"{"nftables":[
           {"rule":{"chain":"ufw-user-input",
-            "expr":[{"match":{"op":"==","left":{"payload":{"protocol":"ip","field":"saddr"}},"right":"1.1.1.1"}},
+            "expr":[{"match":{"op":"==","left":{"payload":{"protocol":"ip","field":"saddr"}},"right":"198.51.100.1"}},
                     {"counter":{"packets":0,"bytes":0}},{"drop":null}]}},
           {"rule":{"chain":"ufw-user-input",
-            "expr":[{"match":{"op":"==","left":{"payload":{"protocol":"ip","field":"saddr"}},"right":"2.2.2.2"}},
+            "expr":[{"match":{"op":"==","left":{"payload":{"protocol":"ip","field":"saddr"}},"right":"198.51.100.2"}},
                     {"counter":{"packets":99,"bytes":5940}},{"drop":null}]}}
         ]}"#;
         let s = FirewallState::from_nft_json(json).unwrap();
         assert_eq!(s.blocks.len(), 2);
         assert_eq!(
             s.active().map(|b| b.address.as_str()).collect::<Vec<_>>(),
-            ["2.2.2.2"]
+            ["198.51.100.2"]
         );
         assert_eq!(
             s.blocked_addresses().collect::<Vec<_>>(),
-            ["1.1.1.1", "2.2.2.2"],
+            ["198.51.100.1", "198.51.100.2"],
             "sorted, so two nodes' states can be compared directly"
         );
     }

@@ -1,0 +1,40 @@
+[package]
+name    = "m6-log"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "m6_log"
+
+[dependencies]
+itoa        = "1"
+# `Line::json` writes one nested value from a type's `Serialize` impl, so a
+# document's field list exists once rather than in a second copy here.
+serde       = "1"
+serde_json  = "1"
+# Raw descriptor writes and the non-blocking flag, from the platform layer.
+m6-platform = { path = "../m6-platform" }
+
+[build-dependencies]
+# The one build helper. It is m6-platform's, re-exported by m6-core, because
+# m6-core links m6-log and so cannot be this crate's build dependency.
+m6-platform = { path = "../m6-platform" }
+
+[dev-dependencies]
+serde_json         = "1"
+tempfile           = "3"
+criterion          = { version = "0.5", features = ["html_reports"] }
+# The custom-harness tests speak libtest's protocol (`--list --format terse`,
+# `--exact <name>`), which is what `nextest` lists and runs.
+libtest-mimic = "0.8"
+
+[[test]]
+name    = "no_allocation"
+harness = false
+
+[[bench]]
+name    = "line"
+harness = false

@@ -30,10 +30,25 @@
 //! Same rule as the sibling file, §8: skip with a visible warning on a laptop,
 //! fail under `M6_BACKENDS_REQUIRE_ALL=1`, which `deploy/run-tests.sh` sets.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
+
+use m6_core::platform::process::{Child, Io, Streams};
+
+/// A backend's stdout is not read, and its stderr is drained into the failure
+/// message.
+const BACKEND_STREAMS: Streams = Streams {
+    stdin: Io::Inherit,
+    stdout: Io::Null,
+    stderr: Io::Piped,
+};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -91,39 +106,7 @@ fn backend_command(lang: &str, work: &Path, sock: &Path) -> Command {
     let src = backends_dir().join(lang);
     match lang {
         "c" | "cpp" | "go" => {
-            let bin = work.join("ex");
-            match lang {
-                "c" => run_ok(
-                    "cc",
-                    &[
-                        "-std=c11",
-                        "-O2",
-                        "-pthread",
-                        "-o",
-                        bin.to_str().unwrap(),
-                        src.join("main.c").to_str().unwrap(),
-                    ],
-                    None,
-                ),
-                "cpp" => run_ok(
-                    "c++",
-                    &[
-                        "-std=c++17",
-                        "-O2",
-                        "-pthread",
-                        "-o",
-                        bin.to_str().unwrap(),
-                        src.join("main.cpp").to_str().unwrap(),
-                    ],
-                    None,
-                ),
-                _ => run_ok(
-                    "go",
-                    &["build", "-o", bin.to_str().unwrap(), "."],
-                    Some((&src, work.join("gocache"))),
-                ),
-            }
-            let mut c = Command::new(bin);
+            let mut c = Command::new(compiled(lang));
             c.arg(sock).arg(payload_path());
             c
         }
@@ -143,7 +126,7 @@ fn backend_command(lang: &str, work: &Path, sock: &Path) -> Command {
             std::fs::copy(payload_path(), site.join("status.json")).unwrap();
             std::fs::write(
                 site.join("site.toml"),
-                "[site]\nname = \"be\"\ndomain = \"localhost\"\n\n[log]\nlevel = \"warn\"\nformat = \"text\"\n",
+                "[site]\nname = \"be\"\ndomain = \"localhost\"\n\n[log]\nlevel = \"warn\"\n",
             )
             .unwrap();
             let conf = work.join("bexample.toml");
@@ -160,6 +143,103 @@ fn backend_command(lang: &str, work: &Path, sock: &Path) -> Command {
         }
         other => panic!("unknown language {other}"),
     }
+}
+
+/// Compile a C, C++ or Go example once for the whole test binary.
+///
+/// [`backend_command`] is called once per test, and each call used to compile
+/// into that test's own scratch directory. Seven tests then compiled three
+/// languages each, and every Go build started from an empty `GOCACHE` and
+/// rebuilt the standard library, which was most of the 110 seconds this file
+/// took on the build host. The compiled binary does not depend on which test
+/// asked for it, so it is built once and cached here.
+fn compiled(lang: &str) -> PathBuf {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    // The lock is held across the compile: two tests starting the same language
+    // at once would otherwise both write the same output path, and the second
+    // link would truncate the binary the first had already started running.
+    let mut guard = cache.lock().expect("backend build cache");
+    if let Some(p) = guard.get(lang) {
+        return p.clone();
+    }
+
+    let src = backends_dir().join(lang);
+    let bin = build_dir().join(lang);
+    match lang {
+        "c" => run_ok(
+            "cc",
+            &[
+                "-std=c11",
+                "-O2",
+                "-pthread",
+                "-o",
+                bin.to_str().unwrap(),
+                src.join("main.c").to_str().unwrap(),
+            ],
+            None,
+        ),
+        "cpp" => run_ok(
+            "c++",
+            &[
+                "-std=c++17",
+                "-O2",
+                "-pthread",
+                "-o",
+                bin.to_str().unwrap(),
+                src.join("main.cpp").to_str().unwrap(),
+            ],
+            None,
+        ),
+        "go" => run_ok(
+            "go",
+            &["build", "-o", bin.to_str().unwrap(), "."],
+            Some((&src, go_cache())),
+        ),
+        other => panic!("{other} is not compiled"),
+    }
+    assert!(
+        bin.is_file(),
+        "{lang} built but {} does not exist",
+        bin.display()
+    );
+    guard.insert(lang.to_string(), bin.clone());
+    bin
+}
+
+/// Where the compiled examples for THIS run go.
+///
+/// Not the per-test scratch directory, which is dropped when that test ends.
+/// Named by process id so two concurrent runs cannot share an output path, and
+/// under the exec-capable root because these binaries are spawned.
+fn build_dir() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = m6_core::testkit::exec_scratch_root()
+            .join(format!("m6px-build-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("backend build directory");
+        dir
+    })
+    .clone()
+}
+
+/// The Go build cache, shared by every run on this machine.
+///
+/// A per-run `GOCACHE` makes `go build` recompile the standard library, which
+/// costs tens of seconds. The cache is content-addressed and safe for
+/// concurrent use, so one copy under the scratch root serves every run.
+fn go_cache() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = m6_core::testkit::exec_scratch_root().join("m6-go-build-cache");
+        std::fs::create_dir_all(&dir).expect("go build cache directory");
+        dir
+    })
+    .clone()
 }
 
 fn run_ok(tool: &str, args: &[&str], cwd_env: Option<(&Path, PathBuf)>) {
@@ -278,6 +358,22 @@ fn https_get(
 
 // ── One example behind one edge ──────────────────────────────────────────────
 
+/// Owns a spawned backend from the moment it is spawned, so a panic anywhere
+/// in `Stack::start` after the spawn still kills it. Once `Stack` owns the
+/// child the child is taken out and `Stack::drop` takes over.
+struct BackendGuard {
+    child: Option<Child>,
+}
+
+impl Drop for BackendGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 struct Stack {
     _backend: Child,
     _edge: Service,
@@ -298,10 +394,6 @@ impl Drop for Stack {
 
 impl Stack {
     fn start(lang: &str) -> Option<Stack> {
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .ok();
-
         if !available(lang) {
             let msg = format!("{lang}: {} is not installed", toolchain_for(lang));
             assert!(
@@ -325,6 +417,22 @@ impl Stack {
             .prefix("m6px-")
             .tempdir_in(m6_core::testkit::exec_scratch_root())
             .unwrap();
+        Self::start_in(lang, tmp, false, &mut None)
+    }
+
+    /// The spawn+guard path, given the scratch dir. `broken_tls_key` writes a
+    /// system.toml naming a missing TLS key so the edge exits before binding.
+    /// `backend_pid` receives the spawned backend's pid before the edge is
+    /// spawned, so a caller can assert the guard reaped it on a failed start.
+    fn start_in(
+        lang: &str,
+        tmp: tempfile::TempDir,
+        broken_tls_key: bool,
+        backend_pid: &mut Option<u32>,
+    ) -> Option<Stack> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
         let base = tmp.path();
 
         // The socket goes under /tmp with a short name, NOT in the temp dir:
@@ -371,7 +479,6 @@ mode = "internal"
 
 [log]
 level  = "warn"
-format = "text"
 
 [analytics]
 enabled = false
@@ -398,31 +505,45 @@ backend = "example"
         .unwrap();
 
         let sys = base.join("system.toml");
+        let tls_key_arg = if broken_tls_key {
+            "missing-key.pem".to_string()
+        } else {
+            key_f.display().to_string()
+        };
         std::fs::write(
             &sys,
             format!(
-                "[server]\nbind     = \"127.0.0.1:{port}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\n",
+                "[node]\nname = \"edge\"\n\n[server]\nbind     = \"127.0.0.1:{port}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\n",
                 cert_f.display(),
-                key_f.display()
+                tls_key_arg
             ),
         )
         .unwrap();
 
-        // Backend first: the socket appearing is what puts it in the pool
-        // (spec §8.1), and starting the edge first would just mean it discovers
-        // the member a moment later.
-        let mut backend = backend_command(lang, base, &sock)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|e| panic!("{lang}: spawn: {e}"));
+        // Backend first: the pool reads its glob once at start, so the socket
+        // must exist before m6-http is spawned. The guard owns the child from
+        // this moment, so a failure in the edge path below still reaps it.
+        let mut backend = BackendGuard {
+            child: Some(
+                m6_core::platform::process::spawn(
+                    &mut backend_command(lang, base, &sock),
+                    BACKEND_STREAMS,
+                )
+                .unwrap_or_else(|e| panic!("{lang}: spawn: {e}")),
+            ),
+        };
+        *backend_pid = backend.child.as_ref().map(|c| c.id());
 
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
         loop {
             if sock.exists() && std::os::unix::net::UnixStream::connect(&sock).is_ok() {
                 break;
             }
-            if let Some(code) = backend.try_wait().ok().flatten() {
+            if let Some(code) = backend
+                .child
+                .as_mut()
+                .and_then(|c| c.try_wait().ok().flatten())
+            {
                 panic!("{lang}: backend exited with {code} before binding");
             }
             assert!(
@@ -433,7 +554,7 @@ backend = "example"
             std::thread::sleep(Duration::from_millis(25));
         }
 
-        let edge = Service::spawn(
+        let mut edge = Service::spawn(
             "m6-http",
             Command::new(binary("m6-http")).args([
                 site.to_str().unwrap(),
@@ -445,26 +566,12 @@ backend = "example"
 
         let tls = trusting_client(&cert_der);
         // Wait for the edge to answer, rather than sleeping a fixed amount.
-        //
-        // The panic matters. This loop used to run to its deadline and then carry
-        // on regardless, so an edge that never bound produced a connection error
-        // in whichever assertion happened to run first, naming the symptom instead
-        // of the cause. A wait that cannot fail is not a wait, it is a sleep with
-        // extra steps.
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "{lang}: the edge never bound 127.0.0.1:{port} within 20s"
-            );
-            std::thread::sleep(Duration::from_millis(25));
-        }
+        // `wait_for_tcp` fails at once with the edge's exit status and stderr
+        // if the edge exits, instead of waiting out the whole deadline.
+        edge.wait_for_tcp(port, m6_core::testkit::STARTUP_BOUND);
 
         Some(Stack {
-            _backend: backend,
+            _backend: backend.child.take().unwrap(),
             _edge: edge,
             port,
             tls,
@@ -663,6 +770,26 @@ fn a_non_compressing_backend_gets_no_vary_accept_encoding() {
             "{lang}: and nothing should be compressed"
         );
     });
+}
+
+#[test]
+fn a_failed_start_leaves_no_backend_process_behind() {
+    // The sandbox denies the exec scratch root /var/tmp, so build the stack in
+    // a writable temp dir and go through start_in's real spawn+guard path: the
+    // real backend is spawned, then the edge is made to exit before binding by
+    // naming a missing TLS key, and the guard must reap the backend.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut backend_pid = None;
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = Stack::start_in("rust-plain", tmp, true, &mut backend_pid);
+    }));
+    assert!(failed.is_err(), "the edge should fail to start");
+    let pid = backend_pid.expect("the backend was spawned before the edge failed");
+    let alive = m6_core::platform::process::is_alive(pid);
+    assert!(
+        !alive,
+        "the backend process should have been reaped after the failed edge start"
+    );
 }
 
 #[test]

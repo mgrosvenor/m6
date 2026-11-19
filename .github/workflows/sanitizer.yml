@@ -100,5 +100,15 @@ jobs:
           # rather than --target reaches the cargo that testkit::binary runs
           # to build the services, so that build gets the same treatment.
           CARGO_BUILD_TARGET: ${{ env.SANITISER_TARGET }}
+          # heap_resident.rs reads this and does not run: the sanitiser runtime
+          # makes `mlockall` a no-op, so that test has nothing to measure here.
+          M6_SANITISER: address
         run: |
+          # m6-http pins its memory at start ([server] lock_memory, on by default),
+          # and a runner account's RLIMIT_MEMLOCK is 8 MiB, as in ci.yml. The pin
+          # is a no-op under the sanitiser, but the limit keeps the start-up the same.
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          # The workspace binaries first: testkit::binary() reads them from
+          # <target>/<profile>, which a test-only build does not fill.
+          cargo +nightly build --workspace --bins
           time cargo +nightly test --workspace -- --test-threads=1

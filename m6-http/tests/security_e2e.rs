@@ -16,6 +16,11 @@
 //! cargo test -p m6-http --test security_e2e -- --test-threads=1
 //! ```
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
 use std::process::Command;
@@ -25,7 +30,14 @@ use std::time::{Duration, Instant};
 use quiche::h3::NameValue as _;
 use rustls::StreamOwned;
 
-use m6_core::testkit::{binary, claim_port, PortClaim, Service};
+use m6_core::platform::{Events, Poll, Token};
+use m6_core::testkit::{binary, claim_port, PortClaim, Reply, Service};
+
+#[path = "support/check.rs"]
+mod check_support;
+use m6_http_lib::forward::{HttpRequest, HttpResponse as H2Response};
+use m6_http_lib::h2s_client::H2sTlsClientConn;
+use m6_http_lib::probe;
 
 // ── Crypto fixtures ───────────────────────────────────────────────────────────
 
@@ -38,45 +50,9 @@ fn generate_tls_cert() -> (String, String, Vec<u8>) {
     (ck.cert.pem(), ck.key_pair.serialize_pem(), der)
 }
 
-/// ES256 keypair for JWT signing. Returns (private_pem, public_pem).
-fn generate_jwt_keypair() -> (String, String) {
-    let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ec keypair");
-    (kp.serialize_pem(), kp.public_key_pem())
-}
-
-/// Mint an ES256 JWT carrying `groups`, valid for one hour.
-fn mint_jwt(private_pem: &str, sub: &str, groups: &[&str]) -> String {
-    #[derive(serde::Serialize)]
-    struct Claims {
-        sub: String,
-        iss: String,
-        exp: u64,
-        groups: Vec<String>,
-        roles: Vec<String>,
-    }
-    let exp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        + 3600;
-    let claims = Claims {
-        sub: sub.to_string(),
-        iss: "m6-auth".to_string(),
-        exp,
-        groups: groups.iter().map(|s| s.to_string()).collect(),
-        roles: vec![],
-    };
-    let key = jsonwebtoken::EncodingKey::from_ec_pem(private_pem.as_bytes()).expect("ec key");
-    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
-    jsonwebtoken::encode(&header, &claims, &key).expect("sign jwt")
-}
-
 // ── HTTP/1.1 client ───────────────────────────────────────────────────────────
 
 fn tls_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .ok();
     let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());
     let mut store = rustls::RootCertStore::empty();
     store.add(cert).unwrap();
@@ -110,11 +86,20 @@ fn no_response(reason: impl std::fmt::Display) -> HttpResponse {
 impl HttpResponse {
     /// Case-insensitive header lookup over the raw header block.
     fn has_header(&self, name: &str) -> bool {
-        let want = format!("{}:", name.to_ascii_lowercase());
-        self.headers
-            .split("\r\n")
-            .skip(1)
-            .any(|l| l.to_ascii_lowercase().starts_with(&want))
+        self.header(name).is_some()
+    }
+
+    /// The value of one header field, case-insensitively.
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.split("\r\n").skip(1).find_map(|line| {
+            let (field, value) = line.split_once(':')?;
+            field.eq_ignore_ascii_case(name).then_some(value.trim())
+        })
+    }
+
+    /// The `Retry-After` a 503 carries, for a retry that honours it.
+    fn retry_after(&self) -> Option<Duration> {
+        check_support::retry_after(self.header("retry-after"))
     }
 }
 
@@ -186,6 +171,107 @@ fn https_get(
     }
 }
 
+// ── HTTP/1.1 and HTTP/2 clients on one reused connection ─────────────────────
+
+/// Read one HTTP/1.1 response from an open connection.
+///
+/// Framed by `Content-Length`, and a 304 carries neither a length nor a body,
+/// so the response after a 304 starts at the next byte on the wire. That is
+/// what makes the second request on the same connection a framing assertion.
+fn read_h1_response<S: Read>(stream: &mut S) -> HttpResponse {
+    let mut raw = Vec::new();
+    let mut one = [0u8; 1];
+    loop {
+        match stream.read(&mut one) {
+            Ok(0) => break,
+            Ok(_) => {
+                raw.push(one[0]);
+                if raw.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let status = text
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let len = text
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    let mut body = vec![0u8; len];
+    if len > 0 {
+        let _ = stream.read_exact(&mut body);
+    }
+    HttpResponse {
+        status,
+        headers: text,
+        body,
+    }
+}
+
+/// One HTTP/2 GET on an already-open connection.
+///
+/// The client is m6-http's own outbound H2 core, driven by the same poll
+/// primitive the service uses. No sleep: it waits on the descriptor and on a
+/// deadline.
+fn h2_get(
+    conn: &mut H2sTlsClientConn,
+    path: &str,
+    extra: &[(&str, &str)],
+) -> Result<H2Response, String> {
+    let request = HttpRequest {
+        version: "HTTP/2".to_string(),
+        method: "GET".to_string(),
+        path: path.to_string(),
+        query: None,
+        headers: extra
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        body: vec![],
+    };
+    let stream_id = conn
+        .dispatch(&request, "127.0.0.1", "127.0.0.1", "127.0.0.1")
+        .map_err(|e| e.to_string())?;
+
+    let mut poll = Poll::new().map_err(|e| e.to_string())?;
+    let mut events = Events::with_capacity(8);
+    poll.registry()
+        .register_fd(conn.raw_fd(), Token(0), conn.phase_interest())
+        .map_err(|e| e.to_string())?;
+    let deadline = m6_core::platform::now() + m6_core::testkit::STARTUP_BOUND;
+    loop {
+        conn.drive();
+        if let Some(done) = conn
+            .drain_completions()
+            .into_iter()
+            .find(|c| c.stream_id == stream_id)
+        {
+            return done.result.map_err(|e| e.to_string());
+        }
+        let left = deadline.saturating_duration_since(m6_core::platform::now());
+        if left.is_zero() {
+            return Err("h2 response timed out".to_string());
+        }
+        poll.registry()
+            .reregister_fd(conn.raw_fd(), Token(0), conn.phase_interest())
+            .map_err(|e| e.to_string())?;
+        poll.poll(&mut events, Some(left))
+            .map_err(|e| e.to_string())?;
+    }
+}
+
 // ── HTTP/3 client ─────────────────────────────────────────────────────────────
 
 fn quic_flush(conn: &mut quiche::Connection, udp: &UdpSocket, out: &mut [u8]) {
@@ -194,9 +280,47 @@ fn quic_flush(conn: &mut quiche::Connection, udp: &UdpSocket, out: &mut [u8]) {
     }
 }
 
+/// One HTTP/3 request on a shared QUIC connection.
+struct H3Request<'a> {
+    path: &'a str,
+    headers: &'a [(&'a str, &'a str)],
+}
+
+/// One HTTP/3 response, with the fields a conditional request is judged on.
+struct H3Reply {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body_len: usize,
+}
+
+impl H3Reply {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
 /// Issue `count` sequential HTTP/3 GETs for `path` over a single QUIC
 /// connection. Returns one status per request.
 fn h3_get_many(port: u16, path: &str, count: usize) -> Result<Vec<u16>, String> {
+    let requests: Vec<H3Request<'_>> = (0..count)
+        .map(|_| H3Request { path, headers: &[] })
+        .collect();
+    Ok(h3_requests(port, &requests)?
+        .into_iter()
+        .map(|r| r.status)
+        .collect())
+}
+
+/// Issue every request in `requests` sequentially over one QUIC connection.
+///
+/// One request in flight at a time, so each response is unambiguously
+/// attributable and the server's per-request path runs in order. The same
+/// connection is reused deliberately: a bodyless 304 that corrupts stream
+/// framing shows up on the request after it.
+fn h3_requests(port: u16, requests: &[H3Request<'_>]) -> Result<Vec<H3Reply>, String> {
     let server_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let udp = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
     udp.set_nonblocking(true).unwrap();
@@ -225,15 +349,18 @@ fn h3_get_many(port: u16, path: &str, count: usize) -> Result<Vec<u16>, String> 
     let mut buf = vec![0u8; 65536];
     let mut out = vec![0u8; 1350];
 
-    let mut statuses: Vec<u16> = Vec::new();
+    let mut replies: Vec<H3Reply> = Vec::new();
+    // The reply whose body bytes are currently arriving. Only one request is
+    // in flight, so there is at most one.
+    let mut current: Option<usize> = None;
     let mut sent = 0usize;
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
 
     loop {
         if Instant::now() > deadline {
             return Err(format!(
                 "h3 timeout: sent={sent} got={} established={}",
-                statuses.len(),
+                replies.len(),
                 conn.is_established()
             ));
         }
@@ -258,7 +385,7 @@ fn h3_get_many(port: u16, path: &str, count: usize) -> Result<Vec<u16>, String> 
         if conn.is_closed() {
             return Err(format!(
                 "connection closed after {} responses",
-                statuses.len()
+                replies.len()
             ));
         }
 
@@ -271,16 +398,17 @@ fn h3_get_many(port: u16, path: &str, count: usize) -> Result<Vec<u16>, String> 
         }
 
         if let Some(ref mut h3c) = h3 {
-            // Keep one request in flight at a time so each response is
-            // unambiguously attributable and the server's per-request path
-            // (including any rate-limit check) runs sequentially.
-            if sent == statuses.len() && sent < count {
-                let headers = vec![
+            if sent == replies.len() && sent < requests.len() {
+                let req = &requests[sent];
+                let mut headers = vec![
                     quiche::h3::Header::new(b":method", b"GET"),
-                    quiche::h3::Header::new(b":path", path.as_bytes()),
+                    quiche::h3::Header::new(b":path", req.path.as_bytes()),
                     quiche::h3::Header::new(b":scheme", b"https"),
                     quiche::h3::Header::new(b":authority", b"localhost"),
                 ];
+                for (name, value) in req.headers {
+                    headers.push(quiche::h3::Header::new(name.as_bytes(), value.as_bytes()));
+                }
                 match h3c.send_request(&mut conn, &headers, true) {
                     Ok(_) => sent += 1,
                     Err(quiche::h3::Error::Done) => {}
@@ -291,16 +419,29 @@ fn h3_get_many(port: u16, path: &str, count: usize) -> Result<Vec<u16>, String> 
             loop {
                 match h3c.poll(&mut conn) {
                     Ok((_, quiche::h3::Event::Headers { list, .. })) => {
+                        let mut status = 0u16;
+                        let mut headers = Vec::new();
                         for h in &list {
                             if h.name() == b":status" {
                                 let s = std::str::from_utf8(h.value()).unwrap_or("0");
                                 if let Ok(code) = s.parse::<u16>() {
-                                    // Ignore 1xx informational (103 Early Hints).
-                                    if code >= 200 {
-                                        statuses.push(code);
-                                    }
+                                    status = code;
                                 }
+                            } else {
+                                headers.push((
+                                    String::from_utf8_lossy(h.name()).into_owned(),
+                                    String::from_utf8_lossy(h.value()).into_owned(),
+                                ));
                             }
+                        }
+                        // Ignore 1xx informational (103 Early Hints).
+                        if status >= 200 {
+                            current = Some(replies.len());
+                            replies.push(H3Reply {
+                                status,
+                                headers,
+                                body_len: 0,
+                            });
                         }
                     }
                     Ok((sid, quiche::h3::Event::Data)) => {
@@ -309,8 +450,12 @@ fn h3_get_many(port: u16, path: &str, count: usize) -> Result<Vec<u16>, String> 
                             if n == 0 {
                                 break;
                             }
+                            if let Some(index) = current {
+                                replies[index].body_len += n;
+                            }
                         }
                     }
+                    Ok((_, quiche::h3::Event::Finished)) => current = None,
                     Ok(_) => {}
                     Err(quiche::h3::Error::Done) => break,
                     Err(e) => return Err(format!("poll: {e}")),
@@ -320,13 +465,13 @@ fn h3_get_many(port: u16, path: &str, count: usize) -> Result<Vec<u16>, String> 
 
         quic_flush(&mut conn, &udp, &mut out);
 
-        if statuses.len() >= count {
+        if replies.len() >= requests.len() {
             break;
         }
         std::thread::sleep(Duration::from_millis(1));
     }
 
-    Ok(statuses)
+    Ok(replies)
 }
 
 // ── Site fixture ──────────────────────────────────────────────────────────────
@@ -336,6 +481,7 @@ struct Server {
     cert_der: Vec<u8>,
     /// JWT signed for a member of `admins`.
     admin_jwt: String,
+    _check: check_support::RunningCheck,
     http: std::cell::RefCell<Service>,
     file: Service,
     _dir: tempfile::TempDir,
@@ -374,12 +520,12 @@ impl Server {
 
     /// Wait until a request actually reaches the backend.
     ///
-    /// Listening on the port is not the same as being able to serve: m6-http
-    /// fills its backend pool from a periodic rescan, so there is a window
-    /// where every request is a 502. This was `sleep(2500)`, a number tuned on
-    /// a fast laptop, and it was not enough on the slower Linux build box.
+    /// Listening on the port is not the same as being able to serve: a backend
+    /// that has not finished starting answers 502. This was `sleep(2500)`, a
+    /// number tuned on a fast laptop, and it was not enough on the slower Linux
+    /// build box.
     fn wait_until_serving(&self) {
-        let ready = m6_core::testkit::wait::until(Duration::from_secs(30), || {
+        let ready = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
             https_get(self, "/public/probe.txt", &[], self.tls()).status == 200
         });
         assert!(
@@ -393,8 +539,17 @@ impl Server {
     /// anything reaching the backend pool fails.
     fn kill_backend(&mut self) {
         self.file.kill();
-        // Let m6-http notice the socket has gone (2s rescan interval).
-        std::thread::sleep(Duration::from_millis(2500));
+        // The signal that m6-http has stopped reaching the backend is a cache
+        // miss answering 502. A fresh query string is a miss, because the cache
+        // key includes the query.
+        let ready = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
+            https_get(self, "/public/open.txt?kill_backend_probe", &[], self.tls()).status == 502
+        });
+        assert!(
+            ready,
+            "m6-http never answered 502 for a cache miss after the backend was killed\n--- output ---\n{}",
+            self.http.borrow().output()
+        );
     }
 }
 
@@ -404,16 +559,23 @@ impl Server {
 ///
 /// `rate_limit_per_min` is written into `site.toml` verbatim.
 fn start_server(rate_limit_per_min: u32) -> Server {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).unwrap();
     let site = dir.path();
 
     let (cert_pem, key_pem, cert_der) = generate_tls_cert();
     std::fs::write(site.join("cert.pem"), &cert_pem).unwrap();
     std::fs::write(site.join("key.pem"), &key_pem).unwrap();
 
-    let (jwt_priv, jwt_pub) = generate_jwt_keypair();
-    std::fs::write(site.join("auth-public.pem"), &jwt_pub).unwrap();
-    let admin_jwt = mint_jwt(&jwt_priv, "admin-user", &["admins"]);
+    let admin_jwt = "admin-token".to_string();
+    let check_path = dir.path().join("check.sock");
+    let check = check_support::RunningCheck::start(
+        &check_path,
+        vec![(
+            admin_jwt.clone(),
+            Reply::Identity(check_support::identity(&["admins"], &["admin"])),
+        )],
+    )
+    .unwrap();
 
     // Content.
     std::fs::create_dir_all(site.join("public")).unwrap();
@@ -437,7 +599,6 @@ domain = "localhost"
 
 [log]
 level  = "warn"
-format = "text"
 
 [errors]
 mode = "internal"
@@ -449,13 +610,13 @@ enabled = false
 enabled         = true
 requests_per_min = {rate_limit_per_min}
 
-[auth]
-backend    = "m6-file"
-public_key = "auth-public.pem"
-
 [[backend]]
 name    = "m6-file"
 sockets = "{sock_glob}"
+
+[[backend]]
+name    = "auth-check"
+sockets = "{check}"
 
 [[route]]
 path    = "/public/{{relpath}}"
@@ -467,6 +628,7 @@ backend = "m6-file"
 require = "group:admins"
 "#,
             sock_glob = sock_glob.display(),
+            check = check_path.display(),
         ),
     )
     .unwrap();
@@ -500,6 +662,9 @@ tls_key  = "{key}"
 
 [node]
 name = "test-node"
+
+[auth]
+backend    = "auth-check"
 "#,
             cert = site.join("cert.pem").display(),
             key = site.join("key.pem").display(),
@@ -514,7 +679,7 @@ name = "test-node"
             .arg(site.join("configs/m6-file.conf"))
             .env("M6_SOCKET_OVERRIDE", &sock),
     );
-    file_proc.wait_for_path(&sock, Duration::from_secs(10));
+    file_proc.wait_for_path(&sock, m6_core::testkit::STARTUP_BOUND);
 
     let mut http_proc = Service::spawn(
         "m6-http",
@@ -522,7 +687,7 @@ name = "test-node"
             .arg(site)
             .arg(site.join("system.toml")),
     );
-    http_proc.wait_for_tcp(port, Duration::from_secs(10));
+    http_proc.wait_for_tcp(port, m6_core::testkit::STARTUP_BOUND);
 
     let srv = Server {
         port,
@@ -530,6 +695,7 @@ name = "test-node"
         admin_jwt,
         http: std::cell::RefCell::new(http_proc),
         file: file_proc,
+        _check: check,
         _dir: dir,
         _port: claim,
     };
@@ -565,13 +731,19 @@ fn finding_1_e2e_anonymous_client_must_not_read_protected_content_from_cache() {
         String::from_utf8_lossy(&cold.body)
     );
 
-    // An authorised user fetches it, warming the cache.
-    let authed = https_get(
-        &srv,
-        "/private/secret.txt",
-        &[("Cookie", &format!("session={}", srv.admin_jwt))],
-        srv.tls(),
-    );
+    // An authorised user fetches it, warming the cache. A check that missed
+    // its 50 ms deadline under load answers the design's 503 with
+    // `Retry-After`, which is not this finding, so the warm request is
+    // repeated under the testkit bound until it gets an answer.
+    let authed = check_support::retry_unavailable(m6_core::testkit::RESPONSE_BOUND, || {
+        let r = https_get(
+            &srv,
+            "/private/secret.txt",
+            &[("Cookie", &format!("session={}", srv.admin_jwt))],
+            srv.tls(),
+        );
+        (r.status, r.retry_after(), r)
+    });
     assert_eq!(
         authed.status, 200,
         "authorised request should succeed; headers:\n{}",
@@ -762,7 +934,7 @@ fn hpack_literal(static_index: u8, value: &str) -> Vec<u8> {
 }
 
 fn tls_client_config_h2(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
-    rustls::crypto::ring::default_provider()
+    rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .ok();
     let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());
@@ -823,7 +995,7 @@ fn h2_data_frame_at_max_frame_size_must_get_a_response() {
     // Before the fix the socket just closed, which is exactly what this catches.
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     let mut saw_headers = false;
 
     while Instant::now() < deadline && !saw_headers {
@@ -857,6 +1029,227 @@ fn h2_data_frame_at_max_frame_size_must_get_a_response() {
 
 // ── Conditional requests through the whole stack ──────────────────────────────
 
+/// The browser-caching pattern's other half, on HTTP/1.1.
+///
+/// RFC 9111 4.3.2: a cache that receives a request it can satisfy from a
+/// fresh stored response SHOULD evaluate the request's preconditions against
+/// that response's validators. The backend is killed first, so a 304 here can
+/// only have come from the edge and a 502 would be the miss. RFC 9110 15.4.5
+/// then requires the 304 to carry the `ETag` and `Cache-Control` the 200 did.
+///
+/// The requests share one connection. A 304 has no body and (RFC 9110 8.6) no
+/// `Content-Length`, so if the writer framed one wrongly the next response
+/// would start mid-stream and this test would fail on it.
+#[test]
+fn cache_hit_answers_if_none_match_with_304_on_h1() {
+    let mut srv = start_server(100_000);
+
+    let first = https_get(&srv, "/public/open.txt", &[], srv.tls());
+    assert_eq!(first.status, 200, "headers:\n{}", first.headers);
+    let etag = first
+        .header("etag")
+        .expect("m6-file must send an ETag")
+        .to_string();
+    let cache_control = first
+        .header("cache-control")
+        .expect("m6-file must send Cache-Control")
+        .to_string();
+    assert_eq!(
+        cache_control, "public, max-age=0, must-revalidate, s-maxage=86400",
+        "the unversioned asset must use the browser-caching pattern"
+    );
+
+    // A miss from here on answers 502, so a cache hit is the only way to 304.
+    srv.kill_backend();
+
+    let tcp = srv.tcp().expect("connect for the h1 304 test");
+    tcp.set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set read timeout");
+    let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap();
+    let conn = rustls::ClientConnection::new(srv.tls(), name).expect("tls client");
+    let mut stream = StreamOwned::new(conn, tcp);
+
+    for (label, value) in [("a matching tag", etag.as_str()), ("*", "*")] {
+        let request = format!(
+            "GET /public/open.txt HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\
+             If-None-Match: {value}\r\nConnection: keep-alive\r\n\r\n",
+            srv.port
+        );
+        stream
+            .write_all(request.as_bytes())
+            .unwrap_or_else(|e| panic!("{label}: write: {e}"));
+        stream
+            .flush()
+            .unwrap_or_else(|e| panic!("{label}: flush: {e}"));
+        let response = read_h1_response(&mut stream);
+        assert_eq!(
+            response.status, 304,
+            "{label} must be answered from the fresh stored response\nheaders:\n{}",
+            response.headers
+        );
+        assert!(
+            response.body.is_empty(),
+            "{label}: a 304 must carry no body, got {} bytes",
+            response.body.len()
+        );
+        assert_eq!(
+            response.header("etag"),
+            Some(etag.as_str()),
+            "{label}: the 304 must carry the 200's ETag"
+        );
+        assert_eq!(
+            response.header("cache-control"),
+            Some(cache_control.as_str()),
+            "{label}: the 304 must carry the 200's Cache-Control"
+        );
+        assert_eq!(
+            response.header("connection"),
+            Some("keep-alive"),
+            "{label}: RFC 9112 6.3 says a 304 ends at the empty line, so it \
+             must not advertise a close\nheaders:\n{}",
+            response.headers
+        );
+        assert!(
+            response.header("date").is_some(),
+            "{label}: RFC 9110 15.4.5 requires a Date on the 304\nheaders:\n{}",
+            response.headers
+        );
+    }
+
+    // Same connection. The bodyless 304s must not have consumed bytes from it.
+    let request = format!(
+        "GET /public/open.txt HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        srv.port
+    );
+    stream.write_all(request.as_bytes()).expect("write GET");
+    stream.flush().expect("flush GET");
+    let after = read_h1_response(&mut stream);
+    assert_eq!(
+        after.status, 200,
+        "the connection must still be usable after a 304\nheaders:\n{}",
+        after.headers
+    );
+    assert_eq!(&after.body[..], b"PUBLIC CONTENT");
+}
+
+/// The same property on HTTP/2: one connection, two streams, a 304 that ends
+/// at the END_STREAM flag and a 200 after it.
+#[test]
+fn cache_hit_answers_if_none_match_with_304_on_h2() {
+    let mut srv = start_server(100_000);
+
+    let first = https_get(&srv, "/public/open.txt", &[], srv.tls());
+    assert_eq!(first.status, 200, "headers:\n{}", first.headers);
+    let etag = first
+        .header("etag")
+        .expect("m6-file must send an ETag")
+        .to_string();
+    let cache_control = first
+        .header("cache-control")
+        .expect("m6-file must send Cache-Control")
+        .to_string();
+
+    srv.kill_backend();
+
+    let mut conn = H2sTlsClientConn::connect("127.0.0.1", srv.port, probe::tls_config(b"h2"))
+        .expect("connect HTTP/2");
+
+    let not_modified = h2_get(&mut conn, "/public/open.txt", &[("if-none-match", &etag)])
+        .expect("conditional h2 request");
+    assert_eq!(
+        not_modified.status, 304,
+        "the fresh stored response must answer the tag: {:?}",
+        not_modified.headers
+    );
+    assert!(
+        not_modified.body.is_empty(),
+        "a 304 must carry no body, got {} bytes",
+        not_modified.body.len()
+    );
+    assert_eq!(not_modified.header("etag"), Some(etag.as_str()));
+    assert_eq!(
+        not_modified.header("cache-control"),
+        Some(cache_control.as_str())
+    );
+
+    let after = h2_get(&mut conn, "/public/open.txt", &[]).expect("h2 request after the 304");
+    assert_eq!(
+        after.status, 200,
+        "the second stream must be unaffected by the bodyless 304: {:?}",
+        after.headers
+    );
+    assert_eq!(&after.body[..], b"PUBLIC CONTENT");
+}
+
+/// The same property on HTTP/3, with the requests sequential on one QUIC
+/// connection. QPACK and stream framing are different from h1 and h2, so a
+/// 304 with a body or a missing END_STREAM shows up here and nowhere else.
+#[test]
+fn cache_hit_answers_if_none_match_with_304_on_h3() {
+    let mut srv = start_server(100_000);
+
+    let first = https_get(&srv, "/public/open.txt", &[], srv.tls());
+    assert_eq!(first.status, 200, "headers:\n{}", first.headers);
+    let etag = first
+        .header("etag")
+        .expect("m6-file must send an ETag")
+        .to_string();
+    let cache_control = first
+        .header("cache-control")
+        .expect("m6-file must send Cache-Control")
+        .to_string();
+
+    srv.kill_backend();
+
+    let requests = [
+        H3Request {
+            path: "/public/open.txt",
+            headers: &[("if-none-match", etag.as_str())],
+        },
+        H3Request {
+            path: "/public/open.txt",
+            headers: &[("if-none-match", "*")],
+        },
+        H3Request {
+            path: "/public/open.txt",
+            headers: &[],
+        },
+    ];
+    let replies = h3_requests(srv.port, &requests).expect("h3 requests");
+
+    assert_eq!(
+        replies[0].status, 304,
+        "the tag must match the stored entry"
+    );
+    assert_eq!(
+        replies[0].body_len, 0,
+        "a 304 must carry no body, got {} bytes",
+        replies[0].body_len
+    );
+    assert_eq!(replies[0].header("etag"), Some(etag.as_str()));
+    assert_eq!(
+        replies[0].header("cache-control"),
+        Some(cache_control.as_str())
+    );
+
+    assert_eq!(
+        replies[1].status, 304,
+        "If-None-Match: * is an existence test (RFC 9110 13.1.2)"
+    );
+    assert_eq!(replies[1].body_len, 0, "* must not put a body on a 304");
+
+    assert_eq!(
+        replies[2].status, 200,
+        "the request after two 304s must be unaffected: {:?}",
+        replies[2].headers
+    );
+    assert_eq!(
+        replies[2].body_len,
+        b"PUBLIC CONTENT".len(),
+        "the 200 after a 304 must carry the whole body"
+    );
+}
+
 /// A weak `If-None-Match` must get a 304 even when the request reaches the
 /// backend, not just when m6-http answers it from cache.
 ///
@@ -886,12 +1279,15 @@ fn weak_if_none_match_is_304_on_a_cache_miss() {
         .and_then(|l| l.split_once(':'))
         .map(|(_, v)| v.trim().to_string())
         .expect("m6-file must send an ETag");
+    // m6-file's validator is weak (mtime+size), so the strong form a client
+    // would compare with is the same opaque tag without the `W/` prefix.
+    let strong = etag.strip_prefix("W/").unwrap_or(&etag);
 
     // Strong form on the warm key: m6-http answers this one, and always could.
     let warm = https_get(
         &srv,
         "/public/open.txt",
-        &[("If-None-Match", &etag)],
+        &[("If-None-Match", strong)],
         srv.tls(),
     );
     assert_eq!(
@@ -901,7 +1297,7 @@ fn weak_if_none_match_is_304_on_a_cache_miss() {
     );
 
     // Cold key, weak form: this one has to travel to m6-file.
-    let weak = format!("W/{etag}");
+    let weak = format!("W/{strong}");
     let cold = https_get(
         &srv,
         "/public/open.txt?nonce=cold1",
@@ -924,7 +1320,7 @@ fn weak_if_none_match_is_304_on_a_cache_miss() {
     let cold_strong = https_get(
         &srv,
         "/public/open.txt?nonce=cold2",
-        &[("If-None-Match", &etag)],
+        &[("If-None-Match", strong)],
         srv.tls(),
     );
     assert_eq!(

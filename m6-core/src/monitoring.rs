@@ -1,8 +1,15 @@
-//! The `/health` and `/perf` endpoints: what they publish, and why so little.
+//! The `/health` endpoint and the two documents a monitor reads: what they
+//! carry, and why so little.
 //!
-//! Answered inside m6-http before routing, the cache and any backend, so it
-//! costs a JSON serialisation and nothing else. It exists so that an uptime
-//! monitor has something better to hit than a real page.
+//! `/health` is answered inside m6-http before routing, the cache and any
+//! backend, so it costs a JSON serialisation and nothing else. It exists so
+//! that an uptime monitor has something better to hit than a real page.
+//!
+//! The metrics and traffic documents are built by the same process and written
+//! on its operational log lines, one line each, with `M6_TYPE` set to `perf` or
+//! `traffic`. A monitor reads them from mon's journal. This module holds their
+//! types because the node that writes a document and the monitor that reads it
+//! must agree on the shape.
 //!
 //! # Why not just monitor `/`
 //!
@@ -25,33 +32,41 @@
 //! monitor at `origin.`/`edge-a.`/`edge-b.` and the answer names the node that
 //! produced it.
 //!
-//! # Health means "this node can serve", not "the fleet is fine"
+//! # What `/health` answers for
 //!
-//! The two node roles have genuinely different backend shapes, and conflating
-//! them produces a health check that lies:
+//! `/health` answers for the m6-http process and for the dependencies whose
+//! failure the process already observes. It probes nothing: every answer is a
+//! flag read and a JSON serialisation.
 //!
-//! - The **origin** has unix-socket pools (m6-html, m6-file, the renderers).
-//!   If every socket in a pool is gone, that pool cannot serve, and the node
-//!   is degraded.
-//! - A **cache node** has one URL backend (the origin over h2c) and *no*
-//!   socket pools at all. `total_active_members()` counts only socket pools,
-//!   so it reads 0 on every cache node permanently.
+//! A cache node's origin is one such dependency. Its flag is the follower's own
+//! down bit, set where a heartbeat or a forwarded client request already
+//! observes the origin failing and cleared by the next heartbeat answer. While
+//! it is set `/health` answers 503 `{"status":"degraded","node":"<name>"}`.
+//! While it is clear `/health` answers 200 `{"status":"ok","node":"<name>"}`.
 //!
-//! A naive "0 members means unhealthy" check would therefore report both edge
-//! nodes as permanently down. Worse, it would be wrong in the other direction
-//! too: a cache node with a warm cache keeps serving correctly while the
-//! origin is unreachable, which is the entire point of having edges. So an
-//! unreachable origin is deliberately *not* this node's health problem.
+//! So `/health` has two answers plus an absence. A process that is gone, or
+//! whose listener refuses, answers nothing, and `m6-monitor` reads that as
+//! `unreachable`. The two answers and the monitor's four states were designed
+//! to fit.
 //!
-//! What is reported is strictly what this node can answer for: every
-//! configured socket pool has at least one live member. That is checkable
-//! locally, cheaply, and without a network round trip that could itself hang.
+//! Proving the origin reachable inside the check would put a network round trip
+//! on the most frequently hit path on the box, and a warm cache keeps serving
+//! while the origin is unreachable. The flag costs one branch.
 //!
-//! # Two endpoints, because they have opposite requirements
+//! The degraded body names the node and never the dependency. `/health` is
+//! public and unsecured, so a dependency name tells a stranger which part of
+//! the node to wait out. The warn and info lines the process logs on the change
+//! carry that detail.
 //!
-//! `/health` answers up or down. `/perf` answers counters and latency
-//! percentiles. They are separate paths rather than one path with a richer
-//! response for authorised callers, and the reason is cost.
+//! A socket pool keeps no per-member health state, so a dead member cannot
+//! change the answer. A request that connects to a dead member takes the next
+//! member, and that is where the failure is found.
+//!
+//! # Why the figures are not on `/health`
+//!
+//! `/health` answers `ok` or `degraded`. The metrics document carries counters
+//! and latency percentiles. They are separate surfaces rather than one answer
+//! that grows richer for authorised callers, and the reason is cost.
 //!
 //! **A health check has to be constant-cost by construction.** It is the most
 //! frequently hit path on the box, it runs when the machine is already in
@@ -59,10 +74,10 @@
 //! alive. Percentiles mean sorting a 4096-sample reservoir and serialising a
 //! larger payload. Put that behind a conditional on the same path and the
 //! expensive branch is one misconfigured header away from being taken on
-//! every check, on every node, forever. Splitting the paths makes the cheap
-//! answer cheap because there is no other answer it can give.
+//! every check, on every node, forever. Keeping the figures on their own line
+//! makes the cheap answer cheap because there is no other answer it can give.
 //!
-//! **`/perf` is token-gated, and not out of modesty about traffic volume.**
+//! **The figures are not public, and not out of modesty about traffic volume.**
 //! Live latency and error counters are a feedback channel for whoever is
 //! attacking you. An attacker probing for a resource-exhaustion path is
 //! normally blind: they cannot tell whether a request is expensive or whether
@@ -71,8 +86,8 @@
 //! between a cache hit and a backend miss runs to three orders of magnitude,
 //! so the ranking is unambiguous. `backend_errors_total` then confirms in real
 //! time when they have found something that hurts. That turns a blind probe into a
-//! tuning loop. Gating it also means an anonymous scrape loop can never reach
-//! the sort.
+//! tuning loop. Keeping the document off the public listener also means an
+//! anonymous scrape loop can never reach the sort.
 //!
 //! **`/health` exposes no version or build string.** It is unauthenticated, and a
 //! version on a public URL tells a scanner which vulnerabilities are worth trying.
@@ -85,125 +100,77 @@
 //! usefulness argument does not: **a hash on its own tells a reader nothing at
 //! all.** It could be a hash of anything. An identity is a hash keyed to the
 //! name and version of the thing it identifies, and the place those already live
-//! is `/perf`. Owner's decision. See `BuildId`.
+//! is the metrics document. Owner's decision. See `BuildId`.
 //!
-//! `/perf` does report the release, from 2026-09-16. This reverses "no version at
-//! any tier", so the reasoning is recorded rather than left as a silent edit.
+//! The metrics document does report the release, from 2026-09-16. This reverses
+//! "no version at any tier", so the reasoning is recorded rather than left as a
+//! silent edit.
 //!
-//! The disclosure argument applies to an anonymous reader, and `/perf` has none:
-//! with no token configured it is a 404, and with one it is a 401 without the
-//! credential. An attacker holding the perf token already reads live latency
-//! percentiles and error counters, which is a far better tuning signal than a
-//! version string. So the marginal disclosure is small, and it is bounded by a
-//! secret we already treat as sensitive.
+//! The disclosure argument applies to an anonymous reader. The metrics document
+//! is not on a public route. It is written to the operational log, which the
+//! node's own monitor receives over the journal, and it answers no request. An
+//! attacker who can read that log already reads live latency percentiles and
+//! error counters, which is a far better tuning signal than a version string. So
+//! the marginal disclosure is small, and it is bounded by access to the log we
+//! already treat as sensitive.
 //!
 //! Against that: with no version anywhere, "every node runs the release we think
 //! it does" is an invariant nothing can check without ssh. Four written records
 //! can disagree about one fleet while every node serves something none of them
 //! names, and nothing in the system is able to say so. An operator cannot act on
 //! a fleet they cannot observe, and a silent version turns a deploy defect into
-//! months of plausible-looking bookkeeping. The version goes behind the token, not on
-//! `/health`, which keeps the public surface exactly as it was.
+//! months of plausible-looking bookkeeping. The version goes in the metrics
+//! document, not on `/health`, which keeps the public surface exactly as it was.
 //!
-//! With no token configured `/perf` does not exist at all (404, not 401), so
-//! forgetting to configure it fails closed and does not advertise a door.
+//! The document is read from the log rather than fetched over a route, so there
+//! is no door to configure and none to forget.
 
 use serde::{Deserialize, Serialize};
 
 use crate::telemetry::StatsSnapshot;
 
-/// Backend name tagged onto a `/health` response.
-pub const HEALTH_BACKEND: &str = "health";
-/// Backend name tagged onto a `/perf` response.
-pub const PERF_BACKEND: &str = "perf";
-
-/// Whether a completed response came from the monitoring endpoints.
+/// One socket-backed backend pool's size.
 ///
-/// These must not be counted as site traffic. Both answer from local state
-/// and return `Ready`, so the cache-miss accounting on the serving paths
-/// would otherwise record every health check as a cache miss -- inflating
-/// requests_total with monitor polling, depressing the hit rate, and
-/// poisoning the miss latency percentiles with ~10us samples that never
-/// touched a backend.
-///
-/// That matters most for the signal the endpoint exists to give: if a
-/// 30-second monitor contributes to requests_total, then "the request count
-/// stopped moving" can no longer detect a traffic stall, because the monitor
-/// keeps it moving on its own.
-pub fn is_monitoring_endpoint(backend: &str) -> bool {
-    backend == HEALTH_BACKEND || backend == PERF_BACKEND
-}
-
-/// Compare a presented credential against the expected one without leaking
-/// the match position through timing.
-///
-/// A naive `==` on strings returns at the first differing byte, so response
-/// time reveals how many leading bytes were correct and the token can be
-/// recovered one byte at a time. Lengths are compared first and unequal
-/// lengths rejected outright, which does leak length; that is not
-/// recoverable-secret information in the way a prefix is.
-fn credential_matches(presented: &str, expected: &str) -> bool {
-    let (a, b) = (presented.as_bytes(), expected.as_bytes());
-    if a.len() != b.len() || expected.is_empty() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
-/// Whether this request may see metrics.
-///
-/// Expects `Authorization: Bearer <token>`. Returns false when no token is
-/// configured, so metrics are off unless deliberately switched on.
-pub fn metrics_authorised(headers: &[(String, String)], configured_token: Option<&str>) -> bool {
-    let Some(expected) = configured_token.filter(|t| !t.is_empty()) else {
-        return false;
-    };
-    crate::headers::get(headers, "authorization")
-        .and_then(|value| {
-            // The scheme is case-insensitive per RFC 9110 11.1.
-            let rest = value.strip_prefix("Bearer ").or_else(|| {
-                value
-                    .get(..7)
-                    .filter(|p| p.eq_ignore_ascii_case("bearer "))
-                    .and_then(|_| value.get(7..))
-            })?;
-            Some(credential_matches(rest.trim(), expected))
-        })
-        .unwrap_or(false)
-}
-
-/// One socket-backed backend pool's occupancy.
+/// A node built before the pool lost its health state sent an `active` field
+/// beside the count. A monitor of that build cannot read a newer node's report,
+/// because the field it requires is gone, so the monitor is upgraded before the
+/// nodes it watches. A newer monitor reads an older node's report unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PoolHealth {
     pub name: String,
-    /// Members currently available (not marked failed).
-    pub active: usize,
-    /// Members known to the pool, including temporarily unavailable ones.
+    /// Members the pool holds. The pool keeps no per-member health state, so
+    /// every member stays in rotation.
     pub total: usize,
 }
 
 /// The public payload. Field order here is the field order on the wire.
 ///
-/// Two fields, and that is the whole endpoint. It is an unauthenticated public
-/// URL, so everything on it is published to anyone who asks, and a monitor
-/// needs exactly two things from it: whether this node can serve, and which
-/// node answered.
+/// The status, the node and the process index when the node has one. It is an
+/// unauthenticated public URL, so everything on it is published to anyone who
+/// asks, and a monitor needs exactly those things from it: whether this node
+/// can serve, which node answered, and which of the node's processes did.
 ///
 /// It deliberately does not carry `uptime_s`, the name and occupancy of every
 /// socket pool, or the names of the URL backends. That would tell an anonymous
 /// caller the internal service topology (`m6-html`, `m6-file`, `render-contact`,
-/// `render-analytics`), how many workers back each one, when the process last
+/// `render-reports`), how many workers back each one, when the process last
 /// restarted, and, by polling, exactly when a deploy or a crash happened and
-/// whether a pool was losing members. None of that helps a monitor decide up
-/// or down, and all of it helps someone deciding what to aim at. It lives on
-/// `/perf` now, which is token-gated.
+/// whether a pool was losing members. None of that helps a monitor decide
+/// whether the node can serve, and all of it helps someone deciding what to
+/// aim at. It lives in the metrics document, which is written to the log.
+///
+/// The degraded answer names no dependency for the same reason. The dependency
+/// is in the warn and info lines the process logs on the change.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HealthReport {
-    /// `"ok"` or `"degraded"`.
+    /// Which of a node's `reuse_port` processes answered, 0 to N-1. Absent
+    /// unless `[server] process_index` is set, so an existing node's body is
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_index: Option<u32>,
+    /// `"ok"` with 200 while the process is alive and every dependency it
+    /// reads answers. `"degraded"` with 503 while the process is alive and
+    /// serving its public and cached pages with a dependency failing.
     ///
     /// `String` rather than `&'static str` because an aggregator reads this
     /// back off the wire and cannot produce a `'static` one.
@@ -213,60 +180,52 @@ pub struct HealthReport {
     pub node: String,
 }
 
-/// What is running: the binary's name, its version, and a hash of its bytes.
+/// What is running: the binary's name and the full version it was built from.
 ///
-/// **A hash alone is not an identity.** That was the first shape of #105 and it
-/// was wrong: an opaque number on its own could be a hash of anything, and a
-/// reader who sees two of them differ learns that something differs, not what.
-/// Keyed to the name and the version it becomes the answer to a question an
-/// operator actually asks, which is "what is this node running".
-///
-/// The three carry different information and none is redundant:
+/// The two carry different information and neither is redundant:
 ///
 /// - `name` says WHICH binary. A node runs several, and "the node is on 1.10.0"
 ///   has never been one fact. A fleet can have m6-http and its renderers built
 ///   from different trees, and before this nothing could express that.
-/// - `version` says which release it claims to be. It is what an operator reads
-///   and what release notes are written against.
-/// - `hash` says which BUILD it actually is. Rust is not byte-reproducible, so
-///   one tag built twice gives two binaries reporting one version. Two nodes
-///   can then agree on a version and run different bytes, and only the hash
-///   shows it.
+/// - `version` is the full SemVer 2.0.0 string with build metadata, for example
+///   `1.16.0-rc.1+abc123def456` or `1.16.0-rc.1+abc123def456.dirty`. The part
+///   before the `+` is the release an operator reads and release notes are
+///   written against. The build metadata is the commit the binary was built
+///   from, so one tag built twice reports two different strings. Rust is not
+///   byte-reproducible, and this is the difference a release tag alone cannot
+///   show.
 ///
-/// `hash` and not `md5`: the algorithm is how the value is produced, not what it
-/// means, and naming the field after it makes changing it a wire break for every
-/// reader. It IS md5 today, because that is the number the surrounding tooling
-/// already compares: a deployment records md5 per node and refuses a promotion
-/// when two nodes disagree. A second hash of the same bytes under another
-/// algorithm would give an operator two numbers and answer nothing.
+/// Both come from compile-time constants, so reporting them reads no file. The
+/// commit comes from the build script's `git rev-parse --short=12 HEAD`, and a
+/// source tarball with no git reports `unknown`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildId {
-    /// The binary's own name, e.g. `"m6-http"`, from its crate at compile time.
+    /// The binary's own name, e.g. `"m6-http"`, from the running executable.
     pub name: String,
-    /// The m6 release this was built against. Same value, and the same
-    /// reasoning, as the `version` field this replaced.
+    /// The m6 release this was built against, as full SemVer with build
+    /// metadata. Same reasoning as the `version` field always had, plus the
+    /// commit the hash used to carry.
     pub version: String,
-    /// Hex md5 of the running executable. Empty when it could not be read, which
-    /// the monitor renders as unknown and counts as drift rather than agreement.
-    pub hash: String,
 }
 
 /// This process's own [`BuildId`], computed once.
 ///
-/// Computed once and cached for the life of the process, which is correct and
-/// not merely cheap: a deploy replaces the file on disk while this process keeps
-/// running the bytes it started with, and the bytes it started with are the
-/// honest answer to "what is serving". Re-reading per request would report the
-/// NEW binary while still running the old one, which is exactly the lie this is
-/// here to prevent.
+/// The version is m6-core's build-time identity, which is the m6 release: for
+/// the workspace binaries that is their own version, and for a service linking
+/// core from a git tag it is that tag, which is the more useful answer for a
+/// service whose own version says nothing about which m6 it is built against.
+/// The commit in its build metadata is what tells two builds of one tag apart.
 ///
 /// The name comes from the running executable rather than from a compile-time
 /// constant, because the constant available to a library is m6-core's own name
-/// and the answer wanted is the binary's. The version is m6-core's, which is the
-/// m6 release: for the workspace binaries that is their own version, and for a
-/// service linking core from a git tag it is that tag, which is the more useful
-/// answer for a service whose own version says nothing about which m6 it is
-/// built against.
+/// and the answer wanted is the binary's. The read is cached for the life of the
+/// process so the periodic metrics document does not pay for it, and the name
+/// reported is the binary that started rather than whatever file a deploy put at
+/// that path afterwards.
+///
+/// The serving binary calls this once with its other start-time constants,
+/// before any listener binds, so the periodic metrics document never pays for
+/// the read.
 pub fn build_id() -> &'static BuildId {
     static BUILD: std::sync::OnceLock<BuildId> = std::sync::OnceLock::new();
     BUILD.get_or_init(|| BuildId {
@@ -274,74 +233,52 @@ pub fn build_id() -> &'static BuildId {
             .ok()
             .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
             .unwrap_or_default(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        hash: executable_md5(),
+        version: crate::build_info::identity().full(),
     })
 }
 
-/// Hex md5 of this process's own executable, or empty if it cannot be read.
-///
-/// Read in chunks rather than with `fs::read`, which would allocate the whole
-/// binary: m6-http is tens of megabytes and this runs on a 1 cpu node with the
-/// event loop about to start.
-///
-/// Empty on any failure, which is a real possibility under confinement and must
-/// never take `/perf` down: a node that cannot say what it is running is still a
-/// node that can report its latency. The monitor reads an empty hash as unknown
-/// and counts it as drift rather than as agreement.
-fn executable_md5() -> String {
-    use md5::{Digest, Md5};
-    use std::io::Read;
-
-    let Ok(path) = std::env::current_exe() else {
-        return String::new();
-    };
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return String::new();
-    };
-    let mut hasher = Md5::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        match file.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => hasher.update(&buf[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            // A partial read is worse than none: it produces a
-            // plausible-looking hash of a prefix, which compares unequal
-            // across two nodes running identical binaries and reports drift
-            // that is not there.
-            Err(_) => return String::new(),
-        }
-    }
-    format!("{:x}", hasher.finalize())
-}
-
 impl HealthReport {
-    /// Build a report and the HTTP status that should carry it.
+    /// The `ok` answer: 200, the process is alive and every dependency it
+    /// reads answers.
     ///
-    /// Degraded when any configured socket pool has no live member. A node
-    /// with no socket pools at all (every cache node) is not degraded by
-    /// that fact alone.
-    /// `pools` decides the verdict and is not reported. The status code still
-    /// carries the whole answer a monitor acts on, and `/perf` has the detail
-    /// for whoever is allowed to see which pool went quiet.
-    pub fn build(node: &str, pools: &[PoolHealth]) -> (u16, HealthReport) {
-        let degraded = pools.iter().any(|p| p.active == 0);
-        let status = if degraded { "degraded" } else { "ok" }.to_string();
-        // 503 is the honest code: the node is up enough to answer, but not
-        // able to serve. A monitor treating any non-2xx as down is then
-        // correct without needing to parse the body.
-        //
-        // Deliberately never derived from performance. A latency spike is a
-        // signal for a human or a dashboard to act on, not grounds for a node
-        // to declare itself down and be pulled from rotation while it is
-        // still serving every request correctly. That is also why the numbers
-        // live on `/perf` and not here.
-        let code = if degraded { 503 } else { 200 };
+    /// A socket pool keeps no per-member health state, so this process cannot
+    /// judge one, and `config` refuses a pool with no members at start. A dead
+    /// member is found when a request connects to it, and that request takes
+    /// the next member.
+    ///
+    /// Deliberately never derived from performance. A latency spike is a
+    /// signal for a human or a dashboard to act on, not grounds for a node
+    /// to declare itself down and be pulled from rotation while it is
+    /// still serving every request correctly. That is also why the numbers
+    /// live in the metrics document and not here.
+    pub fn build(node: &str) -> (u16, HealthReport) {
         (
-            code,
+            200,
             HealthReport {
-                status,
+                process_index: None,
+                status: "ok".to_string(),
+                node: node.to_string(),
+            },
+        )
+    }
+
+    /// The `degraded` answer: 503, the process is alive and serving its public
+    /// and cached pages while a dependency it reads is failing.
+    ///
+    /// The status carries the answer so a reader that treats a non-200 as
+    /// degraded sees it without parsing the body, which is how `m6-monitor`
+    /// already reads a node.
+    ///
+    /// The body names the node and never the dependency or a reason. `/health`
+    /// is public and unsecured, so naming the failing dependency would tell a
+    /// stranger which part of the node to wait out or to aim at. That detail is
+    /// in the warn and info lines the process logs on the change.
+    pub fn degraded(node: &str) -> (u16, HealthReport) {
+        (
+            503,
+            HealthReport {
+                process_index: None,
+                status: "degraded".to_string(),
                 node: node.to_string(),
             },
         )
@@ -357,7 +294,7 @@ impl HealthReport {
             // A serialisation failure here is not a reason to fail the health
             // check with an unparseable body; fall back to something a
             // monitor can still read.
-            .unwrap_or_else(|_| br#"{"status":"degraded"}"#.to_vec());
+            .unwrap_or_else(|_| br#"{"status":"ok"}"#.to_vec());
         let headers = vec![
             (
                 "Content-Type".to_string(),
@@ -372,7 +309,7 @@ impl HealthReport {
     }
 }
 
-/// The `/perf` payload: the numbers, plus the detail `/health` must not leak.
+/// The metrics document: the numbers, plus the detail `/health` must not leak.
 ///
 /// Carries `node` and `uptime_s` so a dashboard scraping several nodes can
 /// attribute a sample without correlating two requests, and so a counter reset
@@ -381,23 +318,31 @@ impl HealthReport {
 ///
 /// `pools` and `url_backends` moved here from `/health`. They are genuinely
 /// useful for diagnosing a degraded node, which is why they are kept rather
-/// than dropped, and they are behind the token for the same reason the
+/// than dropped, and they are kept out of `/health` for the same reason the
 /// latency percentiles are: they describe the shape of the thing being served.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerfReport {
+    /// Which of a node's `reuse_port` processes answered, 0 to N-1. Absent
+    /// unless `[server] process_index` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_index: Option<u32>,
     pub node: String,
-    /// What this node is running: name, version and build hash.
+    /// What this node is running: the binary's name and the full version it was
+    /// built from.
     ///
-    /// [`BuildId`] says why the three fields differ and why the hash is md5.
-    /// The version stays because without one the only way to learn what a node
-    /// runs was to ssh in and ask the binary, so "every node runs the pinned
-    /// release" was an invariant nothing could check. Four written records
-    /// can disagree about one fleet with none of them matching it: a deploy
-    /// repository pinning one tag, its captured config naming that tag with an
-    /// artefact hash matching nothing running, a release log naming an older
-    /// tag, and every node serving a fourth. No node has to be faulty for that.
-    /// Nothing can observe the truth, so the records rot without anyone being
-    /// wrong on purpose.
+    /// [`BuildId`] says why the two fields differ. The version stays because
+    /// without one the only way to learn what a node runs was to ssh in and ask
+    /// the binary, so "every node runs the pinned release" was an invariant
+    /// nothing could check. Four written records can disagree about one fleet
+    /// with none of them matching it: a deploy repository pinning one tag, its
+    /// captured config naming that tag with an artefact hash matching nothing
+    /// running, a release log naming an older tag, and every node serving a
+    /// fourth. No node has to be faulty for that. Nothing can observe the truth,
+    /// so the records rot without anyone being wrong on purpose.
+    ///
+    /// The commit in the version string's build metadata is what tells two
+    /// builds of one tag apart. It is fixed at compile time, so this payload
+    /// costs no file read.
     ///
     /// `serde(default)` so a node older than this change deserialises to an empty
     /// `BuildId` instead of making the whole payload unparseable to an
@@ -411,16 +356,22 @@ pub struct PerfReport {
     /// Socket-backed pools. Empty on a cache node, which has none.
     pub pools: Vec<PoolHealth>,
     /// Names of URL backends. Presence only: proving one reachable would mean
-    /// a network round trip inside a monitoring endpoint, which is how a
-    /// monitoring endpoint learns to hang.
+    /// a network round trip on the accounting tick, which would stall the
+    /// serving loop that builds the document.
     pub url_backends: Vec<String>,
-    /// The TLS chain this process loaded, and how long each certificate has
-    /// left. Leaf first, so `tls[0]` is the certificate an *ACME* client
-    /// renews. Empty on a process serving no TLS.
+    /// The TLS chain this process loaded, how long each certificate has
+    /// left, and each certificate's SHA-256 fingerprint. Leaf first, so
+    /// `tls[0]` is the certificate an *ACME* client renews. Empty on a process
+    /// serving no TLS.
+    ///
+    /// The fingerprint is what tells two certificates with one expiry apart,
+    /// so a fleet can be checked for serving one certificate rather than for
+    /// expiring on one day. [`crate::tls::Fingerprint`] says what is hashed
+    /// and why. It is the DER a client already receives in the handshake.
     ///
     /// From the loaded material rather than from a file on disk, which is the
     /// whole value of reporting it here: a renewal that wrote a new certificate
-    /// and never reloaded the server leaves the two facts disagreeing, and the
+    /// and never restarted the server leaves the two facts disagreeing, and the
     /// one that matters is what is being served.
     ///
     /// `serde(default)` so a node older than this field stays parseable to an
@@ -437,53 +388,21 @@ pub struct PerfReport {
     /// the leaf is unaccounted for.
     #[serde(default)]
     pub tls_unreadable: usize,
-    /// Whether the log is emitting and when the log file was last reopened.
+    /// Whether the log is emitting.
     ///
-    /// `None` means a node older than this field, which is not the same as a
-    /// node that writes no log file. That case is `Some` with no `reopen`.
+    /// `None` means a node older than this field.
     #[serde(default)]
     pub logging: Option<LoggingHealth>,
     pub metrics: StatsSnapshot,
-    /// The machine underneath: load, memory, disk, temperature, uptime.
+    /// The machine underneath: load, memory, disk, temperature, uptime. m6-http
+    /// reads it once a minute and repeats it on the lines between.
     ///
-    /// Here rather than on a separate endpoint because an aggregator wants one
-    /// request per node, and because these are the numbers you want *next to*
-    /// the latency figures: a p99 that moved is a different conversation
+    /// Here rather than in a document of its own because an aggregator wants
+    /// one document per node, and because these are the numbers you want *next
+    /// to* the latency figures: a p99 that moved is a different conversation
     /// depending on whether load also moved. Every field is optional, and a
     /// field a platform cannot answer is absent rather than zero.
-    pub host: crate::host::HostSnapshot,
-}
-
-/// Outcome of a `/perf` request.
-pub enum PerfOutcome {
-    /// A traffic summary from `/traffic`. Same gate as `/perf`.
-    ///
-    /// Its own path rather than more fields on `/perf`, for the reason that
-    /// split `/health` from `/perf`: the cost profiles differ. `/perf` sorts a
-    /// reservoir in memory. This reads the tail of a log that can run to tens
-    /// of megabytes. Putting the expensive one behind a conditional on the
-    /// cheaper path leaves the expensive branch one misconfigured header away
-    /// from being taken on every request, and splitting the paths is what keeps
-    /// each answer's cost a property of the path rather than of the caller.
-    /// Boxed: `TrafficReport` is far larger than every other variant here, so
-    /// carrying it inline made the whole enum that size even when the outcome
-    /// was a one-word error.
-    Traffic(Box<TrafficReport>),
-    /// The analytics log could not be read. Said out loud rather than reported
-    /// as a quiet hour, which is a mistake this codebase has made: an absent
-    /// file at the expected path looked exactly like a feature switched off.
-    TrafficError(String),
-    /// No token configured: the endpoint is switched off and answers 404, so
-    /// it does not advertise a door that cannot be opened.
-    Disabled,
-    /// Configured, but the caller presented no or wrong credentials.
-    Unauthorised,
-    /// The token is valid but lacks the required claim.
-    Forbidden,
-    /// Boxed for the same reason as `Traffic`: `PerfReport` is 608 bytes
-    /// against the 24 of the largest error variant, and an inline copy made
-    /// every `PerfOutcome` that size.
-    Ok(Box<PerfReport>),
+    pub host: crate::platform::host::HostSnapshot,
 }
 
 /// What a report is about: the node, and the live facts to report on it.
@@ -492,66 +411,28 @@ pub struct PerfSubject<'a> {
     pub uptime_s: u64,
     pub pools: Vec<PoolHealth>,
     pub url_backends: Vec<String>,
-    pub host_path: &'a std::path::Path,
-}
-
-/// Who is asking, and what would authorise them.
-///
-/// Separate from [`PerfSubject`] because the two are answered at different
-/// times and by different code: access decides whether there is a report at
-/// all, and the subject is only read once it has. Keeping them apart is also
-/// what stopped `build` taking eight positional arguments, six of which were
-/// `&str`-ish and easy to transpose.
-pub struct PerfAccess<'a> {
-    pub headers: &'a [(String, String)],
-    pub configured_token: Option<&'a str>,
-}
-
-impl PerfAccess<'_> {
-    /// Why the legacy bearer gate refuses this caller, or `None` when it
-    /// passes. No token configured is `Disabled`, a wrong or missing one is
-    /// `Unauthorised`.
-    pub fn refusal(&self) -> Option<PerfOutcome> {
-        match self.configured_token.filter(|t| !t.is_empty()) {
-            None => Some(PerfOutcome::Disabled),
-            Some(_) if !metrics_authorised(self.headers, self.configured_token) => {
-                Some(PerfOutcome::Unauthorised)
-            }
-            Some(_) => None,
-        }
-    }
+    /// The host block, which the caller reads at its own, slower cadence:
+    /// [`crate::platform::host::snapshot`] costs far more than the rest of the
+    /// document.
+    pub host: crate::platform::host::HostSnapshot,
+    /// This process's `[server] process_index`, if it has one.
+    pub process_index: Option<u32>,
 }
 
 impl PerfReport {
-    pub fn build(
-        subject: PerfSubject<'_>,
-        access: PerfAccess<'_>,
-        snapshot: impl FnOnce() -> StatsSnapshot,
-    ) -> PerfOutcome {
-        match access.refusal() {
-            Some(outcome) => outcome,
-            None => Self::build_authorised(subject, snapshot),
-        }
-    }
-
-    /// The report itself, for a caller that has already been authorised by
-    /// some other gate. Nothing here checks access.
-    pub fn build_authorised(
-        subject: PerfSubject<'_>,
-        snapshot: impl FnOnce() -> StatsSnapshot,
-    ) -> PerfOutcome {
+    /// The report itself, for the caller that writes the metrics line.
+    /// Nothing here checks access.
+    pub fn build(subject: PerfSubject<'_>, metrics: StatsSnapshot) -> PerfReport {
         let PerfSubject {
+            process_index,
             node,
             uptime_s,
             pools,
             url_backends,
-            host_path,
+            host,
         } = subject;
-        // `snapshot` is a closure so the reservoir sort happens only
-        // after authorisation passes, never for an anonymous caller.
-        // Read after authorisation, like the reservoir sort: an
-        // anonymous caller never causes a /proc read either.
-        PerfOutcome::Ok(Box::new(PerfReport {
+        PerfReport {
+            process_index,
             node: node.to_string(),
             build: build_id().clone(),
             uptime_s,
@@ -559,56 +440,37 @@ impl PerfReport {
             url_backends,
             // Read from the registry the TLS loader wrote, not from
             // the certificate file: no path is opened to answer this,
-            // so a monitoring endpoint cannot be made to do disk work
-            // by being polled.
+            // so building a document cannot be made to do disk work
+            // by a request.
             tls: crate::tls::loaded(),
             tls_unreadable: crate::tls::unreadable(),
             logging: Some(LoggingHealth::read()),
-            metrics: snapshot(),
-            host: crate::host::snapshot(host_path),
-        }))
+            metrics,
+            host,
+        }
     }
 }
 
-impl PerfOutcome {
-    pub fn into_response(self) -> (u16, Vec<(String, String)>, Vec<u8>) {
-        let mut headers = vec![
-            (
-                "Content-Type".to_string(),
-                "application/json; charset=utf-8".to_string(),
-            ),
-            ("Cache-Control".to_string(), "no-store".to_string()),
-            ("X-Robots-Tag".to_string(), "noindex, nofollow".to_string()),
-        ];
-        match self {
-            PerfOutcome::Disabled => (404, headers, br#"{"error":"not found"}"#.to_vec()),
-            PerfOutcome::Unauthorised => {
-                // RFC 9110 11.6.1: a 401 MUST carry WWW-Authenticate naming
-                // the scheme, otherwise a client cannot know how to retry.
-                headers.push(("WWW-Authenticate".to_string(), "Bearer".to_string()));
-                (401, headers, br#"{"error":"unauthorised"}"#.to_vec())
-            }
-            PerfOutcome::Forbidden => (403, headers, br#"{"error":"forbidden"}"#.to_vec()),
-            PerfOutcome::Ok(report) => {
-                let body = serde_json::to_vec(&report)
-                    .unwrap_or_else(|_| br#"{"error":"serialisation failed"}"#.to_vec());
-                (200, headers, body)
-            }
-            PerfOutcome::Traffic(report) => {
-                let body = serde_json::to_vec(&report)
-                    .unwrap_or_else(|_| br#"{"error":"serialisation failed"}"#.to_vec());
-                (200, headers, body)
-            }
-            // 503, not 500: the node is serving, but its own view of its
-            // traffic is not available. A monitor shows that as a gap rather
-            // than as a quiet hour.
-            PerfOutcome::TrafficError(why) => {
-                let body = serde_json::to_vec(&serde_json::json!({"error": why}))
-                    .unwrap_or_else(|_| br#"{"error":"unreadable"}"#.to_vec());
-                (503, headers, body)
-            }
-        }
-    }
+/// The headers a metrics answer carries.
+///
+/// One definition, because the 404 a disabled gate gives and a serialised
+/// document carry the same three headers, and a second copy is a second thing
+/// to keep in step with it.
+pub fn perf_headers() -> Vec<(String, String)> {
+    vec![
+        (
+            "Content-Type".to_string(),
+            "application/json; charset=utf-8".to_string(),
+        ),
+        ("Cache-Control".to_string(), "no-store".to_string()),
+        ("X-Robots-Tag".to_string(), "noindex, nofollow".to_string()),
+    ]
+}
+
+/// The 404 a disabled or unknown monitoring path answers, with the metrics
+/// headers. It names no credential, so it advertises no door.
+pub fn not_found() -> (u16, Vec<(String, String)>, Vec<u8>) {
+    (404, perf_headers(), br#"{"error":"not found"}"#.to_vec())
 }
 
 #[cfg(test)]
@@ -616,60 +478,34 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    fn pool(name: &str, active: usize, total: usize) -> PoolHealth {
-        PoolHealth {
-            name: name.to_string(),
-            active,
-            total,
-        }
-    }
-
     #[test]
-    fn origin_with_live_pools_is_ok() {
-        let (code, report) =
-            HealthReport::build("origin", &[pool("m6-html", 1, 1), pool("m6-file", 2, 2)]);
+    fn health_is_ok_and_names_the_node() {
+        let (code, report) = HealthReport::build("origin");
         assert_eq!(code, 200);
         assert_eq!(report.status, "ok");
         assert_eq!(report.node, "origin");
     }
 
-    /// The regression this endpoint most needs to not have.
-    ///
-    /// A cache node has no socket pools at all, so `total_active_members()`
-    /// reads 0 on a cache node at all times. Deriving health from that count alone
-    /// reports every cache node as permanently down.
+    /// A degraded node answers 503 and the body carries the status and the
+    /// node. It names no dependency and no reason: `/health` is public and
+    /// unsecured, so that detail belongs in the process log.
     #[test]
-    fn cache_node_with_no_socket_pools_is_ok_not_degraded() {
-        let (code, report) = HealthReport::build("edge-a", &[]);
-        assert_eq!(
-            code, 200,
-            "a cache node has no socket pools and is not degraded for it"
-        );
-        assert_eq!(report.status, "ok");
-    }
-
-    #[test]
-    fn an_empty_pool_degrades_the_node() {
-        let (code, report) = HealthReport::build(
-            "origin",
-            &[pool("m6-html", 1, 1), pool("render-contact", 0, 1)],
-        );
+    fn degraded_is_503_and_the_body_names_only_the_node() {
+        let (code, report) = HealthReport::degraded("edge-a");
         assert_eq!(code, 503);
         assert_eq!(report.status, "degraded");
-    }
-
-    /// A member marked failed still counts in `total`, so a pool that has
-    /// members but none available must degrade. Reading `total` instead of
-    /// `active` would call this healthy.
-    #[test]
-    fn members_present_but_all_failed_is_degraded() {
-        let (code, _) = HealthReport::build("origin", &[pool("m6-html", 0, 3)]);
+        assert_eq!(report.node, "edge-a");
+        let (code, _, body) = report.into_response(code);
         assert_eq!(code, 503);
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            r#"{"status":"degraded","node":"edge-a"}"#
+        );
     }
 
     #[test]
     fn response_is_never_stored_and_never_indexed() {
-        let (code, report) = HealthReport::build("origin", &[]);
+        let (code, report) = HealthReport::build("origin");
         let (code, headers, body) = report.into_response(code);
         assert_eq!(code, 200);
         let get = |k: &str| {
@@ -687,124 +523,71 @@ mod tests {
         assert_eq!(parsed["node"], "origin");
     }
 
-    /// Traffic volume and build identity are not public. If a future change
-    /// adds them to the public payload, this fails.
-    fn auth(value: &str) -> Vec<(String, String)> {
-        vec![("Authorization".to_string(), value.to_string())]
-    }
-
-    #[test]
-    fn no_configured_token_means_metrics_are_never_served() {
-        // The secure default: forgetting to configure it fails closed, and no
-        // presented credential can talk its way past a token that is unset.
-        assert!(!metrics_authorised(&auth("Bearer anything"), None));
-        assert!(!metrics_authorised(&auth("Bearer anything"), Some("")));
-        assert!(!metrics_authorised(&[], None));
-    }
-
-    #[test]
-    fn correct_bearer_token_authorises() {
-        assert!(metrics_authorised(&auth("Bearer s3cret"), Some("s3cret")));
-        // RFC 9110 11.1: the auth scheme is case-insensitive.
-        assert!(metrics_authorised(&auth("bearer s3cret"), Some("s3cret")));
-        assert!(metrics_authorised(&auth("BEARER s3cret"), Some("s3cret")));
-        // Header field names are case-insensitive too.
-        assert!(metrics_authorised(
-            &[("authorization".to_string(), "Bearer s3cret".to_string())],
-            Some("s3cret")
-        ));
-    }
-
-    #[test]
-    fn wrong_or_malformed_credentials_are_refused() {
-        for value in [
-            "Bearer wrong",
-            "Bearer s3cre",     // prefix of the real token
-            "Bearer s3secret1", // longer
-            "Basic s3cret",     // wrong scheme
-            "s3cret",           // no scheme
-            "Bearer",           // no token
-            "",
-        ] {
-            assert!(
-                !metrics_authorised(&auth(value), Some("s3cret")),
-                "must refuse {value:?}"
-            );
-        }
-        assert!(!metrics_authorised(&[], Some("s3cret")));
-    }
-
-    /// A prefix of the real token must not compare equal. This is the
-    /// property that a length check alone would give, but the comparison is
-    /// also constant-time so response latency cannot be used to recover the
-    /// token one byte at a time.
-    #[test]
-    fn credential_comparison_rejects_prefixes_and_empty() {
-        assert!(credential_matches("abc123", "abc123"));
-        assert!(!credential_matches("abc12", "abc123"));
-        assert!(!credential_matches("abc1234", "abc123"));
-        assert!(!credential_matches("", ""));
-        assert!(!credential_matches("", "abc123"));
-    }
-
     /// An empty snapshot. The collector that fills one in lives in m6-http;
-    /// these tests are about the endpoint's shape and authorisation, not about
-    /// how the numbers are gathered.
+    /// these tests are about the document's shape, not about how the numbers
+    /// are gathered.
     fn snap() -> StatsSnapshot {
         StatsSnapshot::default()
     }
 
     #[test]
-    fn perf_is_404_when_no_token_is_configured() {
+    fn not_found_is_a_404_with_no_door() {
         // Off by default, and it does not advertise a door that cannot be
         // opened: 404, not 401.
-        let out = PerfReport::build(
-            PerfSubject {
-                node: "origin",
-                uptime_s: 5,
-                pools: vec![],
-                url_backends: vec![],
-                host_path: Path::new("/"),
-            },
-            PerfAccess {
-                headers: &auth("Bearer x"),
-                configured_token: None,
-            },
-            snap,
-        );
-        let (code, _, body) = out.into_response();
+        let (code, _, body) = not_found();
         assert_eq!(code, 404);
         assert!(!String::from_utf8_lossy(&body).contains("unauthorised"));
     }
 
-    /// The build identity reaches the wire, whole. An aggregator cannot report
-    /// drift it never receives, and each of the three parts answers a different
-    /// question: which binary, which release it claims to be, which build it
-    /// actually is.
+    /// The build identity reaches the wire, whole, and the commit travels in
+    /// the version string's build metadata. An aggregator cannot report drift it
+    /// never receives, and a release tag alone cannot tell two builds apart.
     #[test]
-    fn perf_reports_the_running_build_identity() {
+    fn the_report_carries_the_running_build_identity() {
         let out = PerfReport::build(
             PerfSubject {
+                process_index: None,
                 node: "origin",
                 uptime_s: 5,
                 pools: vec![],
                 url_backends: vec![],
-                host_path: Path::new("/"),
+                host: crate::platform::host::snapshot(Path::new("/")),
             },
-            PerfAccess {
-                headers: &auth("Bearer right"),
-                configured_token: Some("right"),
-            },
-            snap,
+            snap(),
         );
-        let (code, _, body) = out.into_response();
-        assert_eq!(code, 200);
+        let body = serde_json::to_vec(&out).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            v["build"]["version"].as_str(),
-            Some(env!("CARGO_PKG_VERSION"))
+        let version = v["build"]["version"].as_str().expect("a version");
+        let parsed = semver::Version::parse(version).expect("the full form must be SemVer 2.0.0");
+        let expected =
+            semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("workspace version is SemVer");
+        assert_eq!(parsed.major, expected.major);
+        assert_eq!(parsed.minor, expected.minor);
+        assert_eq!(parsed.patch, expected.patch);
+        assert_eq!(parsed.pre, expected.pre, "the release part is the tag");
+
+        // The metadata is the commit the build script read, and a source
+        // tarball has no git and says `unknown`. A dirty build appends
+        // `.dirty`. Any other shape means the version string is malformed.
+        let metadata = parsed.build.as_str();
+        let mut parts = metadata.split('.');
+        let commit = parts.next().expect("build metadata is not empty");
+        assert!(
+            commit == "unknown"
+                || (commit.len() == 12 && commit.chars().all(|c| c.is_ascii_hexdigit())),
+            "build metadata {metadata:?} must start with a twelve-character commit or `unknown`"
         );
-        assert!(!v["build"]["version"].as_str().unwrap().is_empty());
+        assert!(
+            parts.next().is_none_or(|rest| rest == "dirty") && parts.next().is_none(),
+            "build metadata {metadata:?} is the commit with an optional `.dirty`"
+        );
+
+        // The hash field is gone from the wire, not merely empty. A reader that
+        // still expects it is reading a document no node sends.
+        assert!(
+            v["build"].get("hash").is_none(),
+            "the executable hash must not be on the wire: {version:?}"
+        );
 
         // The name is the RUNNING binary's, not m6-core's. A library cannot
         // know the binary's name at compile time, so this reads the executable,
@@ -816,46 +599,36 @@ mod tests {
             "the name must come from the running executable, not from the \
              library's own CARGO_PKG_NAME: every service would report m6-core"
         );
-
-        // The hash is the md5 of this very binary. Checked against a hash taken
-        // here rather than against a constant, which would pin whatever the
-        // code produced on the day and prove only that it has not changed.
-        // This is the property that makes the field worth having: it must equal
-        // `md5sum` of the artefact.
-        use md5::{Digest, Md5};
-        let exe = std::env::current_exe().expect("a test binary has a path");
-        let expected = format!("{:x}", Md5::digest(std::fs::read(&exe).unwrap()));
-        assert_eq!(v["build"]["hash"].as_str(), Some(expected.as_str()));
-        assert_eq!(expected.len(), 32, "hex md5 is 32 characters");
     }
 
-    /// Two builds of one tag report the same version and different hashes. That
-    /// is the whole reason the hash is there, so it is asserted rather than
-    /// assumed: a version comparison cannot see this and a hash comparison can.
+    /// Two builds of one tag report the same release and different commits.
+    /// That is the whole reason the build metadata is there, so it is asserted
+    /// rather than assumed: comparing the release tag alone cannot see this and
+    /// comparing the metadata can.
     ///
-    /// Simulated by hashing two different byte strings, because the real case
-    /// needs two compilations of one source and Rust gives no way to force that
-    /// in a unit test. What is being pinned is the CLAIM: same version, different
-    /// bytes, and only the hash distinguishes them.
+    /// The real case needs two compilations of one source, so the claim is
+    /// pinned on the strings a build script produces.
     #[test]
-    fn one_version_two_builds_differ_only_in_the_hash() {
-        use md5::{Digest, Md5};
+    fn one_version_two_builds_differ_only_in_the_build_metadata() {
         let a = BuildId {
             name: "m6-http".into(),
-            version: "1.10.0".into(),
-            hash: format!("{:x}", Md5::digest(b"build one")),
+            version: "1.16.0-rc.1+aaaaaaaaaaaa".into(),
         };
         let b = BuildId {
-            hash: format!("{:x}", Md5::digest(b"build two")),
+            version: "1.16.0-rc.1+bbbbbbbbbbbb".into(),
             ..a.clone()
         };
 
-        assert_eq!(a.version, b.version, "same tag");
+        assert_eq!(
+            a.version.split('+').next(),
+            b.version.split('+').next(),
+            "same tag"
+        );
         assert_eq!(a.name, b.name, "same binary");
-        assert_ne!(a.hash, b.hash, "different bytes");
+        assert_ne!(a.version, b.version, "different commits");
         assert_ne!(
             a, b,
-            "a fleet holding these two is NOT uniform, and comparing versions \
+            "a fleet holding these two is NOT uniform, and comparing the tag \
              alone would call it uniform."
         );
     }
@@ -864,25 +637,22 @@ mod tests {
     /// node at a time and an aggregator that cannot read an older node learns
     /// nothing about the node it most needs to ask about.
     #[test]
-    fn a_perf_payload_without_a_build_still_parses() {
+    fn a_metrics_document_without_a_build_still_parses() {
         // A real payload with the field taken out, rather than a hand-written
         // fixture: a fixture only proves the fixture parses, and the first attempt
         // at one failed on unrelated required fields of StatsSnapshot.
         let out = PerfReport::build(
             PerfSubject {
+                process_index: None,
                 node: "origin",
                 uptime_s: 5,
                 pools: vec![],
                 url_backends: vec![],
-                host_path: Path::new("/"),
+                host: crate::platform::host::snapshot(Path::new("/")),
             },
-            PerfAccess {
-                headers: &auth("Bearer right"),
-                configured_token: Some("right"),
-            },
-            snap,
+            snap(),
         );
-        let (_, _, body) = out.into_response();
+        let body = serde_json::to_vec(&out).unwrap();
         let mut v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(v.as_object_mut().unwrap().remove("build").is_some());
         let p: PerfReport = serde_json::from_value(v).expect("older node must parse");
@@ -893,175 +663,76 @@ mod tests {
         );
     }
 
-    fn authorised_perf_json() -> serde_json::Value {
+    fn metrics_document_json() -> serde_json::Value {
         let out = PerfReport::build(
             PerfSubject {
+                process_index: None,
                 node: "origin",
                 uptime_s: 5,
                 pools: vec![],
                 url_backends: vec![],
-                host_path: Path::new("/"),
+                host: crate::platform::host::snapshot(Path::new("/")),
             },
-            PerfAccess {
-                headers: &auth("Bearer right"),
-                configured_token: Some("right"),
-            },
-            snap,
+            snap(),
         );
-        let (_, _, body) = out.into_response();
+        let body = serde_json::to_vec(&out).unwrap();
         serde_json::from_slice(&body).unwrap()
     }
 
     #[test]
-    fn perf_carries_logging_with_reopen_state() {
-        let v = authorised_perf_json();
+    fn the_document_carries_logging_state() {
+        let v = metrics_document_json();
         let p: PerfReport = serde_json::from_value(v.clone()).unwrap();
         assert!(p.logging.is_some());
         assert!(v["logging"].get("events_total").is_some());
     }
 
     #[test]
-    fn a_perf_payload_from_a_node_older_than_logging_still_parses() {
-        let mut v = authorised_perf_json();
+    fn a_metrics_document_from_a_node_older_than_logging_still_parses() {
+        let mut v = metrics_document_json();
         assert!(v.as_object_mut().unwrap().remove("logging").is_some());
         let p: PerfReport = serde_json::from_value(v).expect("older node must parse");
         assert!(p.logging.is_none());
         let l: LoggingHealth =
             serde_json::from_str(r#"{"events_total":3,"seconds_since_last":1}"#).unwrap();
-        assert!(l.reopen.is_none());
+        assert_eq!(l.events_total, 3);
     }
 
     #[test]
-    fn log_reopen_health_says_never_rather_than_zero() {
-        let h = LogReopenHealth {
-            reopens_total: 0,
-            failures_total: 0,
-            seconds_since_last_reopen: None,
-            last_reopen_unix: None,
-            seconds_since_last_failure: None,
-        };
-        let json = serde_json::to_string(&h).unwrap();
-        assert!(json.contains(r#""seconds_since_last_reopen":null"#));
-    }
-
-    #[test]
-    fn refusal_matches_the_legacy_gate() {
-        let none = PerfAccess {
-            headers: &auth("Bearer x"),
-            configured_token: None,
-        };
-        assert!(matches!(none.refusal(), Some(PerfOutcome::Disabled)));
-        let wrong = PerfAccess {
-            headers: &auth("Bearer wrong"),
-            configured_token: Some("right"),
-        };
-        assert!(matches!(wrong.refusal(), Some(PerfOutcome::Unauthorised)));
-        let right = PerfAccess {
-            headers: &auth("Bearer right"),
-            configured_token: Some("right"),
-        };
-        assert!(right.refusal().is_none());
-    }
-
-    #[test]
-    fn build_authorised_reports_without_a_token() {
-        let out = PerfReport::build_authorised(
+    fn the_report_builds_with_no_credential() {
+        let out = PerfReport::build(
             PerfSubject {
+                process_index: None,
                 node: "origin",
                 uptime_s: 5,
                 pools: vec![],
                 url_backends: vec![],
-                host_path: Path::new("/"),
+                host: crate::platform::host::snapshot(Path::new("/")),
             },
-            snap,
+            snap(),
         );
-        let (code, _, body) = out.into_response();
-        assert_eq!(code, 200);
+        let body = serde_json::to_vec(&out).unwrap();
         let p: PerfReport = serde_json::from_slice(&body).expect("a report");
         assert_eq!(p.node, "origin");
     }
 
     #[test]
-    fn forbidden_is_a_403_with_no_store_and_no_www_authenticate() {
-        let (code, headers, body) = PerfOutcome::Forbidden.into_response();
-        assert_eq!(code, 403);
-        assert_eq!(body, br#"{"error":"forbidden"}"#);
-        let has = |name: &str| headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(name));
-        assert!(has("X-Robots-Tag"));
-        assert!(!has("WWW-Authenticate"));
-        assert!(headers
-            .iter()
-            .any(|(n, v)| n == "Cache-Control" && v == "no-store"));
-    }
-
-    #[test]
-    fn perf_is_401_with_a_scheme_hint_when_credentials_are_wrong() {
+    fn a_built_report_carries_the_metrics() {
         let out = PerfReport::build(
             PerfSubject {
-                node: "origin",
-                uptime_s: 5,
-                pools: vec![],
-                url_backends: vec![],
-                host_path: Path::new("/"),
-            },
-            PerfAccess {
-                headers: &auth("Bearer wrong"),
-                configured_token: Some("right"),
-            },
-            snap,
-        );
-        let (code, headers, _) = out.into_response();
-        assert_eq!(code, 401);
-        assert!(headers
-            .iter()
-            .any(|(n, v)| n.eq_ignore_ascii_case("WWW-Authenticate") && v == "Bearer"));
-    }
-
-    /// The reservoir sort must never run for an unauthorised caller. If it
-    /// did, an anonymous scrape loop would be a cheap way to make the server
-    /// work.
-    #[test]
-    fn perf_does_not_snapshot_unless_authorised() {
-        let mut taken = false;
-        let counting = || {
-            taken = true;
-            snap()
-        };
-        let _ = PerfReport::build(
-            PerfSubject {
-                node: "origin",
-                uptime_s: 5,
-                pools: vec![],
-                url_backends: vec![],
-                host_path: Path::new("/"),
-            },
-            PerfAccess {
-                headers: &[],
-                configured_token: Some("tok"),
-            },
-            counting,
-        );
-        assert!(!taken, "snapshot must not be taken without authorisation");
-    }
-
-    #[test]
-    fn perf_returns_metrics_when_authorised() {
-        let out = PerfReport::build(
-            PerfSubject {
+                process_index: None,
                 node: "origin",
                 uptime_s: 11,
-                pools: vec![pool("m6-html", 1, 1)],
+                pools: vec![PoolHealth {
+                    name: "m6-html".to_string(),
+                    total: 1,
+                }],
                 url_backends: vec!["origin".to_string()],
-                host_path: Path::new("/"),
+                host: crate::platform::host::snapshot(Path::new("/")),
             },
-            PerfAccess {
-                headers: &auth("Bearer tok"),
-                configured_token: Some("tok"),
-            },
-            snap,
+            snap(),
         );
-        let (code, _, body) = out.into_response();
-        assert_eq!(code, 200);
+        let body = serde_json::to_vec(&out).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["node"], "origin");
         assert_eq!(parsed["uptime_s"], 11);
@@ -1074,7 +745,7 @@ mod tests {
         // request and can read latency next to the load that produced it.
         assert!(
             parsed["host"].is_object(),
-            "/perf carries the host snapshot"
+            "the metrics document carries the host snapshot"
         );
         assert!(parsed["host"]["cpus"].as_u64().unwrap_or(0) >= 1);
         assert!(parsed["host"]["disk"]["total_bytes"].as_u64().unwrap_or(0) > 0);
@@ -1093,34 +764,40 @@ mod tests {
     /// test whose name says why that is a decision and not a formality.
     #[test]
     fn public_payload_is_exactly_status_and_node() {
-        let (code, report) = HealthReport::build("origin", &[pool("m6-html", 1, 1)]);
-        let (_, _, body) = report.into_response(code);
-        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let object = parsed.as_object().expect("object");
+        for (code, report) in [
+            HealthReport::build("origin"),
+            HealthReport::degraded("edge-a"),
+        ] {
+            let (_, _, body) = report.into_response(code);
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let object = parsed.as_object().expect("object");
 
-        let mut keys: Vec<&str> = object.keys().map(|k| k.as_str()).collect();
-        keys.sort_unstable();
-        assert!(
-            !object.contains_key("host"),
-            "/health must not publish load, memory or disk either: it is the \
-             same class of thing as the pool topology that was moved to /perf"
-        );
-        assert_eq!(
-            keys,
-            ["node", "status"],
-            "/health is unauthenticated and public: every field here is \
-             published to anyone who asks. Topology, worker counts and uptime \
-             belong on token-gated /perf."
-        );
+            let mut keys: Vec<&str> = object.keys().map(|k| k.as_str()).collect();
+            keys.sort_unstable();
+            assert!(
+                !object.contains_key("host"),
+                "/health must not publish load, memory or disk either: it is the \
+                 same class of thing as the pool topology that was moved to the \
+                 metrics document"
+            );
+            assert_eq!(
+                keys,
+                ["node", "status"],
+                "/health is unauthenticated and public: every field here is \
+                 published to anyone who asks. Topology, worker counts, uptime \
+                 and the failing dependency belong in the metrics document or in \
+                 the process log."
+            );
+        }
     }
 }
 
-// ── /traffic ─────────────────────────────────────────────────────────────────
+// ── The traffic document ─────────────────────────────────────────────────────
 
-/// What `/traffic` publishes: the node's own view of who has been asking it
-/// for things, and whether its logging is alive.
+/// What the traffic document carries: the node's own view of who has been
+/// asking it for things, and whether its logging is alive.
 ///
-/// This is the endpoint that lets a fleet report be assembled without ssh. The
+/// This is the document that lets a fleet report be assembled without ssh. The
 /// alternative was shipping the analytics log to a central box, and the size
 /// says not to: a busy node's log runs to tens of megabytes, one request is
 /// about 350 bytes, and the summary a human reads is about 1KB. Roughly
@@ -1134,7 +811,20 @@ mod tests {
 pub struct TrafficReport {
     pub node: String,
     /// The window summarised, in minutes.
+    ///
+    /// A node that keeps its window in memory reports the span that window
+    /// really holds, which is shorter than the window when a full ring
+    /// overwrote events still inside it.
     pub window_minutes: u64,
+    /// Events the window overwrote while they were still inside the window
+    /// this report covers, counted by minute.
+    ///
+    /// Non-zero means the summary is missing those events: the totals are for
+    /// `window_minutes`, not for a full hour. Zero for a report built from a
+    /// log. `serde(default)`, so a node older than the field reads as zero
+    /// drops instead of making the whole report unparseable.
+    #[serde(default)]
+    pub events_dropped: u64,
     pub total_requests: u64,
     pub status: std::collections::BTreeMap<u16, u64>,
     /// Clients worth a human's attention. Already graded: see
@@ -1167,56 +857,18 @@ pub struct TrafficReport {
     pub firewall: Option<crate::firewall::FirewallState>,
 }
 
-/// Whether this process's main log layer is still emitting.
+/// Whether this process's log is still emitting.
 ///
-/// Replaces counting log targets out of `journalctl` over ssh. A config reload
-/// can silence every target except `analytics`, and when it does the process
-/// looks entirely healthy from outside. It does not look healthy from inside,
-/// which is where this is measured.
+/// Replaces counting log targets out of `journalctl` over ssh. A log level set
+/// at start can silence everything, and when it does the process looks
+/// entirely healthy from outside. It does not look healthy from inside, which
+/// is where this is measured.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LoggingHealth {
     pub events_total: u64,
     /// `None` means nothing has ever been emitted, which is not the same as
     /// "emitted zero seconds ago" and must not be reported as healthy.
     pub seconds_since_last: Option<u64>,
-    /// The log file's reopen record. `None` means this process writes no log
-    /// file, or is a node older than the field.
-    #[serde(default)]
-    pub reopen: Option<LogReopenHealth>,
-}
-
-/// When a process last reopened its log file, so a reader can tell whether
-/// rotation is still running.
-///
-/// The node computes the ages itself, so clock skew between the node and its
-/// reader does not matter. `last_reopen_unix` is for a reader that stores
-/// history.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LogReopenHealth {
-    pub reopens_total: u64,
-    pub failures_total: u64,
-    /// `None` means never reopened since start, which is not the same as
-    /// "reopened zero seconds ago".
-    pub seconds_since_last_reopen: Option<u64>,
-    pub last_reopen_unix: Option<u64>,
-    pub seconds_since_last_failure: Option<u64>,
-}
-
-impl LogReopenHealth {
-    /// `None` when this process writes no log file.
-    pub fn read() -> Option<Self> {
-        if !crate::log::writes_log_file() {
-            return None;
-        }
-        let r = crate::log::reopens();
-        Some(Self {
-            reopens_total: r.successes(),
-            failures_total: r.failures(),
-            seconds_since_last_reopen: r.seconds_since_last_success(),
-            last_reopen_unix: r.last_success_unix(),
-            seconds_since_last_failure: r.seconds_since_last_failure(),
-        })
-    }
 }
 
 impl LoggingHealth {
@@ -1224,7 +876,6 @@ impl LoggingHealth {
         Self {
             events_total: crate::log::pulse().events(),
             seconds_since_last: crate::log::pulse().seconds_since_last(),
-            reopen: LogReopenHealth::read(),
         }
     }
 
@@ -1267,11 +918,11 @@ pub struct HeavyHitter {
     /// reader wanted did not exist.
     ///
     /// The WIRE name stays `user_agents`, because the count has been published
-    /// under it since this struct existed and an aggregator reads `/traffic`
-    /// from nodes on other versions. Giving the strings that key instead would
-    /// make a payload from any node on the other side of this change a type
-    /// error rather than a partly readable report, which is the treatment
-    /// `firewall` and `PerfReport.tls` are documented as avoiding.
+    /// under it since this struct existed and an aggregator reads the traffic
+    /// document from nodes on other versions. Giving the strings that key
+    /// instead would make a payload from any node on the other side of this
+    /// change a type error rather than a partly readable report, which is the
+    /// treatment `firewall` and `PerfReport.tls` are documented as avoiding.
     #[serde(rename = "user_agents")]
     pub distinct_user_agents: usize,
     /// A heavy hitter carries the COUNT and no sample, deliberately.
@@ -1310,15 +961,44 @@ pub struct CrawlerReport {
 }
 
 impl TrafficReport {
-    /// Summarise an analytics stream.
+    /// Summarise records that are already parsed.
     ///
-    /// `since` is an RFC 3339 prefix; the timestamps are fixed-width UTC so a
-    /// string compare is a time compare.
-    pub fn build(node: &str, ndjson: &str, since: &str, window_minutes: u64) -> Self {
-        let records: Vec<crate::telemetry::AnalyticsRecord> =
-            crate::telemetry::parse_analytics(ndjson, since).collect();
-        let summary = crate::telemetry::TrafficSummary::from_records(&records);
+    /// The traffic window keeps its records in memory and never reads the log,
+    /// so the report a window produces and the report the same lines would
+    /// produce from the file run through this one body. A caller with records
+    /// from a file leaves [`events_dropped`](Self::events_dropped) at zero,
+    /// because a log keeps every event in its window.
+    pub fn from_records(
+        node: &str,
+        records: &[crate::telemetry::AnalyticsRecord],
+        window_minutes: u64,
+    ) -> Self {
+        Self::from_summary(
+            node,
+            crate::telemetry::TrafficSummary::from_records(records),
+            window_minutes,
+        )
+    }
 
+    /// Summarise requests read as borrowed views, as the traffic window
+    /// holds them, with no record built per request.
+    pub fn from_views<'a>(
+        node: &str,
+        records: impl IntoIterator<Item = crate::telemetry::RequestView<'a>>,
+        window_minutes: u64,
+    ) -> Self {
+        Self::from_summary(
+            node,
+            crate::telemetry::TrafficSummary::from_views(records),
+            window_minutes,
+        )
+    }
+
+    fn from_summary(
+        node: &str,
+        summary: crate::telemetry::TrafficSummary,
+        window_minutes: u64,
+    ) -> Self {
         let notable: Vec<NotableClient> = summary
             .clients
             .iter()
@@ -1360,6 +1040,7 @@ impl TrafficReport {
         Self {
             node: node.to_string(),
             window_minutes,
+            events_dropped: 0,
             heavy_hitters,
             total_requests: summary.total_requests,
             status: summary.status.clone(),
@@ -1433,7 +1114,9 @@ mod traffic_tests {
                 "curl/8",
             ));
         }
-        let r = TrafficReport::build("origin", &lines.join("\n"), "", 60);
+        let ndjson = lines.join("\n");
+        let records: Vec<_> = crate::telemetry::parse_analytics(&ndjson, "").collect();
+        let r = TrafficReport::from_records("origin", &records, 60);
 
         assert_eq!(r.total_requests, 6);
         assert_eq!(r.crawlers.len(), 1);
@@ -1455,14 +1138,12 @@ mod traffic_tests {
         let never = LoggingHealth {
             events_total: 0,
             seconds_since_last: None,
-            reopen: None,
         };
         assert!(never.is_blind());
 
         let alive = LoggingHealth {
             events_total: 5000,
             seconds_since_last: Some(3),
-            reopen: None,
         };
         assert!(!alive.is_blind());
 
@@ -1470,7 +1151,6 @@ mod traffic_tests {
         let quiet = LoggingHealth {
             events_total: 5000,
             seconds_since_last: Some(600),
-            reopen: None,
         };
         assert!(
             quiet.is_blind(),
@@ -1478,9 +1158,9 @@ mod traffic_tests {
         );
     }
 
-    /// A `/traffic` payload from a node on another version still parses.
+    /// A traffic document from a node on another version still parses.
     ///
-    /// The aggregator reads this endpoint over the network, and a rollout has
+    /// The aggregator reads this document from the journal, and a rollout has
     /// nodes on both sides of a field change at once. A node that publishes
     /// `user_agents` as the COUNT must stay readable here, and the count must
     /// keep that wire name so an aggregator older than the sample reads it
@@ -1509,5 +1189,199 @@ mod traffic_tests {
         // And the count still goes out under the name an older reader expects.
         let json = serde_json::to_value(&r).unwrap();
         assert_eq!(json["heavy_hitters"][0]["user_agents"], 3);
+    }
+
+    /// `process_index` is in the body only when the process has one, so a node
+    /// that does not set it answers as before. Break: always serialised, which
+    /// changes every existing `/health` body.
+    #[test]
+    fn process_index_is_reported_only_when_set() {
+        let (_, plain) = HealthReport::build("edge");
+        let body = String::from_utf8(plain.into_response(200).2).unwrap();
+        assert!(!body.contains("process_index"), "{body}");
+
+        let (_, mut with) = HealthReport::build("edge");
+        with.process_index = Some(2);
+        let body = String::from_utf8(with.into_response(200).2).unwrap();
+        assert!(body.contains("\"process_index\":2"), "{body}");
+    }
+}
+
+/// The periodic metrics line carries the whole metrics document, so the
+/// document's size is a log-budget fact: a line past `[limits.log_buffer] max`
+/// is refused whole, and a refused metrics line is a node that stops reporting.
+///
+/// This builds the document with every section at its maximum cardinality and
+/// measures it. The number is recorded in `docs/m6-log.md` and
+/// `docs/m6-http.md`, so a reader who has to size a log budget does not have
+/// to derive it.
+#[cfg(test)]
+mod perf_line_size_tests {
+    use super::*;
+    use crate::telemetry::{ChannelSnapshot, HandshakeStats, LoopTriggerSnapshot, StatsSnapshot};
+    use crate::tls::{Fingerprint, TlsCertificate};
+
+    fn handshake() -> HandshakeStats {
+        HandshakeStats {
+            samples: 1024,
+            p50_ns: 1_234_567,
+            p99_ns: 9_876_543,
+            total: u64::MAX,
+            mean_ns: 1_345_678,
+            min_ns: 123_456,
+            max_ns: 12_345_678,
+        }
+    }
+
+    fn channel(version: &str, iface: &str) -> ChannelSnapshot {
+        ChannelSnapshot {
+            channel: format!("{version}/{iface}"),
+            version: version.to_string(),
+            iface: iface.to_string(),
+            requests: u64::MAX,
+            hits: u64::MAX,
+            misses: u64::MAX,
+            backend_errors: u64::MAX,
+            hit_samples: 4096,
+            hit_p50_ns: 1_234_567_890,
+            hit_p99_ns: 1_234_567_890,
+            miss_samples: 4096,
+            miss_p50_ns: 1_234_567_890,
+            miss_p99_ns: 1_234_567_890,
+            handshake_full: handshake(),
+            handshake_resumed: handshake(),
+        }
+    }
+
+    /// Every section at its maximum: 500 status codes, six channels, sixteen
+    /// event-loop triggers, three certificates, three pools, three URL
+    /// backends, three named backend errors, and the largest integer values.
+    fn maximal_report() -> PerfReport {
+        let mut metrics = StatsSnapshot {
+            requests_total: u64::MAX,
+            cache_hits_total: u64::MAX,
+            cache_misses_total: u64::MAX,
+            cache_hits_valid_total: u64::MAX,
+            cache_hits_invalid_total: u64::MAX,
+            cache_misses_fetched_total: u64::MAX,
+            cache_misses_answered_locally_total: u64::MAX,
+            backend_errors_total: u64::MAX,
+            monitor_requests_total: u64::MAX,
+            monitor_samples: 4096,
+            monitor_p50_ns: 1_234_567_890,
+            monitor_p99_ns: 1_234_567_890,
+            rps_peak: u64::MAX,
+            hit_samples: 4096,
+            hit_p50_ns: 1_234_567_890,
+            hit_p99_ns: 1_234_567_890,
+            hit_max_ns: 1_234_567_890,
+            miss_samples: 4096,
+            miss_p50_ns: 1_234_567_890,
+            miss_p99_ns: 1_234_567_890,
+            miss_max_ns: 1_234_567_890,
+            ..StatsSnapshot::default()
+        };
+        for code in 100..=599u16 {
+            metrics.status_counts.insert(code, u64::MAX);
+        }
+        for version in ["http/1.1", "http/2", "http/3"] {
+            for iface in ["external", "internal"] {
+                metrics.channels.push(channel(version, iface));
+            }
+        }
+        for n in 0..16 {
+            metrics.event_loop.push(LoopTriggerSnapshot {
+                name: format!("connection_{n}_maximum"),
+                count: u64::MAX,
+                wait_min_ns: 1_234_567_890,
+                wait_max_ns: 1_234_567_890,
+                wait_mean_ns: 1_234_567_890,
+                work_min_ns: 1_234_567_890,
+                work_max_ns: 1_234_567_890,
+                work_mean_ns: 1_234_567_890,
+            });
+        }
+        for name in ["render-contact", "render-analytics", "m6-html"] {
+            metrics
+                .backend_errors_by_name
+                .insert(name.to_string(), u64::MAX);
+        }
+
+        let certificate = TlsCertificate {
+            depth: 2,
+            not_after_unix: 1_800_000_000,
+            expires_in_seconds: 30_000_000,
+            fingerprint: Some(Fingerprint::of(b"a certificate's DER bytes")),
+        };
+
+        PerfReport {
+            process_index: Some(15),
+            node: "edge-b-with-a-long-name".to_string(),
+            build: BuildId {
+                name: "m6-http".to_string(),
+                version: "1.15.0+0123456789ab".to_string(),
+            },
+            uptime_s: u64::MAX,
+            pools: ["m6-html", "m6-file", "render-cms"]
+                .iter()
+                .map(|name| PoolHealth {
+                    name: name.to_string(),
+                    total: 4,
+                })
+                .collect(),
+            url_backends: ["origin-that-has-a-long-name", "second-url-backend", "third"]
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
+            tls: vec![certificate, certificate, certificate],
+            tls_unreadable: 0,
+            logging: Some(LoggingHealth {
+                events_total: u64::MAX,
+                seconds_since_last: Some(u64::MAX),
+            }),
+            metrics,
+            host: crate::platform::host::snapshot(std::path::Path::new("/")),
+        }
+    }
+
+    #[test]
+    fn the_maximal_document_is_well_under_the_log_buffer_maximum() {
+        let document = super::tests_support::perf_document_of(&maximal_report());
+        let bytes = serde_json::to_vec(&document).expect("the document serialises");
+        // Measured at 20,477 bytes on 2026-11-17, with the sections above at
+        // their maximum. The buffer's maximum is 1 MiB, so the margin is about
+        // fifty times. A field that pushes this past a quarter of a megabyte
+        // is a field that should not be in a log line.
+        assert!(
+            bytes.len() < 256 * 1024,
+            "the maximal metrics document is {} bytes, past the quarter-megabyte \
+             budget this test keeps; the log buffer refuses a line past 1 MiB, \
+             and a refused metrics line is a node that stops reporting",
+            bytes.len()
+        );
+        let host = serde_json::to_vec(&document["host"])
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let metrics = serde_json::to_vec(&document["metrics"])
+            .map(|v| v.len())
+            .unwrap_or(0);
+        eprintln!(
+            "maximal metrics document: {} bytes (host {}, metrics {})",
+            bytes.len(),
+            host,
+            metrics
+        );
+    }
+}
+
+/// Helpers the size test shares with the document builders.
+#[cfg(test)]
+mod tests_support {
+    use super::*;
+
+    /// The report as the metrics line serialises it, with no generation or disk
+    /// block: those are m6-http's own and are added to the value there.
+    pub fn perf_document_of(report: &PerfReport) -> serde_json::Value {
+        serde_json::to_value(report).unwrap_or_else(|_| serde_json::json!({"error": "x"}))
     }
 }

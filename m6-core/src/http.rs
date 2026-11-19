@@ -7,8 +7,8 @@
 //! one file and relied on in another.
 //!
 //! `RawResponse` is the low-level answer, for code writing its own status,
-//! headers and body with no framework around it. `Response` is what an `App`
-//! handler returns, and a `RawResponse` lifts into one.
+//! headers and body with no site around it. `Response` is what a request arm
+//! returns, and a `RawResponse` lifts into one.
 
 /// HTTP method constants.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,9 +145,51 @@ impl RawResponse {
     }
 }
 
+/// The wire answer of a token check's refusal: status, headers and body.
+pub type TokenRefusal = (u16, Vec<(String, String)>, Vec<u8>);
+
+/// The one answer a token check gives when it refuses, whatever route asked.
+///
+/// `forbidden` is `false` for no credential or a credential that does not
+/// verify (401), and `true` for a credential that verifies but does not carry
+/// the required role or group (403). A 401 carries `WWW-Authenticate` naming
+/// the scheme, which RFC 9110 11.6.1 requires. `m6-http`'s route check and
+/// `/genid` both answer through here, so the status, headers and body a caller
+/// sees are the same whichever path it asked for.
+pub fn token_refusal(forbidden: bool) -> TokenRefusal {
+    let mut headers = vec![
+        (
+            "Content-Type".to_string(),
+            "application/json; charset=utf-8".to_string(),
+        ),
+        ("Cache-Control".to_string(), "no-store".to_string()),
+        ("X-Robots-Tag".to_string(), "noindex, nofollow".to_string()),
+    ];
+    if forbidden {
+        (403, headers, br#"{"error":"forbidden"}"#.to_vec())
+    } else {
+        headers.push(("WWW-Authenticate".to_string(), "Bearer".to_string()));
+        (401, headers, br#"{"error":"unauthorised"}"#.to_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_token_refusal_is_one_definition() {
+        let (status, headers, body) = token_refusal(false);
+        assert_eq!(status, 401);
+        assert_eq!(body, br#"{"error":"unauthorised"}"#);
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k == "WWW-Authenticate" && v == "Bearer"));
+        let (status, headers, body) = token_refusal(true);
+        assert_eq!(status, 403);
+        assert_eq!(body, br#"{"error":"forbidden"}"#);
+        assert!(!headers.iter().any(|(k, _)| k == "WWW-Authenticate"));
+    }
 
     #[test]
     fn test_raw_request_header_lookup_case_insensitive() {
@@ -187,7 +229,10 @@ mod tests {
         let bytes = resp.to_bytes();
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.starts_with("HTTP/1.1 204 No Content\r\n"));
-        assert!(text.contains("Content-Length: 0\r\n"));
+        // RFC 9110 8.6: a 204 MUST NOT carry Content-Length. This test used to
+        // assert the opposite, which is the `Content-Length: 0` the core writer
+        // added to every bodyless status.
+        assert!(!text.to_ascii_lowercase().contains("content-length"));
         assert!(text.ends_with("\r\n\r\n"));
     }
 }
@@ -259,6 +304,12 @@ mod redirect_tests {
 pub trait HeaderSource {
     fn find(&self, name: &str) -> Option<&str>;
     fn find_all<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a str>;
+    /// True when the source holds no header fields.
+    ///
+    /// A cached response's existence is asked through this, since a stored
+    /// 200 with no header fields is not a representation a conditional
+    /// request can match.
+    fn is_empty(&self) -> bool;
 }
 
 impl HeaderSource for [(String, String)] {
@@ -271,6 +322,37 @@ impl HeaderSource for [(String, String)] {
         self.iter()
             .filter(move |(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
+}
+
+impl HeaderSource for [crate::headers::Header] {
+    fn find(&self, name: &str) -> Option<&str> {
+        self.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+    fn find_all<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a str> {
+        self.iter()
+            .filter(move |(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
+}
+
+impl HeaderSource for Vec<crate::headers::Header> {
+    fn find(&self, name: &str) -> Option<&str> {
+        self.as_slice().find(name)
+    }
+    fn find_all<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a str> {
+        self.as_slice().find_all(name)
+    }
+    fn is_empty(&self) -> bool {
+        self.is_empty()
     }
 }
 
@@ -285,6 +367,29 @@ impl HeaderSource for Vec<(String, String)> {
     }
     fn find_all<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a str> {
         self.as_slice().find_all(name)
+    }
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
+}
+
+// A borrowed request head's headers: `httparse::Header` slices, whose names and
+// values point into the request buffer rather than into the slice itself. The
+// value lifetime outlives the slice borrow by construction (`RequestHead`
+// unifies both), which is what lets `find` return a `&str` tied to `&self`.
+impl HeaderSource for [httparse::Header<'_>] {
+    fn find(&self, name: &str) -> Option<&str> {
+        self.iter()
+            .find(|h| h.name.eq_ignore_ascii_case(name))
+            .and_then(|h| std::str::from_utf8(h.value).ok())
+    }
+    fn find_all<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a str> {
+        self.iter()
+            .filter(move |h| h.name.eq_ignore_ascii_case(name))
+            .filter_map(|h| std::str::from_utf8(h.value).ok())
+    }
+    fn is_empty(&self) -> bool {
+        self.is_empty()
     }
 }
 

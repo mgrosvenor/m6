@@ -45,8 +45,67 @@
 ///   repeat, and a request must not carry a response pseudo-header.
 /// - **8.3.1**: `:method`, `:scheme` and `:path` are mandatory for anything
 ///   that is not CONNECT, and `:path` must not be empty.
+#[cfg(test)]
 pub(crate) fn validate_request_headers(headers: &[(String, String)]) -> Result<(), &'static str> {
     validate_request_header_bytes(headers.iter().map(|(k, v)| (k.as_bytes(), v.as_bytes())))
+}
+
+/// The size of one field in the RFC 9113 6.5.2 count: its name, its value and
+/// 32 bytes of overhead.
+pub const FIELD_OVERHEAD: usize = 32;
+
+/// Whether a response field is connection-specific and therefore forbidden on
+/// HTTP/2 and HTTP/3 (RFC 9113 8.2.2, RFC 9114 4.2).
+///
+/// These are HTTP/1.1 hop-by-hop fields: they describe the one connection the
+/// message travelled on, and neither h2 nor h3 has a connection to describe.
+/// Both protocols say a message carrying one is malformed.
+///
+/// One helper for both serialisers, because the h3 writer dropping its own
+/// copy of this rule is exactly how example 08's `/logs` came to be answered
+/// as 200 with no body: the m6-html backend closes its HTTP/1.1 connection, so
+/// every page it returns carries `Connection: close`, h2 stripped it and h3
+/// forwarded it, and a client enforcing RFC 9114 4.2 read no body at all.
+pub fn is_connection_specific(name: &str) -> bool {
+    name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("keep-alive")
+        || name.eq_ignore_ascii_case("proxy-connection")
+        || name.eq_ignore_ascii_case("transfer-encoding")
+        || name.eq_ignore_ascii_case("upgrade")
+}
+
+/// The status an over-limit decoded request head earns, if it is over one.
+///
+/// 414 is the request line: `:method` and `:path` joined by one space, the way
+/// those two fields carry the HTTP/1.1 request line. 400 is a field over
+/// `MAX_HEADER_LINE`, or a field section over `MAX_REQUEST_HEAD`. The section
+/// total arrives from the caller because HTTP/2 counts it while it decodes, and
+/// the last field that crossed the bound is not kept.
+pub fn head_limit_status<'a, I>(headers: I, list_size: usize) -> Option<u16>
+where
+    I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
+{
+    let (mut method, mut target) = (None, None);
+    let mut too_large_field = false;
+    for (name, value) in headers {
+        if m6_core::headers::field_over_limit(name, value) {
+            too_large_field = true;
+        }
+        match name {
+            b":method" => method = Some(value),
+            b":path" => target = Some(value),
+            _ => {}
+        }
+    }
+    if let (Some(method), Some(target)) = (method, target) {
+        if m6_core::headers::request_line_len(method, target) > m6_core::headers::MAX_HEADER_LINE {
+            return Some(414);
+        }
+    }
+    if too_large_field || list_size > m6_core::headers::MAX_REQUEST_HEAD {
+        return Some(400);
+    }
+    None
 }
 
 /// The rules above, over raw bytes, so HTTP/3 can share them.
@@ -169,6 +228,16 @@ where
         _ => {}
     }
 
+    // :path carries a request target (RFC 9113 8.3.1, RFC 9114 4.3.1), and a
+    // request target has no space and no control byte (RFC 9112 3.2, RFC 3986
+    // 2). HTTP/1.1's request-line parser refuses those bytes before a request
+    // exists; here nothing did, so a target that cannot be forwarded as an
+    // HTTP/1.1 request line reached the backend forwarder and was refused
+    // there instead of at the door.
+    if path_value.is_some_and(|p| !crate::forward::request_target_is_safe(p)) {
+        return Err(":path with a space or control byte");
+    }
+
     // RFC 9113 8.3.1 and RFC 9114 4.3.1, the same sentence in both: if :scheme
     // names a scheme with a mandatory authority component (http and https do),
     // the request MUST carry either :authority or a Host header.
@@ -219,6 +288,30 @@ mod pseudo_header_tests {
         (":path", "/"),
         (":authority", "example.com"),
     ];
+
+    /// A request target with a space or a control byte is refused at the door,
+    /// in the path or the query, as HTTP/1.1's parser refuses it. The wrong
+    /// outcome: it is accepted here and refused only when forwarded, after a
+    /// backend has been chosen. An encoded space is an ordinary target.
+    #[test]
+    fn a_path_with_a_space_or_control_byte_is_refused() {
+        for path in [
+            "/a b",
+            "/?a b",
+            "/?a\rb",
+            "/?a\nb",
+            "/?a\u{0}b",
+            "/?a\tb",
+            "/?a\u{7f}b",
+        ] {
+            let mut req = GOOD.to_vec();
+            req[2] = (":path", path);
+            assert_eq!(bad(&req), ":path with a space or control byte", "{path:?}");
+        }
+        let mut req = GOOD.to_vec();
+        req[2] = (":path", "/a%20b?q=x%20y&r=%0D");
+        ok(&req);
+    }
 
     /// A well-formed request must still pass. Without this the whole module
     /// could "fix" 21 failures by rejecting everything.

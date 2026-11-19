@@ -1,20 +1,21 @@
 //! The signing key material.
 //!
-//! Rotation is: write the private key file and the public key file, then touch
-//! the service's config. `main::reload_state` reads both files again and swaps
-//! the result in. The key files are not watched, so a reader never sees one
-//! half of a pair.
+//! Rotation is: write the private key file and the public key file, run
+//! `m6-auth-cli sessions revoke-all`, then restart the service. The keys are
+//! read once at start, and a change takes a restart.
 //!
-//! Rotation semantics (per spec): m6-auth begins signing with the new key
-//! immediately. Previously issued access tokens expire naturally. Refresh
-//! tokens are verified against the *database* (hash match), not re-validated by
-//! JWT signature, so old refresh tokens remain usable until they expire.
+//! Rotation semantics: m6-auth begins signing with the new key immediately
+//! after the restart, and a previously issued access token is refused by its
+//! signature. A refresh token is verified against the *database* (hash match),
+//! not re-validated by JWT signature, so the key change alone does not end it.
+//! `sessions revoke-all` deletes every refresh row, and that is the step that
+//! ends every session. The auth generation, the new epoch and list key, and the
+//! cache acknowledgement arrive with the token-rules step, when a cache can
+//! hold a decision list.
 
 use crate::jwt::JwtEngine;
 
-/// The signing key material, replaced as a whole when the config is touched.
-/// Wrapped in `Arc<RwLock<>>` so `reload_state` can swap it while request
-/// threads hold read locks.
+/// The signing key material, loaded once at start.
 pub struct KeyMaterial {
     pub jwt: JwtEngine,
     pub public_key_pem: String,
@@ -25,6 +26,7 @@ impl KeyMaterial {
         private_key_path: &std::path::Path,
         public_key_path: &std::path::Path,
         issuer: String,
+        audience: String,
     ) -> anyhow::Result<Self> {
         let private_pem = std::fs::read_to_string(private_key_path).map_err(|e| {
             anyhow::anyhow!(
@@ -41,8 +43,33 @@ impl KeyMaterial {
             )
         })?;
 
-        let jwt = JwtEngine::new(&private_pem, &public_pem, issuer.clone())?;
+        let jwt = JwtEngine::new(&private_pem, &public_pem, issuer.clone(), audience)?;
         check_pair(&jwt, &issuer)?;
+        Ok(KeyMaterial {
+            jwt,
+            public_key_pem: public_pem,
+        })
+    }
+
+    /// Load only the public key, for a process that answers `/check`.
+    ///
+    /// That route decodes a token and never signs one, so the check side does
+    /// not need the private key and must not read it: a bug in the process
+    /// that parses a client token on every protected request then cannot use
+    /// the signing key it never held.
+    pub fn load_verify_only(
+        public_key_path: &std::path::Path,
+        issuer: String,
+        audience: String,
+    ) -> anyhow::Result<Self> {
+        let public_pem = std::fs::read_to_string(public_key_path).map_err(|e| {
+            anyhow::anyhow!(
+                "cannot read public key {}: {}",
+                public_key_path.display(),
+                e
+            )
+        })?;
+        let jwt = JwtEngine::verify_only(&public_pem, issuer, audience)?;
         Ok(KeyMaterial {
             jwt,
             public_key_pem: public_pem,
@@ -54,15 +81,17 @@ impl KeyMaterial {
 ///
 /// Both files parse on their own, so a rotation caught between its two writes
 /// loads a private key beside the previous public key without an error. Every
-/// token signed afterwards would then fail to verify. An `Err` here keeps the
-/// running keys, and core retries the reload with a growing delay.
+/// token signed afterwards would then fail to verify. An `Err` here exits 2 at
+/// start.
 fn check_pair(jwt: &JwtEngine, issuer: &str) -> anyhow::Result<()> {
     let now = crate::jwt::now_secs();
     let claims = crate::jwt::AccessClaims {
         iss: issuer.to_string(),
+        aud: jwt.audience.clone(),
         sub: "key-pair-check".to_string(),
         exp: now + 60,
         iat: now,
+        jti: m6_auth::new_token_id(),
         username: String::new(),
         groups: Vec::new(),
         roles: Vec::new(),
@@ -71,4 +100,48 @@ fn check_pair(jwt: &JwtEngine, issuer: &str) -> anyhow::Result<()> {
     jwt.decode_access(&token)
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("the private and public key are not a pair: {e}"))
+}
+
+/// A freshly generated RSA key pair for one test, made with `openssl` the way
+/// the integration tests make theirs.
+#[cfg(test)]
+pub(crate) fn test_key_material() -> KeyMaterial {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let private = dir.path().join("test.key");
+    let public = dir.path().join("test.pub");
+
+    let generated = std::process::Command::new("openssl")
+        .arg("genrsa")
+        .arg("-out")
+        .arg(&private)
+        .arg("2048")
+        .output()
+        .expect("run openssl genrsa");
+    assert!(
+        generated.status.success(),
+        "openssl genrsa failed: {}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let exported = std::process::Command::new("openssl")
+        .arg("rsa")
+        .arg("-in")
+        .arg(&private)
+        .arg("-pubout")
+        .arg("-out")
+        .arg(&public)
+        .output()
+        .expect("run openssl rsa -pubout");
+    assert!(
+        exported.status.success(),
+        "openssl rsa -pubout failed: {}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+
+    KeyMaterial::load(
+        &private,
+        &public,
+        "test.example.com".to_string(),
+        "test.example.com".to_string(),
+    )
+    .expect("load the test keys")
 }

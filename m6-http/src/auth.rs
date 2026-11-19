@@ -1,7 +1,14 @@
-/// JWT authentication: local verification, no network calls.
-use base64::Engine;
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
-use serde::{Deserialize, Serialize};
+//! Credential extraction and the one `POST /check` request's bytes.
+//!
+//! No token is decoded here. `m6-auth-server` answers `/check`, and the edge
+//! forwards the identity it gets back.
+
+/// How long a `require` route waits for `POST /check` before answering 503.
+///
+/// The measured parts of one check add to about 111 µs, so this fires only on
+/// an authority that has stopped answering. A page carrying one protected
+/// request stalls at most this long on a refused credential.
+pub const CHECK_DEADLINE: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Reconstruct the logical `Cookie` header from a request's header list.
 ///
@@ -24,126 +31,46 @@ pub fn combined_cookie_header(
     Some(parts.collect::<Vec<_>>().join("; "))
 }
 
-/// JWT claims we care about.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Claims {
-    pub sub: Option<String>,
-    pub iss: Option<String>,
-    pub exp: Option<u64>,
-    pub groups: Option<Vec<String>>,
-    pub roles: Option<Vec<String>>,
-    /// Keep all extra claims for forwarding.
-    #[serde(flatten)]
-    pub extra: std::collections::HashMap<String, serde_json::Value>,
+/// The most a credential can be and still fit one request header line:
+/// [`m6_core::headers::MAX_HEADER_LINE`] counts the field's name and value,
+/// and the field and scheme this edge writes are `Authorization: Bearer `.
+pub const MAX_CREDENTIAL: usize =
+    m6_core::headers::MAX_HEADER_LINE - "Authorization: Bearer ".len();
+
+/// Whether a credential is safe to write into an HTTP/1.1 field value.
+///
+/// The forward path refuses a field value with CR, LF or NUL through
+/// `forward::h1_field_value_is_safe`, but the check request is written by hand
+/// before that serializer runs. A credential that would inject a header or a
+/// request line is refused here, at the one place a client string enters the
+/// hand-built request.
+fn credential_is_safe(credential: &str) -> bool {
+    credential.len() <= MAX_CREDENTIAL
+        && !credential
+            .bytes()
+            .any(|byte| byte == b'\r' || byte == b'\n' || byte == 0)
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum AuthError {
-    #[error("no token provided")]
-    NoToken,
-    #[error("invalid token: {0}")]
-    Invalid(#[from] jsonwebtoken::errors::Error),
-    #[error("token expired")]
-    Expired,
-    #[error("insufficient claims: required {0}")]
-    InsufficientClaims(String),
-}
-
-/// Loaded public key for JWT verification.
-pub struct PublicKey {
-    decoding_key: DecodingKey,
-    algorithm: Algorithm,
-}
-
-impl PublicKey {
-    /// Load from a PEM file. Supports RS256 (RSA) and ES256 (EC).
-    pub fn from_pem_file(path: &std::path::Path) -> anyhow::Result<Self> {
-        let pem = std::fs::read(path)
-            .map_err(|e| anyhow::anyhow!("reading public key {}: {}", path.display(), e))?;
-
-        // Try RS256 first, then ES256
-        if let Ok(key) = DecodingKey::from_rsa_pem(&pem) {
-            return Ok(PublicKey {
-                decoding_key: key,
-                algorithm: Algorithm::RS256,
-            });
-        }
-        if let Ok(key) = DecodingKey::from_ec_pem(&pem) {
-            return Ok(PublicKey {
-                decoding_key: key,
-                algorithm: Algorithm::ES256,
-            });
-        }
-        anyhow::bail!("public key at {} is neither RSA nor EC PEM", path.display())
-    }
-
-    /// Verify a JWT token and return the claims.
-    pub fn verify(&self, token: &str) -> Result<Claims, AuthError> {
-        let mut validation = Validation::new(self.algorithm);
-        // We check exp manually to give a better error
-        validation.validate_exp = true;
-        // Don't require any audience
-        validation.set_required_spec_claims(&["exp"]);
-
-        let data =
-            decode::<Claims>(token, &self.decoding_key, &validation).map_err(AuthError::Invalid)?;
-
-        Ok(data.claims)
-    }
-}
-
-/// A `require` string: the claim list it reads and the name that must be in it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Require<'a> {
-    Role(&'a str),
-    Group(&'a str),
-}
-
-impl<'a> Require<'a> {
-    /// Parse `"role:<name>"` or `"group:<name>"`. `None` for any other form.
-    /// The one definition of the format, read by the request-path check and
-    /// by config validation.
-    pub fn parse(require: &'a str) -> Option<Self> {
-        if let Some(group) = require.strip_prefix("group:") {
-            return Some(Self::Group(group));
-        }
-        require.strip_prefix("role:").map(Self::Role)
-    }
-}
-
-/// Check if claims satisfy the `require` string.
-/// Format: `group:<name>` or `role:<name>`. Any other form denies.
-pub fn check_require(claims: &Claims, require: &str) -> bool {
-    let (list, name) = match Require::parse(require) {
-        Some(Require::Group(g)) => (&claims.groups, g),
-        Some(Require::Role(r)) => (&claims.roles, r),
-        None => return false,
-    };
-    list.as_ref().is_some_and(|l| l.iter().any(|v| v == name))
-}
-
-/// Extract JWT token from Authorization header or session cookie.
-/// Returns None if not found.
+/// Extract the credential from `Authorization: Bearer`, else the `session`
+/// cookie. `None` when neither carries a safe value.
 pub fn extract_token<'a>(
     auth_header: Option<&'a str>,
     cookie_header: Option<&'a str>,
 ) -> Option<&'a str> {
-    // Authorization: Bearer <token> takes precedence
     if let Some(auth) = auth_header {
         if let Some(token) = auth.strip_prefix("Bearer ") {
             let token = token.trim();
-            if !token.is_empty() {
+            if !token.is_empty() && credential_is_safe(token) {
                 return Some(token);
             }
         }
     }
-    // Fall back to session cookie
     if let Some(cookies) = cookie_header {
         for cookie in cookies.split(';') {
             let cookie = cookie.trim();
             if let Some(val) = cookie.strip_prefix("session=") {
                 let val = val.trim();
-                if !val.is_empty() {
+                if !val.is_empty() && credential_is_safe(val) {
                     return Some(val);
                 }
             }
@@ -152,43 +79,24 @@ pub fn extract_token<'a>(
     None
 }
 
-/// Why a request failed the `require` check.
-#[derive(Debug)]
-pub enum Refusal {
-    /// No `Authorization: Bearer` header and no session cookie.
-    NoToken,
-    /// A token was sent but did not verify.
-    Invalid(AuthError),
-    /// The token verified but lacks the required role or group.
-    Insufficient,
-}
-
-/// Extract, verify and check a request's token against a `require` string.
+/// The bytes of one `POST /check`, written into `buf`.
 ///
-/// Shared by route `require` and the metrics gate, so both accept the same
-/// tokens and refuse the same ways. It never redirects: a browser redirect is
-/// the route block's choice, made on its own refusal path.
-pub fn authorise(
-    key: &PublicKey,
-    headers: &[(String, String)],
-    require: &str,
-) -> Result<Claims, Refusal> {
-    let auth = m6_core::headers::get(headers, "authorization");
-    let cookies = combined_cookie_header(headers);
-    match extract_token(auth, cookies.as_deref()) {
-        None => Err(Refusal::NoToken),
-        Some(t) => match key.verify(t) {
-            Err(e) => Err(Refusal::Invalid(e)),
-            Ok(c) if check_require(&c, require) => Ok(c),
-            Ok(_) => Err(Refusal::Insufficient),
-        },
+/// Hand-built: a check is one small request on the socket-backend dispatch, so
+/// it costs no `HttpRequest` and no allocation once `buf` has capacity. No
+/// credential sends no `Authorization`, which is the start probe's request.
+pub fn encode_check_request(buf: &mut Vec<u8>, credential: Option<&str>) {
+    buf.clear();
+    buf.extend_from_slice(b"POST /check HTTP/1.1\r\nHost: localhost\r\n");
+    // The one second line of defence: `extract_token` already refuses an
+    // unsafe credential, and this is the place every caller passes through.
+    // An unsafe one writes no `Authorization`, so the checker answers 401 and
+    // the request is refused rather than a header or a request line injected.
+    if let Some(credential) = credential.filter(|credential| credential_is_safe(credential)) {
+        buf.extend_from_slice(b"Authorization: Bearer ");
+        buf.extend_from_slice(credential.as_bytes());
+        buf.extend_from_slice(b"\r\n");
     }
-}
-
-/// Encode claims as base64 JSON for X-Auth-Claims header.
-pub fn encode_claims_header(claims: &Claims) -> String {
-    let json = serde_json::to_string(claims).unwrap_or_default();
-    base64::engine::general_purpose::STANDARD.encode(json.as_bytes())
+    buf.extend_from_slice(b"Content-Length: 0\r\nConnection: close\r\n\r\n");
 }
 
 /// Check if Accept header indicates a browser (text/html).
@@ -213,7 +121,6 @@ pub fn extract_refresh_cookie(cookie_header: Option<&str>) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::test_keys::{bearer, keypair, mint};
     use super::*;
 
     #[test]
@@ -233,10 +140,6 @@ mod tests {
 
     #[test]
     fn test_combined_cookie_header_split_across_fields() {
-        // What HTTP/2 clients are RFC-compliant to send: one cookie per
-        // field instead of one joined field. This is the exact shape that
-        // broke session-cookie auth — a naive single-field `.find()` only
-        // ever saw whichever crumb happened to be in the first field.
         let headers = vec![
             ("cookie".to_string(), "_m6sid=abc".to_string()),
             ("cookie".to_string(), "session=xyz".to_string()),
@@ -285,31 +188,51 @@ mod tests {
     }
 
     #[test]
-    fn test_check_require_group() {
-        let claims = Claims {
-            sub: None,
-            iss: None,
-            exp: None,
-            groups: Some(vec!["editors".to_string(), "writers".to_string()]),
-            roles: None,
-            extra: Default::default(),
-        };
-        assert!(check_require(&claims, "group:editors"));
-        assert!(!check_require(&claims, "group:admins"));
+    fn a_credential_with_a_line_break_is_not_extracted() {
+        assert_eq!(
+            extract_token(Some("Bearer a\r\nX-Injected: yes"), None),
+            None
+        );
+        assert_eq!(extract_token(Some("Bearer a\nX-Injected: yes"), None), None);
+        assert_eq!(
+            extract_token(None, Some("session=a\r\nX-Injected: yes")),
+            None
+        );
     }
 
     #[test]
-    fn test_check_require_role() {
-        let claims = Claims {
-            sub: None,
-            iss: None,
-            exp: None,
-            groups: None,
-            roles: Some(vec!["admin".to_string()]),
-            extra: Default::default(),
-        };
-        assert!(check_require(&claims, "role:admin"));
-        assert!(!check_require(&claims, "role:superuser"));
+    fn a_credential_with_a_nul_is_not_extracted() {
+        assert_eq!(extract_token(Some("Bearer a\0b"), None), None);
+        assert_eq!(extract_token(None, Some("session=a\0b")), None);
+    }
+
+    #[test]
+    fn an_overlong_credential_is_not_extracted() {
+        let long = "a".repeat(MAX_CREDENTIAL + 1);
+        let header = format!("Bearer {long}");
+        assert_eq!(extract_token(Some(&header), None), None);
+        let cookie = format!("session={long}");
+        assert_eq!(extract_token(None, Some(&cookie)), None);
+        let ok = "a".repeat(MAX_CREDENTIAL);
+        let header = format!("Bearer {ok}");
+        assert_eq!(extract_token(Some(&header), None), Some(ok.as_str()));
+    }
+
+    #[test]
+    fn an_unsafe_credential_writes_no_authorization_line() {
+        let mut buf = Vec::new();
+        encode_check_request(&mut buf, Some("a\r\nX-Injected: yes"));
+        let text = String::from_utf8_lossy(&buf);
+        assert!(!text.contains("Authorization"), "{text}");
+        assert!(!text.contains("X-Injected"), "{text}");
+
+        encode_check_request(&mut buf, Some("safe-token"));
+        let text = String::from_utf8_lossy(&buf);
+        assert_eq!(
+            text.matches("Authorization: Bearer safe-token").count(),
+            1,
+            "{text}"
+        );
     }
 
     #[test]
@@ -320,25 +243,6 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_claims_header() {
-        let claims = Claims {
-            sub: Some("user1".to_string()),
-            iss: None,
-            exp: None,
-            groups: None,
-            roles: None,
-            extra: Default::default(),
-        };
-        let encoded = encode_claims_header(&claims);
-        // Decode and verify
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(&encoded)
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
-        assert_eq!(json["sub"], "user1");
-    }
-
-    #[test]
     fn test_extract_refresh_cookie() {
         assert_eq!(
             extract_refresh_cookie(Some("session=abc; refresh=def")),
@@ -346,99 +250,5 @@ mod tests {
         );
         assert_eq!(extract_refresh_cookie(Some("session=abc")), None);
         assert_eq!(extract_refresh_cookie(None), None);
-    }
-
-    #[test]
-    fn authorise_without_a_token_is_no_token() {
-        let (_d, key, _) = keypair();
-        let r = authorise(&key, &[], "role:monitor");
-        assert!(matches!(r, Err(Refusal::NoToken)));
-    }
-
-    #[test]
-    fn authorise_with_another_keys_signature_is_invalid() {
-        let (_d, key, _) = keypair();
-        let (_d2, _, other_private) = keypair();
-        let t = mint(&other_private, &["monitor"], 3600);
-        let r = authorise(&key, &bearer(&t), "role:monitor");
-        assert!(matches!(r, Err(Refusal::Invalid(_))));
-    }
-
-    #[test]
-    fn authorise_an_expired_token_is_invalid() {
-        let (_d, key, private) = keypair();
-        // An hour ago, well beyond the verifier's 60 s leeway.
-        let t = mint(&private, &["monitor"], -3600);
-        let r = authorise(&key, &bearer(&t), "role:monitor");
-        assert!(matches!(r, Err(Refusal::Invalid(_))));
-    }
-
-    #[test]
-    fn authorise_the_wrong_role_is_insufficient() {
-        let (_d, key, private) = keypair();
-        let t = mint(&private, &["reader"], 3600);
-        let r = authorise(&key, &bearer(&t), "role:monitor");
-        assert!(matches!(r, Err(Refusal::Insufficient)));
-    }
-
-    #[test]
-    fn authorise_the_right_role_passes() {
-        let (_d, key, private) = keypair();
-        let t = mint(&private, &["monitor"], 3600);
-        let claims = authorise(&key, &bearer(&t), "role:monitor").expect("passes");
-        assert_eq!(claims.sub.as_deref(), Some("t"));
-    }
-
-    #[test]
-    fn authorise_reads_the_session_cookie_like_routes() {
-        let (_d, key, private) = keypair();
-        let t = mint(&private, &["monitor"], 3600);
-        let headers = vec![
-            ("cookie".to_string(), "_m6sid=abc".to_string()),
-            ("cookie".to_string(), format!("session={t}")),
-        ];
-        assert!(authorise(&key, &headers, "role:monitor").is_ok());
-    }
-}
-
-/// ES256 fixtures shared by this crate's unit tests.
-#[cfg(test)]
-pub(crate) mod test_keys {
-    use super::PublicKey;
-
-    /// A verify key on disk, plus the matching signing key.
-    pub(crate) fn keypair() -> (tempfile::TempDir, PublicKey, String) {
-        let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ec keypair");
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pub.pem");
-        std::fs::write(&path, kp.public_key_pem()).unwrap();
-        let key = PublicKey::from_pem_file(&path).unwrap();
-        (dir, key, kp.serialize_pem())
-    }
-
-    /// Mint an ES256 token with `roles`, expiring `exp_offset_s` from now.
-    pub(crate) fn mint(private_pem: &str, roles: &[&str], exp_offset_s: i64) -> String {
-        #[derive(serde::Serialize)]
-        struct C {
-            sub: String,
-            exp: i64,
-            roles: Vec<String>,
-        }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        let claims = C {
-            sub: "t".to_string(),
-            exp: now + exp_offset_s,
-            roles: roles.iter().map(|r| r.to_string()).collect(),
-        };
-        let key = jsonwebtoken::EncodingKey::from_ec_pem(private_pem.as_bytes()).unwrap();
-        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
-        jsonwebtoken::encode(&header, &claims, &key).unwrap()
-    }
-
-    pub(crate) fn bearer(token: &str) -> Vec<(String, String)> {
-        vec![("authorization".to_string(), format!("Bearer {token}"))]
     }
 }

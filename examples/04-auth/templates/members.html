@@ -1,0 +1,9 @@
+{% extends "templates/base.html" %}
+{% block title %}Members · {{ site_name }}{% endblock %}
+{% block content %}
+  <h1>Members Area</h1>
+  <p>Welcome. This page is only visible after login.</p>
+  <form method="post" action="/auth/logout">
+    <button type="submit">Logout</button>
+  </form>
+{% endblock %}

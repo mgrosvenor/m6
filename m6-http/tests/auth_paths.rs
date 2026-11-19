@@ -25,6 +25,11 @@
 //! cargo test -p m6-http --test auth_paths -- --test-threads=1
 //! ```
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::Command;
@@ -34,6 +39,9 @@ use std::time::Duration;
 use rustls::StreamOwned;
 
 use m6_core::testkit::{binary, claim_port, PortClaim, Service};
+
+#[path = "support/check.rs"]
+mod check_support;
 
 /// How long to wait for a log line to reach the child's output buffer.
 const LOG_DEADLINE: Duration = Duration::from_secs(10);
@@ -49,18 +57,10 @@ fn generate_tls_cert() -> (String, String, Vec<u8>) {
     (ck.cert.pem(), ck.key_pair.serialize_pem(), der)
 }
 
-/// A public key PEM for `[auth] public_key`. Only the verify key is needed:
-/// no test here mints a token, because a public route ignores it and the
-/// redirects happen before a token is verified.
-fn generate_jwt_public_key() -> String {
-    let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ec keypair");
-    kp.public_key_pem()
-}
-
 // ── HTTP/1.1 over TLS client ──────────────────────────────────────────────────
 
 fn tls_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
-    rustls::crypto::ring::default_provider()
+    rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .ok();
     let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());
@@ -158,6 +158,7 @@ struct Server {
     cert_der: Vec<u8>,
     http: std::cell::RefCell<Service>,
     file: Service,
+    _check: check_support::RunningCheck,
     _dir: tempfile::TempDir,
     _port: PortClaim,
 }
@@ -182,7 +183,7 @@ impl Server {
 
     /// Wait until a request actually reaches the backend.
     fn wait_until_serving(&self) {
-        let ready = m6_core::testkit::wait::until(Duration::from_secs(30), || {
+        let ready = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
             https_get(self, "/public/probe.txt", &[], self.tls()).status == 200
         });
         assert!(
@@ -222,15 +223,12 @@ impl Server {
 ///
 /// m6-http runs at log level `debug` so the `auth check` line is emitted.
 fn start_server() -> Server {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).unwrap();
     let site = dir.path();
 
     let (cert_pem, key_pem, cert_der) = generate_tls_cert();
     std::fs::write(site.join("cert.pem"), &cert_pem).unwrap();
     std::fs::write(site.join("key.pem"), &key_pem).unwrap();
-
-    let jwt_pub = generate_jwt_public_key();
-    std::fs::write(site.join("auth-public.pem"), &jwt_pub).unwrap();
 
     std::fs::create_dir_all(site.join("public")).unwrap();
     std::fs::create_dir_all(site.join("private")).unwrap();
@@ -242,6 +240,8 @@ fn start_server() -> Server {
 
     let sock = dir.path().join("m6-file-1.sock");
     let sock_glob = dir.path().join("m6-file-*.sock");
+    let check_path = dir.path().join("check.sock");
+    let check = check_support::RunningCheck::start(&check_path, Vec::new()).unwrap();
 
     std::fs::write(
         site.join("site.toml"),
@@ -253,7 +253,6 @@ domain = "localhost"
 
 [log]
 level  = "debug"
-format = "text"
 
 [errors]
 mode = "internal"
@@ -261,13 +260,13 @@ mode = "internal"
 [analytics]
 enabled = false
 
-[auth]
-backend    = "m6-file"
-public_key = "auth-public.pem"
-
 [[backend]]
 name    = "m6-file"
 sockets = "{sock_glob}"
+
+[[backend]]
+name    = "auth-check"
+sockets = "{check}"
 
 [[route]]
 path    = "/public/{{relpath}}"
@@ -279,6 +278,7 @@ backend = "m6-file"
 require = "group:admins"
 "#,
             sock_glob = sock_glob.display(),
+            check = check_path.display(),
         ),
     )
     .unwrap();
@@ -312,6 +312,9 @@ tls_key  = "{key}"
 
 [node]
 name = "test-node"
+
+[auth]
+backend = "auth-check"
 "#,
             cert = site.join("cert.pem").display(),
             key = site.join("key.pem").display(),
@@ -326,7 +329,7 @@ name = "test-node"
             .arg(site.join("configs/m6-file.conf"))
             .env("M6_SOCKET_OVERRIDE", &sock),
     );
-    file_proc.wait_for_path(&sock, Duration::from_secs(10));
+    file_proc.wait_for_path(&sock, m6_core::testkit::STARTUP_BOUND);
 
     let mut http_proc = Service::spawn(
         "m6-http",
@@ -334,13 +337,14 @@ name = "test-node"
             .arg(site)
             .arg(site.join("system.toml")),
     );
-    http_proc.wait_for_tcp(port, Duration::from_secs(10));
+    http_proc.wait_for_tcp(port, m6_core::testkit::STARTUP_BOUND);
 
     let srv = Server {
         port,
         cert_der,
         http: std::cell::RefCell::new(http_proc),
         file: file_proc,
+        _check: check,
         _dir: dir,
         _port: claim,
     };

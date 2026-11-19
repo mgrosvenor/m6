@@ -1,9 +1,9 @@
 //! Tera, behind the renderer seam.
 //!
 //! Core does not depend on a template engine at the type level, only at the
-//! default: `App::new()` gives you this one, and `.renderer(NoTemplates)` opts
-//! out. What lives here is the engine setup and the site filters, `| asset`
-//! and `img_dims()` among them.
+//! default: `Site::load` takes this one through `TeraFactory`, and a service
+//! that renders nothing passes `NoTemplates`. What lives here is the engine
+//! setup and the site filters, `| asset` and `img_dims()` among them.
 //!
 //! **The engine copies the context into itself.** `tera::Context::insert`
 //! serialises each value into its own map, so the cost scales with the size of
@@ -397,8 +397,8 @@ fn register_filters(tera: &mut Tera, site_dir: &Path) {
     //
     // The manifest is built once here, not per render: hashing on every request
     // would put a filesystem read and a hash in the hot path of a cache miss.
-    // It is rebuilt whenever Tera is, which is what a config reload already
-    // does, so a redeployed asset gets a new hash without a restart.
+    // It is rebuilt when Tera is, at start, so a redeployed asset gets a new
+    // hash after a restart.
     let manifest = std::sync::Arc::new(build_asset_manifest(site_dir));
     tera.register_filter(
         "asset",
@@ -768,28 +768,36 @@ impl crate::render::Renderer for TeraRenderer {
         &self,
         template: &str,
         ctx: &crate::dict::Dict,
-    ) -> std::result::Result<String, crate::render::RenderError> {
+        out: &mut crate::limits::Bounded<u8>,
+    ) -> std::result::Result<(), crate::render::RenderError> {
         let mut tctx = tera::Context::new();
         for (k, v) in ctx.iter() {
-            tctx.insert(k.as_str(), v);
+            tctx.insert(k, v);
         }
-        self.tera.render(template, &tctx).map_err(|e| {
-            // `{{ not_found() }}` fails the render with a sentinel, because a
-            // Tera error carries nothing but a string. The sentinel stops
-            // here: core is told `NotFound`, not handed a string to search.
-            let msg = format!("{e:#}");
-            if msg.contains(NOT_FOUND_SENTINEL) {
-                crate::render::RenderError::NotFound
-            } else {
-                crate::render::RenderError::Failed(
-                    anyhow::Error::new(e).context(format!("rendering template {template}")),
-                )
-            }
-        })
+        self.tera
+            .render_to(template, &tctx, &mut *out)
+            .map_err(|e| {
+                // The area refused a write past its maximum. Tera wraps the I/O
+                // error, so the refusal is read from the area, not the message.
+                if let Some(needed) = out.overflow() {
+                    return crate::render::RenderError::TooLarge(needed);
+                }
+                // `{{ not_found() }}` fails the render with a sentinel, because a
+                // Tera error carries nothing but a string. The sentinel stops
+                // here: core is told `NotFound`, not handed a string to search.
+                let msg = format!("{e:#}");
+                if msg.contains(NOT_FOUND_SENTINEL) {
+                    crate::render::RenderError::NotFound
+                } else {
+                    crate::render::RenderError::Failed(
+                        anyhow::Error::new(e).context(format!("rendering template {template}")),
+                    )
+                }
+            })
     }
 }
 
-/// Builds a `TeraRenderer`, at startup and again on every config reload.
+/// Builds a `TeraRenderer` at startup.
 pub struct TeraFactory;
 
 impl crate::render::RendererFactory for TeraFactory {

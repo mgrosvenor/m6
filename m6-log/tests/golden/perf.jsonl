@@ -1,0 +1,1 @@
+{"timestamp":"2026-11-13T16:55:50.000000Z","level":"INFO","fields":{"message":"stats","perf":{"node":"origin","uptime_s":42,"metrics":{"requests_total":7,"channels":[{"channel":"http/2/external","requests":7}],"status_counts":{"200":7}}}},"target":"m6_http::stats","type":"perf"}

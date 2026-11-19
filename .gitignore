@@ -21,6 +21,8 @@ target
 
 # Runtime output (analytics logs, etc.)
 logs/
+# Example 08 serves a logs/ directory that must exist on a fresh clone.
+!examples/08-logviewer/logs/
 
 # macOS metadata
 .DS_Store

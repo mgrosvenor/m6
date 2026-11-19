@@ -24,10 +24,17 @@
 //! "regression test that has never failed" trap this project has already hit
 //! once with h2spec and h3spec.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
+
+use m6_core::platform::process::{Child, Io, Streams};
 use std::time::{Duration, Instant};
 
 /// Where the examples live, and the one payload file they all serve.
@@ -223,6 +230,22 @@ fn build_root_dir() -> std::path::PathBuf {
     m6_core::testkit::exec_scratch_root()
 }
 
+/// The Go build cache, shared by every run on this machine.
+///
+/// A per-run cache meant every run recompiled Go's standard library: tens of
+/// seconds for a hello-world backend. The cache is content-addressed and safe
+/// for concurrent use, so one copy under the scratch root serves every run. The
+/// name does not start with `m6bx-`, so the sweep above leaves it alone.
+fn go_cache() -> std::path::PathBuf {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = build_root_dir().join("m6-go-build-cache");
+        std::fs::create_dir_all(&dir).expect("go build cache directory");
+        dir
+    })
+    .clone()
+}
+
 /// The sweep, over a named directory and threshold so it can be tested.
 ///
 /// Split out because the alternative is a test that writes into the real `/tmp`
@@ -316,8 +339,11 @@ fn built_binary(lang: Lang, src: &Path) -> PathBuf {
             let out = Command::new("go")
                 .args(["build", "-o", bin.to_str().unwrap(), "."])
                 .current_dir(src)
-                // Go wants a writable cache and the environment may have no HOME.
-                .env("GOCACHE", dir.join("gocache"))
+                // Go wants a writable cache and the environment may have no
+                // HOME. Shared by every run on the machine: a per-run cache
+                // recompiles the standard library, which was tens of seconds of
+                // this file's time.
+                .env("GOCACHE", go_cache())
                 .output()
                 .expect("go build");
             assert!(
@@ -397,7 +423,7 @@ impl Backend {
                 std::fs::write(
                     site.join("site.toml"),
                     "[site]\nname = \"backend-example\"\ndomain = \"localhost\"\n\n\
-                     [log]\nlevel = \"warn\"\nformat = \"text\"\n",
+                     [log]\nlevel = \"warn\"\n",
                 )
                 .unwrap();
                 let conf = scratch.path().join("example.toml");
@@ -415,10 +441,12 @@ impl Backend {
             }
         };
 
-        let child = cmd
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
+        let streams = Streams {
+            stdin: Io::Inherit,
+            stdout: Io::Null,
+            stderr: Io::Piped,
+        };
+        let child = m6_core::platform::process::spawn(&mut cmd, streams)
             .unwrap_or_else(|e| panic!("cannot spawn {} example: {e}", lang.dir()));
 
         let b = Backend {
@@ -431,7 +459,7 @@ impl Backend {
         // Bind before announcing readiness (spec §8.1), so the socket appearing
         // is the signal. Waited for rather than slept on: a fixed sleep is
         // either flaky or slow, and under a loaded build host it is both.
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
         while Instant::now() < deadline {
             if sock.exists() && UnixStream::connect(&sock).is_ok() {
                 return Some(b);
@@ -814,12 +842,11 @@ fn sigterm_drains_removes_the_socket_and_exits_zero() {
         let sock = b.sock.clone();
         assert!(sock.exists(), "{}: socket should exist", lang.dir());
 
-        unsafe {
-            // SIGTERM, the signal systemd sends on stop.
-            libc_kill(b.child.id() as i32, 15);
-        }
+        // A shutdown request: SIGTERM, the signal systemd sends on stop.
+        m6_core::platform::send(b.child.id(), m6_core::platform::Signal::Shutdown)
+            .expect("send the shutdown request");
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
         let status = loop {
             if let Some(s) = b.child.try_wait().expect("try_wait") {
                 break s;
@@ -849,11 +876,6 @@ fn sigterm_drains_removes_the_socket_and_exits_zero() {
             sock.display()
         );
     }
-}
-
-extern "C" {
-    #[link_name = "kill"]
-    fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
 #[cfg(test)]

@@ -22,9 +22,9 @@ name: CI
 #
 # The performance check is still NOT here. A wall-clock measurement on a shared
 # runner measures the runner, not the code. It stays on the build host, which is
-# quiet and is where the recorded numbers in tools/perf-baseline.txt were taken.
-# See CLAUDE.md, "Why the build host and not the laptop" -- the same argument
-# applies twice over to a runner shared with the rest of the world.
+# quiet, where the candidate is compared against a base build in an interleaved
+# A/B. See CLAUDE.md, "Why the build host and not the laptop" -- the same
+# argument applies twice over to a runner shared with the rest of the world.
 
 on:
   pull_request:
@@ -67,30 +67,63 @@ jobs:
     if: github.event_name == 'pull_request' && github.base_ref == 'main'
     runs-on: ubuntu-latest
     steps:
+      # The branch name comes from whoever opened the pull request, so it reaches
+      # the script as data in an environment variable, never pasted into it.
       - name: The head branch must be develop
+        env:
+          HEAD_REF: ${{ github.head_ref }}
         run: |
-          if [ "${{ github.head_ref }}" != "develop" ]; then
+          if [ "$HEAD_REF" != "develop" ]; then
             echo "::error::main takes pull requests from develop only."
-            echo "This pull request is from '${{ github.head_ref }}'."
+            echo "This pull request is from '$HEAD_REF'."
             echo ""
             echo "main is the release line. Merge into develop first, then"
             echo "open develop -> main as the release:"
-            echo "  gh pr create --base develop --head ${{ github.head_ref }}"
+            echo "  gh pr create --base develop --head $HEAD_REF"
             echo "  # merge that, bump the version and write the CHANGELOG entry, then:"
             echo "  gh pr create --base main --head develop --title 'Release X.Y.Z'"
             exit 1
           fi
           echo "head is develop, allowed"
 
-  build-and-test:
-    name: build, tests, clippy
+  # Clippy is a job of its own so its name in a notification means a clippy
+  # finding and nothing else. It needs no release build, so it runs beside the
+  # build-and-test job and reports within minutes.
+  clippy:
+    name: clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Clippy must be silent: `-D warnings`, no ceiling. It went to zero on
+      # 2026-09-13 and is held there the same way rustc warnings are. A new
+      # lint from a toolchain upgrade fails this, which is intended.
+      - name: Clippy, silent
+        run: ./tools/clippy.sh
+
+  # Every independent check runs even when an earlier one failed
+  # (`!cancelled()`), so one push reports every failure at once: a dying test
+  # used to skip clippy, and its problems surfaced only on the next push. A
+  # check that needs an earlier step's output (the toolchain, compiled tests)
+  # runs only if that output exists, so it is skipped rather than failing again
+  # for the same reason. A warning fails its own step and never skips a check
+  # that needs only the code to compile. Clippy is the job above.
+  build-and-test:
+    name: build and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
 
       - uses: Swatinem/rust-cache@v2
 
@@ -106,15 +139,30 @@ jobs:
       # a standing rule and it is checked on Linux because that is where it
       # runs: three defects have only ever shown up there.
       - name: Release build, zero warnings
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: |
-          cargo build --workspace --release 2>&1 | tee build.log
+          status=0
+          cargo build --workspace --release > build.log 2>&1 || status=$?
+          cat build.log
+          [ "$status" -eq 0 ] || { echo "::error::the release build failed with status $status"; exit 1; }
           n=$(grep -c '^warning' build.log || true)
           echo "release warnings: $n"
           [ "$n" -eq 0 ] || { echo "::error::$n release warning(s)"; exit 1; }
 
       - name: Test build, zero warnings
+        id: testbuild
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: |
-          cargo test --workspace --no-run 2>&1 | tee testbuild.log
+          status=0
+          # Cargo's build-dir layout leaves a binary built only for tests out of
+          # <target>/<profile>, and testkit::binary() reads it from there, so
+          # the workspace binaries are built first, as the harness documents.
+          { cargo build --workspace --bins && cargo test --workspace --no-run; } > testbuild.log 2>&1 || status=$?
+          cat testbuild.log
+          # The suite needs the tests to compile, not to compile without
+          # warnings, so it runs on this output and a warning cannot hide it.
+          [ "$status" -eq 0 ] && echo "compiled=true" >> "$GITHUB_OUTPUT"
+          [ "$status" -eq 0 ] || { echo "::error::the test build failed with status $status"; exit 1; }
           n=$(grep -c '^warning' testbuild.log || true)
           echo "test-build warnings: $n"
           [ "$n" -eq 0 ] || { echo "::error::$n test-build warning(s)"; exit 1; }
@@ -123,14 +171,47 @@ jobs:
       # message and leaves a bare `panicked at <file>:<line>`, which names the
       # place and not the reason.
       - name: Test suite
+        if: ${{ !cancelled() && steps.testbuild.outputs.compiled == 'true' }}
         run: |
-          cargo test --workspace > full.log 2>&1 || true
+          # m6-http pins its memory at start (`[server] lock_memory`, on by default),
+          # and a runner account's RLIMIT_MEMLOCK is 8 MiB. This shell is raised, and the
+          # processes it starts inherit the limit, so the m6-http the tests start can pin.
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          status=0
+          cargo test --workspace > full.log 2>&1 || status=$?
           grep -E '^test result:' full.log || true
           if grep -q '^failures:' full.log; then
             sed -n '/^failures:/,$p' full.log | head -80
             echo "::error::tests failed"
             exit 1
           fi
+          # A test build that does not compile, or a test binary that aborts,
+          # prints no `failures:` line, so cargo's own status decides as well.
+          [ "$status" -eq 0 ] || { tail -80 full.log; echo "::error::cargo test exited with status $status"; exit 1; }
+
+      # `cargo test --workspace` builds only the targets whose `required-features`
+      # the workspace turns on. Any other target is omitted, not run, so the test
+      # is invisible and rots. Each line below names a target and the feature
+      # that makes it visible. The coordinator's gate runs the same four lines
+      # with `cargo nextest run`. The m6-core `testkit` targets are already in
+      # the workspace build because m6-html and m6-http ask for `testkit` in
+      # their dev-dependencies, and they are named here so that removing one of
+      # those requests cannot hide them.
+      - name: Feature-gated tests, named explicitly
+        if: ${{ !cancelled() && steps.testbuild.outputs.compiled == 'true' }}
+        run: |
+          # m6-http pins its memory at start (`[server] lock_memory`, on by default),
+          # and a runner account's RLIMIT_MEMLOCK is 8 MiB. This shell is raised, and the
+          # processes it starts inherit the limit, so the m6-http the tests start can pin.
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          # `testkit` also turns on `alloc-count`, so all five counting tests build.
+          cargo test -p m6-core --features testkit --test alloc_count_armed --test event_allocs --test limit_page_allocs --test server_conn --test site_allocs --test upstream_no_alloc
+          # `email` makes these two visible, `testkit` is the harness they use.
+          cargo test -p m6-core --features email,testkit --test email_allocs --test email_in_the_loop
+          # `count-allocations` builds the counting allocator into the binary the test reads.
+          cargo test -p m6-http --features count-allocations --test allocations
+          # `count-allocations` builds the counter into m6-monitor's binary.
+          cargo test -p m6-monitor --features count-allocations --test client_allocs
 
       # Nothing in the workspace turns on some off-by-default core features
       # (`sqlite`, `email`, `multipart`), so `cargo test --workspace` never
@@ -138,6 +219,7 @@ jobs:
       # tests stayed broken), so m6-core is built, warned on and tested here
       # with every feature on, and a new feature is covered without an edit.
       - name: Opt-in core features, zero warnings and tests
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: |
           cargo test -p m6-core --lib --all-features --no-run 2>&1 | tee featbuild.log
           n=$(grep -c '^warning' featbuild.log || true)
@@ -152,11 +234,288 @@ jobs:
           if grep -q '^failures:' feat.log; then sed -n '/^failures:/,$p' feat.log | head -80; echo "::error::m6-core --all-features tests failed"; exit 1; fi
           [ "$status" -eq 0 ] || { tail -80 feat.log; echo "::error::m6-core --all-features tests exited with status $status"; exit 1; }
 
-      # Clippy must be silent: `-D warnings`, no ceiling. It went to zero on
-      # 2026-09-13 and is held there the same way rustc warnings are. A new
-      # lint from a toolchain upgrade fails this, which is intended.
+      # The other side of those features: core with none of them must build
+      # without a warning, and the services that use neither templates nor
+      # minifiers must not link them. `cargo tree` is asked per package because
+      # the workspace build unifies features, and m6-html and m6-md take the defaults.
+      - name: Core with no features, and services that link no engine
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          set -o pipefail
+          cargo check -p m6-core --no-default-features > nofeat.log 2>&1 || { cat nofeat.log; echo "::error::m6-core does not build with no features"; exit 1; }
+          n=$(grep -c '^warning' nofeat.log || true)
+          [ "$n" -eq 0 ] || { cat nofeat.log; echo "::error::$n warning(s) building m6-core with no features"; exit 1; }
+          for p in m6-http m6-monitor m6-auth-server m6-auth-cli; do
+            tree=$(cargo tree -e normal -p "$p") || { echo "::error::cargo tree failed for $p"; exit 1; }
+            if grep -E ' (lightningcss|minify-html|minify-js|tera|comrak) v' <<< "$tree"; then
+              echo "::error::$p links a template engine or a minifier"; exit 1
+            fi
+          done
+
+      # Broken intra-doc links are rustdoc warnings, and the zero-warnings rule
+      # counts pre-existing warnings, so this step holds them at zero. Nothing
+      # ran it until 2026-11-17: a worker ran `cargo doc` by hand on an
+      # unrelated task and found twelve broken links across ten files, because
+      # neither the gate nor this file named the command.
+      #
+      # A step in this job and not a job of its own: `cargo doc` reads the same
+      # source and reuses the same rust-cache as the steps beside it, so the
+      # price of a separate runner is a cold rebuild of every dependency for one
+      # command.
+      #
+      # `--all-features` because `testkit`, m6-core's `sqlite`, `email` and
+      # `multipart` and m6-http's allocation counters are off by default, so the
+      # first line does not compile their docs. Three of the twelve links were
+      # behind those features, which is the same gap the "Opt-in core features"
+      # step above exists for.
+      - name: Rustdoc, silent
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+
+  # The same build and tests on the other two supported targets. Supported
+  # means built and tested here: macOS arm64 and Linux arm64, on GitHub's
+  # free runners for a public repository. The steps are the ones above, in
+  # the same form, so a warning or a failure is reported the same way. Each
+  # job first prints the machine it ran on, so a run's record says which
+  # target it proved. Conformance, the dependency check, the shell check, the
+  # perf tools and the examples stay on Linux x86_64: h2spec and h3spec are
+  # released as x86_64 Linux binaries, cargo-deny checks all three targets'
+  # graphs in one run, and the rest is platform-independent.
+  build-and-test-macos:
+    name: macOS arm64 build and tests
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - id: toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Which machine
+        run: uname -m && rustc --print target-libdir
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Release build, zero warnings
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          status=0
+          cargo build --workspace --release > build.log 2>&1 || status=$?
+          cat build.log
+          [ "$status" -eq 0 ] || { echo "::error::the release build failed with status $status"; exit 1; }
+          n=$(grep -c '^warning' build.log || true)
+          echo "release warnings: $n"
+          [ "$n" -eq 0 ] || { echo "::error::$n release warning(s)"; exit 1; }
+      - name: Test build, zero warnings
+        id: testbuild
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          status=0
+          # Cargo's build-dir layout leaves a binary built only for tests out of
+          # <target>/<profile>, and testkit::binary() reads it from there, so
+          # the workspace binaries are built first, as the harness documents.
+          { cargo build --workspace --bins && cargo test --workspace --no-run; } > testbuild.log 2>&1 || status=$?
+          cat testbuild.log
+          [ "$status" -eq 0 ] && echo "compiled=true" >> "$GITHUB_OUTPUT"
+          [ "$status" -eq 0 ] || { echo "::error::the test build failed with status $status"; exit 1; }
+          n=$(grep -c '^warning' testbuild.log || true)
+          echo "test-build warnings: $n"
+          [ "$n" -eq 0 ] || { echo "::error::$n test-build warning(s)"; exit 1; }
+      - name: Test suite
+        if: ${{ !cancelled() && steps.testbuild.outputs.compiled == 'true' }}
+        run: |
+          status=0
+          cargo test --workspace > full.log 2>&1 || status=$?
+          grep -E '^test result:' full.log || true
+          if grep -q '^failures:' full.log; then
+            sed -n '/^failures:/,$p' full.log | head -80
+            echo "::error::tests failed"
+            exit 1
+          fi
+          [ "$status" -eq 0 ] || { tail -80 full.log; echo "::error::cargo test exited with status $status"; exit 1; }
+      # `cargo test --workspace` builds only the targets whose `required-features`
+      # the workspace turns on. Any other target is omitted, not run, so the test
+      # is invisible and rots. Each line below names a target and the feature
+      # that makes it visible. The coordinator's gate runs the same four lines
+      # with `cargo nextest run`. The m6-core `testkit` targets are already in
+      # the workspace build because m6-html and m6-http ask for `testkit` in
+      # their dev-dependencies, and they are named here so that removing one of
+      # those requests cannot hide them.
+      - name: Feature-gated tests, named explicitly
+        if: ${{ !cancelled() && steps.testbuild.outputs.compiled == 'true' }}
+        run: |
+          # `testkit` also turns on `alloc-count`, so all five counting tests build.
+          cargo test -p m6-core --features testkit --test alloc_count_armed --test event_allocs --test limit_page_allocs --test server_conn --test site_allocs --test upstream_no_alloc
+          # `email` makes these two visible, `testkit` is the harness they use.
+          cargo test -p m6-core --features email,testkit --test email_allocs --test email_in_the_loop
+          # `count-allocations` builds the counting allocator into the binary the test reads.
+          cargo test -p m6-http --features count-allocations --test allocations
+          # `count-allocations` builds the counter into m6-monitor's binary.
+          cargo test -p m6-monitor --features count-allocations --test client_allocs
+      - name: Opt-in core features, zero warnings and tests
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          cargo test -p m6-core --lib --all-features --no-run 2>&1 | tee featbuild.log
+          n=$(grep -c '^warning' featbuild.log || true)
+          [ "$n" -eq 0 ] || { echo "::error::$n warning(s) building m6-core --all-features"; exit 1; }
+          status=0
+          { cargo test -p m6-core --lib --all-features && cargo test -p m6-core --doc --all-features; } > feat.log 2>&1 || status=$?
+          grep -E '^test result:' feat.log || true
+          if grep -q '^failures:' feat.log; then sed -n '/^failures:/,$p' feat.log | head -80; echo "::error::m6-core --all-features tests failed"; exit 1; fi
+          [ "$status" -eq 0 ] || { tail -80 feat.log; echo "::error::m6-core --all-features tests exited with status $status"; exit 1; }
+      - name: Core with no features
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          cargo check -p m6-core --no-default-features > nofeat.log 2>&1 || { cat nofeat.log; echo "::error::m6-core does not build with no features"; exit 1; }
+          n=$(grep -c '^warning' nofeat.log || true)
+          [ "$n" -eq 0 ] || { cat nofeat.log; echo "::error::$n warning(s) building m6-core with no features"; exit 1; }
       - name: Clippy, silent
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: ./tools/clippy.sh
+
+      # Broken intra-doc links are rustdoc warnings, and the zero-warnings rule
+      # counts pre-existing warnings, so this step holds them at zero. Nothing
+      # ran it until 2026-11-17: a worker ran `cargo doc` by hand on an
+      # unrelated task and found twelve broken links across ten files, because
+      # neither the gate nor this file named the command.
+      #
+      # A step in this job and not a job of its own: `cargo doc` reads the same
+      # source and reuses the same rust-cache as the steps beside it, so the
+      # price of a separate runner is a cold rebuild of every dependency for one
+      # command.
+      #
+      # `--all-features` because `testkit`, m6-core's `sqlite`, `email` and
+      # `multipart` and m6-http's allocation counters are off by default, so the
+      # first line does not compile their docs. Three of the twelve links were
+      # behind those features, which is the same gap the "Opt-in core features"
+      # step above exists for.
+      - name: Rustdoc, silent
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+
+  build-and-test-linux-arm64:
+    name: Linux arm64 build and tests
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - id: toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Which machine
+        run: uname -m && rustc --print target-libdir
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Release build, zero warnings
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          status=0
+          cargo build --workspace --release > build.log 2>&1 || status=$?
+          cat build.log
+          [ "$status" -eq 0 ] || { echo "::error::the release build failed with status $status"; exit 1; }
+          n=$(grep -c '^warning' build.log || true)
+          echo "release warnings: $n"
+          [ "$n" -eq 0 ] || { echo "::error::$n release warning(s)"; exit 1; }
+      - name: Test build, zero warnings
+        id: testbuild
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          status=0
+          # Cargo's build-dir layout leaves a binary built only for tests out of
+          # <target>/<profile>, and testkit::binary() reads it from there, so
+          # the workspace binaries are built first, as the harness documents.
+          { cargo build --workspace --bins && cargo test --workspace --no-run; } > testbuild.log 2>&1 || status=$?
+          cat testbuild.log
+          [ "$status" -eq 0 ] && echo "compiled=true" >> "$GITHUB_OUTPUT"
+          [ "$status" -eq 0 ] || { echo "::error::the test build failed with status $status"; exit 1; }
+          n=$(grep -c '^warning' testbuild.log || true)
+          echo "test-build warnings: $n"
+          [ "$n" -eq 0 ] || { echo "::error::$n test-build warning(s)"; exit 1; }
+      - name: Test suite
+        if: ${{ !cancelled() && steps.testbuild.outputs.compiled == 'true' }}
+        run: |
+          # m6-http pins its memory at start (`[server] lock_memory`, on by default),
+          # and a runner account's RLIMIT_MEMLOCK is 8 MiB. This shell is raised, and the
+          # processes it starts inherit the limit, so the m6-http the tests start can pin.
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          status=0
+          cargo test --workspace > full.log 2>&1 || status=$?
+          grep -E '^test result:' full.log || true
+          if grep -q '^failures:' full.log; then
+            sed -n '/^failures:/,$p' full.log | head -80
+            echo "::error::tests failed"
+            exit 1
+          fi
+          [ "$status" -eq 0 ] || { tail -80 full.log; echo "::error::cargo test exited with status $status"; exit 1; }
+      # `cargo test --workspace` builds only the targets whose `required-features`
+      # the workspace turns on. Any other target is omitted, not run, so the test
+      # is invisible and rots. Each line below names a target and the feature
+      # that makes it visible. The coordinator's gate runs the same four lines
+      # with `cargo nextest run`. The m6-core `testkit` targets are already in
+      # the workspace build because m6-html and m6-http ask for `testkit` in
+      # their dev-dependencies, and they are named here so that removing one of
+      # those requests cannot hide them.
+      - name: Feature-gated tests, named explicitly
+        if: ${{ !cancelled() && steps.testbuild.outputs.compiled == 'true' }}
+        run: |
+          # m6-http pins its memory at start (`[server] lock_memory`, on by default),
+          # and a runner account's RLIMIT_MEMLOCK is 8 MiB. This shell is raised, and the
+          # processes it starts inherit the limit, so the m6-http the tests start can pin.
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          # `testkit` also turns on `alloc-count`, so all five counting tests build.
+          cargo test -p m6-core --features testkit --test alloc_count_armed --test event_allocs --test limit_page_allocs --test server_conn --test site_allocs --test upstream_no_alloc
+          # `email` makes these two visible, `testkit` is the harness they use.
+          cargo test -p m6-core --features email,testkit --test email_allocs --test email_in_the_loop
+          # `count-allocations` builds the counting allocator into the binary the test reads.
+          cargo test -p m6-http --features count-allocations --test allocations
+          # `count-allocations` builds the counter into m6-monitor's binary.
+          cargo test -p m6-monitor --features count-allocations --test client_allocs
+      - name: Opt-in core features, zero warnings and tests
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          cargo test -p m6-core --lib --all-features --no-run 2>&1 | tee featbuild.log
+          n=$(grep -c '^warning' featbuild.log || true)
+          [ "$n" -eq 0 ] || { echo "::error::$n warning(s) building m6-core --all-features"; exit 1; }
+          status=0
+          { cargo test -p m6-core --lib --all-features && cargo test -p m6-core --doc --all-features; } > feat.log 2>&1 || status=$?
+          grep -E '^test result:' feat.log || true
+          if grep -q '^failures:' feat.log; then sed -n '/^failures:/,$p' feat.log | head -80; echo "::error::m6-core --all-features tests failed"; exit 1; fi
+          [ "$status" -eq 0 ] || { tail -80 feat.log; echo "::error::m6-core --all-features tests exited with status $status"; exit 1; }
+      - name: Core with no features
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          cargo check -p m6-core --no-default-features > nofeat.log 2>&1 || { cat nofeat.log; echo "::error::m6-core does not build with no features"; exit 1; }
+          n=$(grep -c '^warning' nofeat.log || true)
+          [ "$n" -eq 0 ] || { cat nofeat.log; echo "::error::$n warning(s) building m6-core with no features"; exit 1; }
+      - name: Clippy, silent
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: ./tools/clippy.sh
+
+      # Broken intra-doc links are rustdoc warnings, and the zero-warnings rule
+      # counts pre-existing warnings, so this step holds them at zero. Nothing
+      # ran it until 2026-11-17: a worker ran `cargo doc` by hand on an
+      # unrelated task and found twelve broken links across ten files, because
+      # neither the gate nor this file named the command.
+      #
+      # A step in this job and not a job of its own: `cargo doc` reads the same
+      # source and reuses the same rust-cache as the steps beside it, so the
+      # price of a separate runner is a cold rebuild of every dependency for one
+      # command.
+      #
+      # `--all-features` because `testkit`, m6-core's `sqlite`, `email` and
+      # `multipart` and m6-http's allocation counters are off by default, so the
+      # first line does not compile their docs. Three of the twelve links were
+      # behind those features, which is the same gap the "Opt-in core features"
+      # step above exists for.
+      - name: Rustdoc, silent
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 
   conformance:
     name: h1, h2, h3 conformance
@@ -187,13 +546,31 @@ jobs:
           sudo install -m755 h3spec /usr/local/bin/h3spec
 
       - name: Build the servers under test
-        run: cargo build --workspace --release
+        run: cargo build --workspace --bins
 
       # WITHOUT --allow-missing-tools, deliberately. All three testers are
       # installed above, so an absent one here is a failure and not a skip.
       # That flag exists for a laptop and is never a way to ship.
       - name: Conformance
-        run: ./tools/conformance.sh
+        run: |
+          # m6-http pins its memory at start (`[server] lock_memory`, on by default),
+          # and a runner account's RLIMIT_MEMLOCK is 8 MiB. This shell is raised, and the
+          # processes it starts inherit the limit, so the m6-http the tests start can pin.
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          ./tools/conformance.sh
+
+      # Debug assertions off, as in a release build. Everything above runs the
+      # dev profile, where a `debug_assert!` argument runs. A write inside one
+      # vanishes from a release binary, and HTTP/2's frame writer once did that:
+      # the shipped m6-http sent no HTTP/2 frame while every dev-profile check
+      # passed. The `release-asserts` profile is the dev profile with debug
+      # assertions off, so this costs a dev-speed build, not a fat-LTO one.
+      - name: HTTP/2 without debug assertions
+        run: |
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          cargo build --workspace --bins --profile release-asserts
+          cargo test -p m6-http --lib --profile release-asserts http2
+          M6_BIN_DIR="$PWD/target/release-asserts" ./tools/conformance.sh h2
 
   dependencies:
     name: advisories, licences, duplicates
@@ -241,23 +618,57 @@ jobs:
           echo "checked $COUNT shell script(s)"
           exit $FAIL
 
+      # A teardown that selects its victim by name, port or command-line text
+      # kills another session's stack as easily as its own. bf5e737 and 0f1f2ee
+      # removed the last of those from the examples; this keeps a new one from
+      # landing. It reads the tracked tree only and runs in well under a second.
+      - name: a teardown kills only a recorded pid
+        run: ./tools/check-kill-safety.sh
+
+  # A history rewrite changes every commit hash in the repository at once, and
+  # the ones written into the documents are no exception. The 2026-09-26
+  # rewrite killed thirteen hashes in docs/PERFORMANCE.md, 83e4142 repointed
+  # them, and the rewrite after that killed the replacements too. Nothing ran
+  # that noticed either time (a sweep found the repository had no docs check),
+  # so the next rewrite would be silent as well.
+  #
+  # FULL HISTORY, deliberately: `git cat-file` can only say a hash is dead if
+  # the clone has the objects that should contain it. The checkout defaults to
+  # depth 1 on a runner, and the script refuses a shallow clone rather than
+  # call every hash dead. The job is seconds long and installs nothing, so it
+  # is its own job rather than a step in a build job that would then have to
+  # fetch the whole history twice.
+  commit-hashes:
+    name: documents name live commits
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: ./tools/check-commit-hashes.sh
+
+  # The perf gate's statistic is tested Rust (m6-http's perf_ab module) and its
+  # tests run in the existing build-and-test job. This job checks only that the
+  # C client it relies on builds with no warnings, that the leftover-server
+  # check matches both arms, and measures nothing.
+  perf-tools:
+    name: perf tools
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: the C client builds with no warnings
+        run: cc -O2 -std=c11 -Wall -Wextra -Werror -o /tmp/perf_client tools/perf_client.c
+      - name: the leftover-server check matches both arms
+        run: ./tools/perfcheck-stray-test.sh
+
   examples:
     name: the examples build and work
     runs-on: ubuntu-latest
     steps:
-      # SIBLING CHECKOUTS, and the layout is load-bearing. The example renderer
-      # crates depend on m6 by relative path (`../../../../m6/m6-core`), so
-      # m6-examples and m6 have to sit beside each other. Checking either one out
-      # at the workspace root breaks the path and the error is a missing
-      # Cargo.toml several directories away from the cause.
+      # The examples are examples/ in this repository, their own Cargo
+      # workspace. The renderer crates depend on m6-core by relative path, so
+      # they build against the m6 in this same checkout.
       - uses: actions/checkout@v4
-        with:
-          path: m6
-
-      - uses: actions/checkout@v4
-        with:
-          repository: mgrosvenor/m6-examples
-          path: m6-examples
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -266,11 +677,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
-            m6
-            m6-examples
+            .
+            examples
 
       - name: Build m6
-        working-directory: m6
+        id: build_m6
         run: |
           cargo build --workspace --release
           echo "$PWD/target/release" >> "$GITHUB_PATH"
@@ -278,33 +689,103 @@ jobs:
       # Zero warnings and silent clippy, the same standard as m6 itself: a reader
       # copies from these.
       - name: Examples build, zero warnings
-        working-directory: m6-examples
+        id: build_examples
+        working-directory: examples
         run: |
-          cargo build --release 2>&1 | tee build.log
+          status=0
+          cargo build --release > build.log 2>&1 || status=$?
+          cat build.log
+          # The end-to-end step needs the binaries, not a warning-free build.
+          [ "$status" -eq 0 ] && echo "compiled=true" >> "$GITHUB_OUTPUT"
+          [ "$status" -eq 0 ] || { echo "::error::the examples build failed with status $status"; exit 1; }
           n=$(grep -c '^warning' build.log || true)
           echo "examples release warnings: $n"
           [ "$n" -eq 0 ] || { echo "::error::$n warning(s) building the examples"; exit 1; }
 
+      - name: Examples rustfmt
+        if: ${{ !cancelled() }}
+        working-directory: examples
+        run: cargo fmt --all --check
+
       - name: Examples clippy, silent
-        working-directory: m6-examples
+        if: ${{ !cancelled() && steps.build_m6.outcome == 'success' }}
+        working-directory: examples
         run: |
-          cargo clippy --workspace --all-targets --release 2>&1 | tee clippy.log
+          status=0
+          cargo clippy --workspace --all-targets --release > clippy.log 2>&1 || status=$?
+          cat clippy.log
+          # An error-level lint prints `error:` and no warning, so clippy's own
+          # status decides as well as the warning count.
+          [ "$status" -eq 0 ] || { echo "::error::clippy failed on the examples with status $status"; exit 1; }
           n=$(grep -c '^warning' clippy.log || true)
           [ "$n" -eq 0 ] || { echo "::error::$n clippy finding(s) in the examples"; exit 1; }
 
-      - name: Examples unit tests
-        working-directory: m6-examples
+      # The examples are the platform layer's users too: no example names an
+      # OS in a cfg or links mio, nix, rustix or libc. The same rule the gate
+      # test holds for m6, as a grep here because the examples are a separate workspace.
+      - name: Examples name no platform
+        if: ${{ !cancelled() }}
+        working-directory: examples
         run: |
-          # Example 05's end-to-end test needs the certificate and auth
-          # database that dev.sh creates, and fails without them, so it runs
-          # in the example 05 step below once the stack is up (#277).
-          cargo test --workspace -- --skip blog_site_end_to_end > full.log 2>&1 || true
+          if grep -rnE --include='*.rs' --exclude-dir=target 'target_os|cfg\(unix|cfg\(windows|\b(mio|nix|rustix|libc)::|^\s*use (mio|nix|rustix|libc)\b' .; then
+            echo "::error::an example names the operating system or an OS crate: that belongs in m6-platform"; exit 1
+          fi
+          if grep -nE '^\s*(mio|nix|rustix|libc)\s*=' */*/Cargo.toml */Cargo.toml 2>/dev/null; then
+            echo "::error::an example declares an OS crate"; exit 1
+          fi
+          echo "no example names the operating system"
+
+      - name: Examples unit tests
+        if: ${{ !cancelled() && steps.build_m6.outcome == 'success' }}
+        working-directory: examples
+        run: |
+          # Example 05's end-to-end test makes its own certificate, keys and
+          # auth database in a temporary directory, so it runs here with the
+          # rest (it needed dev.sh's state before the platform layer).
+          # Examples 05 and 09 start m6-http, which pins its memory at start, and
+          # a runner account's RLIMIT_MEMLOCK is 8 MiB, as in the test jobs above.
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          status=0
+          cargo test --workspace > full.log 2>&1 || status=$?
           grep -E '^test result:' full.log || true
           if grep -q '^failures:' full.log; then
             sed -n '/^failures:/,$p' full.log | head -60
             echo "::error::example tests failed"
             exit 1
           fi
+          [ "$status" -eq 0 ] || { tail -60 full.log; echo "::error::cargo test exited with status $status"; exit 1; }
+
+      # A guide that shows m6-http must show a command that starts: m6-http takes a
+      # site directory and a system config. A renewal hook that touches a system
+      # config only works when that file is the one m6-http is started with, so
+      # every `touch` path must be one the same file passes to m6-http. Reads
+      # the guides and the unit files.
+      - name: Guides start m6-http with two arguments, and hooks touch its config
+        working-directory: examples
+        run: |
+          python3 - <<'PY'
+          import re, subprocess, sys
+          files = subprocess.check_output(
+              ["git", "ls-files", "*.md", "*.service", ":!*posts.json"], text=True).split()
+          bad = []
+          for f in files:
+              text = open(f, encoding="utf-8").read().replace("\\\n", " ")
+              configs = set()
+              for m in re.finditer(r"^ExecStart=\S*/m6-http\s+(.*)$", text, re.M):
+                  args = m.group(1).split()
+                  if len(args) < 2:
+                      bad.append(f"{f}: m6-http ExecStart passes {len(args)} argument(s), needs 2: {m.group(0)}")
+                  else:
+                      configs.add(args[1])
+              for m in re.finditer(r"NODE_CONFIG=(\S+)", text):
+                  configs.add(m.group(1))
+                  configs.add("${NODE_CONFIG}")
+              for m in re.finditer(r"^touch (/etc/m6/\S+\.toml)\s*$", text, re.M):
+                  if m.group(1) not in configs:
+                      bad.append(f"{f}: a hook touches {m.group(1)}, which m6-http is not started with here")
+          print("\n".join(bad) if bad else f"{len(files)} files checked")
+          sys.exit(1 if bad else 0)
+          PY
 
       # m6-file's config schema changed on 2026-09-12 and ten example configs
       # were left naming no handler, so the service exited 2 before binding and
@@ -312,69 +793,32 @@ jobs:
       # config with the real binary is a second of work and catches that outright.
       #
       # Every example is accounted for. 06-systemd is systemd units with no site
-      # config, and 09-global-deployment's configs name /etc/letsencrypt paths for
-      # five real cache nodes, so m6-http would reject them here for a missing
-      # certificate rather than for anything wrong with them; its own integration
-      # test covers it and ran above. An example with neither a config nor a
-      # reason recorded here fails the job.
+      # config, and 09-global-deployment holds one system config per node and one
+      # site config per role, so it has no single configs/system-dev.toml for this
+      # loop to parse; its own integration test covers it and ran above. An
+      # example with neither a config nor a reason recorded here fails the job.
       # A FRESH CHECKOUT HAS NO CERTIFICATES, and the config parse needs them:
-      # m6-http validates that tls_cert exists, so every example was rejected here
-      # with "tls_cert file not found: .../keys/dev.pem" on CI's first ever run.
-      # keys/ is gitignored — correctly, they are generated secrets — and each
-      # example's dev.sh creates them on first run. This step does the same thing
-      # dev.sh does, ahead of the parse.
-      #
-      # It passed on the build host only because rsync carried a developer's own
-      # untracked keys/ directories. A check that depends on an untracked file is
-      # not a check, which is the same lesson the mkcert fallback taught earlier.
+      # m6-http validates that tls_cert exists. The development keys live in
+      # /tmp/m6/dev, written by ./dev-keys.sh, which the config parse
+      # below needs, so this step runs it ahead of the parse.
       - name: Generate development certificates
-        working-directory: m6-examples
+        id: certs
+        if: ${{ !cancelled() }}
+        working-directory: examples
         run: |
-          for d in examples/*/; do
-            [ -f "$d/dev.sh" ] || continue
-            mkdir -p "$d/keys"
-            if [ ! -f "$d/keys/dev.pem" ]; then
-              openssl req -x509 -newkey rsa:2048 -sha256 -days 365 -nodes \
-                -keyout "$d/keys/dev-key.pem" -out "$d/keys/dev.pem" \
-                -subj "/CN=localhost" \
-                -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
-            fi
-            # Five examples also need an auth signing keypair, which their
-            # setup.sh generates. Without it the parse fails with
-            # "[auth].public_key file not found" — found by running this against a
-            # genuinely fresh clone rather than a working tree that already had
-            # them.
-            if [ ! -f "$d/keys/auth.pub" ]; then
-              # PKCS#8 (`genpkey`), not SEC1 (`ecparam -genkey`). m6-auth-server
-              # refuses SEC1 with "invalid private key (tried EC and RSA):
-              # InvalidKeyFormat" and exits, and pre-creating one here made dev.sh
-              # skip generating a good one — 33 of 98 checks failed with 502s
-              # because the auth server was never up.
-              # `ec_param_enc:named_curve` too. It is the default for OpenSSL, so it
-              # changes nothing here, but LibreSSL -- which is what macOS ships as
-              # /usr/bin/openssl -- writes explicit curve parameters instead of the
-              # prime256v1 OID, and the token signer refuses those with "JWT encode
-              # error: InvalidEcdsaKey" at every login. Stated here so the two sides
-              # of the check generate the same key.
-              openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -pkeyopt ec_param_enc:named_curve -out "$d/keys/auth.pem" 2>/dev/null
-              openssl pkey -in "$d/keys/auth.pem" -pubout -out "$d/keys/auth.pub" 2>/dev/null
-              chmod 600 "$d/keys/auth.pem" 2>/dev/null || true
-            fi
-            echo "  $(basename "$d")"
-          done
-          # 09 keeps its certificates somewhere else.
-          mkdir -p examples/09-global-deployment/certs
+          ./dev-keys.sh
 
       - name: Every example's config parses
-        working-directory: m6-examples
+        if: ${{ !cancelled() && steps.build_m6.outcome == 'success' }}
+        working-directory: examples
         run: |
           bad=0 unexplained=0
-          for d in examples/*/; do
+          for d in */; do
             name=$(basename "$d")
             case "$name" in
-              data) continue ;;
+              data|common|target) continue ;;
               06-systemd) echo "  $name  not parsed: systemd units only, no site config"; continue ;;
-              09-global-deployment) echo "  $name  not parsed: configs name letsencrypt paths; its integration test covers it"; continue ;;
+              09-global-deployment) echo "  $name  not parsed: per-node configs, no single system-dev.toml; its integration test covers it"; continue ;;
             esac
             sys="$d/configs/system-dev.toml"
             [ -f "$sys" ] || sys="$d/site.toml"
@@ -382,7 +826,10 @@ jobs:
               echo "  $name  NO CONFIG and no reason recorded for that"
               unexplained=$((unexplained + 1)); continue
             fi
-            if out=$(m6-http "$(cd "$d" && pwd)" "$(cd "$(dirname "$sys")" && pwd)/$(basename "$sys")" --dump-config 2>&1 >/dev/null) && [ -z "$out" ]; then
+            # The checked-in config names the key directory as @M6_DEV_HOME@;
+            # m6 reads the copy with the real path filled in.
+            sys=$(. ./dev-home.sh && m6_conf "$sys")
+            if out=$(m6-http "$(cd "$d" && pwd)" "$sys" --dump-config 2>&1 >/dev/null) && [ -z "$out" ]; then
               echo "  $name  ok"
             else
               echo "  $name  $(echo "$out" | head -1)"
@@ -401,34 +848,103 @@ jobs:
       # mkcert) and creates the admin user. That is exactly what a new reader gets
       # on step one of the README, and it is checked here rather than assumed.
       - name: Example 05, end to end over the running stack
-        working-directory: m6-examples/examples/05-cms
+        if: ${{ !cancelled() && steps.build_examples.outputs.compiled == 'true' && steps.certs.outcome == 'success' }}
+        working-directory: examples/05-cms
         run: |
-          M6="$GITHUB_WORKSPACE/m6" M6_NO_BROWSER=1 ./dev.sh --no-open > dev.log 2>&1 &
-          for _ in $(seq 1 180); do
+          # m6-http pins its memory at start (`[server] lock_memory`, on by default),
+          # and a runner account's RLIMIT_MEMLOCK is 8 MiB. This shell is raised, and the
+          # processes it starts inherit the limit, so the m6-http the tests start can pin.
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          M6="$GITHUB_WORKSPACE" M6_NO_BROWSER=1 ./dev.sh --no-open > dev.log 2>&1 &
+          dev_pid=$!
+          dev_start=$(ps -o lstart= -p "$dev_pid" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)
+          printf '%s\t%s\n' "$dev_pid" "${dev_start:--}" > .ci-dev.pid
+          # dev.sh builds m6 and render-cms in release before it starts the
+          # stack, which can take minutes on a cold runner. Wait for the stack
+          # to answer, for dev.sh to exit (a failed start), or for 15 minutes.
+          for _ in $(seq 1 900); do
             code=$(curl -sk --http1.1 -o /dev/null -w '%{http_code}' https://127.0.0.1:8443/ 2>/dev/null || true)
             [ "$code" = "200" ] && break
+            kill -0 "$dev_pid" 2>/dev/null || break
             sleep 1
           done
           if [ "$(curl -sk --http1.1 -o /dev/null -w '%{http_code}' https://127.0.0.1:8443/ 2>/dev/null)" != "200" ]; then
             echo "--- dev.sh ---"; tail -40 dev.log
             echo "--- services ---"; tail -20 logs/*.log 2>/dev/null || true
-            echo "::error::the 05-cms stack never answered in 180s"
+            echo "::error::the 05-cms stack never answered"
             exit 1
           fi
           # `|| { dump; exit 1; }` — when the suite fails, the service logs are the
           # only way to tell a broken example from a broken backend. Without this,
           # 33 failures showing 502s said nothing about WHICH service was down.
           ./test.sh || { echo "--- service logs ---"; tail -30 logs/*.log 2>/dev/null; exit 1; }
-          (cd "$GITHUB_WORKSPACE/m6-examples" && cargo test -p render-cms --test integration)
+          (cd "$GITHUB_WORKSPACE/examples" && cargo test -p render-cms --test integration)
 
       - name: Stop the stack
         if: always()
-        working-directory: m6-examples/examples/05-cms
+        working-directory: examples/05-cms
         run: |
-          for pid in $(pgrep -f "$PWD" 2>/dev/null || true); do
-            [ "$pid" = "$$" ] && continue
-            kill "$pid" 2>/dev/null || true
+          # Stop the dev.sh this job started, and only that pid. The run step
+          # wrote the pid and its start time here when it started dev.sh. A pid
+          # that now belongs to another process has a different start time, so
+          # it is left alone. dev.sh's EXIT trap stops the services it started.
+          # This used to be `pgrep -f "$PWD"`, a command-line match that reaches
+          # anything mentioning the directory and proves nothing about who
+          # started it.
+          [ -f .ci-dev.pid ] || exit 0
+          IFS=$'\t' read -r pid start < .ci-dev.pid || true
+          case "$pid" in ''|*[!0-9]*) exit 0 ;; esac
+          kill -0 "$pid" 2>/dev/null || exit 0
+          now=$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)
+          if [ "${start:--}" != "-" ] && [ -n "$now" ] && [ "$now" != "$start" ]; then
+            echo "pid $pid is a different process now; leaving it alone"
+            exit 0
+          fi
+          kill "$pid" 2>/dev/null || true
+          i=0
+          while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 50 ]; do
+            sleep 0.1
+            i=$((i + 1))
           done
+          if kill -0 "$pid" 2>/dev/null; then
+            kill -9 "$pid" 2>/dev/null || true
+          fi
+
+      # Examples 03 and 04 each have a test.sh: 03 drives the contact form against
+      # a scripted mail relay it starts itself, and 04 drives the auth server
+      # (login, refresh, logout, the throttle). They share port 8443 with 05, so
+      # this runs after 05's stack is stopped, and each stack here is stopped, by
+      # the pid this step recorded, before the next one starts.
+      - name: Examples 03 and 04, end to end
+        if: ${{ !cancelled() && steps.build_examples.outputs.compiled == 'true' && steps.certs.outcome == 'success' }}
+        working-directory: examples
+        run: |
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          status=0
+          for ex in 03-contact 04-auth; do
+            echo "=== $ex ==="
+            M6="$GITHUB_WORKSPACE" "$ex/dev.sh" > "$ex/dev.log" 2>&1 &
+            dev_pid=$!
+            code=000
+            # As for 05: dev.sh may build before it starts, so wait for the stack,
+            # for dev.sh to exit, or for 15 minutes.
+            for _ in $(seq 1 900); do
+              code=$(curl -sk --http1.1 -o /dev/null -w '%{http_code}' https://127.0.0.1:8443/ 2>/dev/null || true)
+              [ "$code" = "200" ] && break
+              kill -0 "$dev_pid" 2>/dev/null || break
+              sleep 1
+            done
+            if [ "$code" = "200" ]; then
+              "$ex/test.sh" || { echo "--- $ex service logs ---"; tail -30 "$ex"/logs/*.log 2>/dev/null; status=1; }
+            else
+              echo "--- $ex dev.sh ---"; tail -40 "$ex/dev.log"
+              echo "::error::the $ex stack never answered"
+              status=1
+            fi
+            kill "$dev_pid" 2>/dev/null || true
+            wait "$dev_pid" 2>/dev/null || true
+          done
+          [ "$status" -eq 0 ] || { echo "::error::an example test.sh failed"; exit 1; }
 
   changelog:
     name: the release says what changed and m6's docs say what is true

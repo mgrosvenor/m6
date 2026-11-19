@@ -1,6 +1,6 @@
 //! m6's own telemetry formats, and how to read them back.
 //!
-//! `/health`, `/perf`, the `periodic stats` log line and the analytics NDJSON
+//! `/health`, the `periodic stats` log line and the analytics NDJSON
 //! stream are all m6 features. Every deployment of m6 emits them and every
 //! deployment therefore has the same problem: turning them back into an answer
 //! about whether a fleet is healthy, fast, and being probed.
@@ -11,10 +11,10 @@
 //!
 //! # The write side has no struct
 //!
-//! `m6-http` emits an analytics row with `tracing::info!(target: "analytics",
-//! node = .., path = .., ..)`, and the JSON is produced by the subscriber's
-//! formatter. So there is no type describing the format, on either side, and
-//! every consumer has re-derived it by looking at a sample. That is how the
+//! `m6-http` emits an analytics row through `m6_core::log`, and the JSON is
+//! produced by the logger's line builder. So there is no type describing the
+//! format, on either side, and every consumer has re-derived it by looking at
+//! a sample. That is how the
 //! field set below came to be read as `ts` and `user_agent` rather than
 //! `timestamp` and `fields.user_agent`, which yields an empty result that
 //! looks exactly like a quiet hour rather than like a bug.
@@ -31,9 +31,9 @@ use serde::{Deserialize, Serialize};
 
 /// One line of the analytics stream.
 ///
-/// The envelope is the tracing subscriber's: a timestamp and level outside, the
-/// event's own fields nested under `fields`. Reading `user_agent` at the top
-/// level finds nothing.
+/// The envelope is the logger's: a timestamp and level outside, the event's own
+/// fields nested under `fields`. Reading `user_agent` at the top level finds
+/// nothing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalyticsRecord {
     pub timestamp: String,
@@ -45,8 +45,8 @@ pub struct AnalyticsRecord {
 /// The event's fields, as emitted by `m6_http::analytics`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AnalyticsFields {
-    /// `"request"` for site traffic, `"monitor"` for a `/health` or `/perf`
-    /// poll. Monitoring is deliberately a different message so that site
+    /// `"request"` for site traffic, `"monitor"` for a `/health` poll.
+    /// Monitoring is deliberately a different message so that site
     /// traffic stays honest while the monitoring itself stays visible; every
     /// consumer that wants traffic must filter on this.
     #[serde(default)]
@@ -85,6 +85,67 @@ impl AnalyticsRecord {
     pub fn user_agent(&self) -> &str {
         self.fields.user_agent.as_deref().unwrap_or("")
     }
+
+    /// The record as the traffic summary reads it, borrowed.
+    pub fn view(&self) -> RequestView<'_> {
+        RequestView {
+            at: Stamp::Text(&self.timestamp),
+            message: &self.fields.message,
+            status: self.fields.status,
+            path: &self.fields.path,
+            client_ip: &self.fields.client_ip,
+            user_agent: self.user_agent(),
+            // A line carries whole values, so nothing parsed from one is cut.
+            truncated: false,
+        }
+    }
+}
+
+/// When a request happened, as the source holds it.
+///
+/// A log line carries the envelope's text, and the traffic window keeps Unix
+/// microseconds. One summary reads one kind, and both order by time: the text
+/// is fixed-width RFC 3339 in UTC, so its order is the time order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Stamp<'a> {
+    Text(&'a str),
+    Micros(u64),
+}
+
+impl Stamp<'_> {
+    /// The time as the logging envelope writes it: UTC, fixed width,
+    /// microsecond precision.
+    pub fn text(self) -> String {
+        match self {
+            Stamp::Text(text) => text.to_string(),
+            Stamp::Micros(at_us) => {
+                let at = i64::try_from(at_us).expect("a Unix time in microseconds fits in i64");
+                chrono::DateTime::from_timestamp_micros(at)
+                    .expect("a Unix time in microseconds is in range")
+                    .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// One request as the traffic summary reads it: the values an analytics line
+/// carries that the summary uses, borrowed from a parsed record or from the
+/// traffic window's slot.
+///
+/// `truncated` says the window cut the path or the user agent. A line carries
+/// whole values, so a parsed record never sets it. The summary has to know,
+/// because a probe marker in the cut part is still a probe marker the request
+/// carried.
+#[derive(Clone, Copy, Debug)]
+pub struct RequestView<'a> {
+    pub at: Stamp<'a>,
+    pub message: &'a str,
+    pub status: u16,
+    pub path: &'a str,
+    pub client_ip: &'a str,
+    pub user_agent: &'a str,
+    pub truncated: bool,
 }
 
 /// Parse an NDJSON stream, keeping records at or after `since`.
@@ -151,13 +212,13 @@ pub fn strip_ansi(s: &str) -> String {
 }
 
 fn field(line: &str, key: &str) -> Option<u64> {
-    let pat = format!("{key}=");
-    let start = line.find(&pat)? + pat.len();
-    let rest = &line[start..];
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-    rest[..end].parse().ok()
+    // A field is a whole whitespace-delimited token `key=value`, so a key must
+    // not be read out of a longer key such as `total_requests`.
+    let prefix = format!("{key}=");
+    let value = line
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix(prefix.as_str()))?;
+    value.parse().ok()
 }
 
 impl PeriodicStats {
@@ -321,13 +382,36 @@ pub const INJECTION_MARKERS: &[&str] = &[
     "benchmark(",
 ];
 
-fn matches_any(haystack: &str, needles: &[&str]) -> bool {
-    let h = haystack.to_ascii_lowercase();
-    needles.iter().any(|n| h.contains(n))
+/// One ASCII-case-insensitive automaton per marker list, built on first use.
+///
+/// The traffic report runs every request of the hour through these, so a
+/// match is one pass over the text with no allocation. Lowercasing the text
+/// and calling `contains` once per marker cost about 1 us a path, which at a
+/// full window was most of a 79 ms report.
+fn markers(needles: &[&str]) -> aho_corasick::AhoCorasick {
+    aho_corasick::AhoCorasick::builder()
+        .ascii_case_insensitive(true)
+        .build(needles)
+        .expect("the marker lists are plain strings")
+}
+
+static BOT: std::sync::LazyLock<aho_corasick::AhoCorasick> =
+    std::sync::LazyLock::new(|| markers(BOT_MARKERS));
+static PROBE: std::sync::LazyLock<aho_corasick::AhoCorasick> =
+    std::sync::LazyLock::new(|| markers(PROBE_MARKERS));
+static INJECTION: std::sync::LazyLock<aho_corasick::AhoCorasick> =
+    std::sync::LazyLock::new(|| markers(INJECTION_MARKERS));
+
+/// Whether `text` matches the automaton as written or, when it carries a
+/// percent escape or a `+`, once decoded by `request::url_decode`.
+fn matches_raw_or_decoded(text: &str, automaton: &aho_corasick::AhoCorasick) -> bool {
+    automaton.is_match(text)
+        || (text.contains(['%', '+'])
+            && automaton.is_match(crate::request::url_decode(text).as_str()))
 }
 
 pub fn claims_to_be_bot(user_agent: &str) -> bool {
-    matches_any(user_agent, BOT_MARKERS)
+    BOT.is_match(user_agent)
 }
 
 // ── Verifying a crawler's claim ───────────────────────────────────────────────
@@ -585,10 +669,7 @@ pub fn verify_crawler(user_agent: &str, ptr: &crate::resolve::Ptr) -> CrawlerVer
 /// Probe shapes, checked raw and decoded, for the same reason as
 /// [`looks_like_injection`]: `..%2F` is a traversal and `%2E%65nv` is `.env`.
 pub fn looks_like_probe(path: &str) -> bool {
-    if matches_any(path, PROBE_MARKERS) {
-        return true;
-    }
-    matches_any(&crate::request::url_decode(path), PROBE_MARKERS)
+    matches_raw_or_decoded(path, &PROBE)
 }
 
 /// Injection shapes, checked against the decoded path.
@@ -600,11 +681,7 @@ pub fn looks_like_probe(path: &str) -> bool {
 /// `request::url_decode` is the one decoder: it reassembles UTF-8 from bytes
 /// rather than mapping each byte to a code point.
 pub fn looks_like_injection(path: &str) -> bool {
-    if matches_any(path, INJECTION_MARKERS) {
-        return true;
-    }
-    let decoded = crate::request::url_decode(path);
-    matches_any(&decoded, INJECTION_MARKERS)
+    matches_raw_or_decoded(path, &INJECTION)
 }
 
 /// What one client address was doing.
@@ -624,6 +701,12 @@ pub struct ClientSummary {
     pub user_agents: Vec<String>,
     pub status: BTreeMap<u16, u64>,
     pub paths: Vec<(String, u64)>,
+    /// Probe-shaped paths and how many requests showed each one.
+    ///
+    /// A request counts when `looks_like_probe` matches its path, or when its
+    /// record says the traffic window cut its path or user agent. The second
+    /// case is what makes a marker past the window's cap visible: the shown
+    /// path need carry none, because the request may.
     pub probe_paths: Vec<(String, u64)>,
     pub injection_paths: Vec<(String, u64)>,
     pub first_seen: String,
@@ -752,8 +835,22 @@ pub const UA_ROTATION_MIN_REQUESTS: u64 = 20;
 pub const USER_AGENTS_KEPT: usize = 4;
 /// Characters kept per user agent. Real ones run to about 150.
 pub const USER_AGENT_MAX_CHARS: usize = 160;
-/// Marks an agent the cap cut short.
+/// Marks a value a cap cut short.
+///
+/// Without it a report cannot tell a short value from the prefix of a long one,
+/// and a cut path would read as the path the client sent. The user-agent sample
+/// uses it at [`USER_AGENT_MAX_CHARS`], and `m6-http`'s traffic window uses this
+/// same value for a path or user agent it cut, so the two marks cannot drift.
 pub const USER_AGENT_TRUNCATED: &str = "...";
+
+/// Counts by key, busiest first, ties by key, at most `keep` of them, with
+/// each kept key copied once.
+fn top_counts(counts: HashMap<&str, u64>, keep: usize) -> Vec<(String, u64)> {
+    let mut v: Vec<(&str, u64)> = counts.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    v.truncate(keep);
+    v.into_iter().map(|(key, n)| (key.to_string(), n)).collect()
+}
 
 /// A capped, deterministic sample of a client's user agents.
 ///
@@ -764,11 +861,11 @@ pub const USER_AGENT_TRUNCATED: &str = "...";
 ///
 /// Each agent then goes through [`reportable_user_agent`], which is where the
 /// character cap and the escaping live.
-fn sample_user_agents<'a>(uas: impl IntoIterator<Item = &'a String>) -> Vec<String> {
-    let mut v: Vec<&String> = uas.into_iter().collect();
+fn sample_user_agents<'a>(uas: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut v: Vec<&str> = uas.into_iter().collect();
     v.sort_unstable();
     v.truncate(USER_AGENTS_KEPT);
-    v.into_iter().map(|ua| reportable_user_agent(ua)).collect()
+    v.into_iter().map(reportable_user_agent).collect()
 }
 
 /// One user agent as a report may print it: one line, visible characters,
@@ -809,23 +906,34 @@ fn reportable_user_agent(ua: &str) -> String {
 
 impl TrafficSummary {
     pub fn from_records<'a>(records: impl IntoIterator<Item = &'a AnalyticsRecord>) -> Self {
-        struct Acc {
+        Self::from_views(records.into_iter().map(AnalyticsRecord::view))
+    }
+
+    /// Summarise requests as borrowed views. A key is copied into the
+    /// summary once per distinct value, never once per request.
+    pub fn from_views<'a>(records: impl IntoIterator<Item = RequestView<'a>>) -> Self {
+        struct Acc<'a> {
             n: u64,
-            uas: HashSet<String>,
-            paths: HashMap<String, u64>,
+            uas: HashSet<&'a str>,
+            paths: HashMap<&'a str, u64>,
+            /// Probe-shaped requests by the path the report shows, counted when
+            /// the record is read. A record whose path or user agent the
+            /// traffic window cut is probe-shaped, and that fact lives on the
+            /// record, not on the stored path.
+            probe_paths: HashMap<&'a str, u64>,
             status: BTreeMap<u16, u64>,
-            first: String,
-            last: String,
+            first: Stamp<'a>,
+            last: Stamp<'a>,
         }
         /// Per-user-agent accumulator. A struct rather than the
         /// `(u64, HashMap, HashMap)` it used to be: the two maps have the same
         /// type and were read positionally as `e.1` and `e.2`, so nothing at the
         /// use site said which one held addresses and which held paths.
         #[derive(Default)]
-        struct UaAcc {
+        struct UaAcc<'a> {
             n: u64,
-            ips: HashMap<String, IpAcc>,
-            paths: HashMap<String, u64>,
+            ips: HashMap<&'a str, IpAcc<'a>>,
+            paths: HashMap<&'a str, u64>,
         }
         /// One address under one user agent: how many, and when.
         ///
@@ -834,61 +942,56 @@ impl TrafficSummary {
         /// has to be the window of the requests it counted. Folding the times
         /// in at the user-agent level would let an address excluded as a
         /// forger widen the span reported for the genuine ones.
-        #[derive(Default)]
-        struct IpAcc {
+        struct IpAcc<'a> {
             n: u64,
-            first: String,
-            last: String,
+            first: Stamp<'a>,
+            last: Stamp<'a>,
         }
-        let mut per_ip: HashMap<String, Acc> = HashMap::new();
-        let mut per_ua: HashMap<String, UaAcc> = HashMap::new();
+        let mut per_ip: HashMap<&'a str, Acc<'a>> = HashMap::new();
+        let mut per_ua: HashMap<&'a str, UaAcc<'a>> = HashMap::new();
         let mut summary = TrafficSummary::default();
 
         for rec in records {
-            if !rec.is_request() {
+            if rec.message != "request" {
                 continue;
             }
-            let f = &rec.fields;
             summary.total_requests += 1;
-            *summary.status.entry(f.status).or_default() += 1;
+            *summary.status.entry(rec.status).or_default() += 1;
 
-            let acc = per_ip.entry(f.client_ip.clone()).or_insert_with(|| Acc {
+            let acc = per_ip.entry(rec.client_ip).or_insert_with(|| Acc {
                 n: 0,
                 uas: HashSet::new(),
                 paths: HashMap::new(),
+                probe_paths: HashMap::new(),
                 status: BTreeMap::new(),
-                first: rec.timestamp.clone(),
-                last: rec.timestamp.clone(),
+                first: rec.at,
+                last: rec.at,
             });
             acc.n += 1;
-            acc.uas.insert(rec.user_agent().to_string());
-            *acc.paths.entry(f.path.clone()).or_default() += 1;
-            *acc.status.entry(f.status).or_default() += 1;
-            if rec.timestamp < acc.first {
-                acc.first = rec.timestamp.clone();
+            acc.uas.insert(rec.user_agent);
+            *acc.paths.entry(rec.path).or_default() += 1;
+            // A cut path or user agent counts as probe-shaped: an honest client
+            // does not send a 512-byte path or a 256-byte agent, and the
+            // marker may be in the part the window did not keep. Decided from
+            // the record's bit, not from the trailing marker.
+            if rec.truncated || looks_like_probe(rec.path) {
+                *acc.probe_paths.entry(rec.path).or_default() += 1;
             }
-            if rec.timestamp > acc.last {
-                acc.last = rec.timestamp.clone();
-            }
+            *acc.status.entry(rec.status).or_default() += 1;
+            acc.first = acc.first.min(rec.at);
+            acc.last = acc.last.max(rec.at);
 
-            let e = per_ua.entry(rec.user_agent().to_string()).or_default();
+            let e = per_ua.entry(rec.user_agent).or_default();
             e.n += 1;
-            let ip_acc = e.ips.entry(f.client_ip.clone()).or_insert_with(|| IpAcc {
+            let ip_acc = e.ips.entry(rec.client_ip).or_insert_with(|| IpAcc {
                 n: 0,
-                first: rec.timestamp.clone(),
-                last: rec.timestamp.clone(),
+                first: rec.at,
+                last: rec.at,
             });
             ip_acc.n += 1;
-            // String comparison is time comparison here: the timestamps are
-            // fixed-width RFC 3339 in UTC, which is the same property
-            // `parse_analytics` relies on to select a window.
-            if rec.timestamp < ip_acc.first {
-                ip_acc.first = rec.timestamp.clone();
-            }
-            if rec.timestamp > ip_acc.last {
-                ip_acc.last = rec.timestamp.clone();
-            }
-            *e.paths.entry(f.path.clone()).or_default() += 1;
+            ip_acc.first = ip_acc.first.min(rec.at);
+            ip_acc.last = ip_acc.last.max(rec.at);
+            *e.paths.entry(rec.path).or_default() += 1;
         }
 
         // Who has disqualified their own claim.
@@ -908,24 +1011,23 @@ impl TrafficSummary {
         // Deliberately NOT part of this: a high error ratio on its own. A
         // genuine crawler re-crawling dead links is mostly 404s and is still
         // a genuine crawler.
-        let forgers: HashSet<String> = per_ip
+        let forgers: HashSet<&str> = per_ip
             .iter()
-            .filter(|(ip, a)| {
+            .filter(|(_, a)| {
                 let rotating =
                     a.uas.len() >= UA_ROTATION_THRESHOLD && a.n >= UA_ROTATION_MIN_REQUESTS;
-                let scanning = a.paths.keys().any(|p| looks_like_probe(p))
-                    || a.paths.keys().any(|p| looks_like_injection(p));
-                let _ = ip;
+                let scanning =
+                    !a.probe_paths.is_empty() || a.paths.keys().any(|p| looks_like_injection(p));
                 rotating || scanning
             })
-            .map(|(ip, _)| ip.clone())
+            .map(|(ip, _)| *ip)
             .collect();
 
         for (ua, UaAcc { n, ips, paths }) in per_ua {
-            if !claims_to_be_bot(&ua) {
+            if !claims_to_be_bot(ua) {
                 continue;
             }
-            let genuine: Vec<(String, IpAcc)> = ips
+            let genuine: Vec<(&str, IpAcc)> = ips
                 .into_iter()
                 .filter(|(ip, _)| !forgers.contains(ip))
                 .collect();
@@ -938,23 +1040,22 @@ impl TrafficSummary {
             // addresses actually counted.
             let first_seen = genuine
                 .iter()
-                .map(|(_, a)| a.first.as_str())
+                .map(|(_, a)| a.first)
                 .min()
-                .unwrap_or_default()
-                .to_string();
+                .map(Stamp::text)
+                .unwrap_or_default();
             let last_seen = genuine
                 .iter()
-                .map(|(_, a)| a.last.as_str())
+                .map(|(_, a)| a.last)
                 .max()
-                .unwrap_or_default()
-                .to_string();
-            let mut ip_list: Vec<String> = genuine.into_iter().map(|(ip, _)| ip).collect();
+                .map(Stamp::text)
+                .unwrap_or_default();
+            let mut ip_list: Vec<String> =
+                genuine.into_iter().map(|(ip, _)| ip.to_string()).collect();
             ip_list.sort();
-            let mut p: Vec<(String, u64)> = paths.into_iter().collect();
-            p.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-            p.truncate(8);
+            let p = top_counts(paths, 8);
             summary.crawlers.push(CrawlerSighting {
-                user_agent: ua,
+                user_agent: ua.to_string(),
                 requests: genuine_n,
                 client_ips: ip_list,
                 paths: p,
@@ -971,33 +1072,30 @@ impl TrafficSummary {
         let mut clients: Vec<(String, ClientSummary)> = per_ip
             .into_iter()
             .map(|(ip, a)| {
-                let mut paths: Vec<(String, u64)> = a.paths.into_iter().collect();
-                paths.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
-                let probe_paths: Vec<(String, u64)> = paths
-                    .iter()
-                    .filter(|(p, _)| looks_like_probe(p))
-                    .cloned()
-                    .collect();
-                let injection_paths: Vec<(String, u64)> = paths
-                    .iter()
-                    .filter(|(p, _)| looks_like_injection(p))
-                    .cloned()
-                    .collect();
+                let injection_paths = top_counts(
+                    a.paths
+                        .iter()
+                        .filter(|(p, _)| looks_like_injection(p))
+                        .map(|(p, n)| (*p, *n))
+                        .collect(),
+                    usize::MAX,
+                );
+                let paths = top_counts(a.paths, 16);
+                let probe_paths = top_counts(a.probe_paths, usize::MAX);
                 let rotating =
                     a.uas.len() >= UA_ROTATION_THRESHOLD && a.n >= UA_ROTATION_MIN_REQUESTS;
-                paths.truncate(16);
                 (
-                    ip,
+                    ip.to_string(),
                     ClientSummary {
                         requests: a.n,
                         distinct_user_agents: a.uas.len(),
-                        user_agents: sample_user_agents(&a.uas),
+                        user_agents: sample_user_agents(a.uas),
                         status: a.status,
                         paths,
                         probe_paths,
                         injection_paths,
-                        first_seen: a.first,
-                        last_seen: a.last,
+                        first_seen: a.first.text(),
+                        last_seen: a.last.text(),
                         is_rotating_user_agents: rotating,
                     },
                 )
@@ -1012,7 +1110,7 @@ impl TrafficSummary {
         clients.sort_by(|a, b| b.1.requests.cmp(&a.1.requests).then(a.0.cmp(&b.0)));
         summary.clients = clients;
 
-        let mut f: Vec<String> = forgers.into_iter().collect();
+        let mut f: Vec<String> = forgers.into_iter().map(str::to_string).collect();
         f.sort();
         summary.forgers = f;
         summary
@@ -1113,6 +1211,72 @@ mod tests {
         assert_eq!(parse_analytics(text, "").count(), 1);
     }
 
+    /// The traffic window's view of a request has to be the view of the line
+    /// m6-http logged for it: the same values, the timestamp in the envelope's
+    /// own text, and so the same summary. One case for each kind of line
+    /// m6-http logs: a request, a monitor poll, and a rate-limited request.
+    #[test]
+    fn a_window_view_matches_the_logged_line() {
+        let at_us = 1_789_106_714_986_903u64;
+        let timestamp = "2026-09-11T06:05:14.986903Z";
+        assert_eq!(Stamp::Micros(at_us).text(), timestamp);
+        // message, status, path, client_ip, user agent
+        let cases: [(&str, u16, &str, &str, Option<&str>); 3] = [
+            (
+                "request",
+                200,
+                "/capabilities",
+                "198.51.100.23",
+                Some("curl/8.7.1"),
+            ),
+            ("monitor", 200, "/health", "192.0.2.9", None),
+            ("request", 429, "/", "203.0.113.5", Some("ExampleBot/1.0")),
+        ];
+        for (message, status, path, client_ip, user_agent) in cases {
+            let ua = match user_agent {
+                Some(ua) => format!(r#","user_agent":"{ua}""#),
+                None => String::new(),
+            };
+            let line = format!(
+                r#"{{"timestamp":"{timestamp}","level":"INFO","fields":{{"message":"{message}","path":"{path}","status":{status},"client_ip":"{client_ip}"{ua}}}}}"#
+            );
+            let parsed = parse_analytics(&line, "").next().expect("one record");
+            let built = RequestView {
+                at: Stamp::Micros(at_us),
+                message,
+                status,
+                path,
+                client_ip,
+                user_agent: user_agent.unwrap_or(""),
+                truncated: false,
+            };
+            assert_eq!(
+                format!("{:?}", TrafficSummary::from_views([built])),
+                format!("{:?}", TrafficSummary::from_records([&parsed])),
+                "{message} {status} {path}"
+            );
+        }
+    }
+
+    /// A cut value counts as probe-shaped, whatever the shown part says.
+    #[test]
+    fn a_cut_path_counts_as_a_probe() {
+        let cut = RequestView {
+            at: Stamp::Micros(1_789_106_714_986_903),
+            message: "request",
+            status: 404,
+            path: "/aaaaaaaa...",
+            client_ip: "192.0.2.1",
+            user_agent: "",
+            truncated: true,
+        };
+        let s = TrafficSummary::from_views([cut]);
+        assert_eq!(
+            s.clients[0].1.probe_paths,
+            [("/aaaaaaaa...".to_string(), 1)]
+        );
+    }
+
     #[test]
     fn monitor_rows_are_not_site_traffic() {
         let mut m = rec("2026-09-11T06:00:00Z", "1.2.3.4", "/health", 200, "curl/8");
@@ -1165,6 +1329,15 @@ mod tests {
         let s = PeriodicStats::parse(line).unwrap();
         assert_eq!(s.cache_hits, 76);
         assert_eq!(s.hit_p50_ns, 3455);
+    }
+
+    /// `requests` must not be read out of a `total_requests` field on the same
+    /// line: `requests=` is a substring of `total_requests=`.
+    #[test]
+    fn requests_is_not_read_out_of_total_requests() {
+        let line = "periodic stats total_requests=9 requests=3";
+        let s = PeriodicStats::parse(line).unwrap();
+        assert_eq!(s.requests, 3);
     }
 
     /// The 2026-09-11 incident, reduced.
@@ -1814,9 +1987,9 @@ mod tests {
     }
 }
 
-// ── The /perf metrics payload ────────────────────────────────────────────────
+// ── The metrics document ────────────────────────────────────────────────────
 //
-// The wire format of m6's monitoring endpoints. Here rather than in the binary
+// The wire format of the metrics document. Here rather than in the binary
 // that produces it, because anything reading a fleet needs the same types the
 // nodes write, and a consumer holding its own copy of the shape is a consumer
 // that drifts from it. That is the mistake the analytics stream made: no type
@@ -1824,9 +1997,9 @@ mod tests {
 //
 // `version` and `iface` are `String` rather than `&'static str` for the same
 // reason. The producer knows them at compile time; a deserializing client
-// cannot. It costs two short allocations per channel on an endpoint that
-// already sorts a 4096 sample reservoir, and it is on no hot path.
-/// One channel's figures, as reported by `/perf`.
+// cannot. It costs two short allocations per channel when the document is
+// built, and it is on no hot path.
+/// One channel's figures, as carried in the metrics document.
 ///
 /// Cumulative counters, unlike the aggregate percentiles, which are windowed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1905,22 +2078,40 @@ pub struct HandshakeStats {
     pub max_ns: u64,
 }
 
-/// A read-only view of the counters, for the health endpoint.
+/// A read-only view of the counters, for the metrics document.
 ///
 /// Cumulative fields are monotonic for the life of the process, which is what
 /// makes "the request count stopped increasing" a usable liveness signal.
 ///
-/// The percentile fields are **not** cumulative. `maybe_emit` clears the
-/// latency reservoirs every 10 seconds, so these describe the current partial
-/// window only, which may hold very few samples or none. That is why
-/// `hit_samples`/`miss_samples` are reported alongside: a p99 drawn from three
-/// samples is noise, and a consumer that cannot see the sample count has no
-/// way to tell it apart from a real one.
+/// The percentile fields are **not** cumulative. They describe the most recent
+/// samples held in the ring, which on a quiet node can cover hours, and which
+/// may hold very few samples or none. That is why `hit_samples`/`miss_samples`
+/// are reported alongside: a p99 drawn from three samples is noise, and a
+/// consumer that cannot see the sample count has no way to tell it apart from
+/// a real one.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StatsSnapshot {
     pub requests_total: u64,
     pub cache_hits_total: u64,
     pub cache_misses_total: u64,
+    /// The hit/miss pair split into the four facts a cache actually has.
+    ///
+    /// A hit on an entry still inside its freshness lifetime and a hit on one
+    /// past it are different events, and so are a miss answered by a backend
+    /// fetch and a miss answered by this node itself. The two totals above stay
+    /// as they were: `cache_hits_total` is the sum of the two hit fields, and
+    /// `cache_misses_total` the sum of the two miss fields.
+    ///
+    /// `#[serde(default)]` so a node older than these fields reads as 0, the
+    /// same shape `backend_errors_by_name` and `event_loop` use.
+    #[serde(default)]
+    pub cache_hits_valid_total: u64,
+    #[serde(default)]
+    pub cache_hits_invalid_total: u64,
+    #[serde(default)]
+    pub cache_misses_fetched_total: u64,
+    #[serde(default)]
+    pub cache_misses_answered_locally_total: u64,
     pub backend_errors_total: u64,
     /// The same errors, attributed to the backend that produced them.
     ///
@@ -1931,21 +2122,23 @@ pub struct StatsSnapshot {
     /// only here.
     #[serde(default)]
     pub backend_errors_by_name: std::collections::BTreeMap<String, u64>,
-    /// /health and /perf polls. Cumulative, and deliberately excluded from
-    /// `requests_total` so a stalled site is still detectable while a monitor
-    /// keeps polling. Reported rather than discarded so the monitor itself is
-    /// observable: a check that stops, or one that floods, shows up here.
+    /// Every request in the monitor population: a `/health` poll, and any
+    /// request on the TLS or QUIC listener from a private network address.
+    /// Cumulative, and deliberately excluded from `requests_total` so a stalled
+    /// site is still detectable while a monitor keeps polling. Reported rather
+    /// than discarded so the monitor itself is observable: a check that stops,
+    /// or one that floods, shows up here.
     pub monitor_requests_total: u64,
     pub monitor_samples: usize,
     pub monitor_p50_ns: u64,
     pub monitor_p99_ns: u64,
     pub rps_peak: u64,
-    /// Samples backing the hit percentiles in the current window.
+    /// Samples backing the hit percentiles in the ring.
     pub hit_samples: usize,
     pub hit_p50_ns: u64,
     pub hit_p99_ns: u64,
     pub hit_max_ns: u64,
-    /// Samples backing the miss percentiles in the current window.
+    /// Samples backing the miss percentiles in the ring.
     pub miss_samples: usize,
     pub miss_p50_ns: u64,
     pub miss_p99_ns: u64,
@@ -1959,4 +2152,23 @@ pub struct StatsSnapshot {
     /// zeros around the four that matter, and the useful signal here is
     /// exactly which codes appeared.
     pub status_counts: std::collections::BTreeMap<u16, u64>,
+    /// The event loop's own figures: how long it waited against how long it
+    /// worked, per kind of event that woke it, since the last accounting tick.
+    ///
+    /// `#[serde(default)]` so a node older than this field still parses.
+    #[serde(default)]
+    pub event_loop: Vec<LoopTriggerSnapshot>,
+}
+
+/// One trigger's event-loop figures in a [`StatsSnapshot`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LoopTriggerSnapshot {
+    pub name: String,
+    pub count: u64,
+    pub wait_min_ns: u64,
+    pub wait_max_ns: u64,
+    pub wait_mean_ns: u64,
+    pub work_min_ns: u64,
+    pub work_max_ns: u64,
+    pub work_mean_ns: u64,
 }

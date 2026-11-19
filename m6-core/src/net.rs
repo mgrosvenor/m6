@@ -16,10 +16,12 @@
 //! form. The unspecified addresses (`0.0.0.0`, `::`) are not private: a socket
 //! bound to one listens on every interface, public ones included.
 //!
-//! Names are never resolved. [`bind_ip`] returns `None` for a host name, and a
-//! host name is therefore never private.
+//! The predicates never resolve a name. [`bind_ip`] returns `None` for a host
+//! name, and a host name is therefore never private. [`resolve`] is the one
+//! lookup in this module, and it is for start only.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 
 fn v4_is_private(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
@@ -50,12 +52,94 @@ pub fn bind_ip(bind: &str) -> Option<IpAddr> {
     if let Ok(sa) = bind.parse::<SocketAddr>() {
         return Some(sa.ip());
     }
-    if let Ok(ip) = bind.parse::<IpAddr>() {
+    literal_ip(bind)
+}
+
+/// The address `host:port` names, resolved once at start.
+///
+/// An IP literal (with or without brackets) returns at once, so a config that
+/// names addresses needs no lookup. A name goes to the system resolver, which
+/// blocks: this belongs in the start phase, never in a loop. The first IPv4
+/// address wins over a later IPv6 one, because a host whose IPv6 route does not
+/// work would otherwise fail on the first connect. A name that does not resolve
+/// is an error naming it, so a service can refuse to start. An address that
+/// changes later needs a restart.
+pub fn resolve(host: &str, port: u16) -> io::Result<SocketAddr> {
+    if let Some(ip) = literal_ip(host) {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| io::Error::new(e.kind(), format!("{host}: {e}")))?;
+    let mut first = None;
+    for addr in addrs {
+        if addr.is_ipv4() {
+            return Ok(addr);
+        }
+        first.get_or_insert(addr);
+    }
+    first.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{host} resolved to no address"),
+        )
+    })
+}
+
+/// The IP address in `host`, with or without brackets, or `None` for a name.
+fn literal_ip(host: &str) -> Option<IpAddr> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
         return Some(ip);
     }
-    bind.strip_prefix('[')
+    host.strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
         .and_then(|s| s.parse::<IpAddr>().ok())
+}
+
+// ── Listeners ───────────────────────────────────────────────────────────────
+
+/// A non-blocking unix listener. Start only. [`crate::platform::net::bind_unix`]
+/// under the name every service calls: a stale socket file is replaced, the
+/// parent directory is created, `mode` is set, and a path over the platform's
+/// limit fails here with the path and the limit in the message.
+pub fn listen_unix(
+    path: &std::path::Path,
+    mode: u32,
+) -> std::io::Result<crate::platform::net::UnixListener> {
+    crate::platform::net::bind_unix(path, mode)
+}
+
+/// A non-blocking TCP listener with `SO_REUSEADDR`. Start only.
+/// [`crate::platform::net::listen_tcp`] under the name every service calls.
+pub fn listen_tcp(addr: SocketAddr) -> std::io::Result<crate::platform::net::TcpListener> {
+    crate::platform::net::listen_tcp(addr)
+}
+
+#[cfg(test)]
+mod listener_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A stale socket from a previous process is replaced, the mode is the one
+    /// asked for, and a missing parent directory is created.
+    #[test]
+    fn listen_unix_replaces_a_stale_socket_and_sets_the_mode() {
+        let dir = tempfile::tempdir_in(crate::platform::socket_scratch_root()).unwrap();
+        let path = dir.path().join("nested").join("m6.sock");
+
+        // The parent does not exist yet: binding must create it.
+        let first = listen_unix(&path, 0o660).expect("first bind");
+
+        // Leave a stale socket file behind the way a killed process does, and
+        // bind again: the file must be replaced rather than refused.
+        drop(first);
+        assert!(path.exists(), "the socket file must be left behind");
+        let listener = listen_unix(&path, 0o660).expect("a stale socket is replaced");
+        drop(listener);
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o660);
+    }
 }
 
 #[cfg(test)]
@@ -122,5 +206,39 @@ mod tests {
         assert!(bind_ip("fdexample.com:80").is_none());
         let any = bind_ip("0.0.0.0:443").expect("a literal");
         assert!(!is_private_ip(any));
+    }
+
+    #[test]
+    fn a_literal_needs_no_lookup() {
+        assert_eq!(
+            resolve("192.0.2.1", 8080).expect("an IPv4 literal"),
+            "192.0.2.1:8080"
+                .parse::<SocketAddr>()
+                .expect("the same address")
+        );
+        assert_eq!(
+            resolve("[2001:db8::1]", 443).expect("a bracketed IPv6 literal"),
+            "[2001:db8::1]:443"
+                .parse::<SocketAddr>()
+                .expect("the same address")
+        );
+    }
+
+    #[test]
+    fn localhost_resolves() {
+        let addr = resolve("localhost", 80).expect("localhost resolves");
+        assert_eq!(addr.port(), 80);
+        assert!(addr.ip().is_loopback(), "{addr}");
+    }
+
+    #[test]
+    fn a_name_that_does_not_exist_is_an_error() {
+        // `.invalid` is reserved by RFC 6761, so no resolver can hand out an
+        // address for it.
+        let err = resolve("does-not-exist.invalid", 80).expect_err("must not resolve");
+        assert!(
+            err.to_string().contains("does-not-exist.invalid"),
+            "the error must name the host: {err}"
+        );
     }
 }

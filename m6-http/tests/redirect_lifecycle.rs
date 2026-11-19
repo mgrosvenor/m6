@@ -20,6 +20,11 @@
 //! upstream reports anything. Here it was worse, because the signal did not
 //! even kill it.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::Command;
@@ -30,13 +35,19 @@ use m6_core::testkit;
 /// Start m6-http in redirect mode on a claimed port, with a site and config
 /// written into a temporary directory.
 fn start() -> (testkit::Service, testkit::PortClaim, tempfile::TempDir) {
+    start_with("")
+}
+
+/// The same, with `extra` appended to the system config's `[server]` table.
+fn start_with(extra: &str) -> (testkit::Service, testkit::PortClaim, tempfile::TempDir) {
     let claim = testkit::claim_port();
     let dir = tempfile::tempdir().expect("tempdir");
     let site = dir.path().join("site");
     std::fs::create_dir_all(&site).expect("site dir");
     std::fs::write(
         site.join("site.toml"),
-        "[site]\nname = \"redirect-lifecycle\"\ndomain = \"localhost\"\n",
+        "[site]\nname = \"redirect-lifecycle\"\ndomain = \"localhost\"\n\n\
+         [analytics]\nenabled = false\n",
     )
     .expect("site.toml");
 
@@ -48,9 +59,10 @@ fn start() -> (testkit::Service, testkit::PortClaim, tempfile::TempDir) {
             // is unbindable, which is the point: if this process ever stopped
             // returning early it would fail loudly here instead of quietly
             // serving.
-            "[server]\nbind = \"127.0.0.1:1\"\nredirect_bind = \"127.0.0.1:{}\"\n\n\
+            "[server]\nbind = \"127.0.0.1:1\"\nredirect_bind = \"127.0.0.1:{}\"\n{}\n\
              [node]\nname = \"redirect-lifecycle\"\n",
-            claim.port()
+            claim.port(),
+            extra
         ),
     )
     .expect("redirect.toml");
@@ -58,8 +70,26 @@ fn start() -> (testkit::Service, testkit::PortClaim, tempfile::TempDir) {
     let mut cmd = Command::new(testkit::binary("m6-http"));
     cmd.arg(&site).arg(&config).env("RUST_LOG", "info");
     let mut svc = testkit::Service::spawn("m6-http-redirect", &mut cmd);
-    svc.wait_for_tcp(claim.port(), Duration::from_secs(10));
+    svc.wait_for_tcp(claim.port(), m6_core::testkit::STARTUP_BOUND);
     (svc, claim, dir)
+}
+
+/// One request, one response head.
+fn one(port: u16, host: &str, path: &str) -> String {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    write!(s, "GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n").expect("write");
+    let mut resp = Vec::new();
+    let mut byte = [0u8; 1];
+    while !resp.ends_with(b"\r\n\r\n") {
+        match s.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => resp.push(byte[0]),
+            Err(e) => panic!("read: {e}"),
+        }
+    }
+    String::from_utf8_lossy(&resp).to_string()
 }
 
 /// SIGTERM must stop it, and it must say so.
@@ -70,7 +100,7 @@ fn start() -> (testkit::Service, testkit::PortClaim, tempfile::TempDir) {
 fn sigterm_shuts_down_rather_than_being_ignored() {
     let (mut svc, _claim, _dir) = start();
 
-    let status = svc.terminate(Duration::from_secs(5));
+    let status = svc.terminate(m6_core::testkit::STARTUP_BOUND);
     assert!(
         status.success(),
         "redirect mode should exit 0 on SIGTERM, got {status}. A signal exit status \
@@ -113,5 +143,32 @@ fn it_answers_a_redirect_before_it_is_stopped() {
         "got: {resp}"
     );
 
-    svc.terminate(Duration::from_secs(5));
+    svc.terminate(m6_core::testkit::STARTUP_BOUND);
+}
+
+/// The redirector makes the same unmatched-host decision as the serving
+/// listener: a served name keeps its HTTPS upgrade, and a name the node does
+/// not serve goes to the site's canonical target with the path kept.
+#[test]
+fn an_unserved_host_goes_to_the_canonical_name() {
+    let (mut svc, claim, _dir) = start_with(
+        "served_hosts = [\"example.com\"]\nredirect_unmatched_to = \"canonical.example\"\n",
+    );
+    let served = one(claim.port(), "example.com", "/capabilities?a=1");
+    assert!(served.starts_with("HTTP/1.1 301 "), "got: {served}");
+    assert!(
+        served
+            .to_ascii_lowercase()
+            .contains("location: https://example.com/capabilities?a=1"),
+        "the served name keeps its own upgrade, got: {served}"
+    );
+    let other = one(claim.port(), "other.example", "/capabilities?a=1");
+    assert!(other.starts_with("HTTP/1.1 301 "), "got: {other}");
+    assert!(
+        other
+            .to_ascii_lowercase()
+            .contains("location: https://canonical.example/capabilities?a=1"),
+        "the unmatched name goes to the canonical target, got: {other}"
+    );
+    svc.terminate(m6_core::testkit::STARTUP_BOUND);
 }

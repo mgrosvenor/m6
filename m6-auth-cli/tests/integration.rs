@@ -15,7 +15,12 @@ impl TestEnv {
         // Create data subdirectory
         std::fs::create_dir_all(dir.path().join("data")).expect("mkdir data");
         // Write config
-        let cfg = "[storage]\npath = \"data/auth.db\"\n\n[tokens]\naccess_ttl = 900\nrefresh_ttl = 2592000\nissuer = \"test\"\n\n[keys]\nprivate_key = \"keys/auth.pem\"\npublic_key = \"keys/auth.pub\"\n";
+        let cfg = format!(
+            "[storage]\npath = \"{}\"\n\n[tokens]\naccess_ttl = 900\nrefresh_ttl = 2592000\nissuer = \"test\"\n\n[keys]\nprivate_key = \"{}\"\npublic_key = \"{}\"\n",
+            dir.path().join("data/auth.db").display(),
+            dir.path().join("keys/auth.pem").display(),
+            dir.path().join("keys/auth.pub").display(),
+        );
         std::fs::write(dir.path().join("m6-auth.conf"), cfg).expect("write config");
         TestEnv { dir }
     }
@@ -93,6 +98,24 @@ impl TestEnv {
         cmd.output().expect("run binary")
     }
 
+    /// The database this test's config names, for a fixture that writes it
+    /// through `m6_auth` rather than through the CLI.
+    fn db_path(&self) -> std::path::PathBuf {
+        self.dir.path().join("data/auth.db")
+    }
+
+    /// Create a user directly at bcrypt's lowest cost, 4.
+    ///
+    /// `user add` is production code and hashes at cost 12, which an
+    /// unoptimised build pays seconds for. A test that only needs the user
+    /// seeds it here. The tests whose subject is `user add` or `user passwd`
+    /// still run the command.
+    fn seed(&self, username: &str, password: &str, roles: &[&str]) {
+        let db = m6_auth::Db::open(&self.db_path()).expect("open db");
+        db.user_create_with_cost(username, password, roles, 4)
+            .expect("seed user");
+    }
+
     /// Run a setup command and assert that it exited 0.
     ///
     /// A setup command that fails silently makes the test fail far from the
@@ -138,16 +161,6 @@ fn test_bootstrap_user_add() {
 #[test]
 fn test_bootstrap_group_add() {
     let env = TestEnv::new();
-    // Need a user first for group member add
-    env.run_ok(&[
-        "user",
-        "add",
-        "admin",
-        "--role",
-        "admin",
-        "--password",
-        "secret",
-    ]);
     let out = env.run(&["group", "add", "editors"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
 }
@@ -155,15 +168,7 @@ fn test_bootstrap_group_add() {
 #[test]
 fn test_bootstrap_group_member_add() {
     let env = TestEnv::new();
-    env.run_ok(&[
-        "user",
-        "add",
-        "admin",
-        "--role",
-        "admin",
-        "--password",
-        "secret",
-    ]);
+    env.seed("admin", "secret", &["admin"]);
     env.run_ok(&["group", "add", "editors"]);
     let out = env.run(&["group", "member", "add", "editors", "admin"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
@@ -172,15 +177,7 @@ fn test_bootstrap_group_member_add() {
 #[test]
 fn test_bootstrap_user_ls_json_contains_admin() {
     let env = TestEnv::new();
-    env.run_ok(&[
-        "user",
-        "add",
-        "admin",
-        "--role",
-        "admin",
-        "--password",
-        "secret",
-    ]);
+    env.seed("admin", "secret", &["admin"]);
     env.run_ok(&["group", "add", "editors"]);
     env.run_ok(&["group", "member", "add", "editors", "admin"]);
 
@@ -202,15 +199,7 @@ fn test_bootstrap_user_ls_json_contains_admin() {
 #[test]
 fn test_bootstrap_group_member_ls_shows_admin() {
     let env = TestEnv::new();
-    env.run_ok(&[
-        "user",
-        "add",
-        "admin",
-        "--role",
-        "admin",
-        "--password",
-        "secret",
-    ]);
+    env.seed("admin", "secret", &["admin"]);
     env.run_ok(&["group", "add", "editors"]);
     env.run_ok(&["group", "member", "add", "editors", "admin"]);
 
@@ -260,7 +249,7 @@ fn test_full_bootstrap_sequence() {
 #[test]
 fn test_user_add_duplicate_exits_1() {
     let env = TestEnv::new();
-    env.run_ok(&["user", "add", "alice", "--password", "pass1"]);
+    env.seed("alice", "pass1", &[]);
     let out = env.run(&["user", "add", "alice", "--password", "pass2"]);
     assert_eq!(out.status.code(), Some(1), "stdout: {}", stdout(&out));
     let err = stderr(&out);
@@ -319,8 +308,8 @@ fn test_no_arguments_exits_2() {
 #[test]
 fn test_user_ls_json_is_valid_array() {
     let env = TestEnv::new();
-    env.run_ok(&["user", "add", "alice", "--password", "pw"]);
-    env.run_ok(&["user", "add", "bob", "--password", "pw"]);
+    env.seed("alice", "pw", &[]);
+    env.seed("bob", "pw", &[]);
 
     let out = env.run(&["user", "ls", "--json"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
@@ -351,17 +340,7 @@ fn test_group_ls_json_is_valid_array() {
 #[test]
 fn test_user_ls_table_format() {
     let env = TestEnv::new();
-    env.run_ok(&[
-        "user",
-        "add",
-        "alice",
-        "--role",
-        "admin",
-        "--role",
-        "user",
-        "--password",
-        "pw",
-    ]);
+    env.seed("alice", "pw", &["admin", "user"]);
 
     let out = env.run(&["user", "ls"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
@@ -387,7 +366,7 @@ fn test_group_ls_table_format() {
 #[test]
 fn test_user_passwd() {
     let env = TestEnv::new();
-    env.run_ok(&["user", "add", "alice", "--password", "old"]);
+    env.seed("alice", "old", &[]);
     let out = env.run(&["user", "passwd", "alice", "--password", "newpass"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
 }
@@ -397,7 +376,7 @@ fn test_user_passwd() {
 #[test]
 fn test_user_roles_set_unset() {
     let env = TestEnv::new();
-    env.run_ok(&["user", "add", "alice", "--role", "user", "--password", "pw"]);
+    env.seed("alice", "pw", &["user"]);
 
     // Add admin role
     let out = env.run(&["user", "roles", "alice", "--set", "admin"]);
@@ -454,7 +433,7 @@ fn test_group_del() {
 #[test]
 fn test_user_del() {
     let env = TestEnv::new();
-    env.run_ok(&["user", "add", "tmp", "--password", "pw"]);
+    env.seed("tmp", "pw", &[]);
     let out = env.run(&["user", "del", "tmp"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
 
@@ -469,7 +448,7 @@ fn test_user_del() {
 fn test_token_create_prints_jwt() {
     let env = TestEnv::new();
     env.setup_keys();
-    env.run_ok(&["user", "add", "alice", "--password", "pw"]);
+    env.seed("alice", "pw", &[]);
 
     let out = env.run(&["token", "create", "alice", "--name", "ci"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
@@ -495,7 +474,7 @@ fn test_token_create_unknown_user_exits_1() {
 fn test_token_create_missing_keys_exits_1() {
     let env = TestEnv::new();
     // No setup_keys() call — keys dir doesn't exist
-    env.run_ok(&["user", "add", "alice", "--password", "pw"]);
+    env.seed("alice", "pw", &[]);
 
     let out = env.run(&["token", "create", "alice"]);
     assert_eq!(out.status.code(), Some(1), "stdout: {}", stdout(&out));
@@ -511,7 +490,7 @@ fn test_token_create_missing_keys_exits_1() {
 fn test_token_ls_shows_created_token() {
     let env = TestEnv::new();
     env.setup_keys();
-    env.run_ok(&["user", "add", "alice", "--password", "pw"]);
+    env.seed("alice", "pw", &[]);
     env.run_ok(&["token", "create", "alice", "--name", "mytoken"]);
 
     let out = env.run(&["token", "ls", "alice"]);
@@ -520,30 +499,135 @@ fn test_token_ls_shows_created_token() {
     assert!(body.contains("mytoken"), "expected token name in: {}", body);
 }
 
+/// The diagnostic for a `token ls --json` failure, built at the moment it is
+/// needed.
+///
+/// The m6 issue 327 record carried neither command stream and no independent
+/// view of the rows. This message carries both streams, the array the listing
+/// answered, and the rows a second, fresh connection can read right now, so a
+/// failure shows whether the rows existed independently of the listing.
+fn listing_failure(env: &TestEnv, out: &Output) -> String {
+    let out_text = stdout(out);
+    let err_text = stderr(out);
+    let parsed = match serde_json::from_str::<serde_json::Value>(&out_text) {
+        Ok(value) => match value.as_array() {
+            Some(arr) => format!("{arr:?}"),
+            None => format!("<not an array: {value:?}>"),
+        },
+        Err(e) => format!("<no JSON array: {e}>"),
+    };
+    let rows = match m6_auth::Db::open(&env.db_path()) {
+        Ok(db) => match db.api_token_list("alice") {
+            Ok(tokens) => {
+                let names: Vec<&str> = tokens.iter().map(|tok| tok.name.as_str()).collect();
+                format!("{} {:?}", tokens.len(), names)
+            }
+            Err(e) => format!("<fresh connection could not list the rows: {e}>"),
+        },
+        Err(e) => format!("<fresh connection could not open the database: {e}>"),
+    };
+    format!(
+        "stdout: {out_text:?}\nstderr: {err_text:?}\nparsed array: {parsed}\nfresh-connection rows: {rows}"
+    )
+}
+
 #[test]
 fn test_token_ls_json_is_valid_array() {
     let env = TestEnv::new();
     env.setup_keys();
-    env.run_ok(&["user", "add", "alice", "--password", "pw"]);
+    env.seed("alice", "pw", &[]);
+    // The rows this test counts are written by the two CLI processes it runs,
+    // so the count proves that two `token create` processes that exited 0 are
+    // both visible to the next command. The failure message reads the rows
+    // again through a second, fresh connection, so a failure shows whether the
+    // rows existed at all.
     env.run_ok(&["token", "create", "alice", "--name", "t1"]);
     env.run_ok(&["token", "create", "alice", "--name", "t2"]);
 
     let out = env.run(&["token", "ls", "alice", "--json"]);
-    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "token ls failed: {}",
+        listing_failure(&env, &out)
+    );
     let body = stdout(&out);
-    let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
-    assert!(parsed.is_array(), "expected array, got: {}", body);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|e| {
+        panic!(
+            "token ls did not answer JSON ({e}): {}",
+            listing_failure(&env, &out)
+        )
+    });
+    assert!(
+        parsed.is_array(),
+        "token ls answered no array: {}",
+        listing_failure(&env, &out)
+    );
     let arr = parsed.as_array().unwrap();
-    assert_eq!(arr.len(), 2);
-    assert!(arr.iter().any(|t| t["name"] == "t1"), "t1 not found");
-    assert!(arr.iter().any(|t| t["name"] == "t2"), "t2 not found");
+    assert_eq!(
+        arr.len(),
+        2,
+        "the two tokens the CLI created are not both listed: {}",
+        listing_failure(&env, &out)
+    );
+    assert!(
+        arr.iter().any(|t| t["name"] == "t1"),
+        "t1 is not listed: {}",
+        listing_failure(&env, &out)
+    );
+    assert!(
+        arr.iter().any(|t| t["name"] == "t2"),
+        "t2 is not listed: {}",
+        listing_failure(&env, &out)
+    );
+}
+
+/// The record from m6 issue 327: a `token create` that exits 0 must be listed
+/// by the very next command. No retry and no sleep: the create's exit is the
+/// event, and the listing is the assertion, so a create that reports success
+/// without its row being visible fails here with both commands' output.
+#[test]
+fn test_token_ls_lists_the_token_the_previous_command_created() {
+    let env = TestEnv::new();
+    env.setup_keys();
+    env.seed("alice", "pw", &[]);
+    env.run_ok(&["token", "create", "alice", "--name", "after-create"]);
+
+    let out = env.run(&["token", "ls", "alice", "--json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "token ls failed: {}",
+        listing_failure(&env, &out)
+    );
+    let body = stdout(&out);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|e| {
+        panic!(
+            "token ls did not answer JSON ({e}): {}",
+            listing_failure(&env, &out)
+        )
+    });
+    let arr = parsed
+        .as_array()
+        .unwrap_or_else(|| panic!("expected an array: {}", listing_failure(&env, &out)));
+    assert_eq!(
+        arr.len(),
+        1,
+        "the token the previous command created is not listed: {}",
+        listing_failure(&env, &out)
+    );
+    assert!(
+        arr.iter().any(|t| t["name"] == "after-create"),
+        "the created token is not listed: {}",
+        listing_failure(&env, &out)
+    );
 }
 
 #[test]
 fn test_token_revoke_removes_token() {
     let env = TestEnv::new();
     env.setup_keys();
-    env.run_ok(&["user", "add", "alice", "--password", "pw"]);
+    env.seed("alice", "pw", &[]);
     env.run_ok(&["token", "create", "alice", "--name", "todel"]);
 
     // Get the token ID from JSON listing
@@ -581,7 +665,7 @@ fn test_token_revoke_unknown_exits_1() {
 #[test]
 fn test_group_member_del() {
     let env = TestEnv::new();
-    env.run_ok(&["user", "add", "alice", "--password", "pw"]);
+    env.seed("alice", "pw", &[]);
     env.run_ok(&["group", "add", "team"]);
     env.run_ok(&["group", "member", "add", "team", "alice"]);
 
@@ -591,4 +675,71 @@ fn test_group_member_del() {
     // Verify removed
     let out2 = env.run(&["group", "member", "ls", "team"]);
     assert!(!stdout(&out2).contains("alice"), "alice still a member");
+}
+
+#[test]
+fn a_relative_storage_path_exits_2() {
+    let env = TestEnv::new();
+    std::fs::write(
+        env.dir.path().join("m6-auth.conf"),
+        "[storage]\npath = \"data/auth.db\"\n",
+    )
+    .expect("write config");
+    let out = env.run(&["user", "ls"]);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("[storage] path"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn a_relative_private_key_exits_2() {
+    let env = TestEnv::new();
+    let db = env.dir.path().join("data/auth.db").display().to_string();
+    let pubkey = env.dir.path().join("keys/auth.pub").display().to_string();
+    std::fs::write(
+        env.dir.path().join("m6-auth.conf"),
+        format!(
+            "[storage]\npath = \"{db}\"\n\n[tokens]\nissuer = \"test.example.com\"\n\n[keys]\nprivate_key = \"keys/auth.pem\"\npublic_key = \"{pubkey}\"\n"
+        ),
+    )
+    .expect("write config");
+    let out = env.run(&["user", "ls"]);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("[keys] private_key"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+/// A config with no `[tokens] issuer` exits 2 and names the key.
+///
+/// This tool reads no site.toml, so there is no deployment name to fall back to
+/// and it refuses rather than inventing `localhost`. The wrong outcome this
+/// catches: every token from a config that names no issuer carries the same
+/// default name, so a token minted for one deployment verifies at another that
+/// shares the signing key.
+#[test]
+fn a_config_without_an_issuer_exits_2_naming_the_key() {
+    let env = TestEnv::new();
+    let db = env.dir.path().join("data/auth.db").display().to_string();
+    let pubkey = env.dir.path().join("keys/auth.pub").display().to_string();
+    std::fs::write(
+        env.dir.path().join("m6-auth.conf"),
+        format!(
+            "[storage]\npath = \"{db}\"\n\n[tokens]\naccess_ttl = 900\nrefresh_ttl = 2592000\n\n[keys]\nprivate_key = \"{}\"\npublic_key = \"{pubkey}\"\n",
+            env.dir.path().join("keys/auth.pem").display(),
+        ),
+    )
+    .expect("write config");
+    let out = env.run(&["user", "ls"]);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("[tokens] issuer"),
+        "stderr: {}",
+        stderr(&out)
+    );
 }

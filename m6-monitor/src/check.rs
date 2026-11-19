@@ -1,10 +1,20 @@
 //! The hourly health check, printed.
 //!
-//! Apart from section H's tunnel check, this takes every figure from the
-//! nodes' own HTTP endpoints. It does not log in
-//! to any node or run `journalctl`, `systemctl`, `df` or `curl` there, and it
-//! does not parse an analytics log over the wire. Each figure is a field on
-//! `/perf` or `/traffic`, computed by the node that owns the data.
+//! HEALTH comes first, because it is the question the check exists to answer:
+//! this poll's `/health` for each node, and the age of the node's last 200 from
+//! the history. A node that has not answered 200 for longer than
+//! `health_last_ok_max_age_s`, which defaults to three poll intervals, is
+//! flagged there and in the verdict.
+//!
+//! Apart from section H's tunnel check, every figure comes from one of two
+//! places: the node's own `/health`, and mon's journal. Each node streams its
+//! metrics and traffic lines there, and each line carries `perf` or `traffic`
+//! on `M6_TYPE` with the node named in the document. The same journal carries
+//! each run's start-up record and its shutdown line, which the STARTUP section
+//! renders. This process runs no
+//! command on a node, and it does not read an analytics log over the wire. The
+//! one command it runs is `journalctl`, here, against mon's copy of the
+//! journals.
 //!
 //! A health check that measures its own effect on the nodes gives wrong
 //! answers. Three ways it goes wrong: it flags its own load generator as a
@@ -22,24 +32,22 @@
 //!
 //! Section I shows the state of the poll history (`history.rs`).
 //!
-//! Section A also shows each node's last log reopen, and the limit it is
-//! judged against when `log_reopen_max_age_s` is set.
-//!
 //! Exit status is 1 when there are faults, so it works as a cron check.
 
 use std::fmt::Write as _;
 
-use crate::digest::{Digest, Level};
+use crate::digest::{fmt_uptime, header_check_text, Digest, Finding, Level};
 use crate::poll::NodeReading;
 
 /// Reverse-lookup results by address, read by [`render`].
 pub type Verdicts = std::collections::HashMap<String, m6_core::resolve::Ptr>;
 
-/// The most new addresses looked up in one poll.
+/// The most new addresses one poll starts a lookup for.
 ///
-/// Each lookup can take the full two-second deadline, and they run one after
-/// another on the poller thread, so this bounds how long a poll is held up by
-/// a resolver that never answers: 8 x 2 s. An address past the cap reads
+/// Each lookup carries the fleet's `timeout_ms` deadline, and the poll keeps up
+/// to this many in flight at once, starting the next as each answer or
+/// deadline frees a slot. A resolver that never answers therefore costs one
+/// fleet timeout per batch, not one per address. An address past the cap reads
 /// "not looked up" in this poll and is tried in the next.
 pub const MAX_LOOKUPS_PER_POLL: usize = 8;
 
@@ -61,14 +69,16 @@ pub const MAX_CACHED_VERDICTS: usize = 512;
 
 /// Lookup results kept across polls, so a report only reads them.
 ///
-/// The poller thread calls [`VerdictCache::refresh`] before it takes the
-/// snapshot's write lock. [`render`] never resolves anything, so `/check`
-/// cannot be stalled by a resolver and cannot hold up the poller.
+/// The poll calls [`VerdictCache::due`] to learn which addresses need a lookup
+/// and [`VerdictCache::record`] for each answer its loop receives. [`render`]
+/// never resolves anything, so `/check` cannot be stalled by a resolver and
+/// cannot hold up the poll.
 pub struct VerdictCache {
     entries: std::collections::HashMap<String, (std::time::Instant, m6_core::resolve::Ptr)>,
     cap: usize,
 }
 
+#[cfg(test)]
 impl Default for VerdictCache {
     fn default() -> Self {
         Self::with_cap(MAX_LOOKUPS_PER_POLL)
@@ -77,6 +87,7 @@ impl Default for VerdictCache {
 
 impl VerdictCache {
     /// A cache for the poller: at most [`MAX_LOOKUPS_PER_POLL`] lookups a poll.
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -89,18 +100,57 @@ impl VerdictCache {
         }
     }
 
-    /// Look up the crawler addresses in `readings` that are not cached or
-    /// have expired, at most the cache's cap of them, and return the
-    /// results for every address the report will show.
-    pub fn refresh(
+    /// The addresses in `readings` that need a lookup now: not cached, not
+    /// expired, and at most the cache's cap, in the order the report shows
+    /// them. `out` is reused every poll.
+    pub fn due(
         &mut self,
         readings: &[NodeReading],
         now: std::time::Instant,
-        lookup: &dyn Fn(&str) -> m6_core::resolve::Ptr,
-    ) -> Verdicts {
-        use m6_core::resolve::Ptr;
+        out: &mut Vec<String>,
+    ) {
         self.entries.retain(|_, (expires, _)| *expires > now);
-        let mut looked_up = 0;
+        out.clear();
+        for ip in readings
+            .iter()
+            .filter_map(|r| r.traffic.as_ref())
+            .flat_map(|t| t.crawlers.iter())
+            .flat_map(|c| c.client_ips.iter().take(CHECKED_ADDRESSES))
+        {
+            if out.contains(ip) || self.entries.contains_key(ip) {
+                continue;
+            }
+            out.push(ip.clone());
+            if out.len() == self.cap {
+                break;
+            }
+        }
+    }
+
+    /// Store one lookup's answer, replacing an older one for the address.
+    pub fn record(&mut self, addr: &str, ptr: m6_core::resolve::Ptr, now: std::time::Instant) {
+        let ttl = if ptr == m6_core::resolve::Ptr::Failed {
+            FAILED_TTL
+        } else {
+            VERDICT_TTL
+        };
+        if self.entries.len() >= MAX_CACHED_VERDICTS && !self.entries.contains_key(addr) {
+            // Drop the entry closest to expiry.
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (e, _))| *e)
+                .map(|(k, _)| k.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(addr.to_string(), (now + ttl, ptr));
+    }
+
+    /// What the report reads: one answer for every address in `readings` that
+    /// has one.
+    pub fn verdicts(&self, readings: &[NodeReading]) -> Verdicts {
         let mut out = Verdicts::new();
         for ip in readings
             .iter()
@@ -111,32 +161,31 @@ impl VerdictCache {
             if out.contains_key(ip) {
                 continue;
             }
-            if !self.entries.contains_key(ip) && looked_up < self.cap {
-                looked_up += 1;
-                let ptr = lookup(ip);
-                let ttl = if ptr == Ptr::Failed {
-                    FAILED_TTL
-                } else {
-                    VERDICT_TTL
-                };
-                if self.entries.len() >= MAX_CACHED_VERDICTS {
-                    // Drop the entry closest to expiry.
-                    if let Some(oldest) = self
-                        .entries
-                        .iter()
-                        .min_by_key(|(_, (e, _))| *e)
-                        .map(|(k, _)| k.clone())
-                    {
-                        self.entries.remove(&oldest);
-                    }
-                }
-                self.entries.insert(ip.clone(), (now + ttl, ptr));
-            }
             if let Some((_, ptr)) = self.entries.get(ip) {
                 out.insert(ip.clone(), ptr.clone());
             }
         }
         out
+    }
+
+    /// Look up every due address through `lookup`, then return the report's
+    /// answers. The unit tests drive the cache through this; the service's
+    /// loop and `--check` call [`due`](Self::due) and [`record`](Self::record)
+    /// around their own non-blocking lookups.
+    #[cfg(test)]
+    pub fn refresh(
+        &mut self,
+        readings: &[NodeReading],
+        now: std::time::Instant,
+        lookup: &dyn Fn(&str) -> m6_core::resolve::Ptr,
+    ) -> Verdicts {
+        let mut due = Vec::new();
+        self.due(readings, now, &mut due);
+        for addr in &due {
+            let ptr = lookup(addr);
+            self.record(addr, ptr, now);
+        }
+        self.verdicts(readings)
     }
 }
 
@@ -156,6 +205,196 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
         d.nodes.len()
     );
     let _ = writeln!(o, "{bar}");
+
+    // ── HEALTH ───────────────────────────────────────────────────────────────
+    //
+    // The first section, because a reader of a fleet report asks whether the
+    // nodes are serving before anything else. Both facts are already collected:
+    // the poll asks every node for `/health` and the service keeps every poll
+    // in its history, so this reads rather than adds a poll.
+    let limit_s = d.thresholds.health_last_ok_age_s;
+    let _ = writeln!(
+        o,
+        "\nHEALTH  (this poll's /health per node and the age of its last 200 from \
+         history. Older than {limit_s}s is flagged)"
+    );
+    for r in readings {
+        let l = health_line(r, d.history.as_ref(), limit_s);
+        let label = if r.status() == "ok" && !l.stale {
+            "ok"
+        } else {
+            "FAULT"
+        };
+        let _ = writeln!(o, "  {:<5} {:<7} {}, {}", r.name, label, l.status, l.age);
+    }
+
+    // ── PROCESSES ────────────────────────────────────────────────────────────
+    //
+    // Only for a node polled as several processes. Each process has its own
+    // line above and below as `<node>/<index>`; this adds them up, because one
+    // process's counters are its share of the node and not the node.
+    if !d.process_groups.is_empty() {
+        let _ = writeln!(
+            o,
+            "\nPROCESSES  (each node's processes added together; every process is also listed \
+             as <node>/<index>)"
+        );
+        for g in &d.process_groups {
+            let label = if g.down.is_empty() { "ok" } else { "FAULT" };
+            let _ = write!(
+                o,
+                "  {:<5} {:<7} {} of {} processes up, {} request(s), {} hit(s), {} miss(es)",
+                g.node,
+                label,
+                g.up,
+                g.processes,
+                g.requests_total,
+                g.cache_hits_total,
+                g.cache_misses_total
+            );
+            if g.reporting < g.processes {
+                let _ = write!(o, " (from {} of {} reports)", g.reporting, g.processes);
+            }
+            if !g.down.is_empty() {
+                let _ = write!(o, "; not answering: {}", g.down.join(", "));
+            }
+            let _ = writeln!(o);
+        }
+    }
+
+    // ── STARTUP ──────────────────────────────────────────────────────────────
+    //
+    // The newest start-up record of each node and app. It answers the two
+    // questions the other sections cannot: what release each process is
+    // running, and which config file it actually read. The deploy's own
+    // expected values sit beside it, so a difference is visible here as well as
+    // in the verdict.
+    let _ = writeln!(
+        o,
+        "\nSTARTUP  (the newest start-up record of each node and app, from the journal; \
+         the expected values from the deploy's record)"
+    );
+    if d.startup.runs.is_empty() {
+        match d.startup.journal_unavailable.as_deref() {
+            Some(reason) => {
+                let _ = writeln!(
+                    o,
+                    "  (no start-up record: the journal reader is not running: {reason})"
+                );
+            }
+            None => {
+                let _ = writeln!(o, "  (no start-up record in the journal)");
+            }
+        }
+    }
+    for run in &d.startup.runs {
+        let labelled = match run.process_index {
+            Some(index) => format!("{}/{index}", run.app),
+            None => run.app.clone(),
+        };
+        let config = if run.config.is_empty() {
+            "-".to_string()
+        } else {
+            run.config
+                .iter()
+                .map(|(role, sha)| format!("{role}={sha}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let label = if run.state == "complete" {
+            "ok"
+        } else {
+            "FAULT"
+        };
+        let _ = writeln!(
+            o,
+            "  {:<8} {:<12} {:<6} {:<26} started {}",
+            run.node, labelled, label, run.version, run.started_at
+        );
+        let complete = match run.complete_lines {
+            Some(lines) => format!("{lines}"),
+            None => "-".to_string(),
+        };
+        let _ = writeln!(
+            o,
+            "           run {}, config {config}, {}/{} line(s)",
+            run.run_id, run.lines, complete
+        );
+        let _ = writeln!(o, "           {} line(s) ingested", run.ingested_lines);
+        if let Some(shutdown) = &run.shutdown {
+            let _ = writeln!(
+                o,
+                "           last shutdown {:?} after {}ms",
+                shutdown.reason, shutdown.uptime_ms
+            );
+        }
+        if let (Some(previous), Some(how)) = (&run.previous_run_id, &run.previous_shutdown) {
+            let ended = match how {
+                Some(s) => format!("shut down {} at {}", s.reason, s.at),
+                None => "no shutdown recorded".to_string(),
+            };
+            let level = match run.restart {
+                Some("warn") => "  [WARN: unexpected restart]",
+                Some(_) => "  [info]",
+                None => "",
+            };
+            let _ = writeln!(o, "           previous: {previous}, {ended}{level}");
+        }
+    }
+    match d.startup.expected_state.as_str() {
+        "loaded" => {
+            let _ = writeln!(
+                o,
+                "  deploy record {}: loaded, environment {}, deploy in progress {}",
+                d.startup.expected_file.as_deref().unwrap_or("-"),
+                d.startup.environment.as_deref().unwrap_or("?"),
+                match d.startup.deploy_in_progress {
+                    Some(true) => "yes",
+                    Some(false) => "no",
+                    None => "unknown",
+                }
+            );
+        }
+        "missing" => {
+            let _ = writeln!(
+                o,
+                "  deploy record {}: waiting for the deploy side (the file does not exist yet)",
+                d.startup.expected_file.as_deref().unwrap_or("-")
+            );
+        }
+        "not_configured" => {
+            let _ = writeln!(
+                o,
+                "  no deploy record configured: set [monitor] expected_deploy_file to the file the deploy writes"
+            );
+        }
+        state => {
+            let _ = writeln!(
+                o,
+                "  deploy record {}: FAULT, {state}{}",
+                d.startup.expected_file.as_deref().unwrap_or("-"),
+                d.startup
+                    .expected_error
+                    .as_deref()
+                    .map(|e| format!(": {e}"))
+                    .unwrap_or_default()
+            );
+        }
+    }
+    if d.startup.cut_records > 0 {
+        let _ = writeln!(
+            o,
+            "  {} start-up record(s) were cut by the journal tail and are not shown",
+            d.startup.cut_records
+        );
+    }
+    if d.startup.orphan_shutdowns > 0 {
+        let _ = writeln!(
+            o,
+            "  {} shutdown line(s) had no start-up record, so they name no run",
+            d.startup.orphan_shutdowns
+        );
+    }
 
     // ── A. logging ───────────────────────────────────────────────────────────
     let _ = writeln!(o, "\nA. LOGGING");
@@ -189,61 +428,6 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
                     r.unreachable
                         .as_deref()
                         .unwrap_or("no traffic summary and no reason given")
-                );
-            }
-        }
-    }
-
-    match d.thresholds.log_reopen_age_s {
-        Some(max) => {
-            let _ = writeln!(
-                o,
-                "  log file reopen (rotation renames the file and signals): limit {max}s"
-            );
-        }
-        None => {
-            let _ = writeln!(
-                o,
-                "  log file reopen (rotation renames the file and signals): \
-                 no limit configured, shown and not judged"
-            );
-        }
-    }
-    for n in &d.nodes {
-        let l = &n.log_reopen;
-        let uptime = n
-            .uptime_s
-            .map_or_else(|| "-".to_string(), |u| u.to_string());
-        match l.state {
-            "ok" => {
-                let _ = write!(
-                    o,
-                    "  {:<5} reopened {}s ago, {} since start",
-                    n.name,
-                    l.age_s.unwrap_or(0),
-                    l.reopens.unwrap_or(0)
-                );
-                if l.failures.unwrap_or(0) > 0 {
-                    let _ = write!(o, ", {} failed", l.failures.unwrap_or(0));
-                }
-                let _ = writeln!(o);
-            }
-            "never" => {
-                let _ = writeln!(
-                    o,
-                    "  {:<5} never reopened since start (up {uptime}s)",
-                    n.name
-                );
-            }
-            "no_log_file" => {
-                let _ = writeln!(o, "  {:<5} writes no log file", n.name);
-            }
-            _ => {
-                let _ = writeln!(
-                    o,
-                    "  {:<5} unknown  {}",
-                    n.name,
-                    l.detail.as_deref().unwrap_or("")
                 );
             }
         }
@@ -316,6 +500,8 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
             for c in &p.metrics.channels {
                 let total = c.hits + c.misses;
                 if total == 0 {
+                    // A monitor channel has requests and no hit or miss, so it
+                    // is skipped here. This section compares visitor traffic.
                     continue;
                 }
                 // The visitor channel is marked because it is what a reader should
@@ -378,36 +564,44 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
             n.thermal_max_c
                 .map(|c| format!("{c:.0}C"))
                 .unwrap_or_else(|| "-".into()),
-            n.uptime_s.map(fmt_dur).unwrap_or_else(|| "-".into()),
+            n.uptime_s.map(fmt_uptime).unwrap_or_else(|| "-".into()),
         );
         // What each node runs, on the line with load and disk rather than in a
         // section of its own: the question "is this node the one that is behind"
         // is asked at the same moment as "is this node the busy one".
         //
-        // Name, version AND build hash, because the version alone cannot tell
-        // two builds of one tag apart and reading three identical version
-        // strings is exactly what "the fleet agrees" looks like while it
-        // does not. Twelve characters of the hash: enough to compare by
-        // eye and the prefix an operator's notes would quote.
+        // Name, full version AND the commit from its build metadata, because
+        // the release tag alone cannot tell two builds of one tag apart and
+        // reading identical release strings is exactly what "the fleet agrees"
+        // looks like while it does not. The commit is the metadata's own text,
+        // parsed out with the semver crate, so no display code slices a version
+        // string. The version beside it keeps the `.dirty` suffix that says the
+        // tree it was built from had uncommitted changes.
         //
         // The certificate is on this line too, for the same reason: "how long
         // has this node got" is asked beside "what is it running", and a
         // certificate reported anywhere an operator does not already look is
         // reported nowhere. From the certificate m6-http loaded, so it is what
         // the node is serving rather than what is on its disk.
+        //
+        // The fingerprint sits beside the expiry because the expiry alone
+        // cannot tell two certificates apart when they expire on the same day,
+        // and issue #275 is that: a reader comparing two nodes needs the
+        // identity, not only the countdown. Twelve characters, like the build
+        // commit, enough to compare by eye.
         let _ = writeln!(
             o,
-            "        {} {} build {} cert {}",
+            "        {} {} build {} cert {} fp {}",
             n.binary.as_deref().unwrap_or("m6"),
             n.version
                 .as_deref()
                 .unwrap_or("unknown (node too old to report it)"),
-            n.hash
-                .as_deref()
-                .map(|h| &h[..h.len().min(12)])
-                .unwrap_or("unknown"),
+            crate::digest::commit(n).unwrap_or_else(|| "unknown".into()),
             n.cert_expires_in_seconds
                 .map(fmt_cert_expiry)
+                .unwrap_or_else(|| "-".into()),
+            n.cert_fingerprint
+                .map(|f| f.short())
                 .unwrap_or_else(|| "-".into()),
         );
     }
@@ -507,11 +701,11 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
 
         // The firewall, which this report has been receiving and discarding.
         //
-        // `/traffic` has carried `firewall: Option<FirewallState>` all along and
-        // nothing rendered it. That was reasonable until 2026-09-15: the collector
-        // that writes /var/lib/m6/firewall.json was written, tested and deployed
-        // nowhere, so every node returned `firewall: null` and there was nothing
-        // to print. It is installed now.
+        // The traffic document has carried `firewall: Option<FirewallState>`
+        // all along and nothing rendered it. That was reasonable until
+        // 2026-09-15: the collector that writes /var/lib/m6/firewall.json was
+        // written, tested and deployed nowhere, so every node returned
+        // `firewall: null` and there was nothing to print. It is installed now.
         //
         // Blocks that have dropped NOTHING are not printed individually. A block
         // at zero has done its job -- whoever it was aimed at stopped coming -- and
@@ -563,7 +757,6 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
     // What to expect is declared by the DEPLOYMENT in the fleet config, not here.
     // A cache policy is a property of a site; m6 is a generic web system and has
     // no business knowing that /capabilities wants max-age=60.
-    let mut header_faults: Vec<String> = Vec::new();
     let any_declared = readings.iter().any(|r| !r.header_checks.is_empty());
     let _ = writeln!(o, "\nF. CACHE HEADERS");
     if !any_declared {
@@ -578,35 +771,20 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
             for hc in &r.header_checks {
                 if hc.passed() {
                     let _ = writeln!(o, "  {:<5} ok     {} {}", r.name, hc.path, hc.header);
-                } else if let Some(e) = &hc.error {
-                    let _ = writeln!(
-                        o,
-                        "  {:<5} FAULT  {} could not be fetched: {}",
-                        r.name, hc.path, e
-                    );
-                    header_faults
-                        .push(format!("{}: {} could not be fetched: {e}", r.name, hc.path));
+                } else if hc.error.is_some() {
+                    let _ = writeln!(o, "  {:<5} FAULT  {}", r.name, header_check_text(hc));
                 } else {
-                    // Absent and wrong are different failures and read
-                    // differently: a missing header is usually a route that lost
-                    // its policy, a wrong one a policy that changed.
-                    let got = hc
-                        .actual
-                        .clone()
-                        .unwrap_or_else(|| "<header absent>".to_string());
                     let code = hc
                         .status
                         .map(|c| format!(" (HTTP {c})"))
                         .unwrap_or_default();
                     let _ = writeln!(
                         o,
-                        "  {:<5} FAULT  {} {} is {:?}, expected {:?}{}",
-                        r.name, hc.path, hc.header, got, hc.expected, code
+                        "  {:<5} FAULT  {}{}",
+                        r.name,
+                        header_check_text(hc),
+                        code
                     );
-                    header_faults.push(format!(
-                        "{}: {} {} is {:?}, expected {:?}",
-                        r.name, hc.path, hc.header, got, hc.expected
-                    ));
                 }
             }
         }
@@ -792,7 +970,7 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
             }
         }
         // The kernel's own count of what the tunnel interface refused to carry,
-        // from each node's /perf, when the node reported it.
+        // from each node's metrics document, when the node reported it.
         for (n, r) in d.nodes.iter().zip(readings) {
             let Some(p) = &r.perf else { continue };
             for dev in p.host.net.iter().filter(|dev| dev.name.starts_with("wg")) {
@@ -879,21 +1057,109 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
             let _ = writeln!(o, "  - {}: {}", f.node, f.text);
         }
     }
-    // Header failures are found HERE rather than in the digest, because the digest
-    // is built from /health and /perf and knows nothing about them. They still
-    // have to reach the verdict: a node serving a page with the wrong cache policy
-    // is not "all clear", and printing that it is would be the report lying.
-    if !header_faults.is_empty() {
-        let _ = writeln!(o, "CACHE HEADER FAULTS ({})", header_faults.len());
-        for f in &header_faults {
-            let _ = writeln!(o, "  - {f}");
-        }
-    }
-    if faults.is_empty() && warns.is_empty() && header_faults.is_empty() {
+    if faults.is_empty() && warns.is_empty() {
         let _ = writeln!(o, "ALL CLEAR on all {} nodes.", d.nodes.len());
     }
     let _ = writeln!(o, "{bar}");
     o
+}
+
+/// One node's HEALTH line.
+struct HealthLine {
+    /// Whether the last 200 is older than the limit.
+    stale: bool,
+    /// `200`, `503 degraded` with the reason, or what the node did instead.
+    status: String,
+    /// `last 200 45s ago`, or which absence the line is reporting.
+    age: String,
+}
+
+/// What this poll's `/health` was, in words. Whether it is a fault is
+/// `NodeReading::status()`, the one rule, and this only describes it.
+fn health_text(r: &NodeReading) -> String {
+    if let Some(why) = &r.unreachable {
+        return format!("unreachable: {why}");
+    }
+    let code = r
+        .health_status
+        .map_or("no answer".into(), |c| c.to_string());
+    match r.status() {
+        "ok" => code,
+        "degraded" => format!("{code} degraded: {}", crate::digest::DEGRADED_REASON),
+        other => format!("{code} {other}"),
+    }
+}
+
+fn health_line(
+    r: &NodeReading,
+    history: Option<&crate::history::HistoryDigest>,
+    limit_s: u64,
+) -> HealthLine {
+    let (age, stale) = if r.status() == "ok" {
+        // This poll's 200 is the node's last 200, and history cannot make it
+        // older. A node that has just recovered must not be flagged for the
+        // time it was away.
+        ("last 200 0s ago".to_string(), false)
+    } else {
+        last_ok(r, history, limit_s)
+    };
+    HealthLine {
+        stale,
+        status: health_text(r),
+        age,
+    }
+}
+
+/// The age of a node's last 200, and whether it is over `limit_s`.
+fn last_ok(
+    r: &NodeReading,
+    history: Option<&crate::history::HistoryDigest>,
+    limit_s: u64,
+) -> (String, bool) {
+    let Some(h) = history else {
+        return (
+            "last 200 unknown (--check keeps no history)".to_string(),
+            false,
+        );
+    };
+    if h.state == "off" {
+        return ("last 200 unknown (history off)".to_string(), false);
+    }
+    let Some(list) = &h.last_ok else {
+        return (
+            "last 200 unknown (history could not be read)".to_string(),
+            false,
+        );
+    };
+    match list.iter().find(|l| l.node == r.name) {
+        None => ("last 200 unknown (no 200 in history)".to_string(), false),
+        Some(l) if l.age_s > limit_s => (
+            format!("last 200 {}s ago, over the {limit_s}s limit", l.age_s),
+            true,
+        ),
+        Some(l) => (format!("last 200 {}s ago", l.age_s), false),
+    }
+}
+
+/// The verdict's finding for a node whose last 200 is over the limit.
+///
+/// The HEALTH line already prints the fault. This puts the same judgement in
+/// the FAULTS list and the exit status, so a line that reads FAULT cannot sit
+/// above an ALL CLEAR.
+pub(crate) fn stale_last_ok_finding(
+    r: &NodeReading,
+    history: Option<&crate::history::HistoryDigest>,
+    limit_s: u64,
+) -> Option<Finding> {
+    if r.status() == "ok" {
+        return None;
+    }
+    let (text, stale) = last_ok(r, history, limit_s);
+    stale.then(|| Finding {
+        level: Level::Fault,
+        node: r.name.clone(),
+        text,
+    })
 }
 
 /// Whether each address behind a sighting supports the agent's claim.
@@ -980,20 +1246,10 @@ fn verdict_lines(c: &m6_core::monitoring::CrawlerReport, verdicts: &Verdicts) ->
     out
 }
 
-fn fmt_dur(secs: u64) -> String {
-    let d = secs / 86_400;
-    let h = (secs % 86_400) / 3_600;
-    if d > 0 {
-        format!("{d}d{h}h")
-    } else {
-        format!("{h}h")
-    }
-}
-
 /// Seconds left on a certificate, as days.
 ///
 /// Days because that is the unit renewal is discussed in, and a bare `12d` next
-/// to a build hash is read correctly without a legend. Separate from `fmt_dur`
+/// to a build commit is read correctly without a legend. Separate from `fmt_uptime`
 /// because this number goes negative and that one cannot: an expired
 /// certificate reads `EXPIRED 3d ago`, which is a different sentence from a
 /// small positive number and has to look like one on a line being skimmed.
@@ -1019,6 +1275,7 @@ mod tests {
         TrafficReport {
             node: "origin".into(),
             window_minutes: 60,
+            events_dropped: 0,
             total_requests: 0,
             status: Default::default(),
             notable: vec![],
@@ -1063,7 +1320,6 @@ mod tests {
         let mut t = traffic(LoggingHealth {
             events_total: 100,
             seconds_since_last: Some(1),
-            reopen: None,
         });
         t.notable = vec![probing_client("203.0.113.9", &["curl/8.4.0"], 1)];
         let out = render_for_test(t);
@@ -1089,7 +1345,6 @@ mod tests {
         let mut t = traffic(LoggingHealth {
             events_total: 100,
             seconds_since_last: Some(1),
-            reopen: None,
         });
         t.notable = vec![probing_client(
             "203.0.113.41",
@@ -1123,7 +1378,6 @@ mod tests {
         let mut t = traffic(LoggingHealth {
             events_total: 100,
             seconds_since_last: Some(1),
-            reopen: None,
         });
         t.notable = vec![probing_client("203.0.113.50", &[""], 1)];
         let out = render_for_test(t);
@@ -1143,13 +1397,19 @@ mod tests {
         render(&d, std::slice::from_ref(&r))
     }
 
+    /// A node that answers `/health` with 200, the state every section of this
+    /// report describes unless a test says otherwise.
     pub(super) fn reading(name: &str, t: Option<TrafficReport>) -> NodeReading {
         NodeReading {
             name: name.into(),
             role: "origin".into(),
             url: "https://origin.example.com".into(),
-            health: None,
-            health_status: None,
+            health: Some(m6_core::monitoring::HealthReport {
+                process_index: None,
+                status: "ok".into(),
+                node: name.into(),
+            }),
+            health_status: Some(200),
             perf: None,
             perf_error: None,
             traffic: t,
@@ -1180,6 +1440,144 @@ mod tests {
         crate::digest::build(&[], &crate::digest::Thresholds::default(), "now".into())
     }
 
+    /// The STARTUP section names each node's and app's current run, with the
+    /// version, the start time and the config sha. A monitor that reported a
+    /// version without the sha could not answer which file produced it.
+    #[test]
+    fn the_startup_section_shows_version_start_and_config_sha() {
+        let mut d = digest();
+        d.startup.runs.push(crate::startup::RunDigest {
+            node: "origin".into(),
+            app: "m6-http".into(),
+            process_index: None,
+            run_id: "1794968180857-37684".into(),
+            version: "1.16.0+abc123".into(),
+            tag: Some("v1.16.0".into()),
+            started_at: "2026-11-18T02:16:20.858965Z".into(),
+            config: [("config".to_string(), "aa11".to_string())]
+                .into_iter()
+                .collect(),
+            config_paths: Default::default(),
+            lines: 4,
+            ingested_lines: 5,
+            complete_lines: Some(4),
+            state: "complete".into(),
+            shutdown: None,
+            previous_run_id: Some("1794968120857-37600".into()),
+            previous_shutdown: Some(Some(crate::startup::ShutdownDigest {
+                reason: "signal".into(),
+                uptime_ms: 60_000,
+                at: "2026-11-18T02:16:19.000000Z".into(),
+            })),
+            restart: Some("info"),
+        });
+        d.startup.runs.push(crate::startup::RunDigest {
+            node: "edge-a".into(),
+            app: "m6-http".into(),
+            process_index: None,
+            run_id: "1794968180900-40000".into(),
+            version: "1.16.0+abc123".into(),
+            tag: Some("v1.16.0".into()),
+            started_at: "2026-11-18T02:16:20.900000Z".into(),
+            config: Default::default(),
+            config_paths: Default::default(),
+            lines: 4,
+            ingested_lines: 4,
+            complete_lines: Some(4),
+            state: "complete".into(),
+            shutdown: None,
+            previous_run_id: Some("1794968000000-39000".into()),
+            previous_shutdown: Some(None),
+            restart: Some("warn"),
+        });
+        d.startup.expected_state = "missing".into();
+        d.startup.expected_file = Some("/run/m6/expected.json".into());
+        let text = super::render(&d, &[], &Default::default());
+        assert!(text.contains("STARTUP"), "{text}");
+        assert!(text.contains("origin"), "the node is named: {text}");
+        assert!(text.contains("m6-http"), "the app is named: {text}");
+        assert!(
+            text.contains("1.16.0+abc123"),
+            "the version is shown: {text}"
+        );
+        assert!(
+            text.contains("2026-11-18T02:16:20.858965Z"),
+            "the start time is shown: {text}"
+        );
+        assert!(
+            text.contains("config=aa11"),
+            "the config sha is shown: {text}"
+        );
+        assert!(
+            text.contains(
+                "previous: 1794968120857-37600, shut down signal at 2026-11-18T02:16:19.000000Z  [info]"
+            ),
+            "a graceful restart names the previous run and its shutdown: {text}"
+        );
+        assert!(
+            text.contains(
+                "previous: 1794968000000-39000, no shutdown recorded  [WARN: unexpected restart]"
+            ),
+            "a run that died is said: {text}"
+        );
+        assert!(text.contains("5 line(s) ingested"), "the raw count: {text}");
+        assert!(
+            text.contains("waiting for the deploy side"),
+            "a missing deploy record is said: {text}"
+        );
+    }
+
+    /// The PROCESSES section exists only for a node polled as processes, and
+    /// names the one that is down. A plain fleet prints no such section, which
+    /// is what keeps its output as it was.
+    #[test]
+    fn the_processes_section_appears_only_for_processes() {
+        let plain = crate::digest::build(
+            &[reading("origin", None)],
+            &crate::digest::Thresholds::default(),
+            "now".into(),
+        );
+        assert!(!render(&plain, &[reading("origin", None)]).contains("PROCESSES"));
+
+        let mut down = reading("edge/1", None);
+        down.unreachable = Some("refused".into());
+        let readings = vec![reading("edge/0", None), down];
+        let d = crate::digest::build(
+            &readings,
+            &crate::digest::Thresholds::default(),
+            "now".into(),
+        );
+        let text = render(&d, &readings);
+        assert!(text.contains("PROCESSES"), "{text}");
+        assert!(
+            text.contains("1 of 2 processes up") && text.contains("not answering: edge/1"),
+            "{text}"
+        );
+    }
+
+    /// A node up minutes, not a whole hour, must read "42m" in the check rather
+    /// than collapsing to "0h". The page and the check share one formatter, and
+    /// this pins the minute-aware wording the check renders.
+    #[test]
+    fn a_node_up_minutes_reads_minutes_in_the_check() {
+        let mut r = reading("origin", None);
+        r.perf = Some(crate::digest::tests::perf(
+            m6_core::platform::host::HostSnapshot {
+                cpus: 1,
+                ..Default::default()
+            },
+            vec![],
+        ));
+        r.perf.as_mut().unwrap().uptime_s = 42 * 60;
+        let d = crate::digest::build(
+            std::slice::from_ref(&r),
+            &crate::digest::Thresholds::default(),
+            "now".into(),
+        );
+        let out = render(&d, std::slice::from_ref(&r));
+        assert!(out.contains("svc up 42m"), "{out}");
+    }
+
     /// Part A, without journalctl. A node whose main log has gone quiet is a
     /// FAULT even though it is answering every request normally, which is the
     /// entire shape of the 2026-09-06 defect.
@@ -1188,7 +1586,6 @@ mod tests {
         let quiet = traffic(LoggingHealth {
             events_total: 5000,
             seconds_since_last: Some(600),
-            reopen: None,
         });
         let out = render(&digest(), &[reading("origin", Some(quiet))]);
         assert!(out.contains("FAULT  main log silent for 600s"), "{out}");
@@ -1199,7 +1596,6 @@ mod tests {
         let alive = traffic(LoggingHealth {
             events_total: 5000,
             seconds_since_last: Some(4),
-            reopen: None,
         });
         let out = render(&digest(), &[reading("origin", Some(alive))]);
         assert!(out.contains("ok     last event 4s ago"), "{out}");
@@ -1211,7 +1607,6 @@ mod tests {
         let never = traffic(LoggingHealth {
             events_total: 0,
             seconds_since_last: None,
-            reopen: None,
         });
         let out = render(&digest(), &[reading("origin", Some(never))]);
         assert!(out.contains("nothing has ever been logged"), "{out}");
@@ -1222,7 +1617,7 @@ mod tests {
     #[test]
     fn no_traffic_data_is_unknown_not_ok() {
         let mut r = reading("edge-b", None);
-        r.traffic_error = Some("404: /traffic not available on this node".into());
+        r.traffic_error = Some("no traffic line in the journal for this node".into());
         let out = render(&digest(), &[r]);
         assert!(out.contains("unknown"), "{out}");
         assert!(!out.contains("edge-b   ok"), "{out}");
@@ -1238,12 +1633,113 @@ mod tests {
                 Some(traffic(LoggingHealth {
                     events_total: 1,
                     seconds_since_last: Some(1),
-                    reopen: None,
                 })),
             )],
         );
         assert!(out.contains("E. CRAWLERS"));
         assert!(out.contains("no genuine crawler traffic in the window"));
+    }
+
+    /// The check and the JSON digest describe one traffic report the same way.
+    ///
+    /// This is the #220 guard. Every fact section D and E print must appear in
+    /// `nodes[].traffic`, with the same number. A fact printed but not
+    /// serialised, or serialised under a different name, fails here.
+    #[test]
+    fn the_check_and_the_json_digest_agree_on_traffic_and_security() {
+        use m6_core::firewall::{Block, FirewallState};
+        use m6_core::monitoring::HeavyHitter;
+
+        let mut t = traffic(LoggingHealth {
+            events_total: 9000,
+            seconds_since_last: Some(600),
+        });
+        t.total_requests = 1234;
+        t.status.insert(200, 1200);
+        t.status.insert(404, 34);
+        t.heavy_hitters = vec![HeavyHitter {
+            ip: "203.0.113.7".into(),
+            requests: 900,
+            top_path: "/".into(),
+            distinct_user_agents: 3,
+            error_ratio: 0.5,
+        }];
+        t.notable = vec![probing_client("203.0.113.9", &["curl/8.4.0"], 1)];
+        t.crawlers = vec![crawler("GPTBot/1.0", &["203.0.113.20"])];
+        t.forged_bot_requests = 12;
+        t.forgers = vec!["203.0.113.66".into()];
+        t.probe_noise = vec!["203.0.113.5 /.git/config".into()];
+        t.firewall = Some(FirewallState {
+            blocks: vec![Block {
+                address: "203.0.113.4".into(),
+                packets: 1215,
+                bytes: 72900,
+                comment: None,
+                chain: "INPUT".into(),
+            }],
+            total_rules: 217,
+        });
+
+        let r = reading("origin", Some(t));
+        let d = crate::digest::build(
+            std::slice::from_ref(&r),
+            &crate::digest::Thresholds::default(),
+            "2026-10-04T02:16:31Z".into(),
+        );
+        let out = render(&d, std::slice::from_ref(&r));
+        let v = serde_json::to_value(&d).unwrap();
+        let j = &v["nodes"][0]["traffic"];
+
+        // Section D: the totals, the loud clients, the probes and the firewall.
+        assert_eq!(j["total_requests"], 1234);
+        assert!(out.contains("1234 requests in 60m"), "{out}");
+        assert_eq!(j["window_minutes"], 60);
+        assert_eq!(j["status"]["200"], 1200);
+        assert_eq!(j["status"]["404"], 34);
+        assert_eq!(j["heavy_hitters"][0]["ip"], "203.0.113.7");
+        assert_eq!(j["heavy_hitters"][0]["requests"], 900);
+        assert_eq!(j["heavy_hitters"][0]["error_ratio"], 0.5);
+        assert!(
+            out.contains("top: 203.0.113.7 x900 / (50% refused, 3 UA)"),
+            "{out}"
+        );
+        assert_eq!(j["notable"][0]["ip"], "203.0.113.9");
+        assert_eq!(j["notable"][0]["requests"], 7);
+        assert!(out.contains("NOTABLE 203.0.113.9 x7"), "{out}");
+        assert_eq!(j["notable"][0]["user_agents"][0], "curl/8.4.0");
+        assert!(out.contains("curl/8.4.0"), "{out}");
+        assert_eq!(j["probe_noise"][0], "203.0.113.5 /.git/config");
+        assert!(
+            out.contains("single refused probes (noise, not escalated): 203.0.113.5 /.git/config"),
+            "{out}"
+        );
+        assert_eq!(j["firewall"]["blocks"], 1);
+        assert_eq!(j["firewall"]["total_rules"], 217);
+        assert!(
+            out.contains("firewall: 1 block(s) of 217 rules, 1 still being hit"),
+            "{out}"
+        );
+        assert_eq!(j["firewall"]["hit"][0]["packets"], 1215);
+        assert!(
+            out.contains("hit 203.0.113.4 1215 packets 72900 bytes"),
+            "{out}"
+        );
+
+        // Section E: the forged count and the genuine sighting.
+        assert_eq!(j["forged_bot_requests"], 12);
+        assert_eq!(j["forgers"][0], "203.0.113.66");
+        assert!(
+            out.contains("12 bot-shaped requests were FORGED by 203.0.113.66"),
+            "{out}"
+        );
+        assert_eq!(j["crawlers"][0]["user_agent"], "GPTBot/1.0");
+        assert_eq!(j["crawlers"][0]["requests"], 3);
+        assert!(out.contains("UA: GPTBot/1.0"), "{out}");
+
+        // Section A's first line comes from the same report.
+        assert_eq!(j["logging"]["state"], "quiet");
+        assert_eq!(j["logging"]["events_total"], 9000);
+        assert!(out.contains("FAULT  main log silent for 600s"), "{out}");
     }
 
     // ── Crawler verification, issue #205 ─────────────────────────────────────
@@ -1375,7 +1871,6 @@ mod tests {
         let mut t = traffic(LoggingHealth {
             events_total: 1,
             seconds_since_last: Some(1),
-            reopen: None,
         });
         t.crawlers = vec![crawler(
             "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
@@ -1404,7 +1899,7 @@ mod tests {
             readings.extend(sighted(&ips));
         }
         let mut cache = VerdictCache::new();
-        let now = std::time::Instant::now();
+        let now = m6_core::platform::now();
         let first = cache.refresh(&readings, now, &lookup);
         assert_eq!(calls.borrow().len(), MAX_LOOKUPS_PER_POLL);
         assert_eq!(first.len(), MAX_LOOKUPS_PER_POLL);
@@ -1433,11 +1928,61 @@ mod tests {
         }
         let v = VerdictCache::with_cap(MAX_LOOKUPS_PER_CHECK).refresh(
             &readings,
-            std::time::Instant::now(),
+            m6_core::platform::now(),
             &lookup,
         );
         assert_eq!(calls.get(), 12);
         assert_eq!(v.len(), 12);
+    }
+
+    /// The poll's split path and the one-shot path agree: `due` never returns
+    /// more than the cap, a `record` for each answer, then `verdicts` gives the
+    /// same map `refresh` gives from the same lookups. The next poll continues
+    /// with the addresses the cap held back, without repeating one.
+    #[test]
+    fn crawler_lookups_go_through_confirm() {
+        use m6_core::resolve::Ptr;
+        let answer = |ip: &str| {
+            if ip.ends_with(".1") {
+                Ptr::Name("crawl.example.com".into())
+            } else if ip.ends_with(".2") {
+                Ptr::None
+            } else {
+                Ptr::Failed
+            }
+        };
+        let mut readings = Vec::new();
+        for n in 0..4 {
+            let ips: Vec<String> = (1..=3).map(|k| format!("192.0.2.{}", n * 3 + k)).collect();
+            let ips: Vec<&str> = ips.iter().map(String::as_str).collect();
+            readings.extend(sighted(&ips));
+        }
+        let now = m6_core::platform::now();
+
+        let mut cache = VerdictCache::new();
+        let mut due = Vec::new();
+        cache.due(&readings, now, &mut due);
+        assert_eq!(due.len(), MAX_LOOKUPS_PER_POLL, "the cap holds");
+        for ip in &due {
+            let ptr = answer(ip);
+            cache.record(ip, ptr, now);
+        }
+        let split = cache.verdicts(&readings);
+
+        let mut through_refresh = VerdictCache::new();
+        let refreshed = through_refresh.refresh(&readings, now, &answer);
+        assert_eq!(split.len(), refreshed.len());
+        for (addr, ptr) in &refreshed {
+            assert_eq!(split.get(addr), Some(ptr), "{addr}");
+        }
+
+        let mut rest = Vec::new();
+        cache.due(&readings, now, &mut rest);
+        assert_eq!(rest.len(), 12 - MAX_LOOKUPS_PER_POLL, "the rest, once");
+        assert!(
+            rest.iter().all(|ip| !due.contains(ip)),
+            "an address looked up is not due again: {rest:?} after {due:?}"
+        );
     }
 
     /// A stored result is reused until it expires, a failure expires sooner,
@@ -1452,7 +1997,7 @@ mod tests {
         };
         let readings = sighted(&["192.0.2.1"]);
         let mut cache = VerdictCache::new();
-        let t0 = std::time::Instant::now();
+        let t0 = m6_core::platform::now();
         cache.refresh(&readings, t0, &lookup);
         cache.refresh(&readings, t0 + std::time::Duration::from_secs(60), &lookup);
         assert_eq!(n.get(), 1, "a failure is kept for FAILED_TTL");
@@ -1564,7 +2109,6 @@ mod tests {
         let mut t = traffic(LoggingHealth {
             events_total: 1,
             seconds_since_last: Some(1),
-            reopen: None,
         });
         t.crawlers = vec![crawler(
             "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
@@ -1588,8 +2132,13 @@ mod tests {
 /// than no check, because the summary is what gets read.
 #[cfg(test)]
 mod header_check_tests {
-    use super::tests::{digest, hc, reading, render};
+    use super::tests::{hc, reading, render};
     use super::*;
+
+    fn out(rs: &[NodeReading]) -> String {
+        let d = crate::digest::build(rs, &crate::digest::Thresholds::default(), "now".into());
+        render(&d, rs)
+    }
 
     #[test]
     fn a_passing_check_is_reported_and_stays_all_clear() {
@@ -1599,7 +2148,7 @@ mod header_check_tests {
             "public, max-age=60",
             Some("public, max-age=60"),
         ));
-        let out = render(&digest(), &[r]);
+        let out = out(&[r]);
         assert!(out.contains("F. CACHE HEADERS"), "{out}");
         assert!(out.contains("/capabilities"), "{out}");
         assert!(
@@ -1608,14 +2157,21 @@ mod header_check_tests {
         );
     }
 
-    /// The one that matters. A wrong cache policy must reach the verdict.
+    /// The one that matters. A wrong cache policy must reach the verdict, and
+    /// it reaches it through the digest's shared FAULTS list, not a side list.
     #[test]
     fn a_wrong_header_is_a_fault_and_removes_all_clear() {
         let mut r = reading("origin", None);
         r.header_checks
             .push(hc("/capabilities", "public, max-age=60", Some("no-store")));
-        let out = render(&digest(), &[r]);
-        assert!(out.contains("CACHE HEADER FAULTS"), "{out}");
+        let out = out(&[r]);
+        assert!(out.contains("FAULTS (1)"), "{out}");
+        assert!(
+            out.contains(
+                "- origin: /capabilities cache-control is \"no-store\", expected \"public, max-age=60\""
+            ),
+            "{out}"
+        );
         assert!(
             !out.contains("ALL CLEAR"),
             "a node serving the wrong cache policy is not all clear:\n{out}"
@@ -1631,7 +2187,7 @@ mod header_check_tests {
         let mut r = reading("edge-a", None);
         r.header_checks
             .push(hc("/capabilities", "public, max-age=60", None));
-        let out = render(&digest(), &[r]);
+        let out = out(&[r]);
         assert!(out.contains("<header absent>"), "{out}");
         assert!(!out.contains("ALL CLEAR"), "{out}");
     }
@@ -1644,7 +2200,7 @@ mod header_check_tests {
         c.error = Some("connection refused".into());
         c.status = None;
         r.header_checks.push(c);
-        let out = render(&digest(), &[r]);
+        let out = out(&[r]);
         assert!(out.contains("could not be fetched"), "{out}");
         assert!(!out.contains("ALL CLEAR"), "{out}");
     }
@@ -1652,7 +2208,7 @@ mod header_check_tests {
     /// Nothing configured must not read as everything passing.
     #[test]
     fn no_checks_declared_says_so() {
-        let out = render(&digest(), &[reading("origin", None)]);
+        let out = out(&[reading("origin", None)]);
         assert!(out.contains("F. CACHE HEADERS"), "{out}");
         assert!(out.contains("none declared"), "{out}");
         // And it is not a fault: declaring none is a choice, not a failure.
@@ -1749,8 +2305,8 @@ mod tunnel_tests {
     #[test]
     fn wg_interface_drops_are_shown_when_the_node_reports_them() {
         let mut r = with_tunnel("edge-a", Handshake::At { age_s: 1 });
-        let mut host = m6_core::host::HostSnapshot::default();
-        host.net.push(m6_core::host::NetDevice {
+        let mut host = m6_core::platform::host::HostSnapshot::default();
+        host.net.push(m6_core::platform::host::NetDevice {
             name: "wg0".into(),
             rx_drop: 3,
             tx_drop: 4,
@@ -1759,96 +2315,6 @@ mod tunnel_tests {
         r.perf = Some(crate::digest::tests::perf(host, vec![]));
         let o = out(&[r]);
         assert!(o.contains("wg0 drops rx 3 tx 4"), "{o}");
-    }
-
-    // ── log reopen ───────────────────────────────────────────────────────────
-
-    use m6_core::monitoring::{LogReopenHealth, LoggingHealth, PerfReport};
-
-    /// A node whose `/perf` carries `reopen`, with the given uptime.
-    fn reopen_reading(uptime_s: u64, reopen: Option<LogReopenHealth>) -> NodeReading {
-        let mut r = reading("origin", None);
-        r.health = Some(m6_core::monitoring::HealthReport {
-            status: "ok".into(),
-            node: "origin".into(),
-        });
-        r.health_status = Some(200);
-        let mut p: PerfReport = crate::digest::tests::perf(
-            m6_core::host::HostSnapshot {
-                cpus: 1,
-                ..Default::default()
-            },
-            vec![],
-        );
-        p.uptime_s = uptime_s;
-        p.logging = Some(LoggingHealth {
-            events_total: 10,
-            seconds_since_last: Some(1),
-            reopen,
-        });
-        r.perf = Some(p);
-        r
-    }
-
-    fn render_reopen(r: NodeReading, max: Option<u64>) -> String {
-        let d = crate::digest::build(
-            std::slice::from_ref(&r),
-            &crate::digest::Thresholds {
-                log_reopen_age_s: max,
-                ..Default::default()
-            },
-            "now".into(),
-        );
-        render(&d, std::slice::from_ref(&r))
-    }
-
-    fn health(age: Option<u64>, reopens: u64) -> LogReopenHealth {
-        LogReopenHealth {
-            reopens_total: reopens,
-            failures_total: 0,
-            seconds_since_last_reopen: age,
-            last_reopen_unix: age.map(|a| 1_789_000_000 - a),
-            seconds_since_last_failure: None,
-        }
-    }
-
-    #[test]
-    fn section_a_shows_each_nodes_last_log_reopen_age() {
-        let o = render_reopen(reopen_reading(9000, Some(health(Some(60), 3))), Some(7200));
-        assert!(o.contains("reopened 60s ago, 3 since start"), "{o}");
-        assert!(o.contains("limit 7200s"), "{o}");
-    }
-
-    #[test]
-    fn section_a_says_never_reopened_since_start_distinctly() {
-        let o = render_reopen(reopen_reading(100, Some(health(None, 0))), Some(7200));
-        assert!(o.contains("never reopened since start (up 100s)"), "{o}");
-    }
-
-    #[test]
-    fn a_stale_log_reopen_removes_all_clear() {
-        let o = render_reopen(
-            reopen_reading(99_999, Some(health(Some(7300), 3))),
-            Some(7200),
-        );
-        assert!(!o.contains("ALL CLEAR"), "{o}");
-        assert!(o.contains("FAULTS (1)"), "{o}");
-        assert!(
-            o.contains("- origin: last reopened its log file 7300s ago"),
-            "{o}"
-        );
-    }
-
-    #[test]
-    fn section_a_says_when_no_limit_is_configured() {
-        let o = render_reopen(reopen_reading(9000, Some(health(Some(60), 3))), None);
-        assert!(o.contains("no limit configured"), "{o}");
-    }
-
-    #[test]
-    fn section_a_says_a_node_writes_no_log_file() {
-        let o = render_reopen(reopen_reading(9000, None), None);
-        assert!(o.contains("writes no log file"), "{o}");
     }
 }
 
@@ -1873,6 +2339,7 @@ mod history_tests {
             dropped: 2,
             pruned: 0,
             last_error: None,
+            last_ok: None,
         }
     }
 
@@ -1899,6 +2366,7 @@ mod history_tests {
             dropped: 0,
             pruned: 0,
             last_error: None,
+            last_ok: None,
         }));
         assert!(o.contains("I. HISTORY"), "{o}");
         assert!(
@@ -1987,5 +2455,303 @@ mod history_tests {
             o.contains("not kept by --check; the running service keeps it"),
             "{o}"
         );
+    }
+}
+
+/// The HEALTH section: this poll's `/health` per node, and the age of each
+/// node's last 200 from the history the service already keeps.
+///
+/// These run against a real history file, so the age the section prints is the
+/// age the service would have rather than a number handed to the renderer.
+#[cfg(test)]
+mod health_tests {
+    use super::tests::reading;
+    use super::*;
+
+    fn degraded(name: &str) -> NodeReading {
+        let mut r = reading(name, None);
+        r.health = Some(m6_core::monitoring::HealthReport {
+            process_index: None,
+            status: "degraded".into(),
+            node: name.into(),
+        });
+        r.health_status = Some(503);
+        r
+    }
+
+    fn unreachable(name: &str, why: &str) -> NodeReading {
+        let mut r = reading(name, None);
+        r.health = None;
+        r.health_status = None;
+        r.unreachable = Some(why.into());
+        r
+    }
+
+    /// The line a node is printed on. The first section a node appears in is
+    /// HEALTH, so one match is enough to find its line there.
+    fn line_of<'a>(out: &'a str, node: &str) -> &'a str {
+        let start = format!("  {node}");
+        out.lines()
+            .find(|l| l.starts_with(&start))
+            .unwrap_or_else(|| panic!("no line for {node}:\n{out}"))
+    }
+
+    fn check(rs: &[NodeReading], history: Option<crate::history::HistoryDigest>) -> String {
+        let mut d = crate::digest::build(
+            rs,
+            &crate::digest::Thresholds::default(),
+            "2026-11-14T00:00:00Z".into(),
+        );
+        d.history = history;
+        super::tests::render(&d, rs)
+    }
+
+    /// A history holding one poll, `age_s` seconds before now, in which `node`
+    /// answered 200.
+    fn history_with_last_ok(
+        node: &str,
+        age_s: u64,
+    ) -> (crate::history::HistoryDigest, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("a temp directory");
+        let cfg = crate::history::Config {
+            file: dir.path().join("history.sqlite3"),
+            max_bytes: 64 << 20,
+        };
+        let mut history = crate::history::start(
+            Some(cfg),
+            &m6_core::limits::Limit::builtin(&m6_core::limits::HISTORY_QUEUE),
+        )
+        .expect("history opens");
+        let r = reading(node, None);
+        let at_ms = crate::history::now_ms() - i64::try_from(age_s).expect("a small age") * 1000;
+        let d = crate::digest::build(
+            std::slice::from_ref(&r),
+            &crate::digest::Thresholds::default(),
+            "2026-11-14T00:00:00Z".into(),
+        );
+        history.record(crate::history::batch(at_ms, std::slice::from_ref(&r), &d));
+        (history.digest(), dir)
+    }
+
+    /// Three nodes that answer 200 are the baseline: one `ok` line each, first
+    /// in the report, and nothing for the verdict to raise.
+    #[test]
+    fn three_healthy_nodes_print_ok_in_the_first_section() {
+        let rs = [
+            reading("origin", None),
+            reading("edge-a", None),
+            reading("edge-b", None),
+        ];
+        let out = check(&rs, None);
+        let health = out
+            .find("HEALTH")
+            .unwrap_or_else(|| panic!("no HEALTH section:\n{out}"));
+        let logging = out
+            .find("A. LOGGING")
+            .unwrap_or_else(|| panic!("no logging section:\n{out}"));
+        assert!(health < logging, "HEALTH must come first:\n{out}");
+        for name in ["origin", "edge-a", "edge-b"] {
+            let line = line_of(&out, name);
+            assert!(line.contains("ok"), "{name} is healthy:\n{out}");
+            assert!(line.contains("200"), "{name} answered 200:\n{out}");
+        }
+        assert!(!out.contains("FAULT"), "{out}");
+    }
+
+    /// A degraded node is a fault, and the reason the body's verdict carries is
+    /// printed beside the code rather than left to the operator to look up.
+    /// The reason names no mechanism: `/health` names no dependency, so the
+    /// line points at the node's log, which does.
+    #[test]
+    fn a_degraded_node_prints_fault_with_the_reason() {
+        let (h, _dir) = history_with_last_ok("edge-a", 30);
+        let out = check(&[degraded("edge-a")], Some(h));
+        let line = line_of(&out, "edge-a");
+        assert!(line.contains("FAULT"), "{out}");
+        assert!(line.contains("503 degraded"), "{out}");
+        assert!(line.contains("a dependency is not answering"), "{out}");
+        assert!(line.contains("see the node's log for which one"), "{out}");
+        assert!(line.contains("last 200"), "{out}");
+    }
+
+    /// A node that cannot be reached is a fault too, with the error that
+    /// stopped the request.
+    #[test]
+    fn an_unreachable_node_prints_fault_with_the_error() {
+        let (h, _dir) = history_with_last_ok("edge-b", 30);
+        let out = check(&[unreachable("edge-b", "connection refused")], Some(h));
+        let line = line_of(&out, "edge-b");
+        assert!(line.contains("FAULT"), "{out}");
+        assert!(line.contains("unreachable"), "{out}");
+        assert!(line.contains("connection refused"), "{out}");
+        assert!(line.contains("last 200"), "{out}");
+    }
+
+    /// A node that has not answered 200 for longer than the limit says so on
+    /// its line, with the age and the limit.
+    #[test]
+    fn a_last_200_older_than_the_limit_prints_fault_with_the_reason() {
+        let (h, _dir) = history_with_last_ok("edge-a", 300);
+        let out = check(&[degraded("edge-a")], Some(h));
+        let line = line_of(&out, "edge-a");
+        assert!(line.contains("FAULT"), "{out}");
+        assert!(line.contains("last 200"), "{out}");
+        assert!(line.contains("over the 90s limit"), "{out}");
+    }
+
+    /// The other side of the threshold: a recent 200 is shown and not called
+    /// stale, so the comparison has to be doing the deciding.
+    #[test]
+    fn a_last_200_inside_the_limit_is_not_called_stale() {
+        let (h, _dir) = history_with_last_ok("edge-a", 30);
+        let out = check(&[degraded("edge-a")], Some(h));
+        let line = line_of(&out, "edge-a");
+        assert!(line.contains("last 200"), "{out}");
+        assert!(!line.contains("over the"), "{out}");
+    }
+
+    /// The limit is a setting, so a deployment that wants a longer one gets it
+    /// rather than the default.
+    #[test]
+    fn the_limit_comes_from_the_thresholds() {
+        let (h, _dir) = history_with_last_ok("edge-a", 300);
+        let r = degraded("edge-a");
+        let mut d = crate::digest::build(
+            std::slice::from_ref(&r),
+            &crate::digest::Thresholds {
+                health_last_ok_age_s: 600,
+                ..Default::default()
+            },
+            "2026-11-14T00:00:00Z".into(),
+        );
+        d.history = Some(h);
+        let out = super::tests::render(&d, std::slice::from_ref(&r));
+        let line = line_of(&out, "edge-a");
+        assert!(line.contains("last 200"), "{out}");
+        assert!(!line.contains("over the"), "{out}");
+    }
+
+    /// The section and the verdict cannot disagree: the same stale judgement
+    /// is added to the FAULTS list that the exit status reads.
+    #[test]
+    fn a_stale_last_200_reaches_the_verdict() {
+        let (h, _dir) = history_with_last_ok("edge-a", 300);
+        let r = degraded("edge-a");
+        let mut d = crate::digest::build(
+            std::slice::from_ref(&r),
+            &crate::digest::Thresholds::default(),
+            "2026-11-14T00:00:00Z".into(),
+        );
+        d.history = Some(h);
+        let f = stale_last_ok_finding(&r, d.history.as_ref(), d.thresholds.health_last_ok_age_s)
+            .expect("a node over the limit raises a finding");
+        assert_eq!(f.level, Level::Fault);
+        assert!(f.text.contains("over the 90s limit"), "{}", f.text);
+        d.add_finding(f);
+        let out = super::tests::render(&d, std::slice::from_ref(&r));
+        assert!(!out.contains("ALL CLEAR"), "{out}");
+        assert!(out.contains("last 200"), "{out}");
+    }
+
+    /// A node with this poll's `/health` code and body status.
+    fn answering(name: &str, code: u16, body: &str) -> NodeReading {
+        let mut r = reading(name, None);
+        r.health = Some(m6_core::monitoring::HealthReport {
+            process_index: None,
+            status: body.into(),
+            node: name.into(),
+        });
+        r.health_status = Some(code);
+        r
+    }
+
+    /// The verdict a set of readings gives with a recent last 200 on file, so
+    /// only this poll's own answer can raise a fault.
+    fn verdict(rs: &[NodeReading]) -> String {
+        let (h, _dir) = history_with_last_ok("edge-a", 10);
+        check(rs, Some(h))
+    }
+
+    /// The one rule: a 503 is not healthy whatever its body says.
+    #[test]
+    fn a_503_with_body_ok_is_a_fault() {
+        let out = verdict(&[answering("edge-a", 503, "ok")]);
+        assert!(line_of(&out, "edge-a").contains("FAULT"), "{out}");
+        assert!(!out.contains("ALL CLEAR"), "{out}");
+    }
+
+    /// The 503 never counts as a 200, so the last-200 age keeps growing: the
+    /// row the poll writes for it is not an ok row.
+    #[test]
+    fn a_503_with_body_ok_does_not_reset_the_last_200_age() {
+        let dir = tempfile::tempdir().expect("a temp directory");
+        let cfg = crate::history::Config {
+            file: dir.path().join("history.sqlite3"),
+            max_bytes: 64 << 20,
+        };
+        let mut history = crate::history::start(
+            Some(cfg),
+            &m6_core::limits::Limit::builtin(&m6_core::limits::HISTORY_QUEUE),
+        )
+        .expect("history opens");
+        let now = crate::history::now_ms();
+        for (ago_s, r) in [
+            (300, answering("edge-a", 200, "ok")),
+            (10, answering("edge-a", 503, "ok")),
+        ] {
+            let d = crate::digest::build(
+                std::slice::from_ref(&r),
+                &crate::digest::Thresholds::default(),
+                "2026-11-14T00:00:00Z".into(),
+            );
+            history.record(crate::history::batch(
+                now - ago_s * 1000,
+                std::slice::from_ref(&r),
+                &d,
+            ));
+        }
+        let last = history.digest().last_ok.expect("history reads");
+        assert_eq!(last.len(), 1);
+        assert!(last[0].age_s >= 300, "{last:?}");
+        let r = answering("edge-a", 503, "ok");
+        let f = stale_last_ok_finding(&r, Some(&history.digest()), 90)
+            .expect("the age is over the limit");
+        assert!(f.text.contains("over the 90s limit"), "{}", f.text);
+    }
+
+    #[test]
+    fn a_200_with_body_degraded_is_a_fault() {
+        let out = verdict(&[answering("edge-a", 200, "degraded")]);
+        assert!(line_of(&out, "edge-a").contains("FAULT"), "{out}");
+        assert!(!out.contains("ALL CLEAR"), "{out}");
+    }
+
+    #[test]
+    fn a_200_with_an_unknown_body_is_a_fault() {
+        let out = verdict(&[answering("edge-a", 200, "starting")]);
+        assert!(line_of(&out, "edge-a").contains("FAULT"), "{out}");
+        assert!(!out.contains("ALL CLEAR"), "{out}");
+    }
+
+    #[test]
+    fn a_node_with_no_answer_is_a_fault() {
+        let mut r = reading("edge-a", None);
+        r.health = None;
+        r.health_status = None;
+        let out = verdict(&[r]);
+        assert!(line_of(&out, "edge-a").contains("FAULT"), "{out}");
+        assert!(!out.contains("ALL CLEAR"), "{out}");
+    }
+
+    #[test]
+    fn three_healthy_nodes_give_no_fault() {
+        let rs = [
+            answering("origin", 200, "ok"),
+            answering("edge-a", 200, "ok"),
+            answering("edge-b", 200, "ok"),
+        ];
+        let out = check(&rs, None);
+        assert!(!out.contains("FAULT"), "{out}");
+        assert!(out.contains("ALL CLEAR"), "{out}");
     }
 }

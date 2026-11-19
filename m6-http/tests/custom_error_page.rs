@@ -20,6 +20,11 @@
 //! and "no self-fetch" are asserted on what the backend actually received, not
 //! inferred from a response shape.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -152,8 +157,8 @@ fn https_get(port: u16, path: &str, tls: Arc<rustls::ClientConfig>) -> Reply {
 
 /// A fake Unix-socket backend that answers by request path and records every
 /// path it is asked for, so a test can assert on what was (and was not)
-/// fetched. `n` sockets are bound; two make a buggy retry observable, because a
-/// failed member is marked down and a retry then lands on the second member.
+/// fetched. `n` sockets are bound; two make a retry observable, because a
+/// request whose member refuses its connect takes the next member in turn.
 struct Fixture {
     requests: Arc<Mutex<Vec<String>>>,
     sockets: Vec<PathBuf>,
@@ -281,7 +286,7 @@ struct Stack {
 
 impl Stack {
     fn start(tag: &str, fail_error_page: bool) -> Stack {
-        rustls::crypto::ring::default_provider()
+        rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .ok();
 
@@ -320,7 +325,6 @@ domain = "localhost"
 
 [log]
 level  = "warn"
-format = "text"
 
 [errors]
 mode = "custom"
@@ -384,7 +388,7 @@ backend = "fixture"
         // 502; once the fixture's socket is in the pool it answers 200. /ok is
         // a plain 200 that does not run the error machinery, so the probe does
         // not pollute the counts the test asserts on.
-        let ready = m6_core::testkit::wait::until(Duration::from_secs(30), || {
+        let ready = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
             https_get(port, "/ok", Arc::clone(&tls)).status == 200
         });
         assert!(

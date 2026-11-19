@@ -1,0 +1,11 @@
+{
+  "site_name": "My Site",
+  "site_tagline": "Engineering notes on performance, systems, and the web.",
+  "nav": [
+    { "label": "Home",    "path": "/" },
+    { "label": "Blog",    "path": "/blog" },
+    { "label": "About",   "path": "/about" },
+    { "label": "Contact", "path": "/contact" },
+    { "label": "Login",   "path": "/login" }
+  ]
+}

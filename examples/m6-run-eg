@@ -1,0 +1,466 @@
+#!/bin/bash
+# m6-run-eg — start, restart, rebuild, reload, or stop an m6 example's dev stack.
+#
+# Usage:
+#   m6-run-eg                           interactive prompt
+#   m6-run-eg <N>                       start example N, or restart it if already running
+#   m6-run-eg <N> start                 start example N
+#   m6-run-eg <N> restart               kill all services, then start fresh
+#   m6-run-eg <N> rebuild               run make/cargo build, then restart
+#   m6-run-eg <N> reload                restart without a build, so every service reads its files again
+#   m6-run-eg <N> stop                  stop example N
+#
+# Flags (can appear anywhere):
+#   --no-browser                        don't open the browser after start
+#
+# Examples live in <NN>-<name>/dev.sh
+# Each dev stack owns a pgid stored in /tmp/m6-eg/<checkout-id>/<NN>.pgid.
+# The checkout id is part of the path: /tmp is shared by every checkout and
+# session on the machine, so a global /tmp/m6-eg/05.pgid let one session's
+# stop signal the process another session had recorded for example 05.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+EXAMPLES_DIR="$SCRIPT_DIR"
+M6_DIR="${M6:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+PGID_DIR="/tmp/m6-eg/$(printf '%s' "$SCRIPT_DIR" | cksum | cut -d' ' -f1)"
+. "$SCRIPT_DIR/own.sh"
+OPEN_BROWSER=1
+# The longest a start waits for the stack to answer, in seconds. A cold build is
+# most of it.
+STARTUP_BOUND=600
+
+# Ensure m6 binaries are on PATH for dev.sh scripts that don't set it themselves.
+[ -n "$M6_DIR" ] && export PATH="$M6_DIR/target/release:$PATH"
+
+# ── Dependency check ─────────────────────────────────────────────────────────
+
+check_deps() {
+    local os
+    os=$(uname -s)
+    local missing=0
+
+    # Detect package manager hint
+    if [ "$os" = "Darwin" ]; then
+        INSTALL_RUST="curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+        INSTALL_MKCERT="brew install mkcert nss"
+        INSTALL_MAKE="xcode-select --install"
+    elif [ -f /etc/debian_version ]; then
+        INSTALL_RUST="curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+        INSTALL_MKCERT="  # download from https://github.com/FiloSottile/mkcert/releases\n  sudo apt install -y libnss3-tools"
+        INSTALL_MAKE="sudo apt install -y make"
+    elif [ -f /etc/redhat-release ]; then
+        INSTALL_RUST="curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+        INSTALL_MKCERT="  # download from https://github.com/FiloSottile/mkcert/releases\n  sudo dnf install -y nss-tools"
+        INSTALL_MAKE="sudo dnf install -y make"
+    else
+        INSTALL_RUST="curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+        INSTALL_MKCERT="see https://github.com/FiloSottile/mkcert"
+        INSTALL_MAKE="install make via your package manager"
+    fi
+
+    # cargo / Rust
+    if ! command -v cargo &>/dev/null; then
+        echo "  MISSING: cargo (Rust toolchain)"
+        echo "    install: $INSTALL_RUST"
+        missing=1
+    fi
+
+    # mkcert
+    if ! command -v mkcert &>/dev/null; then
+        echo "  MISSING: mkcert (dev TLS certificates)"
+        printf "    install: %b\n" "$INSTALL_MKCERT"
+        missing=1
+    fi
+
+    # make (needed by 02-blog and any example with a Makefile)
+    if ! command -v make &>/dev/null; then
+        echo "  MISSING: make"
+        echo "    install: $INSTALL_MAKE"
+        missing=1
+    fi
+
+    # m6 binaries — offer to build if missing
+    local need_build=0
+    for bin in m6-html m6-file m6-http; do
+        if ! command -v "$bin" &>/dev/null; then
+            need_build=1
+        fi
+    done
+    if [ "$need_build" -eq 1 ]; then
+        if [ -n "$M6_DIR" ] && [ -f "$M6_DIR/Cargo.toml" ]; then
+            if command -v cargo &>/dev/null; then
+                echo "  MISSING: m6 binaries (m6-html, m6-file, m6-http)"
+                echo "    building now: cargo build --release in $M6_DIR"
+                (cd "$M6_DIR" && cargo build --release)
+                echo "    done."
+            else
+                echo "  MISSING: m6 binaries — install cargo first, then run:"
+                echo "    cd $M6_DIR && cargo build --release"
+                missing=1
+            fi
+        else
+            echo "  MISSING: m6 binaries — m6 source not found at $M6_DIR"
+            echo "    set M6=/path/to/m6 and run: cargo build --release"
+            missing=1
+        fi
+    fi
+
+    if [ "$missing" -ne 0 ]; then
+        echo ""
+        echo "Fix the above and re-run."
+        exit 1
+    fi
+}
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+die() { echo "error: $*" >&2; exit 1; }
+
+# Map example number → directory (accepts "1", "01", "2", "05", etc.)
+find_eg_dir() {
+    local num
+    num=$(printf "%02d" "$((10#$1))" 2>/dev/null) || die "invalid example number: $1"
+    local dir
+    dir=$(find "$EXAMPLES_DIR" -maxdepth 1 -type d -name "${num}-*" | head -1)
+    [ -n "$dir" ] || die "no example directory matching ${num}-*"
+    echo "$dir"
+}
+
+# Return the stored pgid for a running example, or empty string.
+running_pgid() {
+    local num
+    num=$(printf "%02d" "$((10#$1))")
+    local f="$PGID_DIR/${num}.pgid"
+    [ -f "$f" ] || { echo ""; return; }
+    local pg
+    pg=$(cat "$f")
+    if kill -0 "$pg" 2>/dev/null; then
+        echo "$pg"
+    else
+        rm -f "$f"
+        echo ""
+    fi
+}
+
+# Stop a stack by pgid and wait for it to exit.
+kill_eg() {
+    local num dir pg port
+    num=$(printf "%02d" "$((10#$1))")
+    pg=$(running_pgid "$num")
+    if [ -z "$pg" ]; then
+        echo "example $num is not running."
+        return
+    fi
+    dir=$(find_eg_dir "$1" 2>/dev/null || true)
+    echo "stopping example $num (pid $pg)..."
+    kill "$pg" 2>/dev/null || true          # SIGTERM → triggers dev.sh EXIT trap
+    local i=0
+    while kill -0 "$pg" 2>/dev/null && [ $i -lt 30 ]; do
+        sleep 0.1; i=$((i+1))
+    done
+    if kill -0 "$pg" 2>/dev/null; then
+        # dev.sh ignored SIGTERM. Stop the children it recorded in its own pid
+        # file before force-killing the shell; otherwise they are orphaned on
+        # the port. This is still only what this example wrote down.
+        if [ -n "$dir" ]; then
+            own_init "$dir" stack
+            own_stop_records
+            own_forget
+        fi
+        kill -9 "$pg" 2>/dev/null || true
+    fi
+    port=$(example_port "$num" 2>/dev/null || echo "8443")
+    if ! own_wait_port_free "$port" 30; then
+        local holder
+        holder=$(own_port_holder "$port")
+        echo "warning: port $port is still held by pid ${holder:-unknown}, which example $num did not record; leaving it alone." >&2
+    fi
+    rm -f "$PGID_DIR/${num}.pgid"
+    echo "stopped."
+}
+
+# Start an example in a new process group.
+start_eg() {
+    check_deps
+    local num
+    num=$(printf "%02d" "$((10#$1))")
+    local dir
+    dir=$(find_eg_dir "$1")
+    local dev_sh="$dir/dev.sh"
+    [ -f "$dev_sh" ] || die "no dev.sh in $dir"
+
+    mkdir -p "$PGID_DIR"
+
+    # Stop any other running examples first.
+    for pgid_file in "$PGID_DIR"/*.pgid; do
+        [ -f "$pgid_file" ] || continue
+        local other
+        other=$(basename "$pgid_file" .pgid)
+        [ "$other" = "$num" ] && continue
+        local other_n
+        other_n=$((10#$other))
+        pg=$(running_pgid "$other_n")
+        [ -n "$pg" ] && kill_eg "$other_n"
+    done
+
+    # Stop what a previous run of THIS example recorded (its own pid file).
+    # A listener this checkout did not start belongs to another session; it is
+    # reported and left alone, and this start fails rather than killing it.
+    local port
+    port=$(example_port "$1")
+    own_init "$dir" stack
+    own_reap
+    if ! own_wait_port_free "$port" 30; then
+        local holder
+        holder=$(own_port_holder "$port")
+        echo "error: port $port is held by pid ${holder:-unknown}, which example $num did not start." >&2
+        echo "       Refusing to kill it. Stop that process yourself, or run the example on another port." >&2
+        exit 1
+    fi
+
+    # Run setup.sh if present and not yet completed (detected by absence of keys/ or data/).
+    if [ -f "$dir/setup.sh" ]; then
+        local needs_setup=0
+        ( . "$EXAMPLES_DIR/dev-home.sh" && [ -f "$M6_DEV_HOME/dev/auth.pem" ] ) || needs_setup=1
+        [ ! -d "$dir/data" ] && needs_setup=1
+        if [ "$needs_setup" -eq 1 ]; then
+            echo "running setup.sh for example $num..."
+            bash "$dir/setup.sh"
+        fi
+    fi
+
+    # Build any Cargo sub-packages for this example before launching.
+    while IFS= read -r cargo_toml; do
+        local pkg_name
+        pkg_name=$(grep '^name' "$cargo_toml" | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+        if [ -n "$pkg_name" ] && ! [ -f "$SCRIPT_DIR/target/release/$pkg_name" ]; then
+            echo "building $pkg_name..."
+            (cd "$SCRIPT_DIR" && cargo build --release -p "$pkg_name")
+        fi
+    done < <(find "$dir" -maxdepth 2 -name "Cargo.toml")
+
+    echo "starting example $num ($(basename "$dir"))..."
+
+    # Export browser flag so dev.sh scripts that call `open` directly can respect it.
+    export M6_NO_BROWSER
+    [ "$OPEN_BROWSER" = "0" ] && M6_NO_BROWSER=1 || M6_NO_BROWSER=0
+
+    # Launch dev.sh directly. Its EXIT trap kills all child jobs when we SIGTERM it.
+    bash "$dev_sh" &>/tmp/m6-eg-${num}.log &
+    local pg=$!
+    echo "$pg" > "$PGID_DIR/${num}.pgid"
+
+    local port
+    port=$(example_port "$1")
+    local log="/tmp/m6-eg-${num}.log"
+    echo "pgid $pg — log: $log"
+    echo "waiting for port $port..."
+
+    # Up means the stack answers an HTTPS request on its port, not a duration
+    # that has elapsed. dev.sh builds first, so a fixed ten seconds reported a
+    # stack that was still building as not started. `STARTUP_BOUND` is the
+    # ceiling for a stack that never answers, and a dev.sh that exits ends the
+    # wait at once, so a stack that died is reported in seconds.
+    local started=$SECONDS
+    local deadline=$((started + STARTUP_BOUND))
+    local up=0
+    while :; do
+        if curl -sk --http1.1 -m 2 -o /dev/null "https://127.0.0.1:$port/"; then
+            up=1; break
+        fi
+        if ! kill -0 "$pg" 2>/dev/null || [ "$SECONDS" -ge "$deadline" ]; then
+            break
+        fi
+        sleep 0.2
+    done
+
+    if [ "$up" -eq 1 ]; then
+        echo "up. after $((SECONDS - started))s, $(date '+%H:%M:%S')"
+        [ "$OPEN_BROWSER" = "1" ] && open_browser "$1" || true
+        return 0
+    fi
+
+    if kill -0 "$pg" 2>/dev/null; then
+        echo "error: example $num did not answer within ${STARTUP_BOUND}s and dev.sh is still running." >&2
+    else
+        echo "error: example $num's dev.sh exited before the stack answered." >&2
+    fi
+    echo "       $log, last 20 lines:" >&2
+    tail -20 "$log" 2>/dev/null | sed 's/^/         /' >&2
+    return 1
+}
+
+# Detect the port from an example's dev.sh comment or site.toml (defaults to 8443).
+# dev.sh files that use non-standard ports should declare: # M6_PORT=<port>
+example_port() {
+    local dir
+    dir=$(find_eg_dir "$1" 2>/dev/null) || { echo "8443"; return; }
+    # Check for explicit port declaration in dev.sh.
+    local dev_port
+    dev_port=$(grep -m1 '^# M6_PORT=' "$dir/dev.sh" 2>/dev/null | cut -d= -f2)
+    if [ -n "$dev_port" ]; then
+        echo "$dev_port"
+        return
+    fi
+    local port
+    port=$(grep -m1 'bind' "$dir/site.toml" 2>/dev/null \
+           | grep -o ':[0-9]*"' | tr -d ':"')
+    echo "${port:-8443}"
+}
+
+# Return the landing URL path for a given example number.
+example_url_path() {
+    case "$1" in
+        4)  echo "/login" ;;
+        5)  echo "/cms" ;;
+        7)  echo "/cms" ;;
+        8)  echo "/logs" ;;
+        9)  echo "/blog" ;;
+        *)  echo "/" ;;
+    esac
+}
+
+# Open the browser to the example's landing URL, or print it if unavailable.
+open_browser() {
+    local path
+    path=$(example_url_path "$1")
+    local port
+    port=$(example_port "$1")
+    local url="https://localhost:${port}${path}"
+    if command -v open &>/dev/null; then          # macOS
+        open "$url" 2>/dev/null || true
+    elif command -v xdg-open &>/dev/null; then    # Linux
+        xdg-open "$url" 2>/dev/null || true
+    else
+        echo ""
+        echo "Open in browser: $url"
+    fi
+}
+
+# m6 services read their configuration, site.toml, templates and data once, at
+# start, and a touch of site.toml reloads nothing. To read new files, restart.
+reload_eg() {
+    kill_eg "$1"
+    start_eg "$1"
+}
+
+# Rebuild the example (Makefile, cargo package, or no-op), then restart.
+rebuild_eg() {
+    local dir
+    dir=$(find_eg_dir "$1")
+    local built=0
+
+    # 1. Makefile in the example directory.
+    if [ -f "$dir/Makefile" ]; then
+        echo "running: make -C $dir"
+        make -C "$dir"
+        built=1
+    fi
+
+    # 2. Any Cargo.toml sub-packages under the example directory.
+    while IFS= read -r cargo_toml; do
+        local pkg_name
+        pkg_name=$(grep '^name' "$cargo_toml" | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+        if [ -n "$pkg_name" ]; then
+            echo "running: cargo build --release -p $pkg_name"
+            (cd "$EXAMPLES_DIR" && cargo build --release -p "$pkg_name")
+            built=1
+        fi
+    done < <(find "$dir" -maxdepth 2 -name "Cargo.toml" ! -path "$dir/Cargo.toml")
+
+    if [ "$built" -eq 0 ]; then
+        echo "nothing to build in $(basename "$dir")"
+    fi
+
+    # Always restart after a rebuild, so the new binaries and files are read.
+    reload_eg "$1"
+}
+
+# List all examples with running status.
+list_examples() {
+    echo ""
+    printf "  %-4s  %-32s  %s\n" "NUM" "EXAMPLE" "STATUS"
+    printf "  %-4s  %-32s  %s\n" "---" "-------" "------"
+    for dir in "$EXAMPLES_DIR"/[0-9][0-9]-*/; do
+        [ -d "$dir" ] || continue
+        local name
+        name=$(basename "$dir")
+        local num="${name%%-*}"
+        local n
+        n=$((10#$num))
+        local status="stopped"
+        local pg
+        pg=$(running_pgid "$n")
+        [ -n "$pg" ] && status="running (pgid $pg)"
+        local has_dev=""
+        [ -f "$dir/dev.sh" ] || has_dev=" [no dev.sh]"
+        printf "  %-4s  %-32s  %s%s\n" "$num" "$name" "$status" "$has_dev"
+    done
+    echo ""
+}
+
+# Interactive prompt.
+interactive() {
+    list_examples
+    read -r -p "example number> " num
+    [ -z "$num" ] && exit 0
+    local pg
+    pg=$(running_pgid "$num" 2>/dev/null || echo "")
+    if [ -n "$pg" ]; then
+        echo ""
+        echo "example $num is running (pgid $pg)."
+        read -r -p "[restart/rebuild/reload/stop/cancel]> " action
+        case "$(echo "${action:-cancel}" | tr '[:upper:]' '[:lower:]')" in
+            restart) kill_eg "$num"; start_eg "$num" ;;
+            rebuild) rebuild_eg "$num" ;;
+            reload)  reload_eg "$num" ;;
+            stop)    kill_eg "$num" ;;
+            *)       echo "cancelled." ;;
+        esac
+    else
+        start_eg "$num"
+    fi
+}
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+# Parse flags (can appear anywhere in the args).
+ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --no-browser) OPEN_BROWSER=0 ;;
+        *)            ARGS+=("$arg") ;;
+    esac
+done
+
+NUM="${ARGS[0]:-}"
+ACTION="${ARGS[1]:-}"
+
+if [ -z "$NUM" ]; then
+    interactive
+    exit 0
+fi
+
+re='^[0-9]+$'
+[[ "$NUM" =~ $re ]] || die "example number must be a digit, got: $NUM"
+
+# Default: start if stopped, restart if running.
+if [ -z "$ACTION" ]; then
+    pg=$(running_pgid "$NUM" 2>/dev/null || echo "")
+    if [ -n "$pg" ]; then
+        ACTION="reload"
+    else
+        ACTION="start"
+    fi
+fi
+
+case "$(echo "$ACTION" | tr '[:upper:]' '[:lower:]')" in
+    start)   start_eg "$NUM" ;;
+    restart) kill_eg "$NUM"; start_eg "$NUM" ;;
+    rebuild) rebuild_eg "$NUM" ;;
+    reload)  reload_eg "$NUM" ;;
+    stop)    kill_eg "$NUM" ;;
+    *)       die "unknown action '$ACTION' — expected start, restart, rebuild, reload, or stop" ;;
+esac

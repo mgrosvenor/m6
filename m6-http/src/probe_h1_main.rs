@@ -2,9 +2,9 @@
 //! and split into full and RESUMED.
 //!
 //! One job. No requests, no warmup, no charts, one connection at a time. The
-//! figures are directly comparable to the `http/1.1/*` channel on m6-http's
-//! `/perf`, which times the same span: after TCP connect, to handshake complete,
-//! and which also reports full and resumed separately.
+//! figures are directly comparable to the `http/1.1/*` channel in m6-http's
+//! metrics document, which times the same span: after TCP connect, to handshake
+//! complete, and which also reports full and resumed separately.
 //!
 //! The split is here for the same reason as in m6-probe-h2, and this channel is
 //! the control for that one: a server can read high on resumed http/1.1
@@ -14,13 +14,16 @@
 //!
 //! Sequential on purpose. Opening connections concurrently puts accept-queue
 //! delay inside the number, and on a 1-core VM that is milliseconds. If this and
-//! `/perf` disagree, that queueing is the first thing to suspect, and it can only
-//! be isolated by a client that provably is not causing it.
+//! the metrics document disagree, that queueing is the first thing to suspect,
+//! and it can only be isolated by a client that provably is not causing it.
 
 use m6_http_lib::probe;
 
 fn main() {
-    probe::install_crypto();
+    // `--version` and `--version-full` answer from constants fixed at build
+    // time, before any measurement arguments are required.
+    m6_core::version_flags!(m6_core::build_info::linked());
+
     let (addr, n) = probe::args("127.0.0.1:443", 100);
     let no_resume = std::env::args().any(|a| a == "--no-resume");
     // ONE config, shared, so the session store persists between connections.

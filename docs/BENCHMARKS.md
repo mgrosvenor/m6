@@ -2,7 +2,7 @@
 
 This page reports m6's benchmark figures with the conditions recorded for each set, and section 11 names the cases where that record is thin.
 This page is the authority for what a client observes end to end.
-`docs/PERFORMANCE.md` owns what one component costs, and `tools/perf-baseline.txt` owns the numbers a merge is gated on.
+`docs/PERFORMANCE.md` owns what one component costs, and `tools/perfcheck.sh` owns the merge gate.
 A figure quoted anywhere else without its conditions is wrong, and this page is where the figure is checked.
 
 The sections below give the evidence for that rule.
@@ -392,7 +392,7 @@ Two things are true at the same time.
 - **The cost is real and it is the largest single finding of the backend example comparison.**
   A backend answering trivial requests at a high rate pays 36.8% of its throughput for the convenience, and carries 8.8x the resident memory.
 - **The cost is measured on the shape that maximises it.**
-  The route's own work is one 660-byte copy, so the framework carries the request.
+  The route's own work is one 660-byte copy, so m6-core carries the request.
   Behind the edge cache the hit rate is 0.87 to 0.90 and a hit is served in single-digit microseconds, so 87% to 90% of requests never reach a backend at all.
   Read the 36.8% as this route shape's cost.
 
@@ -403,7 +403,7 @@ Section 10.2 gives the control error that inverted the first version of this res
 The first version of this measurement reported m6-core as 72% faster than plain Rust, and the cause was the control.
 `rust-plain` spawned a thread per connection while m6-core answered from a fixed pool, so the comparison measured the concurrency model.
 
-The concurrency section of [`m6-backend-protocol.md`](m6-backend-protocol.md) names a fixed thread pool with a bounded queue as the reference model, so `rust-plain` was not a faithful reference either.
+The concurrency section of [`m6-backend-protocol.md`](m6-backend-protocol.md) named a fixed thread pool with a bounded queue as the reference model at the time of the measurement, so `rust-plain` was not a faithful reference either.
 Giving it one took it from 17,608 to 46,826 req/s at concurrency 4, a 2.7x improvement, and inverted the sign of the answer.
 
 A control that differs from its subject in two ways measures neither.
@@ -418,7 +418,7 @@ One figure is evidence only with its conditions, and this page is written so a r
 A figure from a busy machine, a mixed core class or a co-located generator at concurrency 8 describes that machine and that harness.
 Section 3 gives the two traps that produce such figures, and section 9 gives the design that cancels machine drift.
 
-The numbers a merge is gated on are different: [`tools/perfcheck.sh`](../tools/perfcheck.sh) measures two render targets against the values recorded in `tools/perf-baseline.txt`, on the build host, with a 20% margin.
+The merge gate is different: [`tools/perfcheck.sh`](../tools/perfcheck.sh) compares the candidate against a base build in an interleaved, pinned A/B on the build host.
 `docs/PERFORMANCE.md` owns what one component costs.
 
 Five items carry weaker conditions than the rest.

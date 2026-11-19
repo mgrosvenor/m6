@@ -1,0 +1,16 @@
+# edge-c cache node
+# TLS files come from the unit's LoadCredential lines.
+
+[server]
+bind     = "0.0.0.0:443"
+tls_cert = "/run/credentials/m6-http-cache.service/tls-cert.pem"
+tls_key  = "/run/credentials/m6-http-cache.service/tls-key.pem"
+
+[node]
+name = "edge-c"
+
+# The cache node follows the origin's site generation: on each heartbeat it asks the
+# origin's /genid, and it empties its cache when the number changes.
+[genid]
+upstream   = "origin"
+token_file = "/run/credentials/m6-http-cache.service/genid-read"

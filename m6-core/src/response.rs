@@ -13,6 +13,9 @@
 //! `send` takes `self` by value, because a stream owns its reader and a
 //! response goes on the wire once.
 
+use crate::headers::{HeaderText, Headers};
+use std::sync::Arc;
+
 use serde_json::{Map, Value};
 
 use crate::error::{Error, Result};
@@ -27,11 +30,11 @@ use crate::request::Request;
 /// that are not there. Here they cannot: `as_bytes` returns `None` for a
 /// stream and the transforms have nothing to work on.
 ///
-/// This is what `App` was missing. `m6-file` streams a file straight to the
-/// wire (`send_stream`), and one minified JavaScript bundle of several
+/// A body from a reader is what `m6-file` needs. It streams a file straight to
+/// the wire (`send_stream`), and one minified JavaScript bundle of several
 /// megabytes used to be read into a `Vec` on every cache miss to be copied
-/// straight out again. A migration onto a `Response` that could only hold bytes
-/// would have put that allocation back, on the service that serves every asset
+/// straight out again. A `Response` that could only hold bytes would put that
+/// allocation back, on the service that serves every asset
 /// on the site.
 pub enum Body {
     /// Bytes already in memory.
@@ -105,7 +108,7 @@ impl std::fmt::Debug for Body {
 #[derive(Debug)]
 pub struct Response {
     pub status: u16,
-    pub headers: Vec<(String, String)>,
+    pub headers: crate::headers::Headers,
     pub body: Body,
     /// The handler has produced the exact representation to send.
     ///
@@ -129,7 +132,7 @@ pub struct Response {
     /// both fields once it has rendered. A `pub(crate)` field would only work
     /// while the renderer lived in the same crate as the type, which is the
     /// arrangement this migration is undoing.
-    pub template_name: Option<String>,
+    pub template_name: Option<Arc<str>>,
     /// The context to render with, when the caller supplied one.
     ///
     /// `None` means "the request's own dictionary", which is what the service
@@ -142,11 +145,10 @@ pub struct Response {
 impl From<crate::http::RawResponse> for Response {
     /// The low-level response type, lifted into the one handlers return.
     ///
-    /// `RawResponse` is what a service builds when it is writing its own
-    /// status, headers and body with no framework around it; `Response` is
-    /// what an `App` handler returns. They hold the same three things, so a
-    /// service migrating onto `App` does not have to rewrite handlers that
-    /// already produce a correct answer.
+    /// `RawResponse` is what a service builds when it writes its own status,
+    /// headers and body with no site around it; `Response` is what a request
+    /// arm returns. They hold the same three things, so a service does not
+    /// rewrite a handler that already produces a correct answer.
     ///
     /// `verbatim`, because a `RawResponse` was built to be written as-is: the
     /// service that produced it set its own `Content-Type` and length and had
@@ -156,7 +158,7 @@ impl From<crate::http::RawResponse> for Response {
     fn from(r: crate::http::RawResponse) -> Self {
         Self {
             status: r.status,
-            headers: r.headers,
+            headers: headers_of_iter(r.headers.into_iter().map(|(k, v)| (k.into(), v.into()))),
             body: Body::Bytes(r.body),
             verbatim: true,
             template_name: None,
@@ -204,13 +206,17 @@ impl Response {
     /// The `Dict` form of `render_dict`, and what the service loop and
     /// `render_with` use, because handing over a `Dict` shares its base rather
     /// than copying it.
-    pub fn render_context(template: &str, dict: crate::dict::Dict, status: u16) -> Result<Self> {
+    pub fn render_context(
+        template: impl Into<Arc<str>>,
+        dict: crate::dict::Dict,
+        status: u16,
+    ) -> Result<Self> {
         Ok(Self {
             status,
-            headers: vec![],
+            headers: Headers::new(),
             body: Body::empty(),
             verbatim: false,
-            template_name: Some(template.to_string()),
+            template_name: Some(template.into()),
             template_dict: Some(dict),
         })
     }
@@ -220,13 +226,13 @@ impl Response {
     /// Carries no context: the service loop already has the request dict and
     /// uses it when none was supplied. This is the common path, and it used to
     /// store a full copy of that dict only to merge it back into itself.
-    pub fn render_request_dict(template: &str, status: u16) -> Self {
+    pub fn render_request_dict(template: impl Into<Arc<str>>, status: u16) -> Self {
         Self {
             status,
-            headers: vec![],
+            headers: Headers::new(),
             body: Body::empty(),
             verbatim: false,
-            template_name: Some(template.to_string()),
+            template_name: Some(template.into()),
             template_dict: None,
         }
     }
@@ -234,7 +240,7 @@ impl Response {
     pub fn redirect(location: &str) -> Self {
         Self {
             status: 302,
-            headers: vec![("Location".to_string(), location.to_string())],
+            headers: headers_of([(HeaderText::Static("Location"), location.into())]),
             body: Body::empty(),
             verbatim: false,
             template_name: None,
@@ -245,7 +251,7 @@ impl Response {
     pub fn redirect_permanent(location: &str) -> Self {
         Self {
             status: 301,
-            headers: vec![("Location".to_string(), location.to_string())],
+            headers: headers_of([(HeaderText::Static("Location"), location.into())]),
             body: Body::empty(),
             verbatim: false,
             template_name: None,
@@ -261,7 +267,10 @@ impl Response {
         let body = serde_json::to_vec(&value).unwrap_or_default();
         Self {
             status,
-            headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+            headers: headers_of([(
+                HeaderText::Static("Content-Type"),
+                HeaderText::Static("application/json"),
+            )]),
             body: Body::Bytes(body),
             verbatim: false,
             template_name: None,
@@ -277,10 +286,10 @@ impl Response {
     pub fn html(s: impl Into<String>) -> Self {
         Self {
             status: 200,
-            headers: vec![(
-                "Content-Type".to_string(),
-                "text/html; charset=utf-8".to_string(),
-            )],
+            headers: headers_of([(
+                HeaderText::Static("Content-Type"),
+                HeaderText::Static("text/html; charset=utf-8"),
+            )]),
             body: Body::Bytes(s.into().into_bytes()),
             verbatim: false,
             template_name: None,
@@ -311,7 +320,7 @@ impl Response {
     pub fn stream(status: u16, len: u64, reader: impl std::io::Read + Send + 'static) -> Self {
         Self {
             status,
-            headers: vec![],
+            headers: Headers::new(),
             body: Body::Stream {
                 len,
                 reader: Box::new(reader),
@@ -341,10 +350,10 @@ impl Response {
     pub fn text(s: &str) -> Self {
         Self {
             status: 200,
-            headers: vec![(
-                "Content-Type".to_string(),
-                "text/plain; charset=utf-8".to_string(),
-            )],
+            headers: headers_of([(
+                HeaderText::Static("Content-Type"),
+                HeaderText::Static("text/plain; charset=utf-8"),
+            )]),
             body: Body::Bytes(s.as_bytes().to_vec()),
             verbatim: false,
             template_name: None,
@@ -364,7 +373,7 @@ impl Response {
     pub fn status(code: u16) -> Self {
         Self {
             status: code,
-            headers: vec![],
+            headers: Headers::new(),
             body: Body::empty(),
             verbatim: false,
             template_name: None,
@@ -387,7 +396,7 @@ impl Response {
     // ---------- chained modifiers ----------
 
     pub fn header(mut self, name: &str, value: &str) -> Self {
-        self.headers.push((name.to_string(), value.to_string()));
+        self.headers.push((name.into(), value.into()));
         self
     }
 
@@ -403,7 +412,8 @@ impl Response {
         } else {
             crate::cookie::Cookie::new(name, value).max_age(max_age)
         };
-        self.headers.push(c.path("/").http_only().to_header());
+        let (k, v) = c.path("/").http_only().to_header();
+        self.headers.push((k.into(), v.into()));
         self
     }
 
@@ -429,13 +439,14 @@ impl Response {
 
         let cookie_val = format!("{}.{}", msg_b64, sig_b64);
         let mut s = self;
-        s.headers.push(
-            crate::cookie::Cookie::new("_flash", cookie_val)
+        {
+            let (name, value) = crate::cookie::Cookie::new("_flash", cookie_val)
                 .max_age(120)
                 .path("/")
                 .http_only()
-                .to_header(),
-        );
+                .to_header();
+            s.headers.push((name.into(), value.into()));
+        }
         s
     }
 
@@ -464,17 +475,9 @@ impl Response {
             ..
         } = self;
 
-        let has = |name: &str| crate::headers::contains(&headers[..], name);
-
-        let etag;
-        let mut hdrs: Vec<(&str, &str)> = headers
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-
-        if !has("content-type") && !body.is_empty() {
-            hdrs.push(("Content-Type", "text/html; charset=utf-8"));
-        }
+        let etag_hash = default_etag(&headers, &body);
+        let mut hdrs: Vec<(&str, &str)> = head_fields(&headers, body.is_empty()).collect();
+        let etag_value;
 
         match body {
             // Written straight through, and deliberately given no default
@@ -490,16 +493,66 @@ impl Response {
                 // Last-Modified off of, but its body is a plain byte string —
                 // a content hash gives conditional-GET (see m6-http's
                 // cache-hit `is_not_modified` check) a real signal to compare
-                // against once this response is cached.
-                if !has("etag") && !bytes.is_empty() {
-                    etag = format!("\"{:x}\"", content_hash(&bytes));
-                    hdrs.push(("ETag", etag.as_str()));
+                // against once this response is cached. A `no-store` response
+                // is never cached, so no cache will revalidate it: hashing its
+                // body is wasted work.
+                if let Some(hash) = etag_hash {
+                    etag_value = format!("\"{hash:x}\"");
+                    hdrs.push(("ETag", etag_value.as_str()));
                 }
                 resp.send(status, &hdrs, &bytes)?;
             }
         }
         Ok(())
     }
+}
+
+/// The response head's fields as borrowed pairs, with the `Content-Type` a
+/// handler left out supplied for a body of bytes.
+///
+/// One rule for every sender: `Response::send` and a connection slot both build
+/// their head from this, so the two cannot default differently.
+pub(crate) fn head_fields<'a>(
+    headers: &'a [crate::headers::Header],
+    body_is_empty: bool,
+) -> impl Iterator<Item = (&'a str, &'a str)> + 'a {
+    let fields = headers.iter().map(|(k, v)| (k.as_str(), v.as_str()));
+    let content_type = if !crate::headers::contains(headers, "content-type") && !body_is_empty {
+        Some(("Content-Type", "text/html; charset=utf-8"))
+    } else {
+        None
+    };
+    fields.chain(content_type)
+}
+
+/// A header list holding `items`.
+fn headers_of<const N: usize>(items: [crate::headers::Header; N]) -> Headers {
+    headers_of_iter(items)
+}
+
+fn headers_of_iter(items: impl IntoIterator<Item = crate::headers::Header>) -> Headers {
+    let mut list = Headers::new();
+    list.extend(items);
+    list
+}
+
+/// The default `ETag` for a buffered body: a content hash, unless the response
+/// carries its own tag, has no body, or asks caches not to store it.
+///
+/// A `Body::Stream` has no `ETag` by construction: hashing it would mean
+/// reading it, which is the whole thing streaming avoids. One rule for
+/// `Response::send` and a connection slot, so the tag they emit cannot differ.
+pub(crate) fn default_etag(headers: &[crate::headers::Header], body: &Body) -> Option<u64> {
+    let Body::Bytes(bytes) = body else {
+        return None;
+    };
+    if bytes.is_empty()
+        || crate::headers::contains(headers, "etag")
+        || cache_control_no_store(headers)
+    {
+        return None;
+    }
+    Some(content_hash(bytes))
 }
 
 fn content_hash(body: &[u8]) -> u64 {
@@ -509,14 +562,49 @@ fn content_hash(body: &[u8]) -> u64 {
     hasher.finish()
 }
 
-/// Map an `Error` to a `Response` (status only, body set by framework).
+/// Whether a `Cache-Control` field asks caches not to store the response.
+///
+/// Splits each value on commas outside quoted strings, the same way m6-http's
+/// cache parser does, so a quoted value such as `no-cache="a,no-store,b"` stays
+/// one directive and does not read as `no-store`. `no-store` is a bare
+/// directive name, matched exactly and case-insensitively across every field
+/// line. It is also the rule for minification in `site.rs`.
+pub(crate) fn cache_control_no_store(headers: &[crate::headers::Header]) -> bool {
+    crate::headers::get_all(headers, "cache-control").any(|value| {
+        let mut in_quotes = false;
+        let mut escaped = false;
+        let mut start = 0;
+        for (i, ch) in value.char_indices() {
+            match ch {
+                '\\' if in_quotes && !escaped => escaped = true,
+                '"' if !escaped => in_quotes = !in_quotes,
+                ',' if !in_quotes => {
+                    if is_no_store_name(&value[start..i]) {
+                        return true;
+                    }
+                    start = i + ch.len_utf8();
+                }
+                _ => escaped = false,
+            }
+        }
+        is_no_store_name(&value[start..])
+    })
+}
+
+/// True when a directive's name is `no-store`, the part before its `=`.
+fn is_no_store_name(raw: &str) -> bool {
+    let name = raw.trim().split_once('=').map_or(raw.trim(), |(n, _)| n);
+    name.trim().eq_ignore_ascii_case("no-store")
+}
+
+/// Map an `Error` to a `Response` (status only, body set by `site`).
 pub fn error_to_response(err: &Error) -> Response {
     match err {
         Error::NotFound => Response::not_found(),
         Error::Forbidden => Response::forbidden(),
         Error::BadRequest(_) => Response::bad_request(),
         Error::Other(_) => {
-            tracing::error!("handler error: {err}");
+            crate::log::error!("handler error: {err}");
             Response::status(500)
         }
     }
@@ -541,7 +629,7 @@ mod body_tests {
         (head, out[sep + 4..].to_vec())
     }
 
-    /// The capability `App` was missing: a body written from a reader, with the
+    /// A body written from a reader, with the
     /// length promised up front and never held in memory.
     #[test]
     fn a_streamed_body_reaches_the_wire_with_its_length() {
@@ -575,6 +663,35 @@ mod body_tests {
         // A byte body still gets one, which is the behaviour that existed
         // before and that m6-http's cache-hit revalidation depends on.
         let (head, _) = send_to_wire(Response::text("abcdef"), "GET");
+        assert!(head.to_lowercase().contains("etag"), "{head}");
+    }
+
+    /// A `no-store` response will not be cached, so no cache will revalidate
+    /// it: hashing the body for an ETag is wasted work. A cacheable response
+    /// still gets one, which a conditional request matches to get a 304.
+    #[test]
+    fn a_no_store_response_is_not_hashed_for_an_etag() {
+        let (head, _) = send_to_wire(
+            Response::text("abcdef").header("Cache-Control", "no-store"),
+            "GET",
+        );
+        assert!(!head.to_lowercase().contains("etag"), "{head}");
+
+        let (head, _) = send_to_wire(
+            Response::text("abcdef").header("Cache-Control", "public, max-age=60"),
+            "GET",
+        );
+        assert!(head.to_lowercase().contains("etag"), "{head}");
+    }
+
+    /// A quoted directive value keeps its comma: `no-cache="a,no-store,b"` is
+    /// one directive named `no-cache`, not a `no-store`, so the response stays
+    /// cacheable and keeps its ETag.
+    #[test]
+    fn a_quoted_value_containing_no_store_is_not_a_no_store_directive() {
+        let r =
+            Response::text("abcdef").header("Cache-Control", "public, no-cache=\"a,no-store,b\"");
+        let (head, _) = send_to_wire(r, "GET");
         assert!(head.to_lowercase().contains("etag"), "{head}");
     }
 

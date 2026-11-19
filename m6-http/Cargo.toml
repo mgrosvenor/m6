@@ -15,6 +15,10 @@ name = "m6-bench"
 path = "src/bench_main.rs"
 
 [[bin]]
+name = "m6-perf-ab"
+path = "src/perf_ab_main.rs"
+
+[[bin]]
 name = "m6-bench-detail"
 path = "src/bench_detail.rs"
 
@@ -24,8 +28,8 @@ path = "src/bench_url_backend_main.rs"
 
 # Three single-purpose handshake probes. One protocol each, one handshake per
 # connection, strictly sequential, no requests and no charts -- the minimum that
-# can check m6-http's own per-channel handshake figure on /perf against an
-# independent measurement taken by our own client.
+# can check m6-http's own per-channel handshake figure on the `type=perf` line
+# against an independent measurement taken by our own client.
 #
 # Separate binaries rather than one with a --proto flag: each is a dozen lines
 # over src/probe.rs, and the h3 figure spans a DIFFERENT thing from the other two
@@ -46,6 +50,25 @@ path = "src/probe_h3_main.rs"
 [lib]
 name = "m6_http_lib"
 path = "src/lib.rs"
+
+[features]
+# Count every heap allocation the run loop makes, and log the count at stop.
+# Off by default, and a plain build has neither the allocator nor the arm calls:
+# `src/main.rs` gates all three on this feature, and m6-core exposes only its
+# counting file through `alloc-count`. `tests/allocations.rs` reads the stop
+# line of a binary built with this feature.
+count-allocations = ["m6-core/alloc-count"]
+# Allocation attribution: dhat as the global allocator, so every allocation is attributed to
+# a source line rather than just counted. It implies `count-allocations` so the
+# binary keeps the same arm and stop lines, and it is off by default. This is
+# measurement instrumentation only: no request path changes.
+alloc-attribution = ["count-allocations", "dep:dhat"]
+
+# RFC 8879 certificate compression for the TCP listener: brotli and zlib. With
+# these rustls features on, a server answers a client that advertises
+# compress_certificate with the compressed Certificate message. Off by default;
+# see the handshake_parts bench for what it saves.
+cert-compression = ["rustls/brotli", "rustls/zlib"]
 
 [dependencies]
 # quiche, from our own fork, pinned BY REVISION and not by branch: a branch name
@@ -77,13 +100,13 @@ serde_json     = "1"
 toml           = "0.8"
 anyhow         = "1"
 thiserror      = "1"
-m6-core        = { path = "../m6-core" }
-tracing        = "0.1"
-tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-jsonwebtoken   = "9"
+m6-core        = { path = "../m6-core", default-features = false }
 glob           = "0.3"
 bytes          = "1"
 base64         = "0.22"
+# Used only by `alloc-attribution`: the heap profiler that records a
+# backtrace for every allocation and writes dhat-heap.json at exit.
+dhat           = { version = "0.3", optional = true }
 sha2           = "0.10"
 httparse       = "1"
 # Upstream, deliberately, despite RUSTSEC-2023-0084 and -0085.
@@ -102,27 +125,39 @@ httparse       = "1"
 # them survives validation and panics.
 hpack          = "0.3"
 ahash          = "0.8"
-libc           = "0.2"
 # tls12 and logging reached release builds only through tokio-rustls's default
 # features while the cold-start benchmark was a [[bin]]. Declare them here so
 # the listener keeps the protocol versions and log records it had when
-# tokio-rustls is a dev-dependency. The one crypto provider is ring.
-rustls         = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# tokio-rustls is a dev-dependency.
+#
+# aws-lc-rs is rustls's own default provider and the only one this tree builds.
+# The build host measured it on Linux guests that hide ADX and SHA-NI: ring's
+# X25519 falls back to its generic path at 83 us per handshake, aws-lc-rs has a
+# non-ADX fast path at 56 us, and aws-lc-rs makes 0 getrandom calls per
+# handshake against ring's 9. Nothing here needs ring, so it is not a second
+# path: `builder()` resolves the provider from these features and there is
+# exactly one provider to resolve.
+rustls         = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
 # rustls-pki-types rather than rustls-pemfile: that crate is unmaintained
 # (RUSTSEC-2025-0134) and its advisory points at this one, which carries the same
 # PEM code behind the `PemObject` trait. rustls already depends on it, so this is
 # naming a dependency the tree already had rather than adding one.
 rustls-pki-types = "1"
 rustls-native-certs = "0.8"
-webpki-roots   = "0.26"
 rand           = "0.8"
 httpdate       = "1"
+# Decimal formatting without allocation on the response hot path: the cached
+# hit writes status, age and content-length through itoa's stack buffer.
+itoa           = "1"
+# Non-blocking socket connect for the socket-backend upstreams. The same
+# version m6-core already uses, so Cargo.lock gains no new crate.
+socket2        = "0.6"
 
-[target.'cfg(target_os = "linux")'.dependencies]
-inotify = "0.10"
+[build-dependencies]
+m6-platform = { path = "../m6-platform" }
 
 [dev-dependencies]
-m6-core       = { path = "../m6-core", features = ["testkit"] }
+m6-core       = { path = "../m6-core", default-features = false, features = ["testkit"] }
 tempfile      = "3"
 # Setting a file's mtime is not in std, and the scratch-sweep test has to age a
 # directory to prove the sweep looks at age at all. Already in the lock as a
@@ -130,12 +165,19 @@ tempfile      = "3"
 filetime      = "0.2"
 anyhow        = "1"
 criterion     = { version = "0.5", features = ["html_reports"] }
+# The custom-harness tests speak libtest's protocol (`--list --format terse`,
+# `--exact <name>`), which is what `nextest` lists and runs.
+libtest-mimic = "0.8"
 rcgen         = "0.13"
 # The cold-start bench is the only user of these four. A [[bin]] cannot use
 # dev-dependencies, so the bench is a [[bench]] and they live here.
 h2             = "0.4"
 tokio          = { version = "1", features = ["rt", "net", "io-util", "macros"] }
-tokio-rustls   = "0.26"
+# The provider comes from this crate's rustls features, not from tokio-rustls.
+# Its defaults enable `aws_lc_rs`, which would give rustls two providers and
+# make `ClientConfig::builder()` panic. On the aws-lc-rs tree the same line
+# leaves exactly one, its own.
+tokio-rustls   = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
 http           = "1"
 
 [[bench]]
@@ -144,4 +186,67 @@ harness = false
 
 [[bench]]
 name    = "bench_coldstart"
+harness = false
+
+# The cached-hit allocation check, on the main thread so the counting allocator
+# reads only the hit path's own allocations.
+[[test]]
+name = "alloc_cached_hit"
+harness = false
+
+# The generation-ID writers' allocation check, on the main thread for the same
+# reason: one process-wide counter, one check at a time.
+[[test]]
+name = "genid_allocs"
+harness = false
+
+# The cache node's store-rule allocation check, on the main thread for the same
+# reason: one process-wide counter, one check at a time.
+[[test]]
+name = "genid_cache_allocs"
+harness = false
+
+# The disk writer's queue allocation check, on the main thread for the same
+# reason: one process-wide counter, one check at a time.
+[[test]]
+name = "disk_cache_allocs"
+harness = false
+
+# The disk cache's write and restart-read integration suite.
+[[test]]
+name = "disk_cache"
+
+# The `type=traffic` line's per-event allocation check, on the main thread for
+# the same reason.
+[[test]]
+name = "traffic_window_alloc"
+harness = false
+
+# The per-request analytics line's allocation check. Its own binary so the
+# counting allocator reads only what `record` allocated, with the analytics Sink
+# opened first.
+[[test]]
+name = "analytics_allocs"
+harness = false
+
+# Heap allocations per cached request, by row, read from the stop line
+# of a binary built with the counting allocator. Needs the feature, so an
+# ordinary `cargo test --workspace` neither builds nor runs it.
+[[test]]
+name = "allocations"
+required-features = ["count-allocations"]
+
+# The same four request-path rows with dhat as the allocator, plus the
+# handshake-only control, at two request
+# counts, writing one dhat-heap.json per server run. It needs both features, so
+# an ordinary test run never builds it.
+[[test]]
+name = "alloc_attribution"
+required-features = ["alloc-attribution"]
+
+# Where a server-side TLS handshake spends its time, per provider and key type,
+# with no sockets in the way. Needs both providers, which the dev-dependency
+# below turns on.
+[[bench]]
+name    = "handshake_parts"
 harness = false

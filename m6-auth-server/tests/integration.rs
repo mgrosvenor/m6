@@ -1,11 +1,17 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
-use m6_core::testkit::{assert_app_lifecycle, binary, wait, Service};
+use m6_core::testkit::{
+    assert_app_lifecycle, binary, read_response, spawn_instances, wait, Service, RESPONSE_BOUND,
+};
 
 // ─── Test fixtures ────────────────────────────────────────────────────────────
 
@@ -14,7 +20,10 @@ use m6_core::testkit::{assert_app_lifecycle, binary, wait, Service};
 fn generate_test_rsa_keys() -> (String, String) {
     use std::process::Command;
 
-    let dir = tempfile::TempDir::new().unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("auth-")
+        .tempdir_in(m6_core::testkit::socket_scratch_root())
+        .unwrap();
     let key_path = dir.path().join("test.key");
     let pub_path = dir.path().join("test.pub");
 
@@ -48,8 +57,14 @@ struct TestEnv {
 }
 
 fn setup_test_env(id: &str) -> TestEnv {
-    let temp = tempfile::TempDir::new().unwrap();
-    let key_dir = tempfile::TempDir::new().unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("auth-")
+        .tempdir_in(m6_core::testkit::socket_scratch_root())
+        .unwrap();
+    let key_dir = tempfile::Builder::new()
+        .prefix("auth-")
+        .tempdir_in(m6_core::testkit::socket_scratch_root())
+        .unwrap();
 
     let site_dir = temp.path().to_path_buf();
     let config_path = site_dir.join("m6-auth-test.conf");
@@ -62,7 +77,7 @@ fn setup_test_env(id: &str) -> TestEnv {
     std::fs::write(&public_key_path, &public_pem).unwrap();
 
     // Write config
-    let db_path = "data/auth.db";
+    let db_path = site_dir.join("data/auth.db").display().to_string();
     let config = format!(
         r#"[storage]
 path = "{}"
@@ -71,10 +86,6 @@ path = "{}"
 access_ttl  = 900
 refresh_ttl = 2592000
 issuer      = "test.example.com"
-
-[thread_pool]
-size = 4
-queue_size = 32
 
 [keys]
 private_key = "{}"
@@ -88,6 +99,7 @@ public_key  = "{}"
 
     // Create data directory
     std::fs::create_dir_all(site_dir.join("data")).unwrap();
+    std::fs::write(site_dir.join("site.toml"), "").unwrap();
 
     // The socket lives in this test's own temp directory, not a shared one.
     // It used to be `$TMPDIR/m6-test-sockets/<id>.sock`, a fixed path per test
@@ -105,9 +117,6 @@ public_key  = "{}"
 }
 
 /// Spawn `m6-auth-server` and wait until it accepts a connection.
-///
-/// Readiness is a successful connect, not an existing path: `bind` creates the
-/// socket file and `listen` comes after, so the file appearing proves nothing.
 fn spawn_server(env: &TestEnv) -> Service {
     let mut svc = Service::spawn(
         "m6-auth-server",
@@ -116,56 +125,138 @@ fn spawn_server(env: &TestEnv) -> Service {
             .arg(&env.config_path)
             .env("M6_SOCKET_OVERRIDE", &env.socket_path),
     );
-    svc.wait_for_path(&env.socket_path, Duration::from_secs(10));
+    wait_until_serving(&mut svc, &env.socket_path);
+    svc
+}
+
+/// Wait until `svc` has created `socket` and accepts a connection on it.
+///
+/// Readiness is a successful connect, not an existing path: `bind` creates the
+/// socket file and `listen` comes after, so the file appearing proves nothing.
+fn wait_until_serving(svc: &mut Service, socket: &Path) {
+    svc.wait_for_path(socket, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
     assert!(
-        wait::for_unix(&env.socket_path, Duration::from_secs(10)),
+        wait::for_unix(socket, m6_core::testkit::STARTUP_BOUND),
         "m6-auth-server created {} but never accepted a connection\n--- output ---\n{}",
-        env.socket_path.display(),
+        socket.display(),
         svc.output()
     );
-    svc
+}
+
+/// Spawn `m6-auth-server` expecting it to refuse `what` at start, and return
+/// its output.
+///
+/// The service must exit 2 within 10 s. A service still running is the failure
+/// this panics on, before any caller's message assertion can hide it.
+fn start_failure(env: &TestEnv, what: &str) -> String {
+    let mut svc = Service::spawn(
+        "m6-auth-server",
+        Command::new(binary("m6-auth-server"))
+            .arg(&env.site_dir)
+            .arg(&env.config_path)
+            .env("M6_SOCKET_OVERRIDE", &env.socket_path),
+    );
+    let status = svc
+        .wait_for_exit(std::time::Instant::now() + m6_core::testkit::STARTUP_BOUND)
+        .unwrap_or_else(|| {
+            panic!(
+                "m6-auth-server did not stop for {what}\n--- output ---\n{}",
+                svc.output()
+            )
+        });
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "m6-auth-server should exit 2 for {what}\n--- output ---\n{}",
+        svc.output()
+    );
+    svc.output()
 }
 
 /// Create a test user via the database before the server starts.
 /// Returns the db path so we can pre-seed it.
+///
+/// Cost 4 is bcrypt's lowest: a fixture needs a user, not production's round
+/// count, and an unoptimised cost-12 hash costs seconds per test.
 fn seed_user(site_dir: &Path, username: &str, password: &str) {
     let db_path = site_dir.join("data/auth.db");
     std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
     let db = m6_auth::Db::open(&db_path).expect("open db");
-    db.user_create(username, password, &["user"])
+    db.user_create_with_cost(username, password, &["user"], 4)
         .expect("create user");
 }
 
+/// Hold the database's write lock until the connection is dropped or the
+/// transaction is committed. `BEGIN IMMEDIATE` takes the lock at the begin, so
+/// a caller that has returned from here holds it.
+fn hold_write_lock(db_path: &Path) -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open(db_path).expect("open the lock connection");
+    conn.busy_timeout(Duration::from_secs(1))
+        .expect("set the lock connection's timeout");
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .expect("take the database's write lock");
+    conn
+}
+
 /// Send a raw HTTP request over a Unix socket and return the full response bytes.
-fn http_request(socket_path: &Path, request: &str) -> String {
+fn http_request(svc: &mut Service, socket_path: &Path, request: &str) -> String {
+    http_request_within(svc, socket_path, request, RESPONSE_BOUND)
+}
+
+/// Send one request and wait for its response, or for `svc` to exit.
+///
+/// The wait is [`m6_core::testkit::read_response`]: the response event or the
+/// child's exit, with `RESPONSE_BOUND` as the safety net. `within` lets the two
+/// tests that assert a prompt answer pass their own bound; the silent-service
+/// test calls the testkit waiter directly to prove the bound itself fails.
+fn http_request_within(
+    svc: &mut Service,
+    socket_path: &Path,
+    request: &str,
+    within: Duration,
+) -> String {
     let mut stream = UnixStream::connect(socket_path)
         .unwrap_or_else(|e| panic!("connect {:?}: {}", socket_path, e));
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
     stream.write_all(request.as_bytes()).unwrap();
     // One response, not read-to-EOF: the connection stays open (RFC 9112 9.3).
     let method = request.split(' ').next().unwrap_or("");
-    let resp = m6_core::testkit::read_one(&mut stream, method).expect("read one response");
+    let resp = m6_core::testkit::read_response(svc, stream, method, within)
+        .unwrap_or_else(|e| panic!("{e}"));
     String::from_utf8_lossy(&resp).into_owned()
 }
 
-fn http_request_with_body(
-    socket_path: &Path,
-    method: &str,
-    path: &str,
-    content_type: &str,
-    body: &str,
-) -> String {
-    let req = format!(
+/// The bytes of a request with a body, for a test that sends it on a
+/// connection it keeps.
+fn request_with_body(method: &str, path: &str, content_type: &str, body: &str) -> String {
+    format!(
         "{} {} HTTP/1.1\r\nHost: localhost\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n{}",
         method,
         path,
         content_type,
         body.len(),
         body
-    );
-    http_request(socket_path, &req)
+    )
+}
+
+/// The JSON login request the locked-database tests send.
+fn login_json_request(body: &str) -> String {
+    request_with_body("POST", "/auth/login", "application/json", body)
+}
+
+fn http_request_with_body(
+    svc: &mut Service,
+    socket_path: &Path,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    body: &str,
+) -> String {
+    http_request(
+        svc,
+        socket_path,
+        &request_with_body(method, path, content_type, body),
+    )
 }
 
 fn parse_status(resp: &str) -> u16 {
@@ -209,10 +300,11 @@ fn get_all_headers<'a>(resp: &'a str, name: &str) -> Vec<&'a str> {
 fn t01_login_form_valid_credentials_302_cookies() {
     let env = setup_test_env("t01");
     seed_user(&env.site_dir, "alice", "correct_pass");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
     let body = "username=alice&password=correct_pass&next=/dashboard";
     let resp = http_request_with_body(
+        &mut guard,
         &env.socket_path,
         "POST",
         "/auth/login",
@@ -259,10 +351,11 @@ fn t01_login_form_valid_credentials_302_cookies() {
 fn t02_login_json_valid_credentials_200_no_cookies() {
     let env = setup_test_env("t02");
     seed_user(&env.site_dir, "bob", "pass123");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
     let body = r#"{"username":"bob","password":"pass123"}"#;
     let resp = http_request_with_body(
+        &mut guard,
         &env.socket_path,
         "POST",
         "/auth/login",
@@ -299,10 +392,11 @@ fn t02_login_json_valid_credentials_200_no_cookies() {
 fn t03_login_form_wrong_password_302_error() {
     let env = setup_test_env("t03");
     seed_user(&env.site_dir, "carol", "right_pass");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
     let body = "username=carol&password=wrong_pass";
     let resp = http_request_with_body(
+        &mut guard,
         &env.socket_path,
         "POST",
         "/auth/login",
@@ -323,10 +417,11 @@ fn t03_login_form_wrong_password_302_error() {
 fn t03b_login_json_wrong_password_401() {
     let env = setup_test_env("t03b");
     seed_user(&env.site_dir, "dave", "right_pass");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
     let body = r#"{"username":"dave","password":"wrong_pass"}"#;
     let resp = http_request_with_body(
+        &mut guard,
         &env.socket_path,
         "POST",
         "/auth/login",
@@ -338,44 +433,58 @@ fn t03b_login_json_wrong_password_401() {
 }
 
 /// Login: 6th attempt within 15 minutes → 429 with Retry-After.
+///
+/// The header must be a wait the client can act on, so it is checked against
+/// the configured window rather than a literal. The block follows five
+/// failures, so the window restarted at the fifth and almost all of it is
+/// left. A header that ignores `window_secs` fails the half-window bound.
 #[test]
 fn t04_login_rate_limited_429() {
+    const WINDOW_SECS: u64 = 900;
     let env = setup_test_env("t04");
-    // No user needed — rate limit checked before credential verification
-    let _guard = spawn_server(&env);
+    set_rate_limit(&env, 5, WINDOW_SECS);
+    // A real user with a cost-4 hash: a missing user costs a cost-12 verify,
+    // CPU work that a loaded host stretches past the read deadline.
+    seed_user(&env.site_dir, "mallory", "right");
+    let mut guard = spawn_server(&env);
 
-    let body = r#"{"username":"nobody","password":"bad"}"#;
+    // The first attempt is an unknown user, so a failure that never reached
+    // credential verification still counts. The rest name the seeded user,
+    // whose wrong password verifies at the fixture's cost 4: the cost-12 dummy
+    // hash behind the unknown-user path costs seconds per attempt in this
+    // profile, and the limiter is what this test measures.
+    let unknown = r#"{"username":"nobody","password":"bad"}"#;
+    let known = r#"{"username":"mallory","password":"bad"}"#;
 
-    // First 5 attempts (fail with 401)
-    for _ in 0..5 {
+    // First 5 attempts must fail with 401. A 429 here would mean the budget was
+    // already spent, and returning early would skip the header check.
+    for attempt in 0..5 {
+        let body = if attempt == 0 { unknown } else { known };
         let resp = http_request_with_body(
+            &mut guard,
             &env.socket_path,
             "POST",
             "/auth/login",
             "application/json",
             body,
         );
-        let status = parse_status(&resp);
-        assert!(
-            status == 401 || status == 429,
-            "expected 401 or 429, got {}",
-            status
+        assert_eq!(
+            parse_status(&resp),
+            401,
+            "failure {} of 5 must not be throttled\n{}",
+            attempt + 1,
+            resp
         );
-        if status == 429 {
-            // We already got rate-limited early, test passes
-            let retry_after = get_header(&resp, "Retry-After").unwrap_or("");
-            assert!(!retry_after.is_empty(), "expected Retry-After header");
-            return;
-        }
     }
 
     // 6th attempt must be 429
     let resp = http_request_with_body(
+        &mut guard,
         &env.socket_path,
         "POST",
         "/auth/login",
         "application/json",
-        body,
+        known,
     );
     assert_eq!(
         parse_status(&resp),
@@ -383,11 +492,300 @@ fn t04_login_rate_limited_429() {
         "6th attempt should be rate-limited\n{}",
         resp
     );
-    let retry_after = get_header(&resp, "Retry-After").unwrap_or("");
+    retry_after_secs(&resp, WINDOW_SECS);
+}
+
+/// The header follows `window_secs`, so two configurations answer differently.
+///
+/// Each server is driven to a block with the same five failures. A hard-coded
+/// 60 fails the half-window bound at 120 seconds, where 60 is not greater than
+/// 60, and again at 900. The two answers would also be equal.
+#[test]
+fn t04b_retry_after_follows_the_configured_window() {
+    let mut answered = Vec::new();
+    for window_secs in [120u64, 900u64] {
+        let env = setup_test_env(&format!("t04b-{window_secs}"));
+        set_rate_limit(&env, 5, window_secs);
+        seed_user(&env.site_dir, "mallory", "right");
+        let mut guard = spawn_server(&env);
+
+        let known = r#"{"username":"mallory","password":"bad"}"#;
+        for attempt in 0..5 {
+            let resp = http_request_with_body(
+                &mut guard,
+                &env.socket_path,
+                "POST",
+                "/auth/login",
+                "application/json",
+                known,
+            );
+            assert_eq!(
+                parse_status(&resp),
+                401,
+                "failure {} of 5 with window_secs {window_secs} must not be throttled\n{}",
+                attempt + 1,
+                resp
+            );
+        }
+        let resp = http_request_with_body(
+            &mut guard,
+            &env.socket_path,
+            "POST",
+            "/auth/login",
+            "application/json",
+            known,
+        );
+        assert_eq!(
+            parse_status(&resp),
+            429,
+            "the 6th attempt with window_secs {window_secs} should be rate-limited\n{}",
+            resp
+        );
+        answered.push(retry_after_secs(&resp, window_secs));
+    }
     assert!(
-        !retry_after.is_empty(),
-        "expected Retry-After header on 429"
+        answered[0] < answered[1],
+        "Retry-After did not follow window_secs: 120s answered {}, 900s answered {}",
+        answered[0],
+        answered[1]
     );
+}
+
+/// Parse the `Retry-After` on a blocked login and check what a client can do
+/// with it.
+///
+/// The block follows five failures, so the window restarted at the fifth and
+/// nearly all of it remains. A value at or below half of `window_secs` means
+/// the header is not derived from the configured window. A value above
+/// `window_secs` would overstate the wait beyond the whole window, and zero
+/// would invite an immediate retry.
+fn retry_after_secs(resp: &str, window_secs: u64) -> u64 {
+    let raw = get_header(resp, "Retry-After")
+        .unwrap_or_else(|| panic!("a blocked login must carry Retry-After\n{resp}"));
+    let secs: u64 = raw
+        .parse()
+        .unwrap_or_else(|_| panic!("Retry-After must be whole seconds, got {raw:?}\n{resp}"));
+    assert!(
+        secs >= 1,
+        "Retry-After must name a positive wait, got {secs}\n{resp}"
+    );
+    assert!(
+        secs <= window_secs,
+        "Retry-After {secs} exceeds window_secs {window_secs}\n{resp}"
+    );
+    assert!(
+        secs > window_secs / 2,
+        "Retry-After {secs} is not close to window_secs {window_secs}, so it is not derived from it\n{resp}"
+    );
+    secs
+}
+
+/// Append a `[rate_limit]` table to the test config.
+///
+/// Call it before `spawn_server`. `setup_test_env` writes no `[rate_limit]`
+/// table, so appending one is valid TOML and the server reads it at start.
+fn set_rate_limit(env: &TestEnv, max_attempts: u32, window_secs: u64) {
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&env.config_path)
+        .expect("open the test config for appending");
+    writeln!(
+        file,
+        "\n[rate_limit]\nmax_attempts = {max_attempts}\nwindow_secs = {window_secs}"
+    )
+    .expect("append the rate limit table");
+}
+
+/// [`set_rate_limit`] with the service's default window.
+fn limit_failures_to(env: &TestEnv, n: u32) {
+    set_rate_limit(env, n, 900);
+}
+
+/// Send one wrong JSON login carrying the extra header lines in `forwarded`,
+/// and return its status. `forwarded` is each header line ending in `\r\n`, or
+/// an empty string for none.
+fn failed_login(svc: &mut Service, socket: &Path, forwarded: &str) -> u16 {
+    let body = r#"{"username":"mallory","password":"bad"}"#;
+    let req = format!(
+        "POST /auth/login HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\n\r\n{}",
+        forwarded,
+        body.len(),
+        body,
+    );
+    let resp = http_request(svc, socket, &req);
+    parse_status(&resp)
+}
+
+/// Each forwarded address is its own rate-limit bucket.
+///
+/// Two failures from `192.0.2.10` use that address's budget and the third is
+/// blocked. A second `X-Forwarded-For` address is not blocked. `X-Real-IP` is
+/// read when `X-Forwarded-For` is absent, and `X-Forwarded-For` wins when both
+/// are present.
+#[test]
+fn forwarded_addresses_select_the_rate_limit_bucket() {
+    let env = setup_test_env("rate-limit-bucket");
+    limit_failures_to(&env, 2);
+    seed_user(&env.site_dir, "mallory", "right");
+    let mut guard = spawn_server(&env);
+    let socket = &env.socket_path;
+
+    assert_eq!(
+        failed_login(&mut guard, socket, "X-Forwarded-For: 192.0.2.10\r\n"),
+        401,
+        "X-Forwarded-For: 192.0.2.10, first failure, expected 401"
+    );
+    assert_eq!(
+        failed_login(&mut guard, socket, "X-Forwarded-For: 192.0.2.10\r\n"),
+        401,
+        "X-Forwarded-For: 192.0.2.10, second failure, expected 401"
+    );
+    assert_eq!(
+        failed_login(&mut guard, socket, "X-Forwarded-For: 192.0.2.10\r\n"),
+        429,
+        "X-Forwarded-For: 192.0.2.10, third failure, expected 429"
+    );
+    assert_eq!(
+        failed_login(&mut guard, socket, "X-Forwarded-For: 192.0.2.11\r\n"),
+        401,
+        "X-Forwarded-For: 192.0.2.11, a second address is not blocked, expected 401"
+    );
+
+    assert_eq!(
+        failed_login(&mut guard, socket, "X-Real-IP: 192.0.2.12\r\n"),
+        401,
+        "X-Real-IP: 192.0.2.12, first failure, expected 401"
+    );
+    assert_eq!(
+        failed_login(&mut guard, socket, "X-Real-IP: 192.0.2.12\r\n"),
+        401,
+        "X-Real-IP: 192.0.2.12, second failure, expected 401"
+    );
+    assert_eq!(
+        failed_login(&mut guard, socket, "X-Real-IP: 192.0.2.12\r\n"),
+        429,
+        "X-Real-IP: 192.0.2.12, third failure, expected 429"
+    );
+
+    assert_eq!(
+        failed_login(
+            &mut guard,
+            socket,
+            "X-Forwarded-For: 192.0.2.11\r\nX-Real-IP: 192.0.2.10\r\n"
+        ),
+        401,
+        "X-Forwarded-For wins over X-Real-IP: 192.0.2.11 is not blocked, expected 401"
+    );
+}
+
+/// Callers that send neither header count against the one `unix` bucket.
+///
+/// Two failures with no forwarded header use the bucket and a third is
+/// blocked. A forwarded address has its own bucket and is not blocked by them.
+#[test]
+fn requests_without_a_forwarded_address_share_one_bucket() {
+    let env = setup_test_env("rate-limit-unix-bucket");
+    limit_failures_to(&env, 2);
+    seed_user(&env.site_dir, "mallory", "right");
+    let mut guard = spawn_server(&env);
+    let socket = &env.socket_path;
+
+    assert_eq!(
+        failed_login(&mut guard, socket, ""),
+        401,
+        "no header, first failure, expected 401"
+    );
+    assert_eq!(
+        failed_login(&mut guard, socket, ""),
+        401,
+        "no header, second failure, expected 401"
+    );
+    assert_eq!(
+        failed_login(&mut guard, socket, ""),
+        429,
+        "no header, third failure, expected 429"
+    );
+    assert_eq!(
+        failed_login(&mut guard, socket, "X-Forwarded-For: 192.0.2.20\r\n"),
+        401,
+        "X-Forwarded-For: 192.0.2.20, a forwarded address is not blocked by the unix bucket, expected 401"
+    );
+}
+
+/// A restart forgets the failure counts, because the counts live in memory.
+///
+/// The 429 before the restart proves the address really was blocked, so the
+/// 401 after it means the count was gone rather than never counted.
+#[test]
+fn a_restart_forgets_the_failure_counts() {
+    let env = setup_test_env("rate-limit-restart");
+    limit_failures_to(&env, 2);
+    seed_user(&env.site_dir, "mallory", "right");
+    let mut svc = spawn_server(&env);
+    let socket = &env.socket_path;
+
+    assert_eq!(
+        failed_login(&mut svc, socket, "X-Forwarded-For: 192.0.2.30\r\n"),
+        401,
+        "X-Forwarded-For: 192.0.2.30, first failure, expected 401"
+    );
+    assert_eq!(
+        failed_login(&mut svc, socket, "X-Forwarded-For: 192.0.2.30\r\n"),
+        401,
+        "X-Forwarded-For: 192.0.2.30, second failure, expected 401"
+    );
+    assert_eq!(
+        failed_login(&mut svc, socket, "X-Forwarded-For: 192.0.2.30\r\n"),
+        429,
+        "X-Forwarded-For: 192.0.2.30, third failure, expected 429"
+    );
+
+    assert!(
+        svc.terminate(m6_core::testkit::STARTUP_BOUND).success(),
+        "the service did not exit cleanly on SIGTERM\n--- output ---\n{}",
+        svc.output()
+    );
+
+    let mut guard = spawn_server(&env);
+    assert_eq!(
+        failed_login(&mut guard, socket, "X-Forwarded-For: 192.0.2.30\r\n"),
+        401,
+        "X-Forwarded-For: 192.0.2.30, after restart, expected 401"
+    );
+}
+
+/// A service that accepts the request and never answers fails at the bound,
+/// rather than hanging the suite.
+///
+/// The child is a stand-in process because the subject is the wait, and a real
+/// m6-auth-server does not hang on demand. The listener accepts and reads the
+/// request, so the connection is live and silent, which is the case the old
+/// fixed read deadline guessed at. The bound is shortened here so the proof
+/// costs 200 ms; `http_request` uses the full [`RESPONSE_BOUND`].
+#[test]
+fn a_silent_service_fails_at_the_response_bound() {
+    let env = setup_test_env("silent-service");
+    let listener =
+        std::os::unix::net::UnixListener::bind(&env.socket_path).expect("bind the silent listener");
+    let server = std::thread::spawn(move || {
+        let (mut conn, _) = listener.accept().expect("accept the request");
+        let mut request = [0u8; 1024];
+        let _ = std::io::Read::read(&mut conn, &mut request);
+        std::thread::sleep(Duration::from_millis(500));
+    });
+
+    let mut svc = Service::spawn("silent-service", Command::new("sleep").arg("2"));
+    let mut stream = UnixStream::connect(&env.socket_path).expect("connect the silent listener");
+    stream
+        .write_all(b"GET /auth/public-key HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("send the request");
+    let err = read_response(&mut svc, stream, "GET", Duration::from_millis(200))
+        .expect_err("a silent service must not be waited for forever");
+    assert!(
+        err.contains("no response within"),
+        "the wait must name the bound it passed: {err}"
+    );
+    server.join().expect("the silent listener thread");
 }
 
 /// Refresh: valid refresh cookie → 302, new session cookie.
@@ -395,11 +793,12 @@ fn t04_login_rate_limited_429() {
 fn t05_refresh_valid_cookie_302_new_session() {
     let env = setup_test_env("t05");
     seed_user(&env.site_dir, "eve", "evepw");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
     // Login to get tokens
     let body = r#"{"username":"eve","password":"evepw"}"#;
     let login_resp = http_request_with_body(
+        &mut guard,
         &env.socket_path,
         "POST",
         "/auth/login",
@@ -420,7 +819,7 @@ fn t05_refresh_valid_cookie_302_new_session() {
         "POST /auth/refresh HTTP/1.1\r\nHost: localhost\r\nCookie: refresh={}\r\nContent-Length: 0\r\n\r\n",
         refresh_token
     );
-    let resp = http_request(&env.socket_path, &req);
+    let resp = http_request(&mut guard, &env.socket_path, &req);
 
     assert_eq!(
         parse_status(&resp),
@@ -444,10 +843,10 @@ fn t05_refresh_valid_cookie_302_new_session() {
 #[test]
 fn t06_refresh_invalid_token_302_login() {
     let env = setup_test_env("t06");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
     let req = "POST /auth/refresh HTTP/1.1\r\nHost: localhost\r\nCookie: refresh=bogus_invalid_token\r\nContent-Length: 0\r\n\r\n";
-    let resp = http_request(&env.socket_path, req);
+    let resp = http_request(&mut guard, &env.socket_path, req);
 
     assert_eq!(parse_status(&resp), 302, "expected 302\n{}", resp);
     let location = get_header(&resp, "Location").unwrap_or("");
@@ -463,11 +862,12 @@ fn t06_refresh_invalid_token_302_login() {
 fn t07_logout_clears_cookies() {
     let env = setup_test_env("t07");
     seed_user(&env.site_dir, "frank", "frankpw");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
     // Login via form to get cookies
     let body = "username=frank&password=frankpw";
     let login_resp = http_request_with_body(
+        &mut guard,
         &env.socket_path,
         "POST",
         "/auth/login",
@@ -492,7 +892,7 @@ fn t07_logout_clears_cookies() {
         "POST /auth/logout HTTP/1.1\r\nHost: localhost\r\nCookie: refresh={}\r\nContent-Length: 0\r\n\r\n",
         refresh_cookie
     );
-    let logout_resp = http_request(&env.socket_path, &req);
+    let logout_resp = http_request(&mut guard, &env.socket_path, &req);
     assert_eq!(
         parse_status(&logout_resp),
         302,
@@ -523,10 +923,10 @@ fn t07_logout_clears_cookies() {
 #[test]
 fn t08_public_key_returns_pem() {
     let env = setup_test_env("t08");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
     let req = "GET /auth/public-key HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    let resp = http_request(&env.socket_path, req);
+    let resp = http_request(&mut guard, &env.socket_path, req);
 
     assert_eq!(parse_status(&resp), 200, "expected 200\n{}", resp);
     assert!(
@@ -541,11 +941,12 @@ fn t08_public_key_returns_pem() {
 fn t09_jwt_verifiable_with_public_key() {
     let env = setup_test_env("t09");
     seed_user(&env.site_dir, "grace", "gracepw");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
     // Get access token
     let body = r#"{"username":"grace","password":"gracepw"}"#;
     let login_resp = http_request_with_body(
+        &mut guard,
         &env.socket_path,
         "POST",
         "/auth/login",
@@ -563,7 +964,7 @@ fn t09_jwt_verifiable_with_public_key() {
 
     // Get public key
     let req = "GET /auth/public-key HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    let pk_resp = http_request(&env.socket_path, req);
+    let pk_resp = http_request(&mut guard, &env.socket_path, req);
     let pk_body_start = pk_resp
         .find("\r\n\r\n")
         .map(|i| i + 4)
@@ -575,6 +976,8 @@ fn t09_jwt_verifiable_with_public_key() {
         .expect("parse public key from PEM");
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
     validation.set_issuer(&["test.example.com"]);
+    // The config names no audience, so the issuer is the audience.
+    validation.set_audience(&["test.example.com"]);
 
     let result =
         jsonwebtoken::decode::<serde_json::Value>(access_token, &decoding_key, &validation);
@@ -590,11 +993,12 @@ fn t09_jwt_verifiable_with_public_key() {
 fn t10_next_external_url_falls_back_to_root() {
     let env = setup_test_env("t10");
     seed_user(&env.site_dir, "henry", "henrypw");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
     // Attempt to redirect to external URL
     let body = "username=henry&password=henrypw&next=https://evil.example.com/steal";
     let resp = http_request_with_body(
+        &mut guard,
         &env.socket_path,
         "POST",
         "/auth/login",
@@ -658,10 +1062,11 @@ fn issuer_falls_back_to_the_configured_site_toml() {
     std::fs::write(&env.config_path, config).unwrap();
 
     seed_user(&env.site_dir, "ivy", "ivypw");
-    let _guard = spawn_server(&env);
+    let mut guard = spawn_server(&env);
 
     let body = r#"{"username":"ivy","password":"ivypw"}"#;
     let login_resp = http_request_with_body(
+        &mut guard,
         &env.socket_path,
         "POST",
         "/auth/login",
@@ -674,13 +1079,15 @@ fn issuer_falls_back_to_the_configured_site_toml() {
     let access_token = json["access_token"].as_str().unwrap();
 
     let req = "GET /auth/public-key HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    let pk_resp = http_request(&env.socket_path, req);
+    let pk_resp = http_request(&mut guard, &env.socket_path, req);
     let pk_start = pk_resp.find("\r\n\r\n").map(|i| i + 4).unwrap();
     let decoding_key =
         jsonwebtoken::DecodingKey::from_rsa_pem(pk_resp.split_at(pk_start).1.as_bytes())
             .expect("parse public key from PEM");
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
     validation.set_issuer(&["site.example.com"]);
+    // The audience falls back to the same name the issuer took.
+    validation.set_audience(&["site.example.com"]);
     let result =
         jsonwebtoken::decode::<serde_json::Value>(access_token, &decoding_key, &validation);
     assert!(
@@ -691,30 +1098,20 @@ fn issuer_falls_back_to_the_configured_site_toml() {
 }
 
 /// The body of `GET /auth/public-key`.
-fn public_key_body(env: &TestEnv) -> String {
+fn public_key_body(svc: &mut Service, env: &TestEnv) -> String {
     let req = "GET /auth/public-key HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    let resp = http_request(&env.socket_path, req);
+    let resp = http_request(svc, &env.socket_path, req);
     let at = resp.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
     resp[at..].to_string()
 }
 
-/// Set the modified time of `path` to now, which is all a `touch` does.
-fn touch(path: &Path) {
-    std::fs::File::options()
-        .write(true)
-        .open(path)
-        .expect("open for touch")
-        .set_modified(std::time::SystemTime::now())
-        .expect("set modified time");
-}
-
-/// A rotation is: write both key files, then touch the config. The key files
-/// are not watched, so nothing changes until the touch.
+/// A rotation is: write both key files, then restart the service. The key
+/// files are read once at start.
 #[test]
-fn a_rotated_signing_key_signs_after_the_config_is_touched() {
+fn a_rotated_signing_key_signs_after_a_restart() {
     let env = setup_test_env("rotate");
-    let guard = spawn_server(&env);
-    let key_a = public_key_body(&env);
+    let mut guard = spawn_server(&env);
+    let key_a = public_key_body(&mut guard, &env);
     assert!(key_a.contains("PUBLIC KEY"), "{key_a}");
 
     let (private_b, public_b) = generate_test_rsa_keys();
@@ -722,227 +1119,86 @@ fn a_rotated_signing_key_signs_after_the_config_is_touched() {
     std::fs::write(env._key_dir.path().join("auth.pem"), &private_b).unwrap();
     std::fs::write(env._key_dir.path().join("auth.pub"), &public_b).unwrap();
 
-    std::thread::sleep(Duration::from_secs(2));
-    assert_eq!(
-        public_key_body(&env),
-        key_a,
-        "writing the key files changed the key without a touch"
-    );
-
-    touch(&env.config_path);
+    // Restart on the same config: the new pair is read at start.
+    let status = guard.terminate(m6_core::testkit::STARTUP_BOUND);
     assert!(
-        wait::until(Duration::from_secs(5), || public_key_body(&env) == public_b),
-        "the new key was not served after the config was touched\n--- output ---\n{}",
+        status.success(),
+        "m6-auth-server did not stop cleanly, got {status}"
+    );
+    let mut guard = spawn_server(&env);
+
+    assert_eq!(
+        public_key_body(&mut guard, &env),
+        public_b,
+        "the new key was not served after a restart\n--- output ---\n{}",
         guard.output()
     );
 }
 
-/// A new key that does not load is refused and the running key stays.
+/// A private key beside a public key from a different pair is refused at start
+/// with exit 2, so a rotation caught between its two writes never serves.
 #[test]
-fn a_bad_new_key_keeps_the_old_one() {
-    let env = setup_test_env("rotate-bad");
-    let guard = spawn_server(&env);
-    let key_a = public_key_body(&env);
-
-    std::fs::write(env._key_dir.path().join("auth.pem"), "not a key\n").unwrap();
-    touch(&env.config_path);
-
-    assert!(
-        wait::until(Duration::from_secs(5), || guard
-            .output()
-            .contains("Reload hook failed")),
-        "the failed reload was not reported\n--- output ---\n{}",
-        guard.output()
-    );
-    assert_eq!(
-        public_key_body(&env),
-        key_a,
-        "a bad key replaced the good one"
-    );
-}
-
-/// Writing the private key and the public key is two writes, and a touch
-/// between them must not install a mismatched pair.
-#[test]
-fn a_mismatched_key_pair_is_refused_and_the_matching_one_lands_on_retry() {
+fn a_mismatched_key_pair_at_start_exits_2() {
     let env = setup_test_env("rotate-mismatch");
-    let guard = spawn_server(&env);
-    let key_a = public_key_body(&env);
-
-    let (private_b, public_b) = generate_test_rsa_keys();
-    // The new private key beside the old public key.
+    // A fresh private key, while the public key setup_test_env wrote stays
+    // from the first pair, so the two do not match.
+    let (private_b, _public_b) = generate_test_rsa_keys();
     std::fs::write(env._key_dir.path().join("auth.pem"), &private_b).unwrap();
-    touch(&env.config_path);
-    assert!(
-        wait::until(Duration::from_secs(5), || guard
-            .output()
-            .contains("Reload hook failed")),
-        "a mismatched pair was installed\n--- output ---\n{}",
-        guard.output()
-    );
-    assert_eq!(public_key_body(&env), key_a);
 
-    // The second write arrives. No touch: core's retry finds the pair.
-    std::fs::write(env._key_dir.path().join("auth.pub"), &public_b).unwrap();
+    let output = start_failure(&env, "a mismatched key pair");
     assert!(
-        wait::until(Duration::from_secs(10), || public_key_body(&env)
-            == public_b),
-        "the matching pair never loaded on the retry\n--- output ---\n{}",
-        guard.output()
+        output.contains("not a pair"),
+        "the error must say the keys are not a pair\n--- output ---\n{output}"
     );
 }
 
-// ─── Database concurrency ────────────────────────────────────────────────────
+// ─── Database ────────────────────────────────────────────────────────────────
 
-/// Take the database's write lock until the returned value is dropped.
-///
-/// A login that reaches `refresh_token_store` waits on this. Reads still work,
-/// because `Db::open` puts every connection in WAL mode.
-fn hold_write_lock(db_path: &Path) -> rusqlite::Connection {
-    let conn = rusqlite::Connection::open(db_path).expect("open the database for the write lock");
-    conn.busy_timeout(Duration::from_secs(5))
-        .expect("set the busy timeout");
-    conn.execute_batch("BEGIN IMMEDIATE")
-        .expect("take the database write lock");
-    conn
-}
-
-/// Three logins waiting on a database write must not block a refresh that only
-/// reads.
-///
-/// The write lock is held from outside the service, so the logins cannot
-/// finish while it is held. The refresh must answer anyway. With one
-/// `Mutex<Db>` for the whole service, the refresh queued behind the logins and
-/// the read below timed out.
+/// Four processes open the one empty database at start. The schema batch runs
+/// in every open, so this asserts that every instance starts, that the result
+/// is one whole schema, and that every instance's connection can use it.
 #[test]
-fn parallel_logins_do_not_serialise_behind_one_connection() {
-    let env = setup_test_env("db-concurrency");
-    seed_user(&env.site_dir, "alice", "correct_pass");
-    let _guard = spawn_server(&env);
+fn instances_opening_an_empty_database_at_once_produce_one_schema() {
+    let env = setup_test_env("db-concurrent-open");
+    let db_path = env.site_dir.join("data/auth.db");
 
-    // One login first, to have a refresh token before any lock is held.
-    let login_body = r#"{"username":"alice","password":"correct_pass"}"#;
-    let resp = http_request_with_body(
-        &env.socket_path,
-        "POST",
-        "/auth/login",
-        "application/json",
-        login_body,
-    );
-    assert_eq!(parse_status(&resp), 200, "the seeding login failed\n{resp}");
-    let body_start = resp.find("\r\n\r\n").map(|i| i + 4).unwrap_or(resp.len());
-    let json: serde_json::Value = serde_json::from_str(&resp[body_start..]).expect("login JSON");
-    let refresh_token = json["refresh_token"]
-        .as_str()
-        .expect("refresh_token in the login response")
-        .to_string();
+    const INSTANCES: usize = 4;
+    let sockets: Vec<PathBuf> = (0..INSTANCES)
+        .map(|i| env.site_dir.join(format!("instance-{i}.sock")))
+        .collect();
 
-    let write_lock = hold_write_lock(&env.site_dir.join("data/auth.db"));
-
-    // Three logins at once. Each reaches `refresh_token_store` and waits for
-    // the write lock.
-    let mut logins = Vec::new();
-    for _ in 0..3 {
-        let mut stream = UnixStream::connect(&env.socket_path)
-            .unwrap_or_else(|e| panic!("connect {:?}: {}", env.socket_path, e));
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        let request = format!(
-            "POST /auth/login HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-            login_body.len(),
-            login_body
-        );
-        stream.write_all(request.as_bytes()).unwrap();
-        logins.push(stream);
+    let mut instances = spawn_instances("m6-auth-server", INSTANCES, |i| {
+        let mut cmd = Command::new(binary("m6-auth-server"));
+        cmd.arg(&env.site_dir)
+            .arg(&env.config_path)
+            .env("M6_SOCKET_OVERRIDE", &sockets[i]);
+        cmd
+    });
+    for (svc, socket) in instances.iter_mut().zip(&sockets) {
+        wait_until_serving(svc, socket);
     }
-    // Let the pool dispatch all three and reach the write.
-    std::thread::sleep(Duration::from_millis(300));
 
-    // The overlap assertion. This refresh only reads, so it must answer while
-    // the three logins are still inside their handlers. It needs no wall-clock
-    // threshold: the logins cannot finish until the lock below is dropped, so
-    // the only thing that decides this is whether the refresh waits behind
-    // them.
-    let refresh_body = serde_json::json!({ "refresh_token": refresh_token }).to_string();
-    let refresh_request = format!(
-        "POST /auth/refresh HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-        refresh_body.len(),
-        refresh_body
-    );
-    let refresh_resp = http_request(&env.socket_path, &refresh_request);
-    assert_eq!(
-        parse_status(&refresh_resp),
-        200,
-        "a refresh could not read while logins waited on a write\n{refresh_resp}"
-    );
+    // One whole schema: a user created through another connection is visible
+    // to every instance's login below.
+    seed_user(&env.site_dir, "alice", "correct_pass");
 
-    drop(write_lock);
-
-    for mut stream in logins {
-        let resp = m6_core::testkit::read_one(&mut stream, "POST").expect("read a login response");
-        let resp = String::from_utf8_lossy(&resp).into_owned();
+    let login_body = r#"{"username":"alice","password":"correct_pass"}"#;
+    for (svc, socket) in instances.iter_mut().zip(&sockets) {
+        let resp = http_request_with_body(
+            svc,
+            socket,
+            "POST",
+            "/auth/login",
+            "application/json",
+            login_body,
+        );
         assert_eq!(
             parse_status(&resp),
             200,
-            "a login failed after the write lock was released\n{resp}"
+            "an instance could not read the schema at {}\n{resp}",
+            socket.display()
         );
     }
-}
-
-/// Workers open their connections at once on an empty database. The schema
-/// batch runs in every open, so this asserts that every open succeeds, that
-/// the result is one whole schema, and that every connection can use it.
-#[test]
-fn workers_opening_an_empty_database_at_once_produce_one_schema() {
-    let temp = tempfile::TempDir::new().unwrap();
-    let db_path = temp.path().join("auth.db");
-
-    const WORKERS: usize = 8;
-    let barrier = Arc::new(Barrier::new(WORKERS));
-    let handles: Vec<_> = (0..WORKERS)
-        .map(|_| {
-            let path = db_path.clone();
-            let barrier = Arc::clone(&barrier);
-            std::thread::spawn(move || {
-                barrier.wait();
-                m6_auth::Db::open(&path)
-            })
-        })
-        .collect();
-
-    let mut dbs = Vec::new();
-    for handle in handles {
-        let db = handle
-            .join()
-            .expect("a worker thread panicked")
-            .expect("a worker could not open an empty database");
-        dbs.push(db);
-    }
-
-    // Every connection sees the one schema: a read succeeds on each.
-    for db in &dbs {
-        assert_eq!(
-            db.user_get("nobody")
-                .expect("read the users table from a worker connection")
-                .map(|u| u.username),
-            None,
-            "a worker connection cannot see the schema"
-        );
-    }
-
-    // A row written through one worker is visible through another.
-    dbs[0]
-        .user_create("alice", "password", &["user"])
-        .expect("create a user through a worker connection");
-    assert_eq!(
-        dbs[WORKERS - 1]
-            .user_get("alice")
-            .expect("read the new user from another worker connection")
-            .map(|u| u.username)
-            .as_deref(),
-        Some("alice")
-    );
 
     // One schema, whole: exactly the five tables the batch creates, in WAL.
     let conn =
@@ -967,54 +1223,154 @@ fn workers_opening_an_empty_database_at_once_produce_one_schema() {
     assert_eq!(journal_mode, "wal", "a connection is not in WAL mode");
 }
 
-/// A worker that cannot open its database answers 500 and the service stays
-/// up. The next request opens the database again.
-///
-/// The service opens the database once at startup, so no worker has a
-/// connection yet. The file is then replaced by a directory, which no open
-/// can use. Core panics when a worker's first-use setup fails and the release
-/// profile aborts, so before the fix the first request killed the process.
+/// A database that cannot be opened stops the service at start: exit 2, an
+/// error naming the path, and no socket file.
 #[test]
-fn a_worker_that_cannot_open_the_database_answers_500_and_retries() {
+fn a_database_that_cannot_be_opened_stops_the_service_at_start() {
     let env = setup_test_env("db-open-fails");
-    seed_user(&env.site_dir, "alice", "correct_pass");
-    let guard = spawn_server(&env);
-
     let db_path = env.site_dir.join("data/auth.db");
-    let parked = env.site_dir.join("data/auth.db.parked");
-    std::fs::rename(&db_path, &parked).expect("move the database aside");
     std::fs::create_dir(&db_path).expect("put a directory where the database was");
 
-    let login_body = r#"{"username":"alice","password":"correct_pass"}"#;
-    let login = || {
-        http_request_with_body(
-            &env.socket_path,
-            "POST",
-            "/auth/login",
-            "application/json",
-            login_body,
-        )
-    };
-
-    // Twice: the second request shows the failure left no half-built state.
-    for _ in 0..2 {
-        let resp = login();
-        assert_eq!(
-            parse_status(&resp),
-            500,
-            "a failed database open was not answered with a 500\n{resp}\n--- output ---\n{}",
-            guard.output()
-        );
-    }
-
-    std::fs::remove_dir(&db_path).expect("remove the directory");
-    std::fs::rename(&parked, &db_path).expect("put the database back");
-
-    let resp = login();
-    assert_eq!(
-        parse_status(&resp),
-        200,
-        "the open was not retried after the database came back\n{resp}\n--- output ---\n{}",
-        guard.output()
+    let output = start_failure(&env, "a database that cannot be opened");
+    assert!(
+        output.contains(&db_path.display().to_string()),
+        "the error must name the database path\n--- output ---\n{output}"
     );
+    assert!(
+        !env.socket_path.exists(),
+        "the socket was created before the database open failed"
+    );
+}
+
+/// The database's directory cannot be created because a regular file sits at
+/// its path, so the service exits 2 and the error names the directory.
+///
+/// The database that cannot be opened test fails inside `Db::open`. This one
+/// fails earlier, in the `create_dir_all` that makes `[storage] path`'s parent,
+/// which is the branch whose message names the directory.
+#[test]
+fn a_storage_directory_that_cannot_be_created_names_the_path() {
+    let env = setup_test_env("db-dir-is-a-file");
+    let data_dir = env.site_dir.join("data");
+    std::fs::remove_dir(&data_dir).expect("remove the data directory");
+    std::fs::write(&data_dir, b"not a directory").expect("put a file where the data directory was");
+
+    let output = start_failure(&env, "a storage directory that cannot be created");
+    assert!(
+        output.contains(&data_dir.display().to_string()),
+        "the error must name the database directory\n--- output ---\n{output}"
+    );
+}
+
+// ─── A locked database ───────────────────────────────────────────────────────
+
+/// A login whose refresh-token write meets another process's write lock is
+/// deferred, and the loop answers another connection while it waits. With the
+/// five-second busy timeout in the loop the login holds the whole process and
+/// the public-key request misses its one-second deadline.
+#[test]
+fn a_locked_database_defers_and_the_service_keeps_serving() {
+    let env = setup_test_env("db-busy-defers");
+    seed_user(&env.site_dir, "alice", "correct_pass");
+    let mut guard = spawn_server(&env);
+    let lock = hold_write_lock(&env.site_dir.join("data/auth.db"));
+
+    // One connection throughout, and a request before the locked one: the
+    // service has answered on this connection, so the login's bytes reach a
+    // loop that is already waiting for them.
+    let mut login = UnixStream::connect(&env.socket_path).expect("connect the login");
+    login
+        .write_all(b"GET /auth/public-key HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("send the public-key request");
+    let warm = m6_core::testkit::read_response_event(
+        login.try_clone().expect("clone the login socket"),
+        "GET",
+        RESPONSE_BOUND,
+    )
+    .expect("the public key");
+    assert_eq!(
+        parse_status(&String::from_utf8_lossy(&warm)),
+        200,
+        "the warm-up request must be answered"
+    );
+
+    let body = r#"{"username":"alice","password":"correct_pass"}"#;
+    login
+        .write_all(login_json_request(body).as_bytes())
+        .expect("send the login");
+
+    // The login's refresh-token store meets the lock. While it is deferred,
+    // another connection must be answered: a read deadline of one second
+    // fails the old five-second busy wait in the loop.
+    let public_key = http_request_within(
+        &mut guard,
+        &env.socket_path,
+        "GET /auth/public-key HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        Duration::from_secs(1),
+    );
+    assert_eq!(
+        parse_status(&public_key),
+        200,
+        "the public key must answer while the login is deferred\n{public_key}"
+    );
+
+    lock.execute_batch("COMMIT").expect("release the lock");
+
+    // The retry happens when the deferred request's five-millisecond deadline
+    // passes, and the answer must arrive within two seconds of the release.
+    login
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set the login's deadline");
+    let answer = m6_core::testkit::read_one(&mut login, "POST").expect("the login's answer");
+    let answer = String::from_utf8_lossy(&answer);
+    assert_eq!(
+        parse_status(&answer),
+        200,
+        "the deferred login must answer once the lock is released\n{answer}"
+    );
+    let body_start = answer
+        .find("\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(answer.len());
+    let json: serde_json::Value =
+        serde_json::from_str(&answer[body_start..]).expect("the login's JSON body");
+    assert!(
+        json["access_token"].is_string(),
+        "the answer has no access token\n{answer}"
+    );
+    assert!(
+        json["refresh_token"].is_string(),
+        "the answer has no refresh token\n{answer}"
+    );
+}
+
+/// A login that meets the lock for over a second is answered with 503 and a
+/// one-second `Retry-After`. The test releases the lock only after it has the
+/// 503, so the service must give up on its own rather than wait forever.
+#[test]
+fn a_database_locked_past_a_second_answers_503() {
+    let env = setup_test_env("db-busy-503");
+    seed_user(&env.site_dir, "alice", "correct_pass");
+    let mut guard = spawn_server(&env);
+    let lock = hold_write_lock(&env.site_dir.join("data/auth.db"));
+
+    let body = r#"{"username":"alice","password":"correct_pass"}"#;
+    let answer = http_request_within(
+        &mut guard,
+        &env.socket_path,
+        &login_json_request(body),
+        Duration::from_secs(3),
+    );
+    assert_eq!(
+        parse_status(&answer),
+        503,
+        "a lock held past a second must answer 503\n{answer}"
+    );
+    assert_eq!(
+        get_header(&answer, "Retry-After"),
+        Some("1"),
+        "the 503 must carry a one-second Retry-After\n{answer}"
+    );
+
+    lock.execute_batch("COMMIT").expect("release the lock");
 }

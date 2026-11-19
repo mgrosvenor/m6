@@ -2,8 +2,16 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use m6_core::config::secret_path;
+use m6_core::site::Methods;
+use m6_core::startup::{self, ConfigRole, ConfigTrace, Section};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use serde_json::{Map, Value};
+
+/// The one `[log]` type, owned by m6-core. Re-exported so this crate's `Config`
+/// uses the same type every other service uses, and `[log]` in site.toml is
+/// parsed by the same function as `[log]` in a service's own config.
+pub use m6_core::config::LogConfig;
 
 /// Full merged configuration for m6-http.
 #[derive(Debug, Clone, Serialize)]
@@ -13,16 +21,79 @@ pub struct Config {
     pub server: ServerConfig,
     pub log: LogConfig,
     pub analytics: AnalyticsConfig,
+    /// How often the periodic stats line is written. Site state: the line is
+    /// the site's record of what its node did.
+    pub stats: StatsConfig,
     pub health: HealthConfig,
     pub rate_limit: RateLimitConfig,
     pub errors: ErrorsConfig,
     pub security: SecurityConfig,
     pub auth: Option<AuthConfig>,
+    /// Where a source node's generation ID comes from, and who may read or
+    /// advance it. `None` means this node has no `/genid`.
+    pub genid: Option<GenidConfig>,
+    /// A cache node's disk cache directory. `None` means the node keeps its
+    /// cache in memory only.
+    pub cache_dir: Option<PathBuf>,
+    /// The `[limits]` table: the start and maximum of each buffer and queue.
+    /// Node state, so it is read from the system config in two-file mode.
+    #[serde(skip)]
+    pub limits: m6_core::limits::Limits,
     pub backends: Vec<BackendConfig>,
     pub routes: Vec<RouteConfig>,
     pub route_groups: Vec<RouteGroupConfig>,
     /// Directory where site.toml lives.
     pub site_dir: PathBuf,
+}
+
+/// The node's `[genid]` table.
+///
+/// Two shapes, one table. A node with `upstream` is a cache node that follows
+/// another node's ID. A node without one is the source that owns the ID, and
+/// the claims say who may read or advance it.
+///
+/// On the source both claims are set or neither: one alone would leave one half
+/// of the endpoint unguarded. Both absent leaves `/genid` answering 404 to
+/// everyone, which is how a node says it does not serve a generation ID.
+#[derive(Debug, Clone, Serialize)]
+pub struct GenidConfig {
+    /// `role:<name>` or `group:<name>` a `GET /genid` needs. Source only.
+    pub read_require: Option<String>,
+    /// The same for `POST /genid`, which advances the generation. Source only.
+    pub write_require: Option<String>,
+    /// The `[[backend]]` a cache node follows. Present makes this node a cache
+    /// node, and the backend must have a `url`.
+    pub upstream: Option<String>,
+    /// The bearer token a heartbeat sends, read from `token_file` at load.
+    ///
+    /// `serde(skip)` in both directions: it must never be printed by
+    /// `--dump-config`, and it must not be settable inline from TOML. It is a
+    /// [`m6_core::Secret`] as well, so no other path can print it either.
+    #[serde(skip)]
+    pub token: Option<m6_core::Secret<String>>,
+    /// How long between heartbeats. Cache node only, default 10 s.
+    #[serde(rename = "heartbeat_secs", serialize_with = "serialize_secs")]
+    pub heartbeat: std::time::Duration,
+}
+
+/// A `Duration` as the whole seconds the config key spells.
+fn serialize_secs<S>(d: &std::time::Duration, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_u64(d.as_secs())
+}
+
+impl Default for GenidConfig {
+    fn default() -> Self {
+        GenidConfig {
+            read_require: None,
+            write_require: None,
+            upstream: None,
+            token: None,
+            heartbeat: std::time::Duration::from_secs(crate::genid::DEFAULT_HEARTBEAT_SECS),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +135,7 @@ pub struct SiteConfig {
 /// byte-for-byte site.toml. The node identity comes from the per-node *system*
 /// config instead, one file per node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     pub name: String,
 }
@@ -82,6 +154,63 @@ pub struct ServerConfig {
     /// Timeout in seconds for a backend call (connect + write + read). Default: 30.
     #[serde(default = "default_backend_timeout_secs")]
     pub backend_timeout_secs: u64,
+    /// Most requests served on one HTTP/1.1 keep-alive connection before it is
+    /// closed. Default: 100, `DEFAULT_MAX_REQUESTS_PER_CONN`. 0 is rejected by
+    /// `load`. Read at startup; a change needs a restart.
+    ///
+    /// Legal, and expensive: closing a connection makes the client pay a new
+    /// TCP and TLS handshake. m6-http talks HTTP/1.1 to its own backends, so
+    /// every cache miss pays that cost on a fresh connection. A cap rather
+    /// than unlimited so a connection cannot be held forever. At 100 requests
+    /// a browser's whole page load fits in one connection and a long-running
+    /// client still cycles. A client that makes many requests on one
+    /// connection, such as a benchmark, wants a higher value.
+    #[serde(default = "default_max_requests_per_connection")]
+    pub max_requests_per_connection: u32,
+    /// Let another m6-http process bind the same address, by setting
+    /// `SO_REUSEPORT` before `bind` on the TLS listener and the QUIC UDP socket
+    /// of `bind`. Default false, so an accidental second instance still fails
+    /// at bind instead of quietly sharing traffic.
+    ///
+    /// True routes both sockets through `m6_platform::net::listen_shared`, so
+    /// they are bound in one call and always share the public 443 port. No
+    /// other socket is shared: the redirect listener on port 80, the internal
+    /// h2c listener and every backend socket keep their own binding. The
+    /// health endpoint is served on that shared listener, so a probe reaches
+    /// one process. Linux spreads a new connection across the sockets by a
+    /// hash of its 4-tuple and macOS does not, so the split is not even and no
+    /// process is guaranteed traffic. A QUIC client that changes address may
+    /// land on another process. Read at start, and a change needs a restart.
+    #[serde(default)]
+    pub reuse_port: bool,
+    /// How many m6-http processes share the port, with `reuse_port`. On Linux
+    /// it makes each client address always reach the same process: the kernel
+    /// is given a socket filter that sends (a hash of the client's source
+    /// address) mod this number to one socket, for TCP and for QUIC, so the
+    /// per-client rate limit is exact. Every process on the port must set the
+    /// same number. Unset, Linux chooses by a hash of the whole connection and
+    /// one client can reach several processes. While a process is stopped,
+    /// some clients move to another until it returns. macOS has no such
+    /// filter, ignores the number, and always gives the last-bound process
+    /// every client. Read at start, and a change needs a restart.
+    #[serde(default)]
+    pub reuse_port_processes: Option<std::num::NonZeroU32>,
+    /// This process's number among the m6-http processes of one node, 0 to N-1
+    /// (N is `reuse_port_processes` when set). `/health` reports it as
+    /// `process_index`, and the metrics document carries it too, so a monitor
+    /// can tell which process answered. With `status_bind` it also picks this
+    /// process's status port. Read at start, and a change needs a restart.
+    #[serde(default)]
+    pub process_index: Option<u32>,
+    /// `"<address>:<base port>"`: where this process answers the health path
+    /// for a monitor, as a TLS listener of its own on the base port plus
+    /// `process_index`. It answers that one path and 404s every other.
+    /// Needs `process_index`. It is not part of the `reuse_port` group, so
+    /// nothing steers to it. Bind it to the node's tunnel address, never a
+    /// public one. Unset means no status listener. Read at start, and a change
+    /// needs a restart.
+    #[serde(default)]
+    pub status_bind: Option<String>,
     /// Optional H2C (HTTP/2 cleartext) listener address.
     /// Intended for use over a private backbone between nodes.
     #[serde(default)]
@@ -105,9 +234,38 @@ pub struct ServerConfig {
     /// failure domain — a slow client on :80 cannot stall TLS serving because
     /// it is not sharing that process's event loop. In this mode nothing else
     /// in the config is read: no TLS, no QUIC, no backends, no routes, no
-    /// cache, so `tls_cert`/`tls_key` may point nowhere.
+    /// cache, so `tls_cert`/`tls_key` may point nowhere. The unmatched-host
+    /// policy is the one exception, because a redirector has to know which
+    /// names it serves and where the rest go.
     #[serde(default)]
     pub redirect_bind: Option<String>,
+    /// The host names this node serves. Empty by default.
+    ///
+    /// Matched against a request's `Host` (or HTTP/2 and HTTP/3 `:authority`)
+    /// with any port stripped and ASCII case ignored. The list is node state:
+    /// a node of a fleet can serve a different name from its neighbour, and a
+    /// site's `[site] domain` is shared by every node and is not enough.
+    ///
+    /// The list alone changes nothing. It takes effect with
+    /// `redirect_unmatched_to`.
+    #[serde(default)]
+    pub served_hosts: Vec<String>,
+    /// Where a request goes when its Host is not in `served_hosts`: a bare
+    /// host name, for example `example.com`. Unset by default, which turns the
+    /// policy off.
+    ///
+    /// When set, a request outside `served_hosts`, including one with no Host,
+    /// is answered 301 to `https://<redirect_unmatched_to><path>`, with the
+    /// query kept, before the cache lookup and before routing. That position
+    /// matters: the cache key has no host component, so a warm entry for a
+    /// served name would otherwise answer a request for a name the node does
+    /// not own. The internal h2c listener is excluded.
+    ///
+    /// Refused at load when `served_hosts` is empty. The combination would
+    /// redirect every request, including the node's own name, which would take
+    /// the deploy's checks and the fleet monitor off the node.
+    #[serde(default)]
+    pub redirect_unmatched_to: Option<String>,
     /// Warm this node's own cache when it starts.
     ///
     /// The server knows its route table, so it can fill its own cache instead of
@@ -131,6 +289,21 @@ pub struct ServerConfig {
     /// cannot stampede: it is the same mechanism that refreshes stale entries.
     #[serde(default)]
     pub warm_on_start: bool,
+    /// Pin every page of the process in RAM as it is faulted, after the heap is
+    /// reserved and before serving (`mlockall` with `MCL_ONFAULT`), so a hot
+    /// page is never a page fault and the kernel never swaps the cache out.
+    /// Default true. Memory the process has reserved and not touched is not
+    /// resident and not pinned: the pin follows the pages the load touches, so
+    /// a warm process holds what its cache holds rather than every mapping
+    /// mimalloc has reserved. It needs `RLIMIT_MEMLOCK` unlimited, which an
+    /// ordinary account's 8 MiB is not: production sets
+    /// `LimitMEMLOCK=infinity` in the systemd unit, and a developer on Linux
+    /// raises the limit for the account (`docs/m6-testing.md`). When the limit
+    /// or the kernel refuses, m6-http stops at start with exit 2 and an error
+    /// that names the limit and the fix; it never carries on unpinned when
+    /// pinning was asked for. Set false to run unpinned. A no-op on macOS. Read
+    /// at start, and a change needs a restart.
+    pub lock_memory: bool,
     /// Request methods this server will serve. Anything else is answered 405
     /// with an `Allow` header, before routing, cache lookup or backend
     /// dispatch.
@@ -142,7 +315,7 @@ pub struct ServerConfig {
     /// Nothing validated the method before this existed, so every verb --
     /// PUT, DELETE, TRACE, and entirely invented ones like FOO -- was answered
     /// 200 with the cached page. TRACE especially should never be served: it
-    /// is a cross-site tracing vector and a content site has no use for it.
+    /// is a cross-site tracking vector and a content site has no use for it.
     ///
     /// Configurable rather than hard-coded because the CMS routes (currently
     /// disabled) need PUT and DELETE when they come back.
@@ -162,6 +335,45 @@ impl ServerConfig {
             .iter()
             .any(|e| e.parse::<std::net::SocketAddr>().is_ok_and(|a| a == l))
     }
+
+    /// True when this node serves `host`, comparing with any port stripped and
+    /// ASCII case ignored. An empty Host is never served.
+    pub fn serves_host(&self, host: &str) -> bool {
+        let host = host.split(':').next().unwrap_or(host);
+        !host.is_empty()
+            && self
+                .served_hosts
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(host))
+    }
+
+    /// The 301 target for a request outside `served_hosts`, or `None` when the
+    /// policy is off, the Host is served, or the path or query cannot be
+    /// written into a `Location`.
+    ///
+    /// The target is built from the configured name, never from the request's
+    /// Host. Echoing a request's own bytes back into `Location` is how open
+    /// redirects and header injection get built.
+    pub fn unmatched_host_redirect(
+        &self,
+        host: Option<&str>,
+        path: &str,
+        query: Option<&str>,
+    ) -> Option<String> {
+        let target = self.redirect_unmatched_to.as_deref()?;
+        if host.is_some_and(|h| self.serves_host(h)) {
+            return None;
+        }
+        let unsafe_byte = |s: &str| s.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0);
+        if unsafe_byte(path) {
+            return None;
+        }
+        match query {
+            Some(q) if unsafe_byte(q) => None,
+            Some(q) => Some(format!("https://{target}{path}?{q}")),
+            None => Some(format!("https://{target}{path}")),
+        }
+    }
 }
 
 fn default_allowed_methods() -> Vec<String> {
@@ -172,58 +384,171 @@ fn default_backend_timeout_secs() -> u64 {
     30
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LogConfig {
-    #[serde(default = "default_log_level")]
-    pub level: String,
-    #[serde(default = "default_log_format")]
-    pub format: String,
+/// A string a `Host` header can plausibly carry as a bare name.
+///
+/// It is deliberately a syntax check, not a DNS check: a name is compared with
+/// a request's Host, which never resolves here. The characters refused are the
+/// ones that cannot match a Host or cannot be written into a `Location`.
+fn is_host_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 253
+        && !s
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+        && !s.contains(['/', '\\', ':', '*', '@'])
 }
 
-fn default_log_level() -> String {
-    "info".to_string()
-}
-fn default_log_format() -> String {
-    "json".to_string()
+/// `[server] served_hosts`: lowercase every entry once, so the stored list
+/// is canonical, and refuse anything that could not match a Host.
+fn validate_served_hosts(hosts: Vec<String>) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::with_capacity(hosts.len());
+    for host in hosts {
+        let host = host.trim().to_ascii_lowercase();
+        if !is_host_name(&host) {
+            anyhow::bail!(
+                "config error: [server].served_hosts entry {host:?} is not a bare host name. Drop any scheme, port, path, whitespace, control byte or wildcard"
+            );
+        }
+        out.push(host);
+    }
+    Ok(out)
 }
 
-impl Default for LogConfig {
-    fn default() -> Self {
-        LogConfig {
-            level: default_log_level(),
-            format: default_log_format(),
+/// `[server] redirect_unmatched_to`: a bare host name, lowercased. An address
+/// is refused because the target is the second hop of the redirect, and no
+/// public certificate authority issues for an address.
+fn validate_redirect_unmatched_to(target: Option<String>) -> anyhow::Result<Option<String>> {
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    let target = target.trim().to_ascii_lowercase();
+    if target.is_empty() {
+        anyhow::bail!(
+            "config error: [server].redirect_unmatched_to is empty. Give the canonical host name, for example example.com"
+        );
+    }
+    if !is_host_name(&target) {
+        anyhow::bail!(
+            "config error: [server].redirect_unmatched_to {target:?} is not a bare host name. It is written into a Location header, so it may not carry a scheme, a port, a path, whitespace, a control byte or a wildcard"
+        );
+    }
+    if target.parse::<std::net::IpAddr>().is_ok() {
+        anyhow::bail!(
+            "config error: [server].redirect_unmatched_to {target:?} is an IP address. No public certificate authority issues for an address, so the canonical target is a host name"
+        );
+    }
+    Ok(Some(target))
+}
+
+/// The address a process's status listener binds: `status_bind`'s address with
+/// its port raised by `process_index`. Checked by `load`, so a bad value is
+/// exit 2 and never reaches the bind.
+pub fn status_addr(status_bind: &str, process_index: u32) -> anyhow::Result<std::net::SocketAddr> {
+    let mut addr = crate::http11::resolve_bind(status_bind)?;
+    let port = u32::from(addr.port()) + process_index;
+    let port = u16::try_from(port).map_err(|_| {
+        anyhow::anyhow!(
+            "config error: [server].status_bind {status_bind:?} plus process_index {process_index} is port {port}, past 65535"
+        )
+    })?;
+    addr.set_port(port);
+    Ok(addr)
+}
+
+/// `[server]` `process_index` and `status_bind`: a status listener needs an
+/// index, and the index must be one of the `reuse_port_processes` when that is
+/// set.
+fn validate_status(
+    process_index: Option<u32>,
+    status_bind: Option<String>,
+    processes: Option<std::num::NonZeroU32>,
+) -> anyhow::Result<(Option<u32>, Option<String>)> {
+    if let (Some(i), Some(n)) = (process_index, processes) {
+        if i >= n.get() {
+            anyhow::bail!(
+                "config error: [server].process_index {i} is not below [server].reuse_port_processes {n}: the indexes run 0 to {}",
+                n.get() - 1
+            );
         }
     }
+    if let Some(bind) = &status_bind {
+        let Some(i) = process_index else {
+            anyhow::bail!(
+                "config error: [server].status_bind needs [server].process_index, which picks this process's port"
+            );
+        };
+        status_addr(bind, i)?;
+    }
+    Ok((process_index, status_bind))
+}
+
+fn default_max_requests_per_connection() -> u32 {
+    crate::http11::DEFAULT_MAX_REQUESTS_PER_CONN
 }
 
 /// Per-request traffic logging (session cookie, referrer, UA, cache state,
 /// node identity, ...) — separate from operational `[log]` above. Written to
-/// its own file via `m6_core::log::init_with_analytics`, always JSON.
+/// the one stream, stdout, through `m6_core::log`, always JSON, with
+/// `type=access`.
 ///
-/// Rotate by renaming the file and sending SIGUSR1: the process reopens the path.
+/// There is no path to rotate. Under systemd the journal rotates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AnalyticsConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Resolved relative to the process's current working directory (not
-    /// `site_dir`, which lives under a generated/rendered tree that gets
-    /// wiped on redeploy) unless absolute.
-    #[serde(default = "default_analytics_log_path")]
-    pub log_path: String,
 }
 
 fn default_true() -> bool {
     true
-}
-fn default_analytics_log_path() -> String {
-    "logs/analytics.ndjson".to_string()
 }
 
 impl Default for AnalyticsConfig {
     fn default() -> Self {
         AnalyticsConfig {
             enabled: default_true(),
-            log_path: default_analytics_log_path(),
+        }
+    }
+}
+
+/// The `[stats]` table: how often the periodic metrics line is written.
+///
+/// One key, because the line carries the whole metrics document at one
+/// interval. A node that logs it more often writes more bytes, and the line's
+/// size is bounded by `[limits.log_buffer]`, not by this.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatsConfig {
+    /// Seconds between two metrics lines. Ten matches the window the line's
+    /// own per-window figures describe, and the default it has always had.
+    #[serde(default = "default_stats_interval_s")]
+    pub interval_s: u64,
+    /// Seconds between two traffic summary lines. One minute, because the
+    /// report summarises a sixty-minute window.
+    #[serde(default = "default_traffic_interval_s")]
+    pub traffic_interval_s: u64,
+}
+
+fn default_stats_interval_s() -> u64 {
+    DEFAULT_STATS_INTERVAL_S
+}
+
+fn default_traffic_interval_s() -> u64 {
+    DEFAULT_TRAFFIC_INTERVAL_S
+}
+
+/// One minute, the traffic summary's own default.
+pub const DEFAULT_TRAFFIC_INTERVAL_S: u64 = 60;
+
+/// Ten seconds: the interval m6-http emitted its stats line at before the key
+/// existed, and the window those per-window figures describe.
+pub const DEFAULT_STATS_INTERVAL_S: u64 = 10;
+
+impl Default for StatsConfig {
+    fn default() -> Self {
+        StatsConfig {
+            interval_s: default_stats_interval_s(),
+            traffic_interval_s: default_traffic_interval_s(),
         }
     }
 }
@@ -233,6 +558,7 @@ impl Default for AnalyticsConfig {
 /// Answered inside m6-http ahead of routing, the cache and every backend, so
 /// it costs a JSON serialisation rather than a page render.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HealthConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -241,84 +567,6 @@ pub struct HealthConfig {
     /// of being silently shadowed by it.
     #[serde(default = "default_health_path")]
     pub path: String,
-    /// Bearer token gating the metrics block (counters + latency
-    /// percentiles). `None` -- the default -- means metrics are never served,
-    /// so forgetting to configure it fails closed.
-    ///
-    /// Path to a file whose contents are the bearer token.
-    ///
-    /// The *path* is configuration and belongs in git; the *contents* are a
-    /// secret and must not. site.toml is rendered from a committed template
-    /// and shipped byte-identically to every node, so a token written inline
-    /// there would be a secret in the repository. The same split applies to
-    /// every other credential a node needs: the file is mode 0600, owned by
-    /// root, and exists only on the box.
-    #[serde(default)]
-    pub metrics_token_file: Option<String>,
-    /// The resolved token, read from `metrics_token_file` at load.
-    ///
-    /// `serde(skip)` in both directions, deliberately. It must never be
-    /// printed by `--dump-config`, which serialises the whole Config, and it
-    /// must not be settable inline from TOML -- otherwise the file
-    /// indirection above is advisory rather than enforced.
-    #[serde(skip)]
-    pub metrics_token: Option<String>,
-    /// Path for the metrics endpoint. Separate from `path` on purpose: the
-    /// health check must stay constant-cost, and percentiles are not.
-    #[serde(default = "default_perf_path")]
-    pub perf_path: String,
-    /// Where the traffic summary is served. Same token as `/perf`.
-    ///
-    /// A third path rather than more fields on `/perf`, for the reason that
-    /// split `/health` from `/perf` in the first place: the cost profiles
-    /// differ. `/perf` sorts a reservoir in memory; this reads the tail of a
-    /// 47MB file. Putting the expensive one behind a conditional on a cheaper
-    /// path leaves the expensive branch one misconfigured header away from
-    /// being taken on every request, so each answer's cost stays a property of
-    /// its path.
-    #[serde(default = "default_traffic_path")]
-    pub traffic_path: String,
-    /// How long a traffic summary is reused before the analytics log is read
-    /// again.
-    ///
-    /// Without this a monitor polling every 30 seconds makes every node
-    /// re-read its analytics tail every 30 seconds, forever, to produce an
-    /// answer that changes slowly. The check that consumes this runs hourly.
-    #[serde(default = "default_traffic_cache_s")]
-    pub traffic_cache_s: u64,
-    /// `role:<name>` or `group:<name>`. When set, `/perf` and `/traffic` need
-    /// an API token that carries this claim, verified with `[auth] public_key`
-    /// exactly as a route `require` is: 401 for no or a bad token, 403 for the
-    /// wrong claim. It wins over `metrics_token_file`.
-    #[serde(default)]
-    pub metrics_require: Option<String>,
-    /// The IP addresses allowed to read `/perf` and `/traffic`, as written.
-    /// Any other peer gets 404. Unset means no address rule.
-    ///
-    /// Each entry must be an IP address in a local range
-    /// (`m6_core::net::is_private_ip`). Names and ranges are refused. The
-    /// peer address is the one a completed TCP or QUIC handshake proved, and
-    /// the endpoints are refused on an internal h2c listener, where the
-    /// address is a forwarded claim.
-    #[serde(default)]
-    pub metrics_peers: Option<Vec<String>>,
-    /// `metrics_peers`, parsed and canonical (an IPv4-mapped IPv6 address is
-    /// stored as IPv4), filled by `load`. The gate reads only this: `None`
-    /// means no address rule. Compared on the request path with no allocation.
-    #[serde(skip)]
-    pub metrics_peer_ips: Option<Vec<std::net::IpAddr>>,
-}
-
-fn default_perf_path() -> String {
-    "/perf".to_string()
-}
-
-fn default_traffic_path() -> String {
-    "/traffic".to_string()
-}
-
-fn default_traffic_cache_s() -> u64 {
-    60
 }
 
 fn default_health_path() -> String {
@@ -330,14 +578,6 @@ impl Default for HealthConfig {
         HealthConfig {
             enabled: default_true(),
             path: default_health_path(),
-            metrics_token_file: None,
-            metrics_token: None,
-            perf_path: default_perf_path(),
-            traffic_path: default_traffic_path(),
-            traffic_cache_s: default_traffic_cache_s(),
-            metrics_require: None,
-            metrics_peers: None,
-            metrics_peer_ips: None,
         }
     }
 }
@@ -345,6 +585,7 @@ impl Default for HealthConfig {
 /// Per-IP request throttling at the edge, ahead of cache lookup and backend
 /// work. Fixed-window counter, in-memory, no external dependency.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RateLimitConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -371,6 +612,7 @@ impl Default for RateLimitConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ErrorsConfig {
     #[serde(default = "default_errors_mode")]
     pub mode: String,
@@ -401,6 +643,7 @@ impl Default for ErrorsConfig {
 /// header entirely. A backend that sets its own value for a given header
 /// always wins — these only fill in what is absent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
     /// `Strict-Transport-Security`. Default is one year. Only meaningful over
     /// TLS, which m6-http always terminates.
@@ -560,15 +803,15 @@ impl SecurityConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
-    /// Optional. When given it must name a `[[backend]]`. Nothing reads it
-    /// beyond that check: verification needs only `public_key`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub backend: Option<String>,
-    pub public_key: String,
+    /// The `[[backend]]` whose members answer `POST /check`, with `sockets`.
+    /// Its members are probed once at start.
+    pub backend: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackendConfig {
     pub name: String,
     /// Unix socket glob, e.g. "/run/m6/m6-html-*.sock"
@@ -630,17 +873,30 @@ impl Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouteConfig {
     pub path: String,
     pub backend: String,
     /// Auth requirement e.g. "group:editors" or "role:admin"
     pub require: Option<String>,
-    /// Captured only so `load()` can warn that m6-http ignores it — see
-    /// `warn_ignored_cache_key`. Deliberately not wired to anything.
+    /// A `Cache-Control` value that replaces the one the backend set, on every
+    /// reply this route gets. It is the route's word over the handler's default,
+    /// so a handler that builds its own header, such as m6-file, can still be
+    /// told `no-store` for one path. Absent leaves the backend's header alone.
     pub cache: Option<String>,
+    /// The methods this route answers, or every method when absent.
+    ///
+    /// A route with a list answers exactly those methods: a request with
+    /// another gets 405 with `Allow`, before the cache or a backend is
+    /// touched (RFC 9110 15.5.6). `GET` also answers `HEAD`.
+    ///
+    /// Validated when the route table is built, so an unknown name stops the
+    /// start with exit 2 rather than becoming a request-time 405.
+    pub methods: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouteGroupConfig {
     /// Glob pattern relative to site dir
     pub glob: String,
@@ -648,23 +904,74 @@ pub struct RouteGroupConfig {
     pub path: String,
     pub backend: String,
     pub require: Option<String>,
-    /// See `RouteConfig::cache` — captured to warn, not to act on.
+    /// See `RouteConfig::cache`.
     pub cache: Option<String>,
+    /// See `RouteConfig::methods`.
+    pub methods: Option<Vec<String>>,
+}
+
+/// A route's `cache` becomes a response header, so it must be a value a header
+/// can carry. An empty one would send a `Cache-Control` that says nothing, and a
+/// control character would end the header early.
+fn check_route_cache(cache: Option<&str>, what: &str) -> anyhow::Result<()> {
+    let Some(value) = cache else { return Ok(()) };
+    if value.trim().is_empty() || value.bytes().any(|b| b.is_ascii_control()) {
+        anyhow::bail!(
+            "config error: {what}: cache must be a Cache-Control value such as \"no-store\", with no control characters"
+        );
+    }
+    Ok(())
+}
+
+/// The methods a `[[route]]` or `[[route_group]]` answers, or every method
+/// when it lists none.
+///
+/// Names are trimmed and upper-cased once at load, matching
+/// `[server] allowed_methods`, so the request-time comparison is a fixed set
+/// and a config typo is an exit 2 rather than a 405 on every request.
+pub(crate) fn route_methods(names: Option<&[String]>, origin: &str) -> anyhow::Result<Methods> {
+    let Some(names) = names else {
+        return Ok(Methods::ANY);
+    };
+    anyhow::ensure!(
+        !names.is_empty(),
+        "config error: {origin} has an empty methods list; leave `methods` out to answer every method"
+    );
+    let upper: Vec<String> = names
+        .iter()
+        .map(|name| name.trim().to_ascii_uppercase())
+        .collect();
+    Methods::from_names(&upper).map_err(|unknown| {
+        anyhow::anyhow!(
+            "config error: {origin} lists the unknown method \"{unknown}\"; \
+             the supported methods are GET (which also answers HEAD), POST, PUT, PATCH and DELETE"
+        )
+    })
 }
 
 // ── Raw serde types for parsing site.toml ──────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawSiteToml {
     site: Option<RawSiteSection>,
     server: Option<RawServerSection>,
-    log: Option<LogConfig>,
+    node: Option<NodeConfig>,
+    log: Option<toml::Value>,
     analytics: Option<AnalyticsConfig>,
+    stats: Option<StatsConfig>,
     health: Option<HealthConfig>,
     rate_limit: Option<RateLimitConfig>,
     errors: Option<ErrorsConfig>,
     security: Option<SecurityConfig>,
     auth: Option<AuthConfig>,
+    genid: Option<RawGenid>,
+    /// The disk cache directory. Node state, so the table is refused in
+    /// `site.toml` in two-file mode.
+    cache: Option<RawCache>,
+    /// The named limits. Node state, so the table is refused in `site.toml` in
+    /// two-file mode.
+    limits: Option<toml::Value>,
     #[serde(rename = "backend", default)]
     backends: Vec<BackendConfig>,
     #[serde(rename = "route", default)]
@@ -674,6 +981,7 @@ struct RawSiteToml {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawSiteSection {
     name: Option<String>,
     domain: Option<String>,
@@ -681,48 +989,64 @@ struct RawSiteSection {
     describedby: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 struct RawServerSection {
     bind: Option<String>,
     warm_on_start: Option<bool>,
+    lock_memory: Option<bool>,
     tls_cert: Option<String>,
     tls_key: Option<String>,
     backend_timeout_secs: Option<u64>,
+    max_requests_per_connection: Option<u32>,
+    reuse_port: Option<bool>,
+    reuse_port_processes: Option<std::num::NonZeroU32>,
+    process_index: Option<u32>,
+    status_bind: Option<String>,
     h2c_bind: Option<String>,
     internal_binds: Option<Vec<String>>,
     internal_peers: Option<Vec<String>>,
     redirect_bind: Option<String>,
+    served_hosts: Option<Vec<String>>,
+    redirect_unmatched_to: Option<String>,
     allowed_methods: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawSystemToml {
     server: Option<RawServerSection>,
     node: Option<NodeConfig>,
-    /// `[auth]` may live here instead of site.toml (never both), so the
-    /// verify key's path is owned by the same file as the node's other
-    /// credentials.
+    /// `[auth]` lives here, so the verify key's path is owned by the same
+    /// file as the node's other credentials.
     auth: Option<AuthConfig>,
-    /// Only the access keys: a node's own credentials and peers belong to the
-    /// node, not to the site that is shipped to every node.
-    /// Kept as a raw value so a site.toml passed as its own system config
-    /// (one file for both, as a development script does) is not rejected for
-    /// the `[health]` keys only site.toml may carry. It is parsed strictly
-    /// into `RawSystemHealth` when the two files differ.
-    health: Option<toml::Value>,
+    /// The generation-ID endpoint. Node state: a site's content ships to every
+    /// node, its publish claims do not.
+    genid: Option<RawGenid>,
+    /// The disk cache directory. Node state, so it belongs beside the node's
+    /// credentials rather than in the site that ships to every node.
+    cache: Option<RawCache>,
+    /// The named limits: each buffer's start and maximum.
+    limits: Option<toml::Value>,
 }
 
-/// The `[health]` keys the system config may carry. Anything else fails to
-/// parse, so a misplaced key is loud instead of ignored.
-/// `NODE_HEALTH_KEYS` lists the same keys for `misplaced_keys`; change both together.
-#[derive(Debug, Deserialize)]
+/// The `[cache]` keys. A cache node may point `dir` at a directory it owns.
+#[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-struct RawSystemHealth {
-    metrics_require: Option<String>,
-    metrics_peers: Option<Vec<String>>,
-    /// A credential path, so it belongs to the node. Absolute only, as
-    /// `[auth].public_key` is in this file.
-    metrics_token_file: Option<String>,
+struct RawCache {
+    dir: Option<String>,
+}
+
+/// The `[genid]` keys. A source sets the two claims. A cache node sets
+/// `upstream` and `token_file`, and may set `heartbeat_secs`.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawGenid {
+    read_require: Option<String>,
+    write_require: Option<String>,
+    upstream: Option<String>,
+    token_file: Option<String>,
+    heartbeat_secs: Option<u64>,
 }
 
 /// Parse a list of peer addresses into canonical form.
@@ -756,22 +1080,6 @@ fn parse_local_peers(
         ips.push(ip.to_canonical());
     }
     Ok(ips)
-}
-
-/// Parse `[health] metrics_peers` into canonical addresses.
-fn validate_metrics_peers(
-    peers: Option<&[String]>,
-) -> anyhow::Result<Option<Vec<std::net::IpAddr>>> {
-    let Some(peers) = peers else {
-        return Ok(None);
-    };
-    parse_local_peers(
-        "[health].metrics_peers",
-        "a metrics peer",
-        "list the peers allowed to read /perf and /traffic, or remove the key",
-        peers,
-    )
-    .map(Some)
 }
 
 // ── Loading ─────────────────────────────────────────────────────────────────
@@ -882,86 +1190,134 @@ fn is_one_file(site_toml: &Path, system_config: &Path) -> bool {
     }
 }
 
-/// Load and merge configs. Returns Config on success. Returns error with
-/// message suitable for exit-2 on any validation failure.
-pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config> {
+/// Load and merge configs, with the trace that says which file set each key.
+///
+/// The trace is what the start-up record needs to label a default as a
+/// default. It is built from the same two parses the load uses, so the record
+/// and the config cannot disagree about what a file contained.
+pub fn load_traced(
+    site_dir: &Path,
+    system_config_path: &Path,
+) -> anyhow::Result<(Config, ConfigTrace)> {
     let site_toml_path = site_dir.join("site.toml");
 
     let site_raw = std::fs::read_to_string(&site_toml_path)
         .with_context(|| format!("reading {}", site_toml_path.display()))?;
-    let site_parsed: RawSiteToml = toml::from_str(&site_raw)
-        .with_context(|| format!("parsing {}", site_toml_path.display()))?;
+    let site_table: toml::Table = toml::from_str(&site_raw)
+        .map_err(|e| anyhow::anyhow!("parsing {}: {e}", site_toml_path.display()))?;
 
     let system_raw = std::fs::read_to_string(system_config_path)
         .with_context(|| format!("reading {}", system_config_path.display()))?;
-    let mut system_parsed: RawSystemToml = toml::from_str(&system_raw)
-        .with_context(|| format!("parsing {}", system_config_path.display()))?;
-    // When both arguments name the same file, its [auth] and [health] belong
-    // to the site config alone, not to a second declaration.
-    if is_one_file(&site_toml_path, system_config_path) {
-        system_parsed.auth = None;
-        system_parsed.health = None;
+    let system_table: toml::Table = toml::from_str(&system_raw)
+        .map_err(|e| anyhow::anyhow!("parsing {}: {e}", system_config_path.display()))?;
+
+    let mut trace = ConfigTrace::new();
+    trace.add_config_file(
+        &site_toml_path,
+        ConfigRole::Site,
+        &site_raw,
+        &toml::Value::Table(site_table.clone()),
+    );
+    if !is_one_file(&site_toml_path, system_config_path) {
+        trace.add_config_file(
+            system_config_path,
+            ConfigRole::Config,
+            &system_raw,
+            &toml::Value::Table(system_table.clone()),
+        );
     }
-    let system_health: Option<RawSystemHealth> = system_parsed
-        .health
-        .take()
-        .map(|v| v.try_into())
-        .transpose()
-        .with_context(|| format!("parsing [health] in {}", system_config_path.display()))?;
 
-    // Warn on unexpected sections in system config (we only check for unknown
-    // top-level keys by seeing if extra keys exist; toml parsing uses deny_unknown_fields
-    // is opt-in, but the spec says warn and ignore instead of error).
-    // We rely on RawSystemToml only accepting `server`/`node`/`auth`/`health`.
+    let one_file = is_one_file(&site_toml_path, system_config_path);
 
-    // Build merged server config:
-    // site.toml [server] provides base values, system config [server] overrides.
-    let site_server = site_parsed.server.unwrap_or(RawServerSection {
-        bind: None,
-        warm_on_start: None,
-        tls_cert: None,
-        tls_key: None,
-        backend_timeout_secs: None,
-        h2c_bind: None,
-        internal_binds: None,
-        internal_peers: None,
-        redirect_bind: None,
-        allowed_methods: None,
-    });
-    let sys_server = system_parsed.server.unwrap_or(RawServerSection {
-        bind: None,
-        warm_on_start: None,
-        tls_cert: None,
-        tls_key: None,
-        backend_timeout_secs: None,
-        h2c_bind: None,
-        internal_binds: None,
-        internal_peers: None,
-        redirect_bind: None,
-        allowed_methods: None,
-    });
+    // One source per setting: a key in the file it does not belong to stops the
+    // start. In one-file mode every key is read from the one file, so the check
+    // does not run.
+    if !one_file {
+        let misplaced = misplaced_keys(&site_table, &system_table, system_config_path);
+        if !misplaced.is_empty() {
+            anyhow::bail!("config error: {}", misplaced.join("\n"));
+        }
+    }
+
+    let site_parsed: RawSiteToml = toml::from_str(&site_raw)
+        .map_err(|e| anyhow::anyhow!("parsing {}: {e}", site_toml_path.display()))?;
+
+    // The node's own values come from one place: the system config in two-file
+    // mode, the one file in one-file mode. The system config is parsed strictly
+    // only when it is a second file, so a one-file config is not refused for the
+    // site-only keys it necessarily carries.
+    let (node_server, node, auth, raw_genid, raw_cache, raw_limits) = if one_file {
+        (
+            site_parsed.server.clone().unwrap_or_default(),
+            site_parsed.node,
+            site_parsed.auth,
+            site_parsed.genid,
+            site_parsed.cache,
+            site_parsed.limits,
+        )
+    } else {
+        let system_parsed: RawSystemToml = toml::from_str(&system_raw)
+            .map_err(|e| anyhow::anyhow!("parsing {}: {e}", system_config_path.display()))?;
+        (
+            system_parsed.server.clone().unwrap_or_default(),
+            system_parsed.node,
+            system_parsed.auth,
+            system_parsed.genid,
+            system_parsed.cache,
+            system_parsed.limits,
+        )
+    };
+    let limits_file = if one_file {
+        &site_toml_path
+    } else {
+        &system_config_path.to_path_buf()
+    };
+    let limits = m6_core::limits::Limits::from_toml(
+        raw_limits.as_ref(),
+        limits_file,
+        m6_core::platform::process::page_size(),
+    )
+    .map_err(|e| anyhow::anyhow!("config error: {e}"))?;
+    let stats = site_parsed.stats.unwrap_or_default();
+    if stats.interval_s == 0 {
+        anyhow::bail!(
+            "config error: [stats].interval_s must be at least 1, because 0 would write the stats line on every pass of the event loop"
+        );
+    }
+    if stats.traffic_interval_s == 0 {
+        anyhow::bail!(
+            "config error: [stats].traffic_interval_s must be at least 1, because 0 would write the traffic line on every pass of the event loop"
+        );
+    }
+    let site_server = site_parsed.server.unwrap_or_default();
 
     // Resolved before `bind`, because in redirect mode it supplies the default.
-    let redirect_bind = sys_server.redirect_bind.or(site_server.redirect_bind);
-    // Same precedence as every other server field: the system config wins, because
-    // warming is a property of the node, not of the site it serves. A cache node
-    // wants it; a laptop running the site locally does not.
-    let warm_on_start = sys_server
-        .warm_on_start
-        .or(site_server.warm_on_start)
-        .unwrap_or(false);
+    let redirect_bind = node_server.redirect_bind;
+    // The unmatched-host policy is node state: a node serves its own names, so
+    // both keys are read from the system config even when site.toml carries a
+    // [server] table.
+    let served_hosts = validate_served_hosts(node_server.served_hosts.unwrap_or_default())?;
+    let redirect_unmatched_to = validate_redirect_unmatched_to(node_server.redirect_unmatched_to)?;
+    if redirect_unmatched_to.is_some() && served_hosts.is_empty() {
+        anyhow::bail!(
+            "config error: [server].redirect_unmatched_to is set but [server].served_hosts is empty. Every request would be redirected, including this node's own name, so the deploy's checks and the monitor could not reach it. List the host names this node serves"
+        );
+    }
+    // Warming is a property of the node, not of the site it serves.
+    let warm_on_start = node_server.warm_on_start.unwrap_or(false);
+    let lock_memory = node_server.lock_memory.unwrap_or(true);
 
     // A redirector binds `redirect_bind` and nothing else, so requiring a
     // separate `bind` there would mean every redirect config carried the same
     // address twice, or carried a second one that was never listened on.
-    let bind = match sys_server.bind.or(site_server.bind) {
+    let bind = match node_server.bind {
         Some(b) => b,
         None => redirect_bind
             .clone()
             .ok_or_else(|| anyhow::anyhow!("config error: [server].bind is required"))?,
     };
-    let tls_cert = sys_server.tls_cert.or(site_server.tls_cert);
-    let tls_key = sys_server.tls_key.or(site_server.tls_key);
+    let tls_cert = node_server.tls_cert;
+    let tls_key = node_server.tls_key;
     if redirect_bind.is_none() {
         if tls_cert.is_none() {
             anyhow::bail!("config error: [server].tls_cert is required");
@@ -970,16 +1326,26 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             anyhow::bail!("config error: [server].tls_key is required");
         }
     }
-    let backend_timeout_secs = sys_server
-        .backend_timeout_secs
-        .or(site_server.backend_timeout_secs)
-        .unwrap_or(30);
-    let h2c_bind = sys_server.h2c_bind.or(site_server.h2c_bind);
+    let backend_timeout_secs = site_server.backend_timeout_secs.unwrap_or(30);
+    let max_requests_per_connection = node_server
+        .max_requests_per_connection
+        .unwrap_or(crate::http11::DEFAULT_MAX_REQUESTS_PER_CONN);
+    if max_requests_per_connection == 0 {
+        anyhow::bail!(
+            "config error: [server].max_requests_per_connection must be at least 1, because 0 would close every connection before it served a request"
+        );
+    }
+    let (process_index, status_bind) = validate_status(
+        node_server.process_index,
+        node_server.status_bind,
+        node_server.reuse_port_processes,
+    )?;
+    let h2c_bind = node_server.h2c_bind;
     // Nothing is inferred from an address: a listener is internal only when
     // this list names it. A redirector binds nothing the list could name, so a
     // site.toml shared with one must not break it.
-    let internal_binds = sys_server.internal_binds.or(site_server.internal_binds);
-    let internal_peers = sys_server.internal_peers.or(site_server.internal_peers);
+    let internal_binds = node_server.internal_binds;
+    let internal_peers = node_server.internal_peers;
     let internal_peers = if redirect_bind.is_none() {
         validate_internal_binds(internal_binds.as_deref(), &bind, h2c_bind.as_deref())?;
         validate_internal_peers(
@@ -991,9 +1357,14 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
     };
     let internal_binds = internal_binds.unwrap_or_default();
 
-    // Resolve TLS cert/key paths relative to site_dir if not absolute.
-    let tls_cert_path = tls_cert.as_deref().map(|c| resolve_path(site_dir, c));
-    let tls_key_path = tls_key.as_deref().map(|k| resolve_path(site_dir, k));
+    let tls_cert_path = tls_cert
+        .as_deref()
+        .map(|c| secret_path("[server] tls_cert", c))
+        .transpose()?;
+    let tls_key_path = tls_key
+        .as_deref()
+        .map(|k| secret_path("[server] tls_key", k))
+        .transpose()?;
 
     // Validate [site] required keys
     let raw_site = site_parsed.site.unwrap_or(RawSiteSection {
@@ -1009,14 +1380,17 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         .domain
         .ok_or_else(|| anyhow::anyhow!("config error: [site].domain is required"))?;
 
-    // Node identity comes from system config, not site.toml (see NodeConfig
-    // doc comment) — falls back to [site].name, with a warning from main, so an older
-    // system config without [node] still starts up instead of hard-failing.
-    // The fallback is reported by `warn_node_fallback` from main, because
-    // warn! inside load() goes to a subscriber that does not exist yet.
-    let node = system_parsed.node.unwrap_or_else(|| NodeConfig {
-        name: site_name.clone(),
-    });
+    // Node identity comes from the system config, which must name it.
+    let node = node.ok_or_else(|| {
+        let file = if one_file {
+            site_toml_path.display()
+        } else {
+            system_config_path.display()
+        };
+        anyhow::anyhow!(
+            "config error: {file} has no [node]. Add [node] with name = \"<this node's name>\", for example name = \"edge-a\""
+        )
+    })?;
 
     let server = ServerConfig {
         bind,
@@ -1027,52 +1401,38 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned()),
         backend_timeout_secs,
+        max_requests_per_connection,
+        reuse_port: node_server.reuse_port.unwrap_or(false),
+        reuse_port_processes: node_server.reuse_port_processes,
+        process_index,
+        status_bind,
         h2c_bind,
         internal_binds,
         internal_peers,
         warm_on_start,
+        lock_memory,
         redirect_bind: redirect_bind.clone(),
+        served_hosts,
+        redirect_unmatched_to,
         // Uppercased once at load so the hot-path check is a plain comparison
         // rather than a case-insensitive one per request.
-        allowed_methods: sys_server
+        allowed_methods: site_server
             .allowed_methods
-            .or(site_server.allowed_methods)
             .unwrap_or_else(default_allowed_methods)
             .iter()
             .map(|m| m.trim().to_ascii_uppercase())
             .filter(|m| !m.is_empty())
             .collect(),
     };
-    let log = site_parsed.log.unwrap_or_default();
+    // The one `[log]` parse, shared with every other service. site.toml is the
+    // bottom of the precedence chain, so an absent level here is `info`.
+    let raw = LogConfig::from_toml(site_parsed.log.as_ref())
+        .map_err(|e| anyhow::anyhow!("parsing {}: {e}", site_toml_path.display()))?;
+    let level = raw.level.unwrap_or_else(|| "info".to_string());
+    m6_core::log::parse_level(&level).map_err(|e| anyhow::anyhow!("config error: [log] {e}"))?;
+    let log = LogConfig { level: Some(level) };
     let analytics = site_parsed.analytics.unwrap_or_default();
-    let mut health = site_parsed.health.unwrap_or_default();
-    // The system config wins key by key, as [server] keys do.
-    if let Some(sys) = system_health {
-        health.metrics_require = sys.metrics_require.or(health.metrics_require);
-        health.metrics_peers = sys.metrics_peers.or(health.metrics_peers);
-        if let Some(p) = sys.metrics_token_file {
-            // A relative path resolves against the site directory, as
-            // `tls_cert` does, so the service does not depend on the working
-            // directory it was started from.
-            let p = resolve_path(site_dir, &p).to_string_lossy().into_owned();
-            health.metrics_token_file = Some(p);
-        }
-    }
-    // Read the token here so the running server never touches the file on the
-    // request path. It is read after the merge so that a path from either file
-    // is the one read. Failure is deliberately not fatal: a missing token file
-    // means /perf answers 404 (fails closed), and refusing to boot the whole
-    // server over a metrics credential would be disproportionate -- the same
-    // call made for the inert `cache =` route key. It is reported by
-    // `warn_health_token` from main, because warn! inside load() goes to a
-    // subscriber that does not exist yet (load supplies the log level).
-    if let Some(ref path) = health.metrics_token_file {
-        health.metrics_token = std::fs::read_to_string(path)
-            .ok()
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty());
-    }
-    health.metrics_peer_ips = validate_metrics_peers(health.metrics_peers.as_deref())?;
+    let health = site_parsed.health.unwrap_or_default();
     let rate_limit = site_parsed.rate_limit.unwrap_or_default();
     let errors = site_parsed.errors.unwrap_or_default();
     let security = site_parsed.security.unwrap_or_default();
@@ -1120,6 +1480,7 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         if !seen_paths.insert(route.path.clone()) {
             anyhow::bail!("config error: duplicate route path `{}`", route.path);
         }
+        check_route_cache(route.cache.as_deref(), &format!("[[route]] {}", route.path))?;
     }
 
     // Validate route_groups
@@ -1132,66 +1493,63 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
                 rg.backend
             );
         }
+        check_route_cache(rg.cache.as_deref(), &format!("[[route_group]] {}", rg.path))?;
     }
 
-    // Validate auth. One owner: declaring [auth] in both files would make a
-    // whole-section override silently change which key verifies every route.
-    let auth = match (site_parsed.auth, system_parsed.auth) {
-        (Some(_), Some(_)) => anyhow::bail!(
-            "config error: [auth] is declared in both site.toml and the system config; declare it in one"
-        ),
-        (None, Some(a)) => {
-            // A relative `public_key` resolves against the site directory below,
-            // as `tls_cert` does.
-            Some(a)
-        }
-        (site, None) => site,
-    };
+    // Validate auth. The misplaced check above has already refused an [auth] in
+    // site.toml in two-file mode, so `auth` is the one owner's value.
     if let Some(ref a) = auth {
-        let key_path = resolve_path(site_dir, &a.public_key);
-        if !key_path.exists() {
+        let Some(backend) = backends.iter().find(|backend| backend.name == a.backend) else {
             anyhow::bail!(
-                "config error: [auth].public_key file not found: {}",
-                key_path.display()
+                "config error: [auth].backend `{}` not in [[backend]]",
+                a.backend
+            );
+        };
+        // The check path is the socket-backend dispatch, so a URL backend
+        // cannot serve it: that would be a different transport and a
+        // different round trip. Refuse it by name at load, where
+        // --dump-config sees it too.
+        if backend.sockets.is_none() {
+            anyhow::bail!(
+                "config error: [auth].backend `{}` is a URL backend: the check path is a Unix socket on this host, so [auth].backend must name a backend with `sockets`",
+                a.backend
             );
         }
-        if let Some(ref b) = a.backend {
-            if !backend_names.contains(b.as_str()) {
-                anyhow::bail!("config error: [auth].backend `{}` not in [[backend]]", b);
+    }
+
+    // Validate require on routes needs [auth], and [auth] needs the check
+    // backend that answers POST /check.
+    let auth_backend = auth.as_ref().map(|auth| auth.backend.as_str());
+    for route in &routes {
+        if route.require.is_some() {
+            if auth.is_none() {
+                anyhow::bail!(
+                    "config error: route {} has `require` but no [auth] declared",
+                    route.path
+                );
+            }
+            if auth_backend.is_none() {
+                anyhow::bail!(
+                    "config error: route {} has `require` but [auth] has no `backend`; the edge asks POST /check, so [auth] backend must name a [[backend]] with `sockets`",
+                    route.path
+                );
             }
         }
     }
-
-    // Validate require on routes needs [auth]
-    for route in &routes {
-        if route.require.is_some() && auth.is_none() {
-            anyhow::bail!(
-                "config error: route {} has `require` but no [auth] declared",
-                route.path
-            );
-        }
-    }
     for rg in &route_groups {
-        if rg.require.is_some() && auth.is_none() {
-            anyhow::bail!(
-                "config error: route_group {} has `require` but no [auth] declared",
-                rg.path
-            );
-        }
-    }
-
-    if let Some(ref r) = health.metrics_require {
-        if auth.is_none() {
-            anyhow::bail!("config error: [health].metrics_require needs [auth] with a public_key");
-        }
-        let named = matches!(
-            crate::auth::Require::parse(r),
-            Some(crate::auth::Require::Role(n) | crate::auth::Require::Group(n)) if !n.is_empty()
-        );
-        if !named {
-            anyhow::bail!(
-                "config error: [health].metrics_require = \"{r}\" must be \"role:<name>\" or \"group:<name>\""
-            );
+        if rg.require.is_some() {
+            if auth.is_none() {
+                anyhow::bail!(
+                    "config error: route_group {} has `require` but no [auth] declared",
+                    rg.path
+                );
+            }
+            if auth_backend.is_none() {
+                anyhow::bail!(
+                    "config error: route_group {} has `require` but [auth] has no `backend`; the edge asks POST /check, so [auth] backend must name a [[backend]] with `sockets`",
+                    rg.path
+                );
+            }
         }
     }
 
@@ -1200,100 +1558,221 @@ pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config
         anyhow::bail!("config error: [errors] mode = \"custom\" requires `path`");
     }
 
-    Ok(Config {
-        site: SiteConfig {
-            name: site_name,
-            domain: site_domain,
-            redirect_www: raw_site.redirect_www.unwrap_or(true),
-            describedby: raw_site.describedby.unwrap_or_default(),
-        },
-        node,
-        server,
-        log,
-        analytics,
-        health,
-        rate_limit,
-        errors,
-        security,
-        auth,
-        backends,
-        routes,
-        route_groups,
-        site_dir: site_dir.to_path_buf(),
-    })
-}
+    // The generation endpoint. Both claims or neither: one alone would leave
+    // one half of the endpoint unguarded, and a value that names no role or
+    // group is a typo that would otherwise refuse every caller at run time.
+    // The generation state. `upstream` makes this a cache node that follows
+    // another node; without it the node is the source that owns the ID.
+    let genid = match raw_genid {
+        None => None,
+        Some(raw) => {
+            // The keys of one shape applied to the other are typos that would
+            // otherwise be ignored, so each is refused by name.
+            if raw.upstream.is_some() {
+                for (key, value) in [
+                    ("read_require", raw.read_require.as_deref()),
+                    ("write_require", raw.write_require.as_deref()),
+                ] {
+                    if value.is_some() {
+                        anyhow::bail!(
+                            "config error: [genid] {key} applies only to the source, which has no upstream"
+                        );
+                    }
+                }
+            } else {
+                for (key, present) in [
+                    ("token_file", raw.token_file.is_some()),
+                    ("heartbeat_secs", raw.heartbeat_secs.is_some()),
+                ] {
+                    if present {
+                        anyhow::bail!(
+                            "config error: [genid] {key} applies only to a cache node with upstream"
+                        );
+                    }
+                }
+            }
 
-/// Resolve a path: if absolute, return as-is; otherwise relative to base.
-pub fn resolve_path(base: &Path, p: &str) -> PathBuf {
-    let pb = Path::new(p);
-    if pb.is_absolute() {
-        pb.to_path_buf()
-    } else {
-        base.join(pb)
-    }
-}
+            let (upstream, token, heartbeat) = match raw.upstream.as_deref() {
+                None => (
+                    None,
+                    None,
+                    std::time::Duration::from_secs(crate::genid::DEFAULT_HEARTBEAT_SECS),
+                ),
+                Some(name) => {
+                    let named = backends.iter().any(|b| b.name == name && b.url.is_some());
+                    if !named {
+                        anyhow::bail!(
+                            "config error: [genid].upstream = \"{name}\" must name a [[backend]] with a url"
+                        );
+                    }
+                    let Some(token_file) = raw.token_file.as_deref() else {
+                        anyhow::bail!(
+                            "config error: [genid].upstream = \"{name}\" needs token_file"
+                        );
+                    };
+                    let path = secret_path("[genid] token_file", token_file)?;
+                    let token = match std::fs::read_to_string(&path) {
+                        Ok(text) => text.trim().to_string(),
+                        Err(e) => anyhow::bail!(
+                            "config error: [genid] token_file {} cannot be read: {e}",
+                            path.display()
+                        ),
+                    };
+                    if token.is_empty() {
+                        anyhow::bail!(
+                            "config error: [genid] token_file {} is empty",
+                            path.display()
+                        );
+                    }
+                    let secs = raw
+                        .heartbeat_secs
+                        .unwrap_or(crate::genid::DEFAULT_HEARTBEAT_SECS);
+                    if secs == 0 {
+                        anyhow::bail!(
+                            "config error: [genid].heartbeat_secs must be at least 1, because 0 would send a heartbeat every loop turn"
+                        );
+                    }
+                    (
+                        Some(name.to_string()),
+                        Some(m6_core::Secret::new(token)),
+                        std::time::Duration::from_secs(secs),
+                    )
+                }
+            };
 
-/// Warn about `cache = "..."` on routes, which m6-http ignores.
-///
-/// It is a real, honoured directive in m6-render's route tables, which makes
-/// it very natural to write here too — but m6-http takes its caching decision
-/// from the *response's* `Cache-Control`, never from the route table, so the
-/// line does exactly nothing. Silently dropping it is the trap: the config
-/// reads as though `no-store` is enforced at the edge when nothing enforces
-/// it.
-///
-/// Warns rather than bailing, so a config carrying a line that has always
-/// been inert can never be turned into a boot failure by this check.
-///
-/// Called from `main` *after* logging is initialised, not from `load()`:
-/// `load()` runs first (it supplies the log level), so a `warn!` inside it
-/// goes to a subscriber that does not exist yet and is silently dropped —
-/// which is exactly the failure mode this function exists to complain about.
-pub fn warn_ignored_route_cache_keys(config: &Config) {
-    for route in &config.routes {
-        if let Some(cache) = &route.cache {
-            warn!(
-                route = %route.path, value = %cache,
-                "site config: `cache` on a [[route]] is ignored by m6-http — set Cache-Control on the backend response instead"
-            );
-        }
-    }
-    for rg in &config.route_groups {
-        if let Some(cache) = &rg.cache {
-            warn!(
-                route_group = %rg.path, value = %cache,
-                "site config: `cache` on a [[route_group]] is ignored by m6-http — set Cache-Control on the backend response instead"
-            );
-        }
-    }
-}
-
-/// Warn about any extra top-level keys in system config toml.
-/// We do this via raw parsing.
-/// Report a configured-but-unusable metrics token file.
-///
-/// Called from `main` after logging is initialised. Warning from inside
-/// `load()` would print nothing at all: `load()` runs before the subscriber
-/// exists, because it is what supplies the log level.
-pub fn warn_health_token(health: &HealthConfig) {
-    if let Some(ref path) = health.metrics_token_file {
-        if health.metrics_require.is_some() {
-            info!(
-                file = %path,
-                "health: metrics_require is set, so metrics_token_file is ignored"
-            );
-        } else {
-            info!(
-                file = %path,
-                "health: metrics_token_file is the legacy gate; metrics_require checks an API token instead"
-            );
-            if health.metrics_token.is_none() {
-                warn!(
-                    file = %path,
-                    "health: metrics token file missing or empty -- /perf will answer 404"
+            // The source's two claims, both or neither.
+            let read = raw.read_require.is_some();
+            let write = raw.write_require.is_some();
+            if read != write {
+                anyhow::bail!(
+                    "config error: [genid] needs both read_require and write_require, or neither"
                 );
             }
+            for (key, value) in [
+                ("read_require", raw.read_require.as_deref()),
+                ("write_require", raw.write_require.as_deref()),
+            ] {
+                let Some(value) = value else { continue };
+                if auth.is_none() {
+                    anyhow::bail!(
+                        "config error: [genid] read_require and write_require need [auth] with a backend"
+                    );
+                }
+                let named = matches!(
+                    m6_core::auth::Require::parse(value),
+                    Some(m6_core::auth::Require::Role(n) | m6_core::auth::Require::Group(n)) if !n.is_empty()
+                );
+                if !named {
+                    anyhow::bail!(
+                        "config error: [genid].{key} = \"{value}\" must be \"role:<name>\" or \"group:<name>\""
+                    );
+                }
+            }
+            Some(GenidConfig {
+                read_require: raw.read_require,
+                write_require: raw.write_require,
+                upstream,
+                token,
+                heartbeat,
+            })
         }
+    };
+
+    // The disk cache. A cache node only, because a source sits beside its
+    // backends and a cold source cache costs one local render per page, while
+    // a cache node's cold miss crosses the network. The directory must be
+    // absolute and writable by this process: a probe file is created and
+    // removed at start, so an unwritable mount fails the start rather than
+    // every later write.
+    let cache_was_set = raw_cache.is_some();
+    let cache_dir = match raw_cache {
+        None => None,
+        Some(raw) => {
+            let dir = raw.dir.ok_or_else(|| {
+                anyhow::anyhow!("config error: [cache] needs dir = \"<absolute path>\"")
+            })?;
+            let is_cache_node = genid.as_ref().is_some_and(|g| g.upstream.is_some());
+            if !is_cache_node {
+                anyhow::bail!("config error: [cache].dir is for a cache node ([genid] upstream)");
+            }
+            let path = PathBuf::from(&dir);
+            if !path.is_absolute() {
+                anyhow::bail!("config error: [cache].dir must be an absolute path");
+            }
+            let probe = path.join(".m6-probe");
+            match std::fs::write(&probe, b"") {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&probe);
+                }
+                Err(e) => anyhow::bail!("config error: [cache].dir {}: {e}", path.display()),
+            }
+            Some(path)
+        }
+    };
+
+    if cache_was_set {
+        trace.mark_file("cache_dir");
+    }
+    Ok((
+        Config {
+            site: SiteConfig {
+                name: site_name,
+                domain: site_domain,
+                redirect_www: raw_site.redirect_www.unwrap_or(true),
+                describedby: raw_site.describedby.unwrap_or_default(),
+            },
+            node,
+            server,
+            log,
+            analytics,
+            stats,
+            health,
+            rate_limit,
+            errors,
+            security,
+            auth,
+            genid,
+            cache_dir,
+            limits,
+            backends,
+            routes,
+            route_groups,
+            site_dir: site_dir.to_path_buf(),
+        },
+        trace,
+    ))
+}
+
+/// Load the effective config without the source trace.
+pub fn load(site_dir: &Path, system_config_path: &Path) -> anyhow::Result<Config> {
+    load_traced(site_dir, system_config_path).map(|(config, _)| config)
+}
+
+impl Config {
+    /// The effective config as JSON, every default included.
+    ///
+    /// The array keys are renamed to the TOML key each one came from, so a
+    /// section path in the record is the path an operator can search the file
+    /// for: `backend.0`, `route.3`, `route_group.0`.
+    pub fn effective_json(&self) -> Value {
+        let mut value = serde_json::to_value(self).unwrap_or_else(|_| Value::Object(Map::new()));
+        if let Value::Object(table) = &mut value {
+            for (from, to) in [
+                ("backends", "backend"),
+                ("routes", "route"),
+                ("route_groups", "route_group"),
+            ] {
+                if let Some(field) = table.remove(from) {
+                    table.insert(to.to_string(), field);
+                }
+            }
+        }
+        value
+    }
+
+    /// Every effective setting, split into bounded sections for the record.
+    pub fn startup_sections(&self, trace: &ConfigTrace) -> Vec<Section> {
+        startup::sections_from_value("", &self.effective_json(), trace)
     }
 }
 
@@ -1307,59 +1786,52 @@ const NODE_SERVER_KEYS: &[&str] = &[
     "internal_peers",
     "redirect_bind",
     "warm_on_start",
+    "lock_memory",
+    "max_requests_per_connection",
+    "reuse_port",
+    "reuse_port_processes",
+    "process_index",
+    "status_bind",
+    "served_hosts",
+    "redirect_unmatched_to",
 ];
-/// The fields of `RawSystemHealth`; change both together.
-const NODE_HEALTH_KEYS: &[&str] = &["metrics_token_file", "metrics_require", "metrics_peers"];
 /// Whole sections that are node state. They belong in the system config.
 ///
-/// `RawSiteToml` has no `[node]` field, so a `[node]` in `site.toml` is
-/// dropped without a word unless it is named here.
-const NODE_SECTIONS: &[&str] = &["auth", "node"];
+/// `RawSiteToml` carries `[node]` only for one-file mode. In two-file mode a
+/// `[node]` in `site.toml` is named here so `load` refuses it.
+const NODE_SECTIONS: &[&str] = &["auth", "cache", "genid", "limits", "node"];
 /// Keys that describe how the site's routes are served. They belong in
 /// `site.toml`.
 const SITE_SERVER_KEYS: &[&str] = &["backend_timeout_secs", "allowed_methods"];
 
 /// Name every key that sits in the file it does not belong to.
 ///
-/// Both files accept most of these keys and the system config wins, so a
-/// misplaced key works and says nothing. Each message names the key and the
-/// file it belongs in. The rule: `site.toml` holds state every node of the site
-/// shares, and the system config holds this node's own state (binds,
-/// certificates, credential paths, per-node security).
+/// Each message names the key and the file it belongs in, and `load` refuses
+/// the start with exit 2 for any of them. The rule: `site.toml` holds state
+/// every node of the site shares, and the system config holds this node's own
+/// state (binds, certificates, credential paths, per-node security).
 ///
-/// Returns nothing when both paths name one file (one-file mode, as a
-/// development script runs) or when either file cannot be read or parsed, since
-/// `load` reports those.
-pub fn misplaced_keys(site_dir: &Path, system_config_path: &Path) -> Vec<String> {
-    let site_toml_path = site_dir.join("site.toml");
-    if is_one_file(&site_toml_path, system_config_path) {
-        return Vec::new();
-    }
-    let read = |p: &Path| -> Option<toml::Value> {
-        std::fs::read_to_string(p).ok()?.parse::<toml::Value>().ok()
-    };
-    let (Some(site), Some(system)) = (read(&site_toml_path), read(system_config_path)) else {
-        return Vec::new();
-    };
-
+/// `site` and `system` are the two files already parsed as tables. The caller
+/// runs this only in two-file mode: in one-file mode every key belongs to the
+/// one file.
+pub fn misplaced_keys(
+    site: &toml::Table,
+    system: &toml::Table,
+    system_config_path: &Path,
+) -> Vec<String> {
     let mut out = Vec::new();
     let in_site = |section: &str, key: &str| site.get(section).and_then(|t| t.get(key)).is_some();
-    for key in NODE_SERVER_KEYS {
+    for &key in NODE_SERVER_KEYS {
         if in_site("server", key) {
             out.push(node_state_message("server", Some(key), system_config_path));
         }
     }
-    for section in NODE_SECTIONS {
+    for &section in NODE_SECTIONS {
         if site.get(section).is_some() {
             out.push(node_state_message(section, None, system_config_path));
         }
     }
-    for key in NODE_HEALTH_KEYS {
-        if in_site("health", key) {
-            out.push(node_state_message("health", Some(key), system_config_path));
-        }
-    }
-    for key in SITE_SERVER_KEYS {
+    for &key in SITE_SERVER_KEYS {
         if system.get("server").and_then(|t| t.get(key)).is_some() {
             out.push(format!(
                 "the system config sets [server].{key}, which is site-wide and belongs in site.toml"
@@ -1380,136 +1852,9 @@ fn node_state_message(section: &str, key: Option<&str>, system_config_path: &Pat
     )
 }
 
-/// Copy the running value of every key that is read only at start into `new`,
-/// and name each one whose value differed.
-///
-/// These are `[server]` `bind`, `h2c_bind`, `internal_binds`, `internal_peers`,
-/// `redirect_bind` and `warm_on_start`, and `[analytics]` `enabled` and
-/// `log_path`. The listeners are bound, the peer list is built and the
-/// analytics log is opened once, before the event loop starts (`main.rs`,
-/// `run`), so a reload cannot apply a new value. Keeping the running value in
-/// `new` makes `/perf` and `--dump-config` describe what is running, and the
-/// returned name goes into a warning that says to restart. The log format is
-/// named by `LogHandle::reload`.
-pub fn carry_restart_only(running: &Config, new: &mut Config) -> Vec<&'static str> {
-    let mut named = Vec::new();
-    if new.server.bind != running.server.bind {
-        named.push("[server].bind");
-        new.server.bind.clone_from(&running.server.bind);
-    }
-    if new.server.h2c_bind != running.server.h2c_bind {
-        named.push("[server].h2c_bind");
-        new.server.h2c_bind.clone_from(&running.server.h2c_bind);
-    }
-    if new.server.internal_binds != running.server.internal_binds {
-        named.push("[server].internal_binds");
-        new.server
-            .internal_binds
-            .clone_from(&running.server.internal_binds);
-    }
-    if new.server.internal_peers != running.server.internal_peers {
-        named.push("[server].internal_peers");
-        new.server
-            .internal_peers
-            .clone_from(&running.server.internal_peers);
-    }
-    if new.server.redirect_bind != running.server.redirect_bind {
-        named.push("[server].redirect_bind");
-        new.server
-            .redirect_bind
-            .clone_from(&running.server.redirect_bind);
-    }
-    if new.server.warm_on_start != running.server.warm_on_start {
-        named.push("[server].warm_on_start");
-        new.server.warm_on_start = running.server.warm_on_start;
-    }
-    if new.analytics.enabled != running.analytics.enabled {
-        named.push("[analytics].enabled");
-        new.analytics.enabled = running.analytics.enabled;
-    }
-    if new.analytics.log_path != running.analytics.log_path {
-        named.push("[analytics].log_path");
-        new.analytics
-            .log_path
-            .clone_from(&running.analytics.log_path);
-    }
-    named
-}
-
-/// The running config with only the keys the process config owns taken from
-/// `loaded`.
-///
-/// A reload that follows a touch of the system config alone has no business
-/// changing the site. If an earlier `site.toml` reload was refused (a route
-/// naming an unknown backend, say), the file on disk differs from what is
-/// running, and swapping in all of `loaded` would leave `state.config`
-/// describing one site while the route table serves another. So this starts
-/// from `running` and copies in `node`, `auth`, the certificate and key paths,
-/// `allowed_methods`, `backend_timeout_secs`, the six restart-only `[server]`
-/// keys (which `carry_restart_only` then puts back and names) and the
-/// `[health]` access keys with the token they resolve to.
-pub fn take_process_owned(running: &Config, loaded: Config) -> Config {
-    let mut c = running.clone();
-    c.node = loaded.node;
-    c.auth = loaded.auth;
-    c.server.tls_cert = loaded.server.tls_cert;
-    c.server.tls_key = loaded.server.tls_key;
-    c.server.allowed_methods = loaded.server.allowed_methods;
-    c.server.backend_timeout_secs = loaded.server.backend_timeout_secs;
-    c.server.bind = loaded.server.bind;
-    c.server.h2c_bind = loaded.server.h2c_bind;
-    c.server.internal_binds = loaded.server.internal_binds;
-    c.server.internal_peers = loaded.server.internal_peers;
-    c.server.redirect_bind = loaded.server.redirect_bind;
-    c.server.warm_on_start = loaded.server.warm_on_start;
-    c.health.metrics_token_file = loaded.health.metrics_token_file;
-    c.health.metrics_token = loaded.health.metrics_token;
-    c.health.metrics_require = loaded.health.metrics_require;
-    c.health.metrics_peers = loaded.health.metrics_peers;
-    c.health.metrics_peer_ips = loaded.health.metrics_peer_ips;
-    c
-}
-
-/// True when the system config names no `[node]`, so the node identity falls
-/// back to `[site].name`.
-pub fn node_falls_back(system_config_path: &Path) -> bool {
-    std::fs::read_to_string(system_config_path)
-        .ok()
-        .and_then(|raw| raw.parse::<toml::Table>().ok())
-        .is_some_and(|t| !t.contains_key("node"))
-}
-
-/// Warn that the node identity fell back to `[site].name`.
-///
-/// Called from `main` after logging is initialised, for the reason given on
-/// [`warn_ignored_route_cache_keys`].
-pub fn warn_node_fallback(system_config_path: &Path) {
-    if node_falls_back(system_config_path) {
-        warn!(
-            file = %system_config_path.display(),
-            "system config: no [node].name set, falling back to [site].name for node identity"
-        );
-    }
-}
-
-pub fn warn_system_config_extra_keys(system_config_path: &Path) {
-    if let Ok(raw) = std::fs::read_to_string(system_config_path) {
-        if let Ok(toml::Value::Table(tbl)) = raw.parse::<toml::Value>() {
-            for key in tbl.keys() {
-                if !matches!(key.as_str(), "server" | "node" | "auth" | "health") {
-                    warn!(
-                        key = %key,
-                        file = %system_config_path.display(),
-                        "system config: ignoring key other than [server], [node], [auth], [health]"
-                    );
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use tempfile::TempDir;
 
@@ -1518,7 +1863,8 @@ mod tests {
     }
 
     fn write_file(dir: &Path, name: &str, content: &str) {
-        std::fs::write(dir.join(name), content).unwrap();
+        let replaced = content.replace("{DIR}", &dir.display().to_string());
+        std::fs::write(dir.join(name), replaced).unwrap();
     }
 
     /// `[[backend]] compresses` and what the edge does with it.
@@ -1540,11 +1886,6 @@ mod tests {
 [site]
 name   = "Test"
 domain = "test.example.com"
-
-[server]
-bind     = "127.0.0.1:8443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
 
 [[backend]]
 name    = "says-yes"
@@ -1572,7 +1913,7 @@ backend = "says-yes"
         write_file(
             dir.path(),
             "system.toml",
-            "[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n",
         );
 
         let cfg = load(dir.path(), &dir.path().join("system.toml")).expect("load");
@@ -1596,11 +1937,6 @@ backend = "says-yes"
 name   = "Test"
 domain = "test.example.com"
 
-[server]
-bind     = "127.0.0.1:8443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
-
 [[backend]]
 name    = "m6-html"
 sockets = "/run/m6/m6-html-*.sock"
@@ -1614,10 +1950,13 @@ backend = "m6-html"
 
     fn minimal_system_toml() -> String {
         r#"
+[node]
+name = "test"
+
 [server]
 bind     = "127.0.0.1:8443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
+tls_cert = "{DIR}/cert.pem"
+tls_key  = "{DIR}/key.pem"
 "#
         .to_string()
     }
@@ -1638,6 +1977,53 @@ tls_key  = "key.pem"
         assert_eq!(cfg.site.name, "Test");
         assert_eq!(cfg.server.bind, "127.0.0.1:8443");
         assert_eq!(cfg.routes.len(), 1);
+    }
+
+    /// The stats line's interval: ten seconds when no `[stats]` table is
+    /// present, and whatever `interval_s` names when one is.
+    #[test]
+    fn the_stats_interval_is_read_from_the_site_table() {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
+        assert_eq!(cfg.stats.interval_s, DEFAULT_STATS_INTERVAL_S);
+        assert_eq!(cfg.stats.interval_s, 10);
+        assert_eq!(cfg.stats.traffic_interval_s, DEFAULT_TRAFFIC_INTERVAL_S);
+        assert_eq!(cfg.stats.traffic_interval_s, 60);
+
+        let with_stats = format!(
+            "{}\n[stats]\ninterval_s = 2\ntraffic_interval_s = 5\n",
+            minimal_site_toml()
+        );
+        write_file(dir.path(), "site.toml", &with_stats);
+        let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
+        assert_eq!(cfg.stats.interval_s, 2);
+        assert_eq!(cfg.stats.traffic_interval_s, 5);
+    }
+
+    /// Zero would write the line on every pass of the event loop: refused at
+    /// start, and the error names the key.
+    #[test]
+    fn a_zero_stats_interval_stops_the_start() {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        let with_stats = format!("{}\n[stats]\ninterval_s = 0\n", minimal_site_toml());
+        write_file(dir.path(), "site.toml", &with_stats);
+        let error = load(dir.path(), &dir.path().join("system.toml")).unwrap_err();
+        let text = format!("{error}");
+        assert!(
+            text.contains("[stats].interval_s"),
+            "the error did not name the key: {text}"
+        );
+
+        let with_traffic = format!("{}\n[stats]\ntraffic_interval_s = 0\n", minimal_site_toml());
+        write_file(dir.path(), "site.toml", &with_traffic);
+        let error = load(dir.path(), &dir.path().join("system.toml")).unwrap_err();
+        let text = format!("{error}");
+        assert!(
+            text.contains("[stats].traffic_interval_s"),
+            "the error did not name the key: {text}"
+        );
     }
 
     #[test]
@@ -1701,10 +2087,6 @@ tls_key  = "key.pem"
             r#"
 [site]
 domain = "test.example.com"
-[server]
-bind = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
 [[backend]]
 name = "b"
 sockets = "/run/m6/*.sock"
@@ -1713,7 +2095,7 @@ sockets = "/run/m6/*.sock"
         write_file(
             dir.path(),
             "system.toml",
-            "[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n",
         );
         let result = load(dir.path(), &dir.path().join("system.toml"));
         assert!(result.is_err());
@@ -1733,8 +2115,8 @@ name   = "Test"
 domain = "test.example.com"
 [server]
 bind     = "0.0.0.0:443"
-tls_cert = "missing-cert.pem"
-tls_key  = "key.pem"
+tls_cert = "{DIR}/missing-cert.pem"
+tls_key  = "{DIR}/key.pem"
 "#,
         );
         write_file(dir.path(), "system.toml", "");
@@ -1755,10 +2137,6 @@ tls_key  = "key.pem"
 [site]
 name   = "Test"
 domain = "test.example.com"
-[server]
-bind     = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
 [[backend]]
 name = "b"
 sockets = "/run/m6/*.sock"
@@ -1767,7 +2145,7 @@ path    = "/"
 backend = "unknown"
 "#,
         );
-        write_file(dir.path(), "system.toml", "");
+        write_file(dir.path(), "system.toml", "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n");
         let result = load(dir.path(), &dir.path().join("system.toml"));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("unknown backend"));
@@ -1785,10 +2163,6 @@ backend = "unknown"
 [site]
 name   = "Test"
 domain = "test.example.com"
-[server]
-bind     = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
 [[backend]]
 name = "b"
 sockets = "/run/m6/*.sock"
@@ -1800,7 +2174,7 @@ path    = "/"
 backend = "b"
 "#,
         );
-        write_file(dir.path(), "system.toml", "");
+        write_file(dir.path(), "system.toml", "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n");
         let result = load(dir.path(), &dir.path().join("system.toml"));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("duplicate"));
@@ -1818,10 +2192,6 @@ backend = "b"
 [site]
 name   = "Test"
 domain = "test.example.com"
-[server]
-bind     = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
 [[backend]]
 name = "b"
 sockets = "/run/m6/*.sock"
@@ -1831,7 +2201,7 @@ backend = "b"
 require = "group:editors"
 "#,
         );
-        write_file(dir.path(), "system.toml", "");
+        write_file(dir.path(), "system.toml", "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n");
         let result = load(dir.path(), &dir.path().join("system.toml"));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("require"));
@@ -1849,10 +2219,6 @@ require = "group:editors"
 [site]
 name   = "Test"
 domain = "test.example.com"
-[server]
-bind     = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
 [errors]
 mode = "custom"
 [[backend]]
@@ -1860,45 +2226,32 @@ name = "b"
 sockets = "/run/m6/*.sock"
 "#,
         );
-        write_file(dir.path(), "system.toml", "");
+        write_file(dir.path(), "system.toml", "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n");
         let result = load(dir.path(), &dir.path().join("system.toml"));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("custom"));
     }
 
     #[test]
-    fn test_system_config_server_wins() {
+    fn bind_in_site_toml_is_refused() {
         let dir = make_test_dir();
         write_file(dir.path(), "cert.pem", "dummy");
         write_file(dir.path(), "key.pem", "dummy");
         write_file(
             dir.path(),
             "site.toml",
-            r#"
-[site]
-name   = "Test"
-domain = "test.example.com"
-[server]
-bind     = "127.0.0.1:8443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
-[[backend]]
-name = "b"
-sockets = "/run/m6/*.sock"
-"#,
+            "[site]\nname = \"Test\"\ndomain = \"test.example.com\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n\n[[backend]]\nname = \"b\"\nsockets = \"/run/m6/*.sock\"\n",
         );
         write_file(
             dir.path(),
             "system.toml",
-            r#"
-[server]
-bind = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key = "key.pem"
-"#,
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n",
         );
-        let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
-        assert_eq!(cfg.server.bind, "0.0.0.0:443");
+        let e = load(dir.path(), &dir.path().join("system.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("site.toml sets [server].bind"), "{e}");
+        assert!(e.contains("belongs in the system config"), "{e}");
     }
 
     /// A :80 redirector terminates no TLS, so it must load with no certificate
@@ -1916,11 +2269,13 @@ tls_key = "key.pem"
 [site]
 name   = "Test"
 domain = "test.example.com"
-[server]
-redirect_bind = "0.0.0.0:80"
 "#,
         );
-        write_file(dir.path(), "system.toml", "");
+        write_file(
+            dir.path(),
+            "system.toml",
+            "[node]\nname = \"test\"\n\n[server]\nredirect_bind = \"0.0.0.0:80\"\n",
+        );
         let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
         assert_eq!(cfg.server.redirect_bind.as_deref(), Some("0.0.0.0:80"));
         assert!(cfg.server.tls_cert.is_none());
@@ -1943,18 +2298,118 @@ redirect_bind = "0.0.0.0:80"
 [site]
 name   = "Test"
 domain = "test.example.com"
-[server]
-bind = "0.0.0.0:443"
 [[backend]]
 name = "b"
 sockets = "/run/m6/*.sock"
 "#,
         );
-        write_file(dir.path(), "system.toml", "");
+        write_file(
+            dir.path(),
+            "system.toml",
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\n",
+        );
         let err = load(dir.path(), &dir.path().join("system.toml"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("tls_cert"), "unexpected error: {err}");
+    }
+
+    // ── [server] served_hosts and redirect_unmatched_to ─────────────────────
+
+    /// The combination that would lock an operator out of their own node: a
+    /// target with no served names answers every request with a redirect,
+    /// including the node's own name. `load` must refuse it, naming the empty
+    /// list, so a typo cannot take the deploy's checks and the monitor off the
+    /// node.
+    #[test]
+    fn a_canonical_target_with_no_served_hosts_refuses_to_start() {
+        let e = load_error("redirect_unmatched_to = \"example.com\"\n");
+        assert!(e.starts_with("config error:"), "{e}");
+        assert!(e.contains("[server].served_hosts is empty"), "{e}");
+        assert!(e.contains("Every request would be redirected"), "{e}");
+        assert!(e.contains("this node's own name"), "{e}");
+    }
+
+    #[test]
+    fn a_served_host_is_matched_without_its_port_or_case() {
+        let cfg = load_with_system_server(
+            "served_hosts = [\"Edge-A.Example.COM\"]\nredirect_unmatched_to = \"Example.COM\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.server.served_hosts,
+            vec!["edge-a.example.com".to_string()]
+        );
+        assert_eq!(
+            cfg.server.redirect_unmatched_to.as_deref(),
+            Some("example.com")
+        );
+        assert!(cfg
+            .server
+            .unmatched_host_redirect(Some("edge-a.example.com:8443"), "/x", None)
+            .is_none());
+        assert_eq!(
+            cfg.server
+                .unmatched_host_redirect(Some("other.example.com"), "/x", Some("a=1")),
+            Some("https://example.com/x?a=1".to_string())
+        );
+        // An absent Host is outside the list, so a redirector sends it to the
+        // canonical name instead of answering 400.
+        assert_eq!(
+            cfg.server.unmatched_host_redirect(None, "/", None),
+            Some("https://example.com/".to_string())
+        );
+    }
+
+    #[test]
+    fn a_served_list_without_a_target_changes_nothing() {
+        let cfg = load_with_system_server("served_hosts = [\"edge-a.example.com\"]\n").unwrap();
+        assert!(cfg
+            .server
+            .unmatched_host_redirect(Some("other.example.com"), "/", None)
+            .is_none());
+    }
+
+    #[test]
+    fn a_target_that_is_an_address_or_carries_a_path_is_refused() {
+        let e = load_error(
+            "served_hosts = [\"edge-a.example.com\"]\nredirect_unmatched_to = \"203.0.113.7\"\n",
+        );
+        assert!(e.contains("IP address"), "{e}");
+        let e = load_error(
+            "served_hosts = [\"edge-a.example.com\"]\nredirect_unmatched_to = \"example.com/x\"\n",
+        );
+        assert!(e.contains("not a bare host name"), "{e}");
+        let e =
+            load_error("served_hosts = [\"edge-a.example.com\"]\nredirect_unmatched_to = \"\"\n");
+        assert!(e.contains("is empty"), "{e}");
+    }
+
+    #[test]
+    fn a_served_entry_with_a_port_or_wildcard_is_refused() {
+        let e = load_error(
+            "served_hosts = [\"edge-a.example.com:8443\"]\nredirect_unmatched_to = \"example.com\"\n",
+        );
+        assert!(e.contains("[server].served_hosts entry"), "{e}");
+        let e = load_error(
+            "served_hosts = [\"*.example.com\"]\nredirect_unmatched_to = \"example.com\"\n",
+        );
+        assert!(e.contains("[server].served_hosts entry"), "{e}");
+    }
+
+    /// The policy is node state, so site.toml must not carry it. `misplaced_keys`
+    /// is one list, and this is the pair of keys that joined it.
+    #[test]
+    fn misplaced_keys_names_the_host_policy_in_site_toml() {
+        let m = misplaced(
+            "[server]\nserved_hosts = [\"edge-a.example.com\"]\nredirect_unmatched_to = \"example.com\"\n",
+            "",
+        );
+        assert_eq!(m.len(), 2, "{m:?}");
+        assert!(m.iter().any(|x| x.contains("[server].served_hosts")));
+        assert!(m
+            .iter()
+            .any(|x| x.contains("[server].redirect_unmatched_to")));
     }
 
     #[test]
@@ -1963,6 +2418,121 @@ sockets = "/run/m6/*.sock"
         setup_minimal(dir.path());
         let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
         assert_eq!(cfg.server.backend_timeout_secs, 30);
+    }
+
+    #[test]
+    fn test_max_requests_per_connection_default() {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
+        assert_eq!(cfg.server.max_requests_per_connection, 100);
+    }
+
+    fn load_with_system_server_line(line: &str) -> anyhow::Result<Config> {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        write_file(
+            dir.path(),
+            "system.toml",
+            &format!(
+                "[node]\nname = \"test\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{{DIR}}/cert.pem\"\ntls_key = \"{{DIR}}/key.pem\"\n{line}\n"
+            ),
+        );
+        load(dir.path(), &dir.path().join("system.toml"))
+    }
+
+    #[test]
+    fn test_max_requests_per_connection_is_read() {
+        let cfg = load_with_system_server_line("max_requests_per_connection = 10000").unwrap();
+        assert_eq!(cfg.server.max_requests_per_connection, 10_000);
+    }
+
+    #[test]
+    fn test_max_requests_per_connection_zero_is_rejected() {
+        let err = load_with_system_server_line("max_requests_per_connection = 0")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_requests_per_connection"), "error: {err}");
+    }
+
+    /// The default is what keeps an accidental second instance from binding a
+    /// live port, so it is false unless the node asks for sharing.
+    #[test]
+    fn reuse_port_defaults_off() {
+        let cfg = load_with_system_server_line("").unwrap();
+        assert!(!cfg.server.reuse_port);
+    }
+
+    #[test]
+    fn reuse_port_is_read_from_the_system_config() {
+        let cfg = load_with_system_server_line("reuse_port = true").unwrap();
+        assert!(cfg.server.reuse_port);
+    }
+
+    #[test]
+    fn reuse_port_processes_is_unset_by_default_and_read_when_set() {
+        let cfg = load_with_system_server_line("reuse_port = true").unwrap();
+        assert_eq!(cfg.server.reuse_port_processes, None);
+        let cfg =
+            load_with_system_server_line("reuse_port = true\nreuse_port_processes = 3").unwrap();
+        assert_eq!(cfg.server.reuse_port_processes.map(|n| n.get()), Some(3));
+    }
+
+    /// A zero would be a modulus of zero in the kernel filter.
+    #[test]
+    fn status_listener_keys_are_read_and_default_off() {
+        let cfg = load_with_system_server_line("").unwrap();
+        assert_eq!(
+            (cfg.server.process_index, cfg.server.status_bind),
+            (None, None)
+        );
+        let cfg = load_with_system_server_line(
+            "reuse_port_processes = 3\nprocess_index = 2\nstatus_bind = \"127.0.0.1:9440\"",
+        )
+        .unwrap();
+        assert_eq!(cfg.server.process_index, Some(2));
+        assert_eq!(
+            status_addr(cfg.server.status_bind.as_deref().unwrap(), 2)
+                .unwrap()
+                .port(),
+            9442
+        );
+    }
+
+    #[test]
+    fn status_bind_without_an_index_is_rejected() {
+        let err = load_with_system_server_line("status_bind = \"127.0.0.1:9440\"")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("status_bind") && err.contains("process_index"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn an_index_past_the_process_count_is_rejected() {
+        let err = load_with_system_server_line("reuse_port_processes = 2\nprocess_index = 2")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("process_index 2"), "error: {err}");
+    }
+
+    #[test]
+    fn a_status_port_past_65535_is_rejected() {
+        let err =
+            load_with_system_server_line("process_index = 5\nstatus_bind = \"127.0.0.1:65533\"")
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("past 65535"), "error: {err}");
+    }
+
+    #[test]
+    fn reuse_port_processes_zero_is_rejected() {
+        let err = load_with_system_server_line("reuse_port = true\nreuse_port_processes = 0")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reuse_port_processes"), "error: {err}");
     }
 
     #[test]
@@ -1978,9 +2548,6 @@ sockets = "/run/m6/*.sock"
 name   = "Test"
 domain = "test.example.com"
 [server]
-bind     = "127.0.0.1:8443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
 backend_timeout_secs = 60
 [[backend]]
 name = "b"
@@ -1993,47 +2560,35 @@ backend = "b"
         write_file(
             dir.path(),
             "system.toml",
-            "[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"cert.pem\"\ntls_key = \"key.pem\"\n",
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n",
         );
         let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
         assert_eq!(cfg.server.backend_timeout_secs, 60);
     }
 
     #[test]
-    fn test_backend_timeout_system_wins() {
+    fn backend_timeout_in_system_config_is_refused() {
         let dir = make_test_dir();
         write_file(dir.path(), "cert.pem", "dummy");
         write_file(dir.path(), "key.pem", "dummy");
         write_file(
             dir.path(),
             "site.toml",
-            r#"
-[site]
-name   = "Test"
-domain = "test.example.com"
-[server]
-bind     = "127.0.0.1:8443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
-backend_timeout_secs = 10
-[[backend]]
-name = "b"
-sockets = "/run/m6/*.sock"
-"#,
+            "[site]\nname = \"Test\"\ndomain = \"test.example.com\"\n\n[server]\nbackend_timeout_secs = 10\n\n[[backend]]\nname = \"b\"\nsockets = \"/run/m6/*.sock\"\n",
         );
         write_file(
             dir.path(),
             "system.toml",
-            r#"
-[server]
-bind = "127.0.0.1:8443"
-tls_cert = "cert.pem"
-tls_key = "key.pem"
-backend_timeout_secs = 120
-"#,
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\nbackend_timeout_secs = 120\n",
         );
-        let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
-        assert_eq!(cfg.server.backend_timeout_secs, 120);
+        let e = load(dir.path(), &dir.path().join("system.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("the system config sets [server].backend_timeout_secs"),
+            "{e}"
+        );
+        assert!(e.contains("belongs in site.toml"), "{e}");
     }
 
     // ── [server] internal_binds ─────────────────────────────────────────────
@@ -2168,8 +2723,8 @@ backend_timeout_secs = 120
         setup_minimal(dir.path());
         let mut site = minimal_site_toml();
         site = site.replace(
-            "tls_key  = \"key.pem\"\n",
-            "tls_key  = \"key.pem\"\ninternal_binds = []\n",
+            "tls_key  = \"{DIR}/key.pem\"\n",
+            "tls_key  = \"{DIR}/key.pem\"\ninternal_binds = []\n",
         );
         write_file(dir.path(), "site.toml", &site);
         let mut sys = minimal_system_toml();
@@ -2189,12 +2744,9 @@ backend_timeout_secs = 120
 [site]
 name   = "Test"
 domain = "test.example.com"
-[server]
-redirect_bind = "0.0.0.0:80"
-internal_binds = ["203.0.113.7:80"]
 "#,
         );
-        write_file(dir.path(), "system.toml", "");
+        write_file(dir.path(), "system.toml", "[node]\nname = \"test\"\n\n[server]\nredirect_bind = \"0.0.0.0:80\"\ninternal_binds = [\"203.0.113.7:80\"]\n");
         let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
         assert_eq!(cfg.server.redirect_bind.as_deref(), Some("0.0.0.0:80"));
     }
@@ -2311,8 +2863,8 @@ internal_binds = ["203.0.113.7:80"]
         setup_minimal(dir.path());
         let mut site = minimal_site_toml();
         site = site.replace(
-            "tls_key  = \"key.pem\"\n",
-            "tls_key  = \"key.pem\"\ninternal_peers = [\"10.0.0.9\"]\n",
+            "tls_key  = \"{DIR}/key.pem\"\n",
+            "tls_key  = \"{DIR}/key.pem\"\ninternal_peers = [\"10.0.0.9\"]\n",
         );
         write_file(dir.path(), "site.toml", &site);
         let mut sys = minimal_system_toml();
@@ -2334,12 +2886,9 @@ internal_binds = ["203.0.113.7:80"]
 [site]
 name   = "Test"
 domain = "test.example.com"
-[server]
-redirect_bind = "0.0.0.0:80"
-internal_peers = ["203.0.113.7"]
 "#,
         );
-        write_file(dir.path(), "system.toml", "");
+        write_file(dir.path(), "system.toml", "[node]\nname = \"test\"\n\n[server]\nredirect_bind = \"0.0.0.0:80\"\ninternal_peers = [\"203.0.113.7\"]\n");
         let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
         assert!(cfg.server.internal_peers.is_empty());
     }
@@ -2349,7 +2898,6 @@ internal_peers = ["203.0.113.7"]
     fn load_with(site_extra: &str, sys_extra: &str) -> (TempDir, anyhow::Result<Config>) {
         let dir = make_test_dir();
         setup_minimal(dir.path());
-        write_file(dir.path(), "auth.pem", "dummy");
         let mut site = minimal_site_toml();
         site.push_str(&site_extra.replace("{DIR}", &dir.path().display().to_string()));
         write_file(dir.path(), "site.toml", &site);
@@ -2361,283 +2909,456 @@ internal_peers = ["203.0.113.7"]
     }
 
     #[test]
-    fn auth_without_backend_loads() {
-        let (_d, cfg) = load_with("\n[auth]\npublic_key = \"auth.pem\"\n", "");
-        let cfg = cfg.unwrap();
-        let auth = cfg.auth.expect("auth present");
-        assert_eq!(auth.backend, None);
-        assert_eq!(auth.public_key, "auth.pem");
+    fn auth_needs_a_backend() {
+        let (_d, r) = load_with("", "\n[auth]\n");
+        let e = r.unwrap_err().to_string();
+        assert!(e.contains("backend"), "{e}");
     }
 
     #[test]
     fn auth_backend_when_given_must_be_declared() {
-        let (_d, r) = load_with(
-            "\n[auth]\nbackend = \"nope\"\npublic_key = \"auth.pem\"\n",
-            "",
-        );
+        let (_d, r) = load_with("", "\n[auth]\nbackend = \"nope\"\n");
         assert!(r
             .unwrap_err()
             .to_string()
             .contains("[auth].backend `nope` not in [[backend]]"));
-        let (_d, ok) = load_with(
-            "\n[auth]\nbackend = \"m6-html\"\npublic_key = \"auth.pem\"\n",
-            "",
-        );
+        let (_d, ok) = load_with("", "\n[auth]\nbackend = \"m6-html\"\n");
         assert!(ok.is_ok());
     }
 
     #[test]
     fn auth_from_the_system_config_is_used() {
-        let (_d, r) = load_with("", "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n");
+        let (_d, r) = load_with("", "\n[auth]\nbackend = \"m6-html\"\n");
         let auth = r.unwrap().auth.expect("auth present");
-        assert!(auth.public_key.ends_with("/auth.pem"));
-        assert_eq!(auth.backend, None);
+        assert_eq!(auth.backend, "m6-html");
     }
 
     #[test]
     fn auth_in_both_files_is_refused() {
         let (_d, r) = load_with(
-            "\n[auth]\npublic_key = \"auth.pem\"\n",
-            "\n[auth]\npublic_key = \"{DIR}/auth.pem\"\n",
+            "\n[auth]\nbackend = \"m6-html\"\n",
+            "\n[auth]\nbackend = \"m6-html\"\n",
+        );
+        let e = r.unwrap_err().to_string();
+        assert!(e.contains("site.toml sets [auth],"), "{e}");
+        assert!(e.contains("belongs in the system config"), "{e}");
+    }
+
+    #[test]
+    fn a_relative_tls_cert_or_key_is_refused_and_named() {
+        for (relative, absolute, expected) in [
+            (
+                "tls_cert = \"cert.pem\"",
+                "tls_key = \"{DIR}/key.pem\"",
+                "[server] tls_cert",
+            ),
+            (
+                "tls_key = \"key.pem\"",
+                "tls_cert = \"{DIR}/cert.pem\"",
+                "[server] tls_key",
+            ),
+        ] {
+            let dir = make_test_dir();
+            write_file(dir.path(), "cert.pem", "dummy");
+            write_file(dir.path(), "key.pem", "dummy");
+            write_file(dir.path(), "site.toml", &minimal_site_toml());
+            let sys = format!(
+                "[node]\nname = \"test\"\n\n[server]\nbind = \"127.0.0.1:8443\"\n{relative}\n{absolute}\n"
+            );
+            write_file(dir.path(), "system.toml", &sys);
+            let e = load(dir.path(), &dir.path().join("system.toml"))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(expected), "{e}");
+        }
+    }
+
+    #[test]
+    fn the_removed_metrics_token_file_is_refused_and_named() {
+        // The legacy bearer gate is gone; an operator still carrying it gets a
+        // start failure that names the key rather than a silently ignored row.
+        let (_d, r) = load_with("\n[health]\nmetrics_token_file = \"token\"\n", "");
+        let e = r.unwrap_err().to_string();
+        assert!(e.contains("metrics_token_file"), "{e}");
+    }
+
+    #[test]
+    fn genid_needs_both_requires_or_neither() {
+        let auth = "\n[auth]\nbackend = \"m6-html\"\n";
+        for only in [
+            "\n[genid]\nread_require = \"role:monitor\"\n",
+            "\n[genid]\nwrite_require = \"role:editor\"\n",
+        ] {
+            let (_d, r) = load_with("", &format!("{auth}{only}"));
+            let e = r.unwrap_err().to_string();
+            assert_eq!(
+                e,
+                "config error: [genid] needs both read_require and write_require, or neither"
+            );
+        }
+        let (_d, ok) = load_with(
+            "",
+            &format!(
+                "{auth}\n[genid]\nread_require = \"role:monitor\"\nwrite_require = \"role:editor\"\n"
+            ),
+        );
+        let cfg = ok.expect("both claims load");
+        let g = cfg.genid.expect("[genid] present");
+        assert_eq!(g.read_require.as_deref(), Some("role:monitor"));
+        assert_eq!(g.write_require.as_deref(), Some("role:editor"));
+    }
+
+    #[test]
+    fn genid_require_needs_auth() {
+        let (_d, r) = load_with(
+            "",
+            "\n[genid]\nread_require = \"role:monitor\"\nwrite_require = \"role:editor\"\n",
         );
         assert_eq!(
             r.unwrap_err().to_string(),
-            "config error: [auth] is declared in both site.toml and the system config; declare it in one"
+            "config error: [genid] read_require and write_require need [auth] with a backend"
         );
     }
 
     #[test]
-    fn a_relative_public_key_in_the_system_config_resolves_against_the_site_dir() {
-        let (_d, r) = load_with("", "\n[auth]\npublic_key = \"auth.pem\"\n");
-        // load_with writes auth.pem into the site directory.
-        let auth = r.unwrap().auth.expect("auth present");
-        assert_eq!(auth.public_key, "auth.pem");
+    fn genid_require_must_name_a_role_or_group() {
+        for (key, bad) in [
+            ("read_require", "admin"),
+            ("write_require", "role:"),
+            ("write_require", "user:x"),
+        ] {
+            let body = match key {
+                "read_require" => {
+                    format!("read_require = \"{bad}\"\nwrite_require = \"role:editor\"\n")
+                }
+                _ => format!("read_require = \"role:monitor\"\nwrite_require = \"{bad}\"\n"),
+            };
+            let (_d, r) = load_with(
+                "",
+                &format!("\n[auth]\nbackend = \"m6-html\"\n\n[genid]\n{body}"),
+            );
+            let e = r.unwrap_err().to_string();
+            assert!(
+                e.contains(&format!("[genid].{key}"))
+                    && e.contains("must be \"role:<name>\" or \"group:<name>\""),
+                "{bad}: {e}"
+            );
+        }
     }
 
     #[test]
-    fn a_relative_public_key_in_the_system_config_must_exist_in_the_site_dir() {
-        let (_d, r) = load_with("", "\n[auth]\npublic_key = \"missing.pem\"\n");
+    fn genid_in_the_system_config_loads() {
+        let (_d, r) = load_with(
+            "",
+            "\n[auth]\nbackend = \"m6-html\"\n\n[genid]\nread_require = \"group:ops\"\nwrite_require = \"role:editor\"\n",
+        );
+        let cfg = r.expect("a source loads");
+        assert_eq!(
+            cfg.genid.expect("present").read_require.as_deref(),
+            Some("group:ops")
+        );
+    }
+
+    /// `[limits]` is read from the system config, names the system config in
+    /// its refusals, and is refused in `site.toml`.
+    #[test]
+    fn limits_in_the_system_config_load_and_in_site_toml_are_refused() {
+        use m6_core::limits::EDGE_REQUEST;
+        let (_d, r) = load_with("", "\n[limits.edge_request]\nmax = \"8MiB\"\n");
+        let cfg = r.expect("limits load");
+        assert_eq!(cfg.limits.get(&EDGE_REQUEST).max(), 8 << 20);
+
+        let (_d, r) = load_with("", "\n[limits.edge_request]\nmax = \"1KiB\"\n");
         let e = r.unwrap_err().to_string();
         assert!(
-            e.contains("[auth].public_key file not found") && e.ends_with("/missing.pem"),
+            e.contains("[limits.edge_request] max = 1 KiB is below start = 4 KiB"),
+            "{e}"
+        );
+        assert!(e.contains("system"), "{e}");
+
+        let (_d, r) = load_with("\n[limits.edge_request]\nmax = \"8MiB\"\n", "");
+        let e = r.unwrap_err().to_string();
+        assert!(e.contains("site.toml sets [limits]"), "{e}");
+    }
+
+    #[test]
+    fn genid_in_site_toml_is_refused() {
+        let (_d, r) = load_with(
+            "\n[genid]\nread_require = \"role:monitor\"\nwrite_require = \"role:editor\"\n",
+            "\n[auth]\nbackend = \"m6-html\"\n",
+        );
+        let e = r.unwrap_err().to_string();
+        assert!(e.contains("site.toml sets [genid]"), "{e}");
+        assert!(e.contains("belongs in the system config"), "{e}");
+    }
+
+    /// A cache node's site: one URL backend named `origin`, then whatever the
+    /// test puts in `[genid]`. The token file is written with `token`, so a
+    /// positive case can read it.
+    fn load_cache_with(
+        sys_extra: &str,
+        token: &str,
+    ) -> (tempfile::TempDir, anyhow::Result<Config>) {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        write_file(dir.path(), "genid-token", token);
+        let mut site = minimal_site_toml();
+        site.push_str("\n[[backend]]\nname = \"origin\"\nurl = \"https://127.0.0.1:9\"\n");
+        write_file(dir.path(), "site.toml", &site);
+        let mut sys = minimal_system_toml();
+        sys.push_str(&sys_extra.replace("{DIR}", &dir.path().display().to_string()));
+        write_file(dir.path(), "system.toml", &sys);
+        let result = load(dir.path(), &dir.path().join("system.toml"));
+        (dir, result)
+    }
+
+    #[test]
+    fn genid_upstream_must_name_a_backend_with_a_url() {
+        for name in ["nope", "m6-html"] {
+            let (_d, r) = load_cache_with(
+                &format!(
+                    "\n[genid]\nupstream = \"{name}\"\ntoken_file = \"{{DIR}}/genid-token\"\n"
+                ),
+                "read-token",
+            );
+            assert_eq!(
+                r.unwrap_err().to_string(),
+                format!(
+                    "config error: [genid].upstream = \"{name}\" must name a [[backend]] with a url"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn genid_upstream_needs_a_token_file() {
+        let (_d, r) = load_cache_with("\n[genid]\nupstream = \"origin\"\n", "read-token");
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "config error: [genid].upstream = \"origin\" needs token_file"
+        );
+    }
+
+    #[test]
+    fn genid_token_file_is_a_secret_path() {
+        let (_d, r) = load_cache_with(
+            "\n[genid]\nupstream = \"origin\"\ntoken_file = \"genid-token\"\n",
+            "read-token",
+        );
+        let e = r.unwrap_err().to_string();
+        assert!(
+            e.contains("[genid] token_file") && e.contains("relative path"),
             "{e}"
         );
     }
 
-    fn peers_error(entries: &str) -> String {
-        let (_d, r) = load_with(&format!("\n[health]\nmetrics_peers = [{entries}]\n"), "");
-        r.expect_err("must refuse").to_string()
-    }
-
     #[test]
-    fn metrics_peers_accepts_local_addresses() {
-        let (_d, r) = load_with(
-            "\n[health]\nmetrics_peers = [\"10.0.0.9\", \"127.0.0.1\", \"fd00::5\", \"100.64.0.1\"]\n",
-            "",
+    fn genid_token_file_must_be_readable_and_not_empty() {
+        let (_d, r) = load_cache_with(
+            "\n[genid]\nupstream = \"origin\"\ntoken_file = \"{DIR}/missing\"\n",
+            "read-token",
         );
-        let h = r.unwrap().health;
-        let ips = h.metrics_peer_ips.expect("peers set");
-        assert_eq!(ips.len(), 4);
-        assert!(ips.contains(&"fd00::5".parse().unwrap()));
-    }
+        let e = r.unwrap_err().to_string();
+        assert!(
+            e.contains("[genid] token_file") && e.contains("cannot be read"),
+            "{e}"
+        );
 
-    #[test]
-    fn metrics_peers_are_stored_canonical() {
-        let (_d, r) = load_with("\n[health]\nmetrics_peers = [\"::ffff:10.0.0.9\"]\n", "");
-        let h = r.unwrap().health;
-        assert_eq!(
-            h.metrics_peer_ips,
-            Some(vec!["10.0.0.9".parse::<std::net::IpAddr>().unwrap()])
+        let (_d, r) = load_cache_with(
+            "\n[genid]\nupstream = \"origin\"\ntoken_file = \"{DIR}/genid-token\"\n",
+            "  \n",
+        );
+        let e = r.unwrap_err().to_string();
+        assert!(
+            e.contains("[genid] token_file") && e.contains("is empty"),
+            "{e}"
         );
     }
 
     #[test]
-    fn metrics_peers_refuses_names_ranges_and_ports() {
-        for entry in ["localhost", "10.0.0.0/24", "10.0.0.9:443"] {
-            let e = peers_error(&format!("\"{entry}\""));
-            assert!(
-                e.contains(&format!(
-                    "metrics_peers entry \"{entry}\" is not an IP address"
-                )),
-                "{entry}: {e}"
-            );
-        }
-    }
-
-    #[test]
-    fn metrics_peers_refuses_public_and_wildcard() {
-        for entry in ["203.0.113.7", "0.0.0.0", "::"] {
-            let e = peers_error(&format!("\"{entry}\""));
-            assert!(e.contains("is not in a local range"), "{entry}: {e}");
-        }
-    }
-
-    #[test]
-    fn an_empty_metrics_peers_is_refused() {
-        assert!(peers_error("").contains("metrics_peers is empty"));
-    }
-
-    #[test]
-    fn metrics_require_needs_auth() {
-        let (_d, r) = load_with("\n[health]\nmetrics_require = \"role:monitor\"\n", "");
+    fn genid_heartbeat_secs_must_be_positive() {
+        let (_d, r) = load_cache_with(
+            "\n[genid]\nupstream = \"origin\"\ntoken_file = \"{DIR}/genid-token\"\nheartbeat_secs = 0\n",
+            "read-token",
+        );
         assert_eq!(
             r.unwrap_err().to_string(),
-            "config error: [health].metrics_require needs [auth] with a public_key"
+            "config error: [genid].heartbeat_secs must be at least 1, because 0 would send a heartbeat every loop turn"
         );
     }
 
     #[test]
-    fn metrics_require_must_name_a_role_or_group() {
-        for bad in ["admin", "role:", "group:", "user:x"] {
-            let (_d, r) = load_with(
-                &format!(
-                    "\n[auth]\npublic_key = \"auth.pem\"\n\n[health]\nmetrics_require = \"{bad}\"\n"
-                ),
-                "",
-            );
-            let e = r.unwrap_err().to_string();
-            assert!(
-                e.contains("must be \"role:<name>\" or \"group:<name>\""),
-                "{bad}: {e}"
+    fn genid_cache_keys_need_an_upstream() {
+        let auth = "\n[auth]\nbackend = \"m6-html\"\n";
+        for key in ["token_file = \"{DIR}/genid-token\"", "heartbeat_secs = 5"] {
+            let (_d, r) = load_with("", &format!("{auth}\n[genid]\n{key}\n"));
+            assert_eq!(
+                r.unwrap_err().to_string(),
+                format!(
+                    "config error: [genid] {} applies only to a cache node with upstream",
+                    key.split(' ').next().unwrap()
+                )
             );
         }
-        let (_d, ok) = load_with(
-            "\n[auth]\npublic_key = \"auth.pem\"\n\n[health]\nmetrics_require = \"group:ops\"\n",
-            "",
-        );
-        assert!(ok.is_ok());
     }
 
     #[test]
-    fn system_health_keys_win_over_site_health_keys() {
-        let (_d, r) = load_with(
-            "\n[auth]\npublic_key = \"auth.pem\"\n\n[health]\nmetrics_require = \"role:site\"\nmetrics_peers = [\"10.0.0.1\"]\n",
-            "\n[health]\nmetrics_require = \"role:system\"\nmetrics_peers = [\"10.0.0.2\"]\n",
+    fn genid_source_claims_do_not_apply_to_a_cache_node() {
+        let auth = "\n[auth]\nbackend = \"m6-html\"\n";
+        let (_d, r) = load_cache_with(
+            &format!(
+                "{auth}\n[genid]\nupstream = \"origin\"\ntoken_file = \"{{DIR}}/genid-token\"\nread_require = \"role:monitor\"\nwrite_require = \"role:editor\"\n"
+            ),
+            "read-token",
         );
-        let h = r.unwrap().health;
-        assert_eq!(h.metrics_require.as_deref(), Some("role:system"));
         assert_eq!(
-            h.metrics_peer_ips,
-            Some(vec!["10.0.0.2".parse::<std::net::IpAddr>().unwrap()])
+            r.unwrap_err().to_string(),
+            "config error: [genid] read_require applies only to the source, which has no upstream"
         );
     }
 
     #[test]
-    fn a_system_health_key_alone_keeps_the_other_from_the_site() {
-        let (_d, r) = load_with(
-            "\n[auth]\npublic_key = \"auth.pem\"\n\n[health]\nmetrics_require = \"role:site\"\n",
-            "\n[health]\nmetrics_peers = [\"10.0.0.2\"]\n",
+    fn genid_cache_node_loads_with_the_default_heartbeat() {
+        let (_d, r) = load_cache_with(
+            "\n[genid]\nupstream = \"origin\"\ntoken_file = \"{DIR}/genid-token\"\n",
+            "  read-token\n",
         );
-        let h = r.unwrap().health;
-        assert_eq!(h.metrics_require.as_deref(), Some("role:site"));
-        assert_eq!(h.metrics_peer_ips.map(|p| p.len()), Some(1));
+        let cfg = r.expect("a cache node loads");
+        let g = cfg.genid.as_ref().expect("[genid] present");
+        assert_eq!(g.upstream.as_deref(), Some("origin"));
+        assert_eq!(
+            g.token.as_ref().map(|t| t.expose().as_str()),
+            Some("read-token"),
+            "the file is trimmed"
+        );
+        assert_eq!(
+            g.heartbeat,
+            std::time::Duration::from_secs(crate::genid::DEFAULT_HEARTBEAT_SECS)
+        );
+        assert_eq!(g.read_require, None);
+        assert_eq!(g.write_require, None);
+
+        // The token is a credential: `--dump-config` must never print it.
+        let dumped = serde_json::to_string(&cfg).expect("serialise");
+        assert!(!dumped.contains("read-token"), "{dumped}");
+    }
+
+    /// The start-up record of a cache node, which holds m6-http's one
+    /// credential, carries neither the token nor its `Debug` form. Every other
+    /// field of the config is in the record, so the check reads a full record.
+    #[test]
+    fn the_startup_record_carries_no_genid_token() {
+        let (dir, r) = load_cache_with(
+            "\n[genid]\nupstream = \"origin\"\ntoken_file = \"{DIR}/genid-token\"\n",
+            "SECRET-genid-token",
+        );
+        let cfg = r.expect("a cache node loads");
+        let (_, trace) = load_traced(dir.path(), &dir.path().join("system.toml"))
+            .expect("the same config loads with its trace");
+        let record = startup::Record::new("m6-http", vec!["m6-http".to_string()])
+            .trace(trace.clone())
+            .sections(cfg.startup_sections(&trace))
+            .host(startup::HostReport::unknown("a test host knows nothing"));
+        let path = dir.path().join("record.jsonl");
+        let mut sink = m6_core::log::Sink::file(&path).expect("a file sink");
+        record.write(&mut sink);
+        sink.finish().expect("the sink flushes");
+        let text = std::fs::read_to_string(&path).expect("the record is text");
+        assert!(
+            text.contains("origin"),
+            "the genid section is recorded: {text}"
+        );
+        assert!(!text.contains("SECRET-genid-token"), "{text}");
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains("SECRET-genid-token"), "{debug}");
     }
 
     #[test]
-    fn an_unknown_health_key_in_the_system_config_fails_to_parse() {
-        let (_d, r) = load_with("", "\n[health]\nperf_path = \"/p\"\n");
-        let e = format!("{:#}", r.unwrap_err());
-        assert!(e.contains("perf_path"), "{e}");
-    }
-
-    #[test]
-    fn health_defaults_have_no_require_and_no_peers() {
-        let (_d, r) = load_with("", "");
-        let h = r.unwrap().health;
-        assert_eq!(h.metrics_require, None);
-        assert_eq!(h.metrics_peers, None);
-        assert_eq!(h.metrics_peer_ips, None);
+    fn genid_cache_node_reads_heartbeat_secs() {
+        let (_d, r) = load_cache_with(
+            "\n[genid]\nupstream = \"origin\"\ntoken_file = \"{DIR}/genid-token\"\nheartbeat_secs = 3\n",
+            "read-token",
+        );
+        let g = r
+            .expect("a cache node loads")
+            .genid
+            .expect("[genid] present");
+        assert_eq!(g.heartbeat, std::time::Duration::from_secs(3));
+        assert_eq!(g.upstream.as_deref(), Some("origin"));
     }
 
     #[test]
     fn one_file_given_as_both_is_read_once() {
         let dir = make_test_dir();
         setup_minimal(dir.path());
-        write_file(dir.path(), "auth.pem", "dummy");
         let mut site = minimal_site_toml();
-        site.push_str("\n[auth]\npublic_key = \"auth.pem\"\n\n[health]\nperf_path = \"/p\"\nmetrics_peers = [\"10.0.0.5\"]\n");
+        site.push_str("\n[node]\nname = \"test\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n\n[auth]\nbackend = \"m6-html\"\n\n[health]\npath = \"/up\"\n");
         write_file(dir.path(), "site.toml", &site);
         let same = dir.path().join("site.toml");
         let cfg = load(dir.path(), &same).expect("one file for both loads");
-        assert_eq!(cfg.auth.expect("auth").public_key, "auth.pem");
-        assert_eq!(cfg.health.perf_path, "/p");
-        assert_eq!(cfg.health.metrics_peer_ips.map(|p| p.len()), Some(1));
+        assert_eq!(cfg.auth.expect("auth").backend, "m6-html");
+        assert_eq!(cfg.health.path, "/up");
     }
 
-    // --- misplaced_keys and metrics_token_file placement ---
+    /// The five keys `/perf` and `/traffic` needed are gone, and a config that
+    /// still sets one is refused by the unknown-key check that every removed
+    /// key goes through. No per-key message and no shim: the refusal names the
+    /// key and the keys that exist.
+    #[test]
+    fn the_removed_health_keys_are_refused_as_unknown_keys() {
+        for key in [
+            "metrics_require",
+            "metrics_peers",
+            "perf_path",
+            "traffic_path",
+            "traffic_cache_s",
+        ] {
+            let (_d, r) = load_with(&format!("\n[health]\n{key} = 1\n"), "");
+            let e = format!("{:#}", r.unwrap_err());
+            assert!(e.contains("unknown field"), "{key}: {e}");
+            assert!(e.contains(key), "{key}: {e}");
+        }
+    }
+
+    // --- misplaced_keys and the removed legacy metrics key ---
 
     #[test]
-    fn metrics_token_file_in_the_system_config_wins() {
+    fn metrics_token_file_in_site_toml_is_refused() {
         let dir = make_test_dir();
         setup_minimal(dir.path());
         let site_token = dir.path().join("site-token");
-        let sys_token = dir.path().join("sys-token");
         std::fs::write(&site_token, "from-site\n").unwrap();
-        std::fs::write(&sys_token, "from-system\n").unwrap();
         let mut site = minimal_site_toml();
         site.push_str(&format!(
             "\n[health]\nmetrics_token_file = \"{}\"\n",
             site_token.display()
         ));
         write_file(dir.path(), "site.toml", &site);
-        let mut sys = minimal_system_toml();
-        sys.push_str(&format!(
-            "\n[health]\nmetrics_token_file = \"{}\"\n",
-            sys_token.display()
-        ));
-        write_file(dir.path(), "system.toml", &sys);
-        let h = load(dir.path(), &dir.path().join("system.toml"))
-            .unwrap()
-            .health;
-        assert_eq!(h.metrics_token_file.as_deref(), sys_token.to_str());
-        assert_eq!(h.metrics_token.as_deref(), Some("from-system"));
-
-        // Alone in the system config it is read too.
-        write_file(dir.path(), "site.toml", &minimal_site_toml());
-        let h = load(dir.path(), &dir.path().join("system.toml"))
-            .unwrap()
-            .health;
-        assert_eq!(h.metrics_token.as_deref(), Some("from-system"));
-    }
-
-    #[test]
-    fn a_relative_metrics_token_file_in_the_system_config_resolves_against_the_site_dir() {
-        let dir = make_test_dir();
-        setup_minimal(dir.path());
-        std::fs::write(dir.path().join("token"), "from-site-dir\n").unwrap();
-        write_file(dir.path(), "site.toml", &minimal_site_toml());
-        let mut sys = minimal_system_toml();
-        sys.push_str("\n[health]\nmetrics_token_file = \"token\"\n");
-        write_file(dir.path(), "system.toml", &sys);
-        let h = load(dir.path(), &dir.path().join("system.toml"))
-            .unwrap()
-            .health;
-        assert_eq!(
-            h.metrics_token_file.as_deref(),
-            dir.path().join("token").to_str()
-        );
-        assert_eq!(h.metrics_token.as_deref(), Some("from-site-dir"));
+        let e = load(dir.path(), &dir.path().join("system.toml"))
+            .unwrap_err()
+            .to_string();
+        // The key is removed outright: neither file accepts it any more, and
+        // the error names it so an operator can find the line.
+        assert!(e.contains("metrics_token_file"), "{e}");
     }
 
     /// Write `site` and `system` into a fresh directory and name the misplaced keys.
     fn misplaced(site: &str, system: &str) -> Vec<String> {
-        let dir = make_test_dir();
-        write_file(dir.path(), "site.toml", site);
-        write_file(dir.path(), "system.toml", system);
-        misplaced_keys(dir.path(), &dir.path().join("system.toml"))
+        let site_table: toml::Table = toml::from_str(site).unwrap_or_default();
+        let system_table: toml::Table = toml::from_str(system).unwrap_or_default();
+        misplaced_keys(&site_table, &system_table, Path::new("system.toml"))
     }
 
     #[test]
     fn misplaced_keys_names_a_bind_in_site_toml() {
         let m = misplaced(
-            "[server]\nbind = \"0.0.0.0:443\"\n\n[auth]\npublic_key = \"k\"\n\n[health]\nmetrics_peers = [\"10.0.0.1\"]\n",
+            "[server]\nbind = \"0.0.0.0:443\"\n\n[health]\npath = \"/up\"\n",
             "[server]\nbind = \"0.0.0.0:443\"\n",
         );
-        assert_eq!(m.len(), 3, "{m:?}");
+        // `[health]` is site state now, so its `path` is in the right file.
+        assert_eq!(m.len(), 1, "{m:?}");
         assert!(m[0].starts_with("site.toml sets [server].bind, which is this node's own state"));
         assert!(m[0].contains("belongs in the system config "), "{}", m[0]);
-        assert!(m.iter().any(|x| x.contains("sets [auth],")));
-        assert!(m.iter().any(|x| x.contains("sets [health].metrics_peers,")));
     }
 
     #[test]
@@ -2657,22 +3378,24 @@ internal_peers = ["203.0.113.7"]
     }
 
     #[test]
-    fn misplaced_keys_is_silent_in_one_file_mode() {
+    fn one_file_mode_reads_node_keys_from_the_one_file() {
         let dir = make_test_dir();
-        write_file(
-            dir.path(),
-            "site.toml",
-            "[server]\nbind = \"0.0.0.0:443\"\nallowed_methods = [\"GET\"]\n\n[auth]\npublic_key = \"k\"\n",
-        );
-        let same = dir.path().join("site.toml");
-        assert!(misplaced_keys(dir.path(), &same).is_empty());
+        setup_minimal(dir.path());
+        let one = "[site]\nname = \"Test\"\ndomain = \"test.example.com\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\nallowed_methods = [\"GET\"]\n\n[node]\nname = \"test\"\n\n[[backend]]\nname = \"m6-html\"\nsockets = \"/run/m6/*.sock\"\n\n[auth]\nbackend = \"m6-html\"\n";
+        write_file(dir.path(), "site.toml", one);
+        std::fs::write(dir.path().join("cert.pem"), "").unwrap();
+        std::fs::write(dir.path().join("key.pem"), "").unwrap();
+        let cfg = load(dir.path(), &dir.path().join("site.toml")).expect("one-file load");
+        assert_eq!(cfg.node.name, "test");
+        assert_eq!(cfg.server.bind, "127.0.0.1:8443");
+        assert!(cfg.auth.is_some());
     }
 
     #[test]
     fn misplaced_keys_is_silent_for_a_clean_pair() {
         let m = misplaced(
-            "[server]\nallowed_methods = [\"GET\"]\nbackend_timeout_secs = 5\n\n[health]\nperf_path = \"/p\"\n",
-            "[server]\nbind = \"0.0.0.0:443\"\n\n[auth]\npublic_key = \"/k\"\n\n[health]\nmetrics_token_file = \"/t\"\n",
+            "[server]\nallowed_methods = [\"GET\"]\nbackend_timeout_secs = 5\n\n[health]\npath = \"/up\"\n",
+            "[server]\nbind = \"0.0.0.0:443\"\n\n[auth]\nbackend = \"m6-html\"\n",
         );
         assert!(m.is_empty(), "{m:?}");
     }
@@ -2685,14 +3408,31 @@ internal_peers = ["203.0.113.7"]
     }
 
     #[test]
-    fn the_node_fallback_is_detected_for_the_caller_to_warn_about() {
+    fn a_system_config_without_node_is_refused() {
         let dir = make_test_dir();
-        let with = dir.path().join("with.toml");
-        let without = dir.path().join("without.toml");
-        write_file(dir.path(), "with.toml", "[node]\nname = \"edge-a\"\n");
-        write_file(dir.path(), "without.toml", "[server]\nbind = \"x\"\n");
-        assert!(!node_falls_back(&with));
-        assert!(node_falls_back(&without));
+        setup_minimal(dir.path());
+        write_file(
+            dir.path(),
+            "system.toml",
+            "[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n",
+        );
+        let err = load(dir.path(), &dir.path().join("system.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has no [node]"), "{err}");
+    }
+
+    #[test]
+    fn one_file_mode_without_node_is_refused() {
+        let dir = make_test_dir();
+        let one = "[site]\nname = \"Test\"\ndomain = \"test.example.com\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n";
+        write_file(dir.path(), "site.toml", one);
+        write_file(dir.path(), "cert.pem", "");
+        write_file(dir.path(), "key.pem", "");
+        let err = load(dir.path(), &dir.path().join("site.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has no [node]"), "{err}");
     }
 
     /// Every key `misplaced_keys` knows, as (section, key, belongs in system config).
@@ -2700,17 +3440,16 @@ internal_peers = ["203.0.113.7"]
     fn every_placed_key() -> Vec<(&'static str, Option<&'static str>, bool)> {
         let mut all = Vec::new();
         all.extend(NODE_SERVER_KEYS.iter().map(|k| ("server", Some(*k), true)));
-        all.extend(NODE_HEALTH_KEYS.iter().map(|k| ("health", Some(*k), true)));
         all.extend(SITE_SERVER_KEYS.iter().map(|k| ("server", Some(*k), false)));
         all.extend(NODE_SECTIONS.iter().map(|s| (*s, None, true)));
         all
     }
 
     #[test]
-    fn every_misplaced_key_warns_in_the_wrong_file_and_not_in_the_right_one() {
+    fn every_misplaced_key_is_reported_in_the_wrong_file_and_not_in_the_right_one() {
         let all = every_placed_key();
-        // Every field of `RawServerSection` and `RawSystemHealth` is placed
-        // in one list or another. Dropping a key from a list fails here.
+        // Every field of `RawServerSection` is placed in one list or another.
+        // Dropping a key from a list fails here.
         let mut server: Vec<&str> = NODE_SERVER_KEYS
             .iter()
             .chain(SITE_SERVER_KEYS)
@@ -2726,20 +3465,25 @@ internal_peers = ["203.0.113.7"]
                 "h2c_bind",
                 "internal_binds",
                 "internal_peers",
+                "lock_memory",
+                "max_requests_per_connection",
+                "process_index",
                 "redirect_bind",
+                "redirect_unmatched_to",
+                "reuse_port",
+                "reuse_port_processes",
+                "served_hosts",
+                "status_bind",
                 "tls_cert",
                 "tls_key",
                 "warm_on_start",
             ]
         );
-        let mut health = NODE_HEALTH_KEYS.to_vec();
-        health.sort_unstable();
-        assert_eq!(
-            health,
-            ["metrics_peers", "metrics_require", "metrics_token_file"]
-        );
-        assert_eq!(NODE_SECTIONS, ["auth", "node"]);
-        assert_eq!(all.len(), 10 + 3 + 2);
+        assert_eq!(NODE_SECTIONS, ["auth", "cache", "genid", "limits", "node"]);
+        // 13 base [server] keys + lock_memory (the mimalloc pin) + served_hosts
+        // and redirect_unmatched_to (the unmatched-host policy) = 16, plus the
+        // two site-wide [server] keys and the five node sections.
+        assert_eq!(all.len(), 18 + 5);
         for (section, key, belongs_in_system) in all {
             let body = match key {
                 Some(k) => format!("[{section}]\n{k} = 1\n"),
@@ -2767,58 +3511,282 @@ internal_peers = ["203.0.113.7"]
         }
     }
 
-    /// A config loaded from the minimal pair, to be changed field by field.
-    fn minimal_loaded() -> Config {
+    #[test]
+    fn an_unknown_key_is_refused_and_named() {
+        let sys = "[node]\nname = \"test\"\n\n[server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n";
+        for (site, system, key) in [
+            ("[site]\nname = \"Test\"\ndomain = \"test.example.com\"\n", format!("{sys}bnid = \"x\"\n"), "bnid"),
+            ("[site]\nname = \"Test\"\ndomain = \"test.example.com\"\ntitel = \"x\"\n", sys.to_string(), "titel"),
+            ("[site]\nname = \"Test\"\ndomain = \"test.example.com\"\n\n[[backend]]\nname = \"b\"\nsockets = \"/run/m6/*.sock\"\n\n[[route]]\npath = \"/\"\nbackend = \"b\"\nbakend = \"x\"\n", sys.to_string(), "bakend"),
+            ("[site]\nname = \"Test\"\ndomain = \"test.example.com\"\n", format!("{sys}\n[logs]\nlevel = \"info\"\n"), "logs"),
+            ("[site]\nname = \"Test\"\ndomain = \"test.example.com\"\n\n[log]\nformat = \"text\"\n", sys.to_string(), "format"),
+        ] {
+            let dir = make_test_dir();
+            write_file(dir.path(), "cert.pem", "");
+            write_file(dir.path(), "key.pem", "");
+            write_file(dir.path(), "site.toml", site);
+            write_file(dir.path(), "system.toml", &system);
+            let e = format!("{:#}", load(dir.path(), &dir.path().join("system.toml")).unwrap_err());
+            assert!(e.contains(key), "expected {key:?} in: {e}");
+        }
+    }
+
+    #[test]
+    fn allowed_methods_in_the_system_config_is_refused() {
+        let e = load_error("allowed_methods = [\"GET\"]\n");
+        assert!(
+            e.contains("the system config sets [server].allowed_methods"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_log_level_is_refused() {
+        let (_d, r) = load_with("[log]\nlevel = \"verbose\"\n", "");
+        let e = r.unwrap_err().to_string();
+        assert!(e.contains("unknown log level"), "{e}");
+    }
+
+    /// site.toml's `[log]` is read into m6-core's `LogConfig`, the same type a
+    /// service's own config uses, and that value is what main hands the logger.
+    /// A second declaration in this crate used to hold the same table.
+    #[test]
+    fn a_site_toml_log_level_reaches_the_one_log_config_type() {
+        let (_d, r) = load_with("[log]\nlevel = \"warn\"\n", "");
+        let cfg = r.unwrap();
+        let level = cfg.log.level.as_deref().expect("site.toml set a level");
+        assert_eq!(level, "warn");
+        assert_eq!(
+            m6_core::log::parse_level(level).unwrap(),
+            m6_core::log::Level::Warn
+        );
+    }
+
+    /// site.toml is the bottom of the precedence chain, so an absent level
+    /// there is `info`, not "unset". `--dump-config` printed this value before
+    /// the type moved and still prints it now.
+    #[test]
+    fn an_absent_site_toml_log_level_is_info() {
+        let (_d, r) = load_with("", "");
+        assert_eq!(r.unwrap().log.level.as_deref(), Some("info"));
+    }
+
+    #[test]
+    fn the_removed_metrics_token_file_is_refused_in_the_system_config_too() {
         let dir = make_test_dir();
         setup_minimal(dir.path());
-        load(dir.path(), &dir.path().join("system.toml")).unwrap()
+        let mut sys = minimal_system_toml();
+        sys.push_str("\n[health]\nmetrics_token_file = \"{DIR}/missing\"\n");
+        write_file(dir.path(), "system.toml", &sys);
+        let e = load(dir.path(), &dir.path().join("system.toml"))
+            .unwrap_err()
+            .to_string();
+        // Removed, not read: the whole `[health]` table is site state now, so
+        // the system config refuses the table and names it.
+        assert!(e.contains("unknown field `health`"), "{e}");
+        assert!(e.contains("[health]"), "{e}");
     }
 
+    /// A route's `cache` is a `Cache-Control` value the edge sends in place of
+    /// the backend's, so it loads on a `[[route]]` and a `[[route_group]]`.
     #[test]
-    fn carry_restart_only_keeps_the_running_bind_and_names_it() {
-        let running = minimal_loaded();
-        let mut new = running.clone();
-        new.server.bind = "127.0.0.1:9443".to_string();
-        new.analytics.log_path = "elsewhere.ndjson".to_string();
-        let named = carry_restart_only(&running, &mut new);
-        assert_eq!(named, vec!["[server].bind", "[analytics].log_path"]);
-        assert_eq!(new.server.bind, "127.0.0.1:8443");
-        assert_eq!(new.analytics.log_path, running.analytics.log_path);
+    fn a_route_cache_key_loads_on_a_route_and_a_route_group() {
+        let (_d, r) = load_with(
+            "[[route]]\npath = \"/x\"\nbackend = \"m6-html\"\ncache = \"no-store\"\n\n\
+             [[route_group]]\nglob = \"content/*.md\"\npath = \"/{stem}\"\nbackend = \"m6-html\"\ncache = \"no-cache\"\n",
+            "",
+        );
+        let config = r.unwrap();
+        let route = config.routes.iter().find(|r| r.path == "/x").unwrap();
+        assert_eq!(route.cache.as_deref(), Some("no-store"));
+        let group = config.route_groups.iter().find(|g| g.path == "/{stem}");
+        assert_eq!(group.unwrap().cache.as_deref(), Some("no-cache"));
     }
 
+    /// A value a header cannot carry is refused at load, naming the route.
     #[test]
-    fn carry_restart_only_names_internal_peers() {
-        let running = minimal_loaded();
-        let mut new = running.clone();
-        new.server.internal_peers = vec!["10.0.0.2".parse().unwrap()];
-        let named = carry_restart_only(&running, &mut new);
-        assert_eq!(named, vec!["[server].internal_peers"]);
-        assert!(new.server.internal_peers.is_empty());
+    fn an_unusable_route_cache_is_refused_and_named() {
+        for bad in ["\"\"", "\"no-store\\r\\nX: y\""] {
+            let (_d, r) = load_with(
+                &format!("[[route]]\npath = \"/x\"\nbackend = \"m6-html\"\ncache = {bad}\n"),
+                "",
+            );
+            let e = r.unwrap_err().to_string();
+            assert!(e.contains("[[route]] /x"), "{e}");
+            assert!(e.contains("Cache-Control"), "{e}");
+        }
     }
 
-    #[test]
-    fn carry_restart_only_is_empty_for_identical_configs() {
-        let running = minimal_loaded();
-        let mut new = running.clone();
-        assert!(carry_restart_only(&running, &mut new).is_empty());
+    // ── [cache] dir ────────────────────────────────────────────────────────
+
+    /// The site and system config of a cache node, ready for a `[cache]`
+    /// table to be appended to the system file. The token file exists, and the
+    /// origin is a URL backend.
+    fn setup_cache_node(dir: &Path) {
+        write_file(
+            dir,
+            "site.toml",
+            "[site]\nname = \"Test\"\ndomain = \"test.example.com\"\n\n\
+             [[backend]]\nname = \"origin\"\nurl = \"https://127.0.0.1:9443\"\ntls_skip_verify = true\n\n\
+             [[route]]\npath = \"/\"\nbackend = \"origin\"\n",
+        );
+        write_file(
+            dir,
+            "system.toml",
+            "[node]\nname = \"edge-a\"\n\n\
+             [server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n\n\
+             [genid]\nupstream = \"origin\"\ntoken_file = \"{DIR}/genid-token\"\n",
+        );
+        write_file(dir, "cert.pem", "dummy");
+        write_file(dir, "key.pem", "dummy");
+        write_file(dir, "genid-token", "read-token\n");
     }
 
+    fn append_to_system(dir: &Path, extra: &str) {
+        let path = dir.join("system.toml");
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(extra);
+        std::fs::write(&path, text).unwrap();
+    }
+
+    /// On a cache node `[cache] dir` is read into `Config::cache_dir`, and the
+    /// start-time probe leaves no file behind.
+    ///
+    /// Break: skip the probe removal, and `.m6-probe` stays in the directory.
     #[test]
-    fn take_process_owned_keeps_the_running_routes_and_takes_the_node_keys() {
-        let running = minimal_loaded();
-        let mut loaded = running.clone();
-        loaded.routes.clear();
-        loaded.site.name = "Edited".to_string();
-        loaded.node.name = "renamed".to_string();
-        loaded.server.tls_cert = Some("new-cert.pem".to_string());
-        loaded.server.allowed_methods = vec!["GET".to_string()];
-        loaded.health.metrics_require = Some("token".to_string());
-        let c = take_process_owned(&running, loaded);
-        assert_eq!(c.routes.len(), 1, "routes stay as running");
-        assert_eq!(c.site.name, "Test", "site keys stay as running");
-        assert_eq!(c.node.name, "renamed");
-        assert_eq!(c.server.tls_cert.as_deref(), Some("new-cert.pem"));
-        assert_eq!(c.server.allowed_methods, vec!["GET".to_string()]);
-        assert_eq!(c.health.metrics_require.as_deref(), Some("token"));
+    fn a_cache_node_reads_its_disk_directory() {
+        let dir = make_test_dir();
+        setup_cache_node(dir.path());
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        append_to_system(
+            dir.path(),
+            &format!("\n[cache]\ndir = \"{}\"\n", cache.display()),
+        );
+        let cfg = load(dir.path(), &dir.path().join("system.toml")).unwrap();
+        assert_eq!(cfg.cache_dir.as_deref(), Some(cache.as_path()));
+        assert!(
+            !cache.join(".m6-probe").exists(),
+            "the write probe file must be removed at start"
+        );
+    }
+
+    /// A relative directory is refused by name.
+    ///
+    /// Break: accept it, and the writer resolves it against the process's
+    /// working directory instead of the deployment's.
+    #[test]
+    fn a_relative_cache_dir_is_refused() {
+        let dir = make_test_dir();
+        setup_cache_node(dir.path());
+        append_to_system(dir.path(), "\n[cache]\ndir = \"cache\"\n");
+        let e = load(dir.path(), &dir.path().join("system.toml"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(e, "config error: [cache].dir must be an absolute path");
+    }
+
+    /// A source may not have one. Its cache sits beside its backends, so a
+    /// warm restart is worth least there.
+    ///
+    /// Break: accept [cache] dir on a source, and `[cache] dir` is documented
+    /// for a node that never writes one.
+    #[test]
+    fn a_cache_dir_on_a_source_is_refused() {
+        let dir = make_test_dir();
+        setup_minimal(dir.path());
+        let cache = dir.path().join("cache");
+        append_to_system(
+            dir.path(),
+            &format!("\n[cache]\ndir = \"{}\"\n", cache.display()),
+        );
+        let e = load(dir.path(), &dir.path().join("system.toml"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            e,
+            "config error: [cache].dir is for a cache node ([genid] upstream)"
+        );
+    }
+
+    /// The directory must exist and be writable by this process. A path that
+    /// is a file, and a path that is missing, both fail the start with the io
+    /// error and the path.
+    ///
+    /// Break: create the directory instead of probing it, and a typo in the
+    /// path starts a node that writes its cache somewhere nobody looks.
+    #[test]
+    fn an_unusable_cache_dir_is_refused_with_the_io_error_and_path() {
+        let dir = make_test_dir();
+        setup_cache_node(dir.path());
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, "x").unwrap();
+        append_to_system(
+            dir.path(),
+            &format!("\n[cache]\ndir = \"{}\"\n", file.display()),
+        );
+        let e = load(dir.path(), &dir.path().join("system.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.starts_with(&format!("config error: [cache].dir {}: ", file.display())),
+            "{e}"
+        );
+
+        let missing = dir.path().join("missing/deeper");
+        let mut sys = std::fs::read_to_string(dir.path().join("system.toml")).unwrap();
+        sys = sys.replace(
+            &format!("dir = \"{}\"", file.display()),
+            &format!("dir = \"{}\"", missing.display()),
+        );
+        std::fs::write(dir.path().join("system.toml"), sys).unwrap();
+        let e = load(dir.path(), &dir.path().join("system.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.starts_with(&format!(
+                "config error: [cache].dir {}: ",
+                missing.display()
+            )),
+            "{e}"
+        );
+    }
+
+    /// A `[cache]` table with no `dir` is a mistake, not a node with the
+    /// default memory-only cache.
+    ///
+    /// Break: treat it as `None`, and the operator's misspelt key silently
+    /// does nothing.
+    #[test]
+    fn a_cache_table_without_dir_is_refused() {
+        let dir = make_test_dir();
+        setup_cache_node(dir.path());
+        append_to_system(dir.path(), "\n[cache]\n");
+        let e = load(dir.path(), &dir.path().join("system.toml"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(e, "config error: [cache] needs dir = \"<absolute path>\"");
+    }
+
+    /// `[cache]` belongs to the system config, because it is this node's own
+    /// state.
+    ///
+    /// Break: accept it in site.toml, and a directory shared by every node is
+    /// written by every node.
+    #[test]
+    fn a_cache_section_in_site_toml_is_refused() {
+        let dir = make_test_dir();
+        setup_cache_node(dir.path());
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let mut site = std::fs::read_to_string(dir.path().join("site.toml")).unwrap();
+        site.push_str(&format!("\n[cache]\ndir = \"{}\"\n", cache.display()));
+        std::fs::write(dir.path().join("site.toml"), site).unwrap();
+        let e = load(dir.path(), &dir.path().join("system.toml"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("[cache]"), "{e}");
+        assert!(e.contains("this node's own state"), "{e}");
+        assert!(e.contains("belongs in the system config"), "{e}");
     }
 }

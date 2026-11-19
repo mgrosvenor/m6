@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 /// Critical-path benchmarks for m6-render.
 ///
 /// Three tiers:
@@ -10,27 +15,24 @@ use criterion::{black_box, criterion_group, Criterion};
 use serde_json::{Map, Value};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
-use tempfile::TempDir;
 
 // Helper: build an HTML response from outside the crate (template_name is pub(crate)).
 fn html_response(html: String) -> Response {
     let mut r = Response::status(200);
-    r.headers.push((
-        "Content-Type".to_string(),
-        "text/html; charset=utf-8".to_string(),
-    ));
+    r.headers
+        .push(("Content-Type".into(), "text/html; charset=utf-8".into()));
     r.body = m6_core::Body::Bytes(html.into_bytes());
     r
 }
 
-use m6_core::app::{
-    compile_pattern, find_route, match_route, route_specificity, CompiledRoute, RouteMethod,
-};
 use m6_core::compress::{brotli_compress, gzip_compress};
 use m6_core::minify::{minify_css, minify_html, minify_js, minify_json};
 use m6_core::request::{parse_cookies, parse_query_string};
 use m6_core::response::Response;
 use m6_core::server::write_response;
+use m6_core::site::{
+    compile_pattern, find_route, match_route, CompiledRoute, Methods, RouteMethod, RouteTable,
+};
 
 // ── Realistic content fixtures ────────────────────────────────────────────────
 
@@ -213,37 +215,37 @@ const JS_3KB: &[u8] = b"
 /// Minimal Tera template — one variable substitution.
 const MINIMAL_TEMPLATE: &str = "<!doctype html><html><body><h1>{{ title }}</h1></body></html>";
 
-fn make_routes() -> Vec<CompiledRoute> {
+fn make_routes() -> RouteTable {
     let patterns = &[
         ("/", RouteMethod::Any),
         ("/about", RouteMethod::Get),
         ("/blog/{stem}", RouteMethod::Get),
         ("/api/v1/posts/{id}", RouteMethod::Any),
     ];
-    let mut routes: Vec<CompiledRoute> = patterns
+    let routes: Vec<CompiledRoute> = patterns
         .iter()
         .map(|(pat, method)| {
             let segs = compile_pattern(pat);
-            let spec = route_specificity(&segs);
             CompiledRoute {
                 pattern: pat.to_string(),
-                method: method.clone(),
+                methods: Methods::from(method),
                 segments: segs,
                 template: None,
                 params_files: vec![],
                 status: 200,
                 cache: "public".to_string(),
+                cache_explicit: false,
                 headers: Vec::new(),
                 last_modified: None,
-                specificity: spec,
+                last_modified_http: None,
+                head: Default::default(),
                 handler: None,
                 settings: std::sync::Arc::new(serde_json::Map::new()),
                 base_dict: std::sync::Arc::new(serde_json::Map::new()),
             }
         })
         .collect();
-    routes.sort_by_key(|r| std::cmp::Reverse(r.specificity));
-    routes
+    RouteTable::new(routes)
 }
 
 // ── Percentile reporter ────────────────────────────────────────────────────────
@@ -318,15 +320,17 @@ fn bench_match_route(c: &mut Criterion) {
     let segs = compile_pattern("/blog/{stem}");
     let route = CompiledRoute {
         pattern: "/blog/{stem}".to_string(),
-        method: RouteMethod::Get,
+        methods: Methods::from(&RouteMethod::Get),
         segments: segs.clone(),
         template: None,
         params_files: vec![],
         status: 200,
         cache: "public".to_string(),
+        cache_explicit: false,
         headers: Vec::new(),
         last_modified: None,
-        specificity: route_specificity(&segs),
+        last_modified_http: None,
+        head: Default::default(),
         handler: None,
         settings: std::sync::Arc::new(serde_json::Map::new()),
         base_dict: std::sync::Arc::new(serde_json::Map::new()),
@@ -374,7 +378,10 @@ fn bench_parse_cookies(c: &mut Criterion) {
 
 /// Tera template rendering: render a minimal template with one variable.
 fn bench_template_render(c: &mut Criterion) {
-    let dir = TempDir::new().unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("m6b-")
+        .tempdir_in(m6_core::platform::socket_scratch_root())
+        .unwrap();
     let tmpl_path = dir.path().join("page.html");
     std::fs::write(&tmpl_path, MINIMAL_TEMPLATE).unwrap();
 
@@ -407,12 +414,9 @@ fn bench_template_render(c: &mut Criterion) {
 /// meant before -- serialisation only.
 fn response_to_write() -> Response {
     let mut r = Response::status(200);
-    r.headers.push((
-        "Content-Type".to_string(),
-        "text/html; charset=utf-8".to_string(),
-    ));
     r.headers
-        .push(("Cache-Control".to_string(), "public".to_string()));
+        .push(("Content-Type".into(), "text/html; charset=utf-8".into()));
+    r.headers.push(("Cache-Control".into(), "public".into()));
     r.body = m6_core::Body::Bytes(MINIMAL_TEMPLATE.as_bytes().to_vec());
     r
 }
@@ -442,7 +446,10 @@ fn bench_response_write(c: &mut Criterion) {
 /// backend latency that m6-http would observe for a cache-miss forwarded to
 /// m6-render.
 fn bench_socket_round_trip(c: &mut Criterion) {
-    let dir = TempDir::new().unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("m6b-")
+        .tempdir_in(m6_core::platform::socket_scratch_root())
+        .unwrap();
 
     // Write template.
     let tmpl_dir = dir.path().join("templates");
@@ -454,10 +461,6 @@ fn bench_socket_round_trip(c: &mut Criterion) {
 [[route]]
 path     = "/blog/{stem}"
 template = "templates/page.html"
-
-[thread_pool]
-size       = 1
-queue_size = 64
 
 [params_cache]
 size = 64
@@ -474,9 +477,8 @@ size = 64
     let cfg_path2 = cfg_path.clone();
 
     std::thread::spawn(move || {
-        // We can't call run_app() (it reads env args), so we replicate the
-        // minimal setup needed: build FrameworkState, accept on the socket.
-        // Instead, build a raw server using the public server + app modules.
+        // The bench needs a socket to measure, not a service: build the site's
+        // config and routes here and drive the blocking reference loop.
         let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
 
         let config = m6_core::config::load(&cfg_path2, &site_dir).unwrap();
@@ -487,29 +489,32 @@ size = 64
         tera.add_template_file(&tmpl_path, Some("templates/page.html"))
             .unwrap();
 
-        let routes: Vec<CompiledRoute> = config
-            .routes
-            .iter()
-            .map(|rc| {
-                let segs = compile_pattern(&rc.path);
-                let spec = route_specificity(&segs);
-                CompiledRoute {
-                    pattern: rc.path.clone(),
-                    method: RouteMethod::Any,
-                    segments: segs,
-                    template: rc.template.clone(),
-                    params_files: rc.params.clone(),
-                    status: rc.status,
-                    cache: rc.cache.clone(),
-                    headers: Vec::new(),
-                    last_modified: None,
-                    specificity: spec,
-                    handler: None,
-                    settings: std::sync::Arc::new(serde_json::Map::new()),
-                    base_dict: std::sync::Arc::new(serde_json::Map::new()),
-                }
-            })
-            .collect();
+        let routes = RouteTable::new(
+            config
+                .routes
+                .iter()
+                .map(|rc| {
+                    let segs = compile_pattern(&rc.path);
+                    CompiledRoute {
+                        pattern: rc.path.clone(),
+                        methods: Methods::ANY,
+                        segments: segs,
+                        template: rc.template.as_deref().map(std::sync::Arc::<str>::from),
+                        params_files: rc.params.clone(),
+                        status: rc.status,
+                        cache: rc.cache.clone(),
+                        cache_explicit: false,
+                        headers: Vec::new(),
+                        last_modified: None,
+                        last_modified_http: None,
+                        head: Default::default(),
+                        handler: None,
+                        settings: std::sync::Arc::new(serde_json::Map::new()),
+                        base_dict: std::sync::Arc::new(serde_json::Map::new()),
+                    }
+                })
+                .collect(),
+        );
 
         for stream in listener.incoming() {
             let mut stream = match stream {
@@ -710,15 +715,17 @@ fn main() {
         let segs = compile_pattern("/blog/{stem}");
         let route = CompiledRoute {
             pattern: "/blog/{stem}".to_string(),
-            method: RouteMethod::Get,
+            methods: Methods::from(&RouteMethod::Get),
             segments: segs.clone(),
             template: None,
             params_files: vec![],
             status: 200,
             cache: "public".to_string(),
+            cache_explicit: false,
             headers: Vec::new(),
             last_modified: None,
-            specificity: route_specificity(&segs),
+            last_modified_http: None,
+            head: Default::default(),
             handler: None,
             settings: std::sync::Arc::new(serde_json::Map::new()),
             base_dict: std::sync::Arc::new(serde_json::Map::new()),
@@ -746,7 +753,10 @@ fn main() {
 
     // Template render
     {
-        let dir = TempDir::new().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("m6b-")
+            .tempdir_in(m6_core::platform::socket_scratch_root())
+            .unwrap();
         let tmpl_path = dir.path().join("page.html");
         std::fs::write(&tmpl_path, MINIMAL_TEMPLATE).unwrap();
         let mut tera = tera::Tera::default();
@@ -780,7 +790,10 @@ fn main() {
 
     // Socket round-trip
     {
-        let dir2 = TempDir::new().unwrap();
+        let dir2 = tempfile::Builder::new()
+            .prefix("m6b-")
+            .tempdir_in(m6_core::platform::socket_scratch_root())
+            .unwrap();
         let tmpl_dir2 = dir2.path().join("templates");
         std::fs::create_dir_all(&tmpl_dir2).unwrap();
         std::fs::write(tmpl_dir2.join("page.html"), MINIMAL_TEMPLATE).unwrap();
@@ -789,10 +802,6 @@ fn main() {
 [[route]]
 path     = "/blog/{stem}"
 template = "templates/page.html"
-
-[thread_pool]
-size       = 1
-queue_size = 64
 
 [params_cache]
 size = 64
@@ -811,29 +820,32 @@ size = 64
             let mut tera = tera::Tera::default();
             tera.add_template_file(&tmpl_path, Some("templates/page.html"))
                 .unwrap();
-            let routes2: Vec<CompiledRoute> = config
-                .routes
-                .iter()
-                .map(|rc| {
-                    let segs = compile_pattern(&rc.path);
-                    let spec = route_specificity(&segs);
-                    CompiledRoute {
-                        pattern: rc.path.clone(),
-                        method: RouteMethod::Any,
-                        segments: segs,
-                        template: rc.template.clone(),
-                        params_files: rc.params.clone(),
-                        status: rc.status,
-                        cache: rc.cache.clone(),
-                        headers: Vec::new(),
-                        last_modified: None,
-                        specificity: spec,
-                        handler: None,
-                        settings: std::sync::Arc::new(serde_json::Map::new()),
-                        base_dict: std::sync::Arc::new(serde_json::Map::new()),
-                    }
-                })
-                .collect();
+            let routes2 = RouteTable::new(
+                config
+                    .routes
+                    .iter()
+                    .map(|rc| {
+                        let segs = compile_pattern(&rc.path);
+                        CompiledRoute {
+                            pattern: rc.path.clone(),
+                            methods: Methods::ANY,
+                            segments: segs,
+                            template: rc.template.as_deref().map(std::sync::Arc::<str>::from),
+                            params_files: rc.params.clone(),
+                            status: rc.status,
+                            cache: rc.cache.clone(),
+                            cache_explicit: false,
+                            headers: Vec::new(),
+                            last_modified: None,
+                            last_modified_http: None,
+                            head: Default::default(),
+                            handler: None,
+                            settings: std::sync::Arc::new(serde_json::Map::new()),
+                            base_dict: std::sync::Arc::new(serde_json::Map::new()),
+                        }
+                    })
+                    .collect(),
+            );
             for stream in listener.incoming() {
                 let mut stream = match stream {
                     Ok(s) => s,

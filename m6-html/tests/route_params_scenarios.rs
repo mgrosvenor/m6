@@ -3,15 +3,20 @@
 //! These tests live in their own file with their own fixtures under
 //! `tests/fixtures/route_params/`, so they do not disturb the older
 //! `integration.rs` suite. Each test below starts from one failure scenario:
-//! the route tie-break, params precedence and restart pickup, query keys in
+//! the route priority rule, params precedence and restart pickup, query keys in
 //! templates with the path-parameter clash, and a route's `status` reaching the
 //! response.
+
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
 
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use m6_core::testkit::{binary, Service};
 
@@ -47,7 +52,7 @@ fn config_path(name: &str) -> PathBuf {
 /// same reason the older suite does it that way: `bind` creates the file before
 /// `listen`, so a path check can pass while a connect would still fail.
 fn spawn_server(id: &str, site_dir: &Path, config: &Path) -> (Server, PathBuf) {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let socket_path = dir.path().join(format!("{id}.sock"));
 
     let mut svc = Service::spawn(
@@ -57,9 +62,10 @@ fn spawn_server(id: &str, site_dir: &Path, config: &Path) -> (Server, PathBuf) {
             .arg(config)
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
-    svc.wait_for_path(&socket_path, Duration::from_secs(10));
+    svc.wait_for_path(&socket_path, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
 
-    let ready = m6_core::testkit::wait::until(Duration::from_secs(10), || {
+    let ready = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
         !http_request(&socket_path, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").is_empty()
     });
     assert!(
@@ -99,33 +105,64 @@ fn http_request(socket_path: &Path, request: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// #289: the equal-specificity route tie
+// #289: two patterns that can match one path
 // ---------------------------------------------------------------------------
 
-/// Two routes of equal specificity match one path (`/blog/{slug}` then
-/// `/blog/{name}`). The wrong outcome this catches: the tie-break flips so the
-/// later declaration answers, leaving the first route silently unreachable.
+/// Two patterns that can match one path (`/blog/{slug}` then
+/// `/blog/{name}`). The wrong outcome this catches: `m6-html` starts, one route
+/// is silently unreachable, and the operator is never told. The start must
+/// refuse and name both routes.
 #[test]
-fn equal_specificity_tie_first_declared_route_answers() {
-    let (_guard, socket_path) = spawn_server("tie", &fixtures_dir(), &config_path("tie.conf"));
+fn two_patterns_on_one_path_refuse_to_start_and_name_both_routes() {
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
+    // Spawned, not `output()`: a service that wrongly starts never exits, and
+    // the test must fail on the deadline rather than hang.
+    let mut svc = Service::spawn(
+        "m6-html",
+        Command::new(binary("m6-html"))
+            .arg(fixtures_dir())
+            .arg(config_path("tie.conf"))
+            .env("M6_SOCKET_OVERRIDE", dir.path().join("tie.sock")),
+    );
+    let status = svc.wait_for_exit(Instant::now() + m6_core::testkit::STARTUP_BOUND);
+    let stderr = svc.output();
 
-    let resp = http_request(
-        &socket_path,
-        "GET /blog/hello HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    assert_eq!(
+        status.and_then(|s| s.code()),
+        Some(2),
+        "the service did not refuse and exit 2: {stderr}"
     );
     assert!(
-        resp.contains("200 OK"),
-        "expected 200, got: {}",
-        &resp[..resp.len().min(300)]
+        stderr.contains("\"/blog/{slug}\"") && stderr.contains("\"/blog/{name}\""),
+        "both routes must be named, got: {stderr}"
     );
+    assert!(stderr.contains("can both answer GET /blog/x"), "{stderr}");
+}
+
+/// A fixed route declared after a pattern that also matches it. The wrong
+/// outcome: the first declaration answers, so `/blog/about` renders the
+/// parameter page and the fixed page can never be reached.
+#[test]
+fn a_fixed_route_answers_ahead_of_a_pattern_declared_before_it() {
+    let (_guard, socket_path) = spawn_server("fixed", &fixtures_dir(), &config_path("fixed.conf"));
+    let get = |path: &str| {
+        http_request(
+            &socket_path,
+            &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+        )
+    };
+
+    let fixed = get("/blog/about");
     assert!(
-        resp.contains("FIRST-ROUTE"),
-        "expected the first declared route to answer the tie, got: {}",
-        &resp[..resp.len().min(300)]
+        fixed.contains("SECOND-ROUTE") && !fixed.contains("FIRST-ROUTE"),
+        "the fixed route must answer /blog/about, got: {}",
+        &fixed[..fixed.len().min(300)]
     );
+    let pattern = get("/blog/hello");
     assert!(
-        !resp.contains("SECOND-ROUTE"),
-        "the later route answered a tie it must lose"
+        pattern.contains("FIRST-ROUTE"),
+        "the pattern must answer every other path, got: {}",
+        &pattern[..pattern.len().min(300)]
     );
 }
 
@@ -212,11 +249,12 @@ fn global_params_change_picked_up_after_restart() {
     // Write only the three files this scenario needs into a fresh temp site, so
     // the global params file can be rewritten without dirtying committed
     // fixtures. This is the socket_mode.rs shape, not a whole-tree copy.
-    let site = tempfile::tempdir().expect("tempdir");
+    let site = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let config = site.path().join("m6-html.conf");
     let global = site.path().join("data").join("site.json");
     std::fs::create_dir_all(site.path().join("templates")).expect("templates dir");
     std::fs::create_dir_all(site.path().join("data")).expect("data dir");
+    std::fs::write(site.path().join("site.toml"), "").unwrap();
     std::fs::write(
         &config,
         "global_params = [\"data/site.json\"]\n\n[[route]]\npath = \"/brand-global\"\ntemplate = \"templates/params.html\"\nparams = []\n",

@@ -3,33 +3,56 @@
 // HTTP/3 over QUIC/UDP using quiche (sans-I/O) + single-threaded epoll.
 // Standard POSIX UDP socket + epoll, accelerated transparently by
 // OpenOnload/ExaSock at deployment. No async runtime, no threads.
+#![deny(unsafe_code)]
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::Context;
 use bytes::Bytes;
+use m6_core::log::{debug, error, info, warn};
+use m6_core::platform::net::{RecvMeta, UdpBatch, MAX_BATCH, RECV_SLOT};
 use quiche::h3::NameValue;
 use rand::RngCore;
-use tracing::{debug, error, info, warn};
 
+use m6_core::auth as core_auth;
+use m6_core::client::Upstream;
 use m6_http_lib::analytics;
 use m6_http_lib::analytics::H3Headers;
 use m6_http_lib::auth;
 use m6_http_lib::cache::{
     evaluate_preconditions, make_lookup_key, not_modified_headers, request_permits_storage,
-    should_cache, strip_set_cookie, Cache, CacheKey, CachedResponse, Precondition,
+    should_cache, strip_uncacheable, Cache, CacheControl, CacheKey, CachedResponse, Precondition,
 };
 use m6_http_lib::config::{self, Config};
+use m6_http_lib::disk_cache::{self, DiskWriter};
 use m6_http_lib::error::{self as error, ErrorMode};
 use m6_http_lib::fields::validate_request_header_bytes;
-use m6_http_lib::forward::{self, HttpResponse};
+use m6_http_lib::forward::{self, UpstreamId, Waiter};
+use m6_http_lib::genid;
+use m6_http_lib::h2_client::H2Completion;
 use m6_http_lib::health;
+use m6_http_lib::http2::{H2Request, RequestRef};
 use m6_http_lib::rate_limit::RateLimiter;
 use m6_http_lib::stats::Stats;
+
+/// The global allocator: mimalloc, which also counts calls when the
+/// `count-allocations` feature turns on m6-core's `alloc-count`. The counting
+/// is not compiled in a plain build.
+#[cfg(not(feature = "alloc-attribution"))]
+#[global_allocator]
+static ALLOC: m6_core::alloc::M6Alloc = m6_core::alloc::M6Alloc;
+
+/// Allocation attribution replaces the counter with dhat only when it is asked
+/// for, because the two global allocators cannot coexist. Still behind
+/// `count-allocations` (the feature implies it), still off in any released
+/// service, and it changes no request path.
+#[cfg(feature = "alloc-attribution")]
+#[global_allocator]
+static ALLOCATOR: dhat::Alloc = dhat::Alloc;
 
 /// RFC 9114 8.1: H3_MESSAGE_ERROR, the stream error a server must raise for a
 /// malformed request. Named here rather than taken from quiche so the wire
@@ -52,68 +75,149 @@ type CachedErrorPage = (std::time::Instant, Vec<(String, String)>, Vec<u8>);
 /// advertise; see issue #93 for why those are gone.
 type FinalizedResponse = (u16, Vec<(String, String)>, Vec<u8>, String);
 
+/// What finishing a backend reply can mean: the response is ready to write, or
+/// the reply itself needs an error page fetched, so the same waiter is stored
+/// on a fresh upstream instead. The error page fetch carries
+/// `error_status_override`, so it never re-derives another error page.
+enum Completion {
+    Ready(FinalizedResponse),
+    Pending {
+        id: UpstreamId,
+        ctx: Box<forward::PendingUrlContext>,
+    },
+}
+
+/// What applying an error mode can mean, on the request path: the response is
+/// ready, or a custom error page must be fetched first and the request parks.
+enum ErrorOutcome {
+    Ready(u16, Vec<(String, String)>, Vec<u8>, String),
+    Pending {
+        id: UpstreamId,
+        ctx: Box<forward::PendingUrlContext>,
+    },
+}
+
+/// The loop state a completion touches, bundled so the completion helpers stay
+/// under clippy's argument ceiling.
+struct CompletionCtx<'a> {
+    state: &'a mut ServerState,
+    tcp: &'a mut Option<Http11Listener>,
+    h2c: &'a mut Option<H2cListener>,
+    registry: &'a m6_core::platform::Registry,
+    quic_port: u16,
+    udp: &'a UdpSocket,
+    batch: UdpBatch,
+    out: &'a mut [u8],
+    connections: &'a mut HashMap<Vec<u8>, QuicConn>,
+    now: Instant,
+}
+
+impl<'a> CompletionCtx<'a> {
+    // The one bundle constructor for the completion context; it exists so the
+    // five completion helpers that take `&mut CompletionCtx` stay under
+    // clippy's argument ceiling.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        state: &'a mut ServerState,
+        tcp: &'a mut Option<Http11Listener>,
+        h2c: &'a mut Option<H2cListener>,
+        registry: &'a m6_core::platform::Registry,
+        quic_port: u16,
+        udp: &'a UdpSocket,
+        batch: UdpBatch,
+        out: &'a mut [u8],
+        connections: &'a mut HashMap<Vec<u8>, QuicConn>,
+        now: Instant,
+    ) -> Self {
+        CompletionCtx {
+            state,
+            tcp,
+            h2c,
+            registry,
+            quic_port,
+            udp,
+            batch,
+            out,
+            connections,
+            now,
+        }
+    }
+}
+
 /// How long a fetched error document is reused before being re-fetched.
 /// Short enough that a redeployed error page appears promptly, long enough
 /// that a sustained sweep costs one fetch a minute rather than one per path.
 const ERROR_PAGE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
-use m6_core::watcher::{Changed, ConfigReloader, Seen};
-use m6_http_lib::auth::PublicKey;
+use m6_core::event::{LoopTrace, Slots, Timeouts};
+use m6_core::platform::process::raise_fd_limit;
+use m6_core::platform::Signals;
+use m6_core::platform::{Events, Interest, Poll, Token};
 use m6_http_lib::h2c_client::H2cClientPool;
 use m6_http_lib::h2s_client::H2sTlsClientPool;
 use m6_http_lib::http11::{
-    load_tls_material, make_tls_server_config, H2cListener, Http11Listener, RequestOutcome,
+    make_tls_server_config, resolve_bind, ConnDrive, H2cListener, HitHeaders, Http11Listener,
+    ParseResult, RequestHead, RequestOutcome, VaryMerge, H2_IDLE_TIMEOUT_SECS,
+    MAX_ACCEPTS_PER_WAKE, READ_TIMEOUT_SECS,
 };
-use m6_http_lib::poller::{Poller, Token, WakeReader, WakeWriter};
 use m6_http_lib::pool::{self, PoolManager};
-use m6_http_lib::router::{self, RouteTable};
-use m6_http_lib::stats::{Channel, Iface, Version as HttpVersion};
-use m6_http_lib::watcher::{FsEvent, FsEventKind, FsWatcher};
+use m6_http_lib::priority;
+use m6_http_lib::router::RouteTable;
+use m6_http_lib::stats::{CacheOutcome, Channel, Iface, Version as HttpVersion};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const TOKEN_UDP: Token = Token(0);
-const TOKEN_INOTIFY: Token = Token(1);
-const TOKEN_TCP: Token = Token(2);
-const TOKEN_H2C: Token = Token(3);
-const TOKEN_H2C_CLIENT: Token = Token(4);
-const TOKEN_H2S_CLIENT: Token = Token(5);
-const TOKEN_WAKE: Token = Token(6);
-const TOKEN_CONFIG: Token = Token(7);
-/// Time given to a backend to finish a reload after it has seen the change.
-///
-/// A backend under `ConfigReloader` reloads at once on the first change, or up
-/// to `RELOAD_DEBOUNCE` later when a second report is held, or up to
-/// `RELOAD_POLL` later when only the once-a-second poll finds the change. The
-/// reload itself then takes time. This margin is added to each of those.
-const CACHE_RELOAD_MARGIN: std::time::Duration = std::time::Duration::from_millis(80);
-
-/// The two later clears after a `site.toml` reload, measured from the end of
-/// the reload.
-///
-/// A backend that reloads after m6-http can answer a request in the gap with
-/// the old page, and that response is cached. m6-http clears at once, then
-/// again once a debounced report has reloaded the backend, then again once the
-/// poll would have found the change. Each delay derives from m6-core's
-/// constants, so it follows them if they change. The cost is one extra cache
-/// miss per page about a second after a content change, and none on the hit
-/// path. A second `site.toml` change re-arms both.
-const CACHE_LATER_CLEARS: [(std::time::Duration, &str); 2] = [
-    (
-        std::time::Duration::from_millis(
-            m6_core::watcher::RELOAD_DEBOUNCE.as_millis() as u64
-                + CACHE_RELOAD_MARGIN.as_millis() as u64,
-        ),
-        "config reload: cache cleared again after the settle window",
-    ),
-    (
-        std::time::Duration::from_millis(
-            m6_core::watcher::RELOAD_POLL.as_millis() as u64
-                + CACHE_RELOAD_MARGIN.as_millis() as u64,
-        ),
-        "config reload: cache cleared a third time after the poll interval",
-    ),
-];
+const TOKEN_UDP: Token = Token(usize::MAX);
+const TOKEN_TLS_LISTENER: Token = Token(usize::MAX - 1);
+const TOKEN_H2C_LISTENER: Token = Token(usize::MAX - 2);
+const TOKEN_SIGNAL: Token = Token(usize::MAX - 3);
+/// The operational log's stdout, registered while it holds bytes a full
+/// destination would not take.
+const TOKEN_LOG: Token = Token(usize::MAX - 4);
+/// The per-process status listener, `[server] status_bind`.
+const TOKEN_STATUS_LISTENER: Token = Token(usize::MAX - 5);
 const MAX_DATAGRAM_SIZE: usize = 1350;
+
+/// The largest payload one UDP GSO `sendmsg` carries. A segmented send is one
+/// UDP payload however many datagrams the kernel cuts it into, so this bounds
+/// a flush's batch.
+const QUIC_BATCH_BYTES: usize = 65_507;
+
+/// The most segments Linux cuts one UDP GSO `sendmsg` into.
+const QUIC_BATCH_SEGMENTS: usize = 64;
+
+/// Who owns a per-descriptor token: the owner and the owner's own slot index.
+#[derive(Clone, Copy)]
+enum Source {
+    /// A freed token, or one not yet assigned.
+    Vacant,
+    TlsConn(usize),
+    H2cConn(usize),
+    /// An outbound h2c or h2s pool connection, found by its token.
+    H2cUpstream,
+    H2sUpstream,
+    /// An in-loop upstream in the shared table: a socket member or a URL
+    /// backend request.
+    Upstream(usize),
+}
+
+/// The [`LoopTrace`] trigger index for an iteration's first event, and the
+/// `timeout` index when none fired. The names are fixed in `event_loop`.
+fn trigger_index(token: Option<Token>, sources: &Slots<Source>) -> usize {
+    match token {
+        Some(TOKEN_UDP) => 3,
+        Some(TOKEN_TLS_LISTENER) | Some(TOKEN_H2C_LISTENER) | Some(TOKEN_STATUS_LISTENER) => 0,
+        Some(TOKEN_SIGNAL) => 4,
+        // A log drain is the loop's own bookkeeping, named so the metrics
+        // document does not report it as a timeout that did not happen.
+        Some(TOKEN_LOG) => 6,
+        Some(Token(k)) => match sources.get(k) {
+            Source::TlsConn(_) | Source::H2cConn(_) => 1,
+            Source::H2cUpstream | Source::H2sUpstream | Source::Upstream(_) => 2,
+            Source::Vacant => 5,
+        },
+        None => 5,
+    }
+}
 
 // ── Shutdown flags ───────────────────────────────────────────────────────────
 
@@ -127,14 +231,6 @@ struct QuicConn {
     /// Responses awaiting flow-control credit, retried by drain_writable() the
     /// next time each stream reports writable.
     partial_responses: HashMap<u64, PendingH3Response>,
-    /// Pending URL-backend requests for H3 streams. Keyed by H3 stream_id.
-    pending_url: HashMap<
-        u64,
-        (
-            std::sync::mpsc::Receiver<std::io::Result<forward::HttpResponse>>,
-            forward::PendingUrlContext,
-        ),
-    >,
     client_addr: SocketAddr,
     /// When we last heard from this connection (for timeout tracking)
     last_active: Instant,
@@ -149,6 +245,10 @@ struct QuicConn {
     /// Set once the handshake has been recorded, so a connection that stays up
     /// for an hour contributes one sample rather than one per packet.
     handshake_recorded: bool,
+    /// The batches a flush packed and the socket refused, in order, kept until
+    /// the socket will take them. `None` when nothing is waiting. See
+    /// [`PendingBatch`].
+    blocked: Option<PendingBatch>,
 }
 
 struct PendingRequest {
@@ -162,42 +262,122 @@ struct PendingRequest {
 /// finish it once quiche reports the stream writable again.
 enum PendingH3Response {
     /// The HEADERS frame itself was blocked — nothing has reached the client
-    /// yet, so both header and body still need sending.
-    Headers(Vec<quiche::h3::Header>, Bytes),
+    /// yet, so both header and body still need sending, at the priority the
+    /// request asked for.
+    Headers(Vec<quiche::h3::Header>, Bytes, priority::Priority),
     /// HEADERS already sent; body is blocked at the given offset.
     Body(Bytes, usize),
 }
 
 // ── Server state ──────────────────────────────────────────────────────────────
 
-/// All mutable server state — owned by the event loop, no Arc/Mutex needed.
+/// What owns an upstream slot.
+#[derive(Clone, Copy)]
+enum UpstreamKind {
+    /// One request on a socket-pool member. The slot is freed when it
+    /// finishes, and the member stays in rotation for the next request.
+    Member,
+    /// A URL backend, by its entry in `PoolManager`. A finished connection the
+    /// backend kept open goes back to that backend's idle list.
+    Url(usize),
+    /// A URL backend slot sitting on that backend's idle list. Its descriptor
+    /// stays registered for read, so a peer close wakes the loop and the slot
+    /// is dropped before any request reuses it.
+    IdleUrl(usize),
+}
+
+/// One in-flight backend request the loop drives, whether its destination is a
+/// socket member or a URL backend. When it completes or expires the loop writes
+/// the result straight into the waiting stream named by `waiter`, with the
+/// request context it carries. The `Upstream` slot, its buffers and the address
+/// are made at start and reused, so a miss allocates nothing on the write or
+/// parse path; a new connection reuses the slot's existing allocations.
+struct UpstreamEntry {
+    upstream: Upstream,
+    addr: m6_core::client::Addr,
+    kind: UpstreamKind,
+    /// The token this slot's descriptor is registered under. An idle URL slot
+    /// keeps its token while it waits, so a close can wake the loop.
+    token: Token,
+    waiter: Option<Waiter>,
+    ctx: Option<Box<forward::PendingUrlContext>>,
+    registered_interest: Interest,
+}
+
+impl UpstreamEntry {
+    fn empty() -> UpstreamEntry {
+        UpstreamEntry {
+            upstream: Upstream::new(64 * 1024, 16 * 1024),
+            addr: m6_core::client::Addr::Unix(std::path::PathBuf::new()),
+            kind: UpstreamKind::Member,
+            token: Token(usize::MAX),
+            waiter: None,
+            ctx: None,
+            registered_interest: Interest::READABLE,
+        }
+    }
+}
+
 struct ServerState {
     config: Config,
-    system_config_path: PathBuf,
     route_table: RouteTable,
     pool_manager: PoolManager,
     cache: Cache,
-    public_key: Option<PublicKey>,
-    invalidation_map: HashMap<String, Vec<String>>,
+    /// The disk copy of the cache on a cache node with `[cache] dir`.
+    /// `None` everywhere else, so a hit and a store gain one `Option` test.
+    disk: Option<DiskWriter>,
+    /// The disk copy read at start, held aside until the first heartbeat
+    /// answers. `None` once it is kept, discarded or installed unverified.
+    pending_disk: Option<disk_cache::Loaded>,
+    /// How many entries the start-time load inserted, and how many files it
+    /// deleted, for the metrics document.
+    loaded_entries: usize,
+    loaded_bad: usize,
+    /// What the first heartbeat decided about the load, for the metrics
+    /// document.
+    disk_state: disk_cache::LoadState,
     error_mode: ErrorMode,
     stats: Stats,
+    /// One `mio` token per descriptor, the single allocator for every
+    /// connection and upstream, mapping a token to its owner.
+    sources: Slots<Source>,
+    /// One generation per token key, bumped each time the key is handed out, so
+    /// a `Waiter` that captured an earlier generation can be recognised as
+    /// stale after its connection was reaped and the token reused.
+    generations: Vec<u64>,
     /// Cache entries queued to be fetched in the background — hint-driven
     /// prefetches and stale-while-revalidate refreshes both land here.
-    prefetch_queue: std::collections::VecDeque<Refresh>,
-    /// Background fetches dispatched to a URL backend and awaiting a reply.
+    prefetch_queue: m6_core::limits::Bounded<Refresh>,
+    /// Refreshes refused past the `refresh_queue` maximum, for the sampled
+    /// error line.
+    refresh_refused: u64,
+    /// In-flight backend requests, one per slot, driven when their descriptor
+    /// fires. Each entry carries the non-blocking upstream, what it belongs to
+    /// (a pool member or a URL backend), the backend name, and who waits for
+    /// the reply.
+    upstreams: Slots<UpstreamEntry>,
+    /// The read timeout (handshakes and HTTP/1.1), as deadlines.
+    read_timeouts: Timeouts,
+    /// The HTTP/2 idle timeout, as deadlines.
+    h2_idle_timeouts: Timeouts,
+    /// Socket-backend request deadlines, as deadlines.
+    upstream_timeouts: Timeouts,
+    /// The `POST /check` deadline, in its own table.
     ///
-    /// A real request parks its pending reply on its own connection, which
-    /// the event loop then polls. A background fetch has no connection, so
-    /// before this existed the returned receiver was simply dropped: on a
-    /// cache node -- whose only backend is origin over h2c, i.e. always the
-    /// async path -- every prefetch and every stale-while-revalidate refresh
-    /// was dispatched and then silently discarded, so nothing was ever
-    /// refilled. Origin was unaffected, its backends being unix sockets that
-    /// complete synchronously inside handle_request.
-    background_pending: Vec<(
-        std::sync::mpsc::Receiver<std::io::Result<forward::HttpResponse>>,
-        forward::PendingUrlContext,
-    )>,
+    /// `Timeouts` keeps one duration per table and finds the earliest expiry
+    /// at its head, so a 50 ms check token in `upstream_timeouts` would sit
+    /// behind a 30 s backend token and fire only when that token expired. The
+    /// two bounds are different, so they are two tables.
+    auth_timeouts: Timeouts,
+    /// Whether the last `POST /check` answered at all.
+    ///
+    /// The `auth-checker` dependency's state. It is set from the outcome the
+    /// request path already has: `false` when the check did not answer (a
+    /// transport failure, or the 50 ms deadline) and `true` on any answer,
+    /// including a 401, a 403 and a 500. A checker that answers is present,
+    /// and naming its internal answer in a public body would leak it. It is
+    /// one bool and one log line per change, with no timer and no probe.
+    auth_check_answered: bool,
     /// Persistent non-blocking H2C outbound client pool.
     h2c_pool: H2cClientPool,
     /// Persistent non-blocking H2S (HTTP/2 over TLS) outbound client pool.
@@ -229,11 +409,41 @@ struct ServerState {
     ///
     /// Keyed by status, so at most a handful of entries ever.
     error_pages: HashMap<u16, CachedErrorPage>,
-    /// When this process began serving, for the health endpoint's uptime.
+    /// When this process began serving, for the metrics document's uptime.
     ///
     /// `Instant`, not `SystemTime`: it is monotonic, so a clock step (NTP
     /// correction, a VM resuming) cannot make uptime jump or go negative.
     started: std::time::Instant,
+    /// The metrics document's host block, kept current one source per
+    /// accounting tick. Read whole, the block is a dozen /proc and /sys files
+    /// and over a hundred system calls, which stalled the loop for the whole
+    /// of the turn that read it.
+    host: m6_core::platform::host::HostReader,
+    /// The last events this process logged, for the traffic report.
+    ///
+    /// A ring allocated at start, pushed once per logged event and never
+    /// allocated while serving. The report builds from it, so the analytics log
+    /// is not read inside the loop.
+    traffic: health::TrafficWindow,
+    /// Reused buffer a cache lookup builds its key into, so a lookup never
+    /// allocates. Capacity 512 matches the old stack buffer's bound.
+    lookup_key_buf: String,
+    /// The `alt-svc` header line, formatted once at start into `ServerState`.
+    alt_svc_line: std::sync::Arc<[u8]>,
+    /// The `link` header line advertising the site description, when configured.
+    /// `None` means the site configures none, so no line is written.
+    describedby_line: Option<std::sync::Arc<[u8]>>,
+    /// The site generation ID this node holds. Present on every node: a source
+    /// owns it, and a cache node follows another node's. Only a node with
+    /// `[genid]` answers `/genid`; a cache node forwards it upstream.
+    genid: genid::Role,
+    /// The `[[backend]]` a cache node's heartbeat asks, by URL-backend index.
+    /// `None` on every other node. Resolved at start, like every URL backend.
+    heartbeat_backend: Option<usize>,
+    /// The encoded `GET /genid` a heartbeat sends, built once at start so a
+    /// tick neither formats nor allocates. Empty when this node has no
+    /// heartbeat.
+    heartbeat_request: Vec<u8>,
 }
 
 /// One cache entry to fetch in the background.
@@ -249,14 +459,6 @@ struct Refresh {
     enc: String,
 }
 
-/// Cap on queued background fetches.
-///
-/// The queue drains one per event-loop iteration, so it only grows when
-/// entries go stale faster than the loop turns. Dropping the excess is right:
-/// a dropped refresh costs one more stale serve, and the next request for that
-/// key queues it again.
-const MAX_REFRESH_QUEUE: usize = 256;
-
 impl ServerState {
     /// Queue a background fetch, skipping one already queued.
     ///
@@ -265,10 +467,75 @@ impl ServerState {
     /// stampede against origin for exactly the case this is meant to shield it
     /// from.
     fn queue_refresh(&mut self, r: Refresh) {
-        if self.prefetch_queue.len() >= MAX_REFRESH_QUEUE || self.prefetch_queue.contains(&r) {
+        if self.prefetch_queue.contains(&r) {
             return;
         }
-        self.prefetch_queue.push_back(r);
+        // The queue grows by doubling and keeps its size. Past the
+        // `refresh_queue` maximum the refresh is refused with an error that
+        // names the key: the entry is served stale once more and the next
+        // request queues it again.
+        if let Err((_, refusal)) = self.prefetch_queue.push_back(r, "a background refresh") {
+            self.refresh_refused += 1;
+            if self.refresh_refused == 1 || self.refresh_refused.is_multiple_of(1024) {
+                error!("{refusal} ({} refused so far)", self.refresh_refused);
+            }
+        }
+    }
+}
+
+impl ServerState {
+    /// The disk-cache block the metrics document reports, when this node has a
+    /// directory.
+    fn disk_perf(&self) -> Option<health::DiskPerf<'_>> {
+        self.disk.as_ref().map(|writer| health::DiskPerf {
+            writer,
+            queued: self.cache.queued(),
+            loaded_entries: self.loaded_entries,
+            loaded_bad: self.loaded_bad,
+            state: self.disk_state,
+        })
+    }
+
+    /// The metrics document, exactly as the metrics line carries it.
+    ///
+    /// One builder, so a metric added to it is on the line. That is the reason
+    /// the line carries this document rather than a second list of fields: two
+    /// copies of a metric list is how a metric gets added to one and not the
+    /// other.
+    ///
+    /// No system call: the host block is the one the accounting tick keeps
+    /// current, and the rest is this process's own counters. It runs on the
+    /// metrics tick and never on an ordinary request.
+    fn perf_report(&self) -> health::PerfReport {
+        let pools: Vec<health::PoolHealth> = self
+            .pool_manager
+            .pool_health()
+            .into_iter()
+            .map(|(name, total)| health::PoolHealth { name, total })
+            .collect();
+        health::PerfReport::build(
+            health::PerfSubject {
+                process_index: self.config.server.process_index,
+                node: &self.config.node.name,
+                uptime_s: self.started.elapsed().as_secs(),
+                pools,
+                url_backends: self.pool_manager.url_backend_names(),
+                host: self.host.snapshot().clone(),
+            },
+            self.stats.snapshot(),
+        )
+    }
+
+    /// Write the metrics line: the report, and this node's generation and
+    /// disk blocks, serialised straight into the log buffer.
+    fn log_perf(&self) {
+        let report = self.perf_report();
+        let genid = self
+            .config
+            .genid
+            .as_ref()
+            .map(|genid_config| (&self.genid, genid_config, self.disk_perf()));
+        m6_http_lib::stats::log_perf(&health::perf_document(&report, genid));
     }
 }
 
@@ -346,35 +613,6 @@ fn seed_cache_warm(state: &mut ServerState) {
     );
 }
 
-// ── Signal handling ───────────────────────────────────────────────────────────
-//
-// One mechanism, shared with every other m6 service: `m6-core` blocks the
-// signals and waits for them on a dedicated thread, so nothing runs in signal
-// context.
-//
-// The epoll loop still needs waking. `epoll_pwait` with a signal mask closes
-// the window between checking the shutdown flag and sleeping, but only on
-// Linux: the kqueue path ignores the mask entirely, so the race it is meant to
-// close stays open on macOS.
-//
-// A self-pipe registered with the poller does the same job on every platform:
-// the shutdown hook writes one byte, the next `wait()` returns immediately
-// whatever timeout it was given, and the loop re-checks the flag. Two file
-// descriptors, created once.
-//
-// SIGUSR1 reopens the analytics log. Core handles it on the same thread, so
-// the epoll loop never sees it.
-
-fn setup_signals(wake: &WakeWriter) -> m6_core::signal::ShutdownHandle {
-    // No `socket`: m6-http listens on TCP and UDP, not a unix socket, so there
-    // is nothing to unlink and nothing to self-connect to. It parks in
-    // epoll/kqueue rather than accept(), which is the one genuine difference
-    // in how an m6 service waits, so it hands core its wake pipe.
-    m6_core::signal::ShutdownHandle::install(
-        m6_core::signal::Service::new("m6-http").wake_fd(wake.as_raw_fd()),
-    )
-}
-
 // ── quiche TLS/QUIC config ────────────────────────────────────────────────────
 
 fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<quiche::Config> {
@@ -392,9 +630,9 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
         .as_deref()
         .context("[server].tls_key is required to serve QUIC")?;
     cfg.load_cert_chain_from_pem_file(tls_cert)
-        .context("load cert chain")?;
+        .with_context(|| format!("load cert chain {tls_cert}"))?;
     cfg.load_priv_key_from_pem_file(tls_key)
-        .context("load private key")?;
+        .with_context(|| format!("load private key {tls_key}"))?;
 
     // ALPN: h3
     cfg.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
@@ -570,71 +808,2164 @@ fn make_quiche_config(server_config: &config::ServerConfig) -> anyhow::Result<qu
 
 /// Everything the event loop polls, owned for its lifetime.
 ///
-/// These six arrived as separate arguments, which put `event_loop` at
-/// eight. They are not unrelated values: they are the set of things the
-/// loop waits on, which is why the poller registers every one of them in the
-/// same breath. `tcp`, `h2c` and `watcher` are optional because a node's role
-/// decides whether it has them at all. `reloader` watches `site.toml` and the
-/// system config and has a descriptor only when the OS watch could be built;
-/// without one it still polls the two files once a second.
+/// These four arrived as separate arguments, which put `event_loop` at
+/// six. They are not unrelated values: they are the set of things the
+/// loop waits on, which is why the poll registers every one of them in the
+/// same breath. `tcp` and `h2c` are optional because a node's role decides
+/// whether it has them at all.
 struct EventLoopIo {
     udp: UdpSocket,
+    /// The QUIC socket's local address, read once when the socket was created.
+    /// Every `RecvInfo` uses it; `getsockname` is not called per datagram.
+    udp_local: SocketAddr,
+    /// Whether the QUIC socket segments a batch, probed once at the socket.
+    udp_batch: UdpBatch,
     tcp: Option<Http11Listener>,
     h2c: Option<H2cListener>,
-    watcher: Option<FsWatcher>,
-    reloader: ConfigReloader,
-    wake_reader: WakeReader,
+    signals: Signals,
+}
+
+// ── Request dispatch (shared by the TLS and h2c listeners) ──────────────────
+
+/// What routing a request resolves to: a cached hit, an immediate answer, or a
+/// miss that must go to a backend.
+enum Routed {
+    Cached {
+        entry: CachedResponse,
+        age: std::time::Duration,
+        set_cookie: Option<String>,
+    },
+    Ready(u16, Vec<(String, String)>, Vec<u8>, String),
+    Miss {
+        start: std::time::Instant,
+        version: HttpVersion,
+        iface: Iface,
+    },
+}
+
+/// Rate limit, redirect and cache lookup, shared by the owned (h2, body) and
+/// borrowed (h1) paths. The request fields are borrowed, so a cached hit never
+/// materialises an owned request. Stats and analytics run here; the caller
+/// writes the outcome in the shape its protocol wants.
+#[allow(clippy::too_many_arguments)] // one request's five borrowed fields plus state, peer and role
+fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
+    state: &mut ServerState,
+    method: &str,
+    path: &str,
+    query: Option<&str>,
+    version: &str,
+    headers: &H,
+    client_ip: &str,
+    h2c: bool,
+) -> Routed {
+    let ua = analytics::header(headers, "user-agent");
+    if let Some(blocked) = check_rate_limit(state, client_ip, path, ua) {
+        let RequestOutcome::Ready(s, h, b, n, _) = blocked else {
+            unreachable!("check_rate_limit returns Ready")
+        };
+        return Routed::Ready(s, h, b, n);
+    }
+    let host = m6_core::headers::get(headers, "host");
+    if let Some(location) = www_redirect_location(host, path, query, &state.config) {
+        return Routed::Ready(
+            301,
+            www_redirect_headers(location),
+            Vec::new(),
+            "www-redirect".to_string(),
+        );
+    }
+    // A Host this node does not serve goes to the site's canonical name. This
+    // runs before the cache lookup for the same reason the www redirect does:
+    // the cache key has no host component, so a warm entry for a served name
+    // would answer a request for a name the node does not own. The internal
+    // h2c listener is excluded: its :authority is the backbone address, and
+    // the cache node behind it has already made this decision.
+    if !h2c {
+        if let Some(location) = state
+            .config
+            .server
+            .unmatched_host_redirect(host, path, query)
+        {
+            return Routed::Ready(
+                301,
+                www_redirect_headers(location),
+                Vec::new(),
+                "unmatched-host-redirect".to_string(),
+            );
+        }
+    }
+    // A method the matched route does not answer is refused here, before the
+    // cache lookup and any backend contact.
+    if let Some(outcome) = route_method_refusal(state, path, method) {
+        let RequestOutcome::Ready(status, headers, body, backend, _) = outcome else {
+            unreachable!("a method refusal is ready")
+        };
+        return Routed::Ready(status, headers, body, backend);
+    }
+    let enc_str = m6_core::headers::get(headers, "accept-encoding").unwrap_or("");
+    let start = m6_core::platform::now();
+
+    let cacheable =
+        !state.route_table.requires_auth(path) && m6_http_lib::cache::method_may_read_cache(method);
+    let lookup_key = make_lookup_key(path, query, enc_str, &mut state.lookup_key_buf);
+    let req_cc = m6_http_lib::cache::RequestDirectives::parse(headers);
+    let looked_up = if cacheable {
+        state.cache.lookup_with(lookup_key, &req_cc)
+    } else {
+        m6_http_lib::cache::Lookup::Miss
+    };
+    if req_cc.only_if_cached && matches!(looked_up, m6_http_lib::cache::Lookup::Miss) {
+        let mut hdrs: Vec<(String, String)> = Vec::new();
+        set_date(&mut hdrs);
+        return Routed::Ready(504, hdrs, Vec::new(), "cache".to_string());
+    }
+    // The lookup already answered the validity question, so the outcome is
+    // read from the value that carries it rather than derived again from the
+    // entry's age in the report.
+    let hit_is_valid = looked_up.is_fresh();
+    let cache_state = if hit_is_valid { "HIT" } else { "STALE" };
+    if let m6_http_lib::cache::Lookup::Stale(..) = looked_up {
+        state.queue_refresh(Refresh {
+            path: path.to_string(),
+            query: query.map(str::to_string),
+            enc: enc_str.to_string(),
+        });
+    }
+    let (http_version, iface) = if h2c {
+        (HttpVersion::Http2, state.h2c_iface)
+    } else {
+        (
+            HttpVersion::from_wire(version),
+            client_ip
+                .parse::<std::net::IpAddr>()
+                .map_or(state.tls_iface, health::peer_iface),
+        )
+    };
+    if let m6_http_lib::cache::Lookup::Fresh(cached, age)
+    | m6_http_lib::cache::Lookup::Stale(cached, age) = looked_up
+    {
+        let elapsed_ns = start.elapsed().as_nanos() as u64;
+        let chan = Channel::new(http_version, iface);
+        let precond = evaluate_preconditions(cached.status, &cached.headers, headers, method);
+        state.stats.record(
+            elapsed_ns,
+            if hit_is_valid {
+                CacheOutcome::ValidHit
+            } else {
+                CacheOutcome::InvalidHit
+            },
+            match precond {
+                Precondition::Failed => 412,
+                Precondition::NotModified => 304,
+                _ => cached.status,
+            },
+            chan,
+            "cache",
+        );
+        if precond == Precondition::Failed {
+            let mut hdrs: Vec<(String, String)> = Vec::new();
+            set_date(&mut hdrs);
+            analytics::finish_response(
+                state.config.analytics.enabled,
+                &mut hdrs,
+                headers,
+                &analytics::Event {
+                    node: &state.config.node.name,
+                    path,
+                    status: 412,
+                    cache_state,
+                    client_ip,
+                    latency_ns: Some(elapsed_ns),
+                },
+                &mut state.traffic,
+            );
+            return Routed::Ready(412, hdrs, Vec::new(), "cache".to_string());
+        }
+        if precond == Precondition::NotModified {
+            let mut hdrs = not_modified_headers(&cached.headers.to_pairs());
+            set_vary_accept_encoding(&mut hdrs, true);
+            set_age(&mut hdrs, age);
+            set_date(&mut hdrs);
+            debug!(
+                path = %path,
+                status = 304,
+                version = %version,
+                backend = "cache",
+                latency_ns = elapsed_ns,
+                cache_hit = true,
+                "request complete"
+            );
+            analytics::finish_response(
+                state.config.analytics.enabled,
+                &mut hdrs,
+                headers,
+                &analytics::Event {
+                    node: &state.config.node.name,
+                    path,
+                    status: 304,
+                    cache_state,
+                    client_ip,
+                    latency_ns: Some(elapsed_ns),
+                },
+                &mut state.traffic,
+            );
+            return Routed::Ready(304, hdrs, Vec::new(), "cache".to_string());
+        }
+        debug!(
+            path = %path,
+            status = cached.status,
+            version = %version,
+            backend = "cache",
+            latency_ns = elapsed_ns,
+            cache_hit = true,
+            "request complete"
+        );
+        let set_cookie = analytics::record(
+            state.config.analytics.enabled,
+            headers,
+            &analytics::Event {
+                node: &state.config.node.name,
+                path,
+                status: cached.status,
+                cache_state,
+                client_ip,
+                latency_ns: Some(elapsed_ns),
+            },
+            &mut state.traffic,
+        )
+        .filter(|_| analytics::is_html_response(&cached.headers))
+        .map(analytics::session_cookie_header_value);
+        return Routed::Cached {
+            entry: cached,
+            age,
+            set_cookie,
+        };
+    }
+    Routed::Miss {
+        start,
+        version: http_version,
+        iface,
+    }
+}
+
+/// Handle one owned request from the HTTP/1.1 body path.
+///
+/// h2 does not reach this: `on_request_h2` answers a cached hit from borrowed
+/// views and calls `into_owned` only on a miss. On a hit here the shared
+/// `Cached` form goes back to `drive_h1`, which writes it without copying.
+fn on_request_impl(
+    state: &mut ServerState,
+    req: &forward::HttpRequest,
+    client_ip: &str,
+    quic_port: u16,
+    registry: &m6_core::platform::Registry,
+    h2c: bool,
+) -> RequestOutcome {
+    match route_request(
+        state,
+        &req.method,
+        &req.path,
+        req.query.as_deref(),
+        &req.version,
+        &req.headers[..],
+        client_ip,
+        h2c,
+    ) {
+        Routed::Cached {
+            entry,
+            age,
+            set_cookie,
+            ..
+        } => {
+            // The entry is shared (`Arc` headers, `Bytes` body), so a hit
+            // carries it by reference all the way to the writer. The fields a
+            // hit adds are written from their start-time values there, in
+            // place of cloning the header list to append them.
+            RequestOutcome::Cached {
+                entry,
+                age,
+                set_cookie,
+            }
+        }
+        Routed::Ready(s, h, b, n) => RequestOutcome::Ready(s, h, b, n, None),
+        Routed::Miss {
+            start,
+            version,
+            iface,
+        } => {
+            let enc = m6_core::headers::get(&req.headers[..], "accept-encoding").unwrap_or("");
+            let outcome = handle_request(
+                req,
+                client_ip,
+                enc,
+                state,
+                false,
+                h2c && state.h2c_iface == Iface::Internal,
+                registry,
+                None,
+            );
+            finish_miss(state, outcome, start, version, iface, quic_port)
+        }
+    }
+}
+
+/// Handle a request decoded on an HTTP/2 connection.
+///
+/// A cache hit is answered entirely from the borrowed view: the lookup key and
+/// the header list are read out of the connection's read buffer, and the shared
+/// cache entry goes back to the writer, so this path allocates nothing.
+/// `into_owned` runs only for a miss, which is a slow path.
+fn on_request_h2(
+    state: &mut ServerState,
+    req: H2Request<'_>,
+    client_ip: &str,
+    quic_port: u16,
+    registry: &m6_core::platform::Registry,
+    h2c: bool,
+) -> RequestOutcome {
+    match route_request(
+        state,
+        req.method,
+        req.path,
+        req.query,
+        "HTTP/2",
+        req.headers(),
+        client_ip,
+        h2c,
+    ) {
+        Routed::Cached {
+            entry,
+            age,
+            set_cookie,
+            ..
+        } => RequestOutcome::Cached {
+            entry,
+            age,
+            set_cookie,
+        },
+        Routed::Ready(s, h, b, n) => RequestOutcome::Ready(s, h, b, n, None),
+        Routed::Miss {
+            start,
+            version,
+            iface,
+        } => {
+            let req = req.into_owned();
+            let enc = m6_core::headers::get(&req.headers[..], "accept-encoding").unwrap_or("");
+            let outcome = handle_request(
+                &req,
+                client_ip,
+                enc,
+                state,
+                false,
+                h2c && state.h2c_iface == Iface::Internal,
+                registry,
+                None,
+            );
+            finish_miss(state, outcome, start, version, iface, quic_port)
+        }
+    }
+}
+
+/// Handle a borrowed h1 head (the bodyless fast path). On a hit it returns the
+/// shared `Cached` form so `drive_h1` writes it with no allocation.
+fn on_request_head(
+    state: &mut ServerState,
+    head: &m6_core::h1::RequestHead<'_>,
+    buf: &[u8],
+    client_ip: &str,
+    quic_port: u16,
+    registry: &m6_core::platform::Registry,
+) -> RequestOutcome {
+    match route_request(
+        state,
+        head.method,
+        head.path,
+        head.query,
+        head.version,
+        head.headers,
+        client_ip,
+        false,
+    ) {
+        Routed::Cached {
+            entry,
+            age,
+            set_cookie,
+            ..
+        } => RequestOutcome::Cached {
+            entry,
+            age,
+            set_cookie,
+        },
+        Routed::Ready(s, h, b, n) => RequestOutcome::Ready(s, h, b, n, None),
+        Routed::Miss {
+            start,
+            version,
+            iface,
+        } => {
+            let mut req = match m6_core::h1::materialize(head, buf) {
+                ParseResult::Complete(r) => r,
+                // The head was parsed complete and carries no body.
+                _ => unreachable!("bodyless head materializes"),
+            };
+            // Strip proxy-owned headers before forwarding, exactly as the owned
+            // h1 and h2 paths do.
+            forward::strip_untrusted_inbound(&mut req.headers);
+            let enc = m6_core::headers::get(&req.headers[..], "accept-encoding").unwrap_or("");
+            let outcome = handle_request(&req, client_ip, enc, state, false, false, registry, None);
+            finish_miss(state, outcome, start, version, iface, quic_port)
+        }
+    }
+}
+
+// ── Token and slot helpers ────────────────────────────────────────────────────
+
+/// The tail every cache miss shares: advertise `alt-svc` and record the miss in
+/// the stats, then return the outcome unchanged.
+///
+/// A `Ready` outcome here is a miss m6-http answered itself, and that is the
+/// case this counter names. Every backend dispatch returns `Pending`, so a
+/// reply that came from a backend is recorded where the backend's answer
+/// arrives, with its status and its latency, and never here.
+fn finish_miss(
+    state: &mut ServerState,
+    mut outcome: RequestOutcome,
+    start: std::time::Instant,
+    version: HttpVersion,
+    iface: Iface,
+    quic_port: u16,
+) -> RequestOutcome {
+    if let RequestOutcome::Ready(status, ref mut headers, _, ref backend, _) = outcome {
+        set_alt_svc(headers, quic_port);
+        let elapsed_ns = start.elapsed().as_nanos() as u64;
+        let chan = Channel::new(version, iface);
+        state.stats.record(
+            elapsed_ns,
+            CacheOutcome::AnsweredLocally,
+            status,
+            chan,
+            backend,
+        );
+    }
+    outcome
+}
+
+/// Take one token from the shared table, growing the three deadline tables and
+/// the generation table to match when the token table doubles. Each hand-out
+/// bumps the key's generation, so a `Waiter` that captured an earlier
+/// generation is stale after the key is freed and reused.
+fn take_token(state: &mut ServerState) -> Option<Token> {
+    let taken = state.sources.take()?;
+    if let Some(n) = taken.grew_to {
+        state.read_timeouts.grow(n);
+        state.h2_idle_timeouts.grow(n);
+        state.upstream_timeouts.grow(n);
+        state.auth_timeouts.grow(n);
+        state.generations.resize(n, 0);
+    }
+    let gen = &mut state.generations[taken.key];
+    *gen = gen.wrapping_add(1);
+    Some(Token(taken.key))
+}
+
+/// Ask the kernel to report the socket writable only once its unsent data
+/// falls below the send queue's bound. The bounded queue decides which frames
+/// enter the kernel; without this option the kernel takes a whole response
+/// body at once and decides what leaves first, so the order would be lost.
+///
+/// The option is the platform layer's: Linux sets `TCP_NOTSENT_LOWAT` and macOS
+/// has no equivalent, so there the kernel's own order stays in force. A kernel
+/// that will not set it still sends everything, in its own order, so the
+/// failure is a log line rather than a refused connection.
+fn limit_kernel_send_queue(fd: RawFd) {
+    let mark = m6_http_lib::limits::edge().h2_send.start();
+    if let Err(e) = m6_core::platform::net::limit_send_queue(fd, mark) {
+        warn!(
+            error = %e,
+            "TCP_NOTSENT_LOWAT: the send queue is bounded, but this kernel will not wait for it"
+        );
+    }
+}
+
+/// Accept TLS connections until the socket would block or the token table is
+/// full. Returns whether the table is at its ceiling.
+fn accept_tls(
+    tcp: &mut Http11Listener,
+    status: bool,
+    state: &mut ServerState,
+    registry: &m6_core::platform::Registry,
+    now: Instant,
+) -> bool {
+    loop {
+        let Some(conn) = (if status {
+            tcp.accept_status()
+        } else {
+            tcp.accept_one()
+        }) else {
+            return false;
+        };
+        let Some(token) = take_token(state) else {
+            return true;
+        };
+        let Some(owner) = tcp.take_slot() else {
+            state.sources.free(token.0);
+            return true;
+        };
+        let mut conn = conn;
+        conn.set_token(token);
+        conn.set_interest(Interest::READABLE);
+        if let Err(e) = registry.register_fd(conn.raw_fd(), token, Interest::READABLE) {
+            warn!(error = %e, "tcp register");
+            tcp.free_slot(owner.key);
+            state.sources.free(token.0);
+            continue;
+        }
+        state.read_timeouts.touch(token, now);
+        *state.sources.get_mut(token.0) = Source::TlsConn(owner.key);
+        *tcp.slot_mut(owner.key) = conn;
+    }
+}
+
+/// Accept h2c connections up to the cap. Returns whether the token table is at
+/// its ceiling and whether the cap was hit (more may be pending).
+fn accept_h2c(
+    h: &mut H2cListener,
+    state: &mut ServerState,
+    registry: &m6_core::platform::Registry,
+    now: Instant,
+) -> (bool, bool) {
+    let mut full = false;
+    let handled = h.accept_up_to(MAX_ACCEPTS_PER_WAKE, |h, mut conn| {
+        if state.sources.is_full() {
+            full = true;
+            return false;
+        }
+        let Some(token) = take_token(state) else {
+            full = true;
+            return false;
+        };
+        let Some(owner) = h.take_slot() else {
+            state.sources.free(token.0);
+            full = true;
+            return false;
+        };
+        conn.set_token(token);
+        conn.set_interest(Interest::READABLE);
+        limit_kernel_send_queue(conn.raw_fd());
+        if let Err(e) = registry.register_fd(conn.raw_fd(), token, Interest::READABLE) {
+            warn!(error = %e, "h2c register");
+            h.free_slot(owner.key);
+            state.sources.free(token.0);
+            return true;
+        }
+        state.h2_idle_timeouts.touch(token, now);
+        *state.sources.get_mut(token.0) = Source::H2cConn(owner.key);
+        *h.slot_mut(owner.key) = conn;
+        true
+    });
+    (full, !full && handled == MAX_ACCEPTS_PER_WAKE)
+}
+
+/// What one connection turn did, for the timeouts.
+enum ConnOutcome {
+    Active,
+    Closed,
+    /// The token was freed earlier in this batch: skip it.
+    Gone,
+}
+
+/// Drive the connection whose token fired.
+fn drive_conn_token(
+    token: Token,
+    state: &mut ServerState,
+    tcp: &mut Option<Http11Listener>,
+    h2c: &mut Option<H2cListener>,
+    registry: &m6_core::platform::Registry,
+    quic_port: u16,
+    now: Instant,
+) -> ConnOutcome {
+    let source = match state.sources.get(token.0) {
+        Source::TlsConn(slot) => (*slot, false),
+        Source::H2cConn(slot) => (*slot, true),
+        _ => return ConnOutcome::Gone,
+    };
+    let (slot, is_h2c) = source;
+    let hit = HitHeaders {
+        alt_svc: state.alt_svc_line.clone(),
+        describedby: state.describedby_line.clone(),
+    };
+    // A connection on the status listener answers the monitoring paths only.
+    let status = !is_h2c && tcp.as_ref().is_some_and(|t| t.is_status(slot));
+    let mut on_head = |state: &mut ServerState, head: &RequestHead<'_>, buf: &[u8], ip: &str| {
+        if status && !is_status_path(state, head.path) {
+            return status_refusal();
+        }
+        on_request_head(state, head, buf, ip, quic_port, registry)
+    };
+    // Only a method refusal is decided from a head. Any other body-bearing
+    // request has to be read before it can be routed, as before.
+    let mut on_head_early =
+        |state: &mut ServerState, head: &RequestHead<'_>, _ip: &str| -> Option<RequestOutcome> {
+            if status && !is_status_path(state, head.path) {
+                return Some(status_refusal());
+            }
+            route_method_refusal(state, head.path, head.method)
+        };
+    let mut on_h2 = |state: &mut ServerState, req: RequestRef<'_>, ip: &str| {
+        if status {
+            let path = match &req {
+                RequestRef::Owned(r) => r.path.as_str(),
+                RequestRef::H2(r) => r.path,
+            };
+            if !is_status_path(state, path) {
+                return status_refusal();
+            }
+        }
+        match req {
+            RequestRef::Owned(req) => on_request_impl(state, req, ip, quic_port, registry, is_h2c),
+            RequestRef::H2(req) => on_request_h2(state, req, ip, quic_port, registry, is_h2c),
+        }
+    };
+    let mut drive = if is_h2c {
+        match h2c.as_mut() {
+            Some(h) => h.drive_one(slot, state, &mut on_h2, &hit, registry),
+            None => return ConnOutcome::Closed,
+        }
+    } else {
+        match tcp.as_mut() {
+            Some(t) => t.drive_one(
+                slot,
+                state,
+                &mut on_head,
+                &mut on_h2,
+                &mut on_head_early,
+                &hit,
+                registry,
+            ),
+            None => return ConnOutcome::Closed,
+        }
+    };
+    // Park each request this turn dispatched to a backend, storing the waiter
+    // in the upstream slot it named.
+    let mut pending = std::mem::take(&mut drive.pending);
+    for d in pending.drain(..) {
+        let gen = state.generations[token.0];
+        let waiter = match d.stream {
+            None => Waiter::H1 { conn: token, gen },
+            Some(stream) => Waiter::H2 {
+                conn: token,
+                stream,
+                gen,
+            },
+        };
+        park(state, d.id, d.ctx, waiter);
+    }
+    if let Some(hs) = drive.handshake {
+        let v = if hs.is_h2 {
+            HttpVersion::Http2
+        } else {
+            HttpVersion::Http11
+        };
+        // A handshake belongs to the same population as the requests that
+        // connection will carry: the internal socket for the backbone, the
+        // peer's address class for a monitor against a visitor on TLS.
+        let iface = if is_h2c {
+            state.h2c_iface
+        } else {
+            tcp.as_ref()
+                .and_then(|t| t.peer_ip(slot))
+                .map_or(state.tls_iface, health::peer_iface)
+        };
+        state
+            .stats
+            .record_handshake(hs.elapsed_ns, Channel::new(v, iface), hs.resumed);
+        // An h2 connection is idle-governed by `h2_idle_timeouts`, not the
+        // 30 s read deadline set at accept, so drop that deadline and start
+        // the idle clock now: a peer that finishes the handshake but never
+        // sends its client preface must still be reaped.
+        if hs.is_h2 {
+            state.read_timeouts.clear(token);
+            state.h2_idle_timeouts.touch(token, now);
+            if let Some(t) = tcp.as_mut() {
+                limit_kernel_send_queue(t.slot_mut(slot).raw_fd());
+            }
+        }
+    }
+    after_conn_drive(token, &drive, state, tcp, h2c, registry, now);
+    // Give the pending buffer back to the listener so the next drive reuses it.
+    if is_h2c {
+        if let Some(h) = h2c.as_mut() {
+            h.return_pending(pending);
+        }
+    } else if let Some(t) = tcp.as_mut() {
+        t.return_pending(pending);
+    }
+    if drive.done {
+        ConnOutcome::Closed
+    } else {
+        ConnOutcome::Active
+    }
+}
+
+/// Whether `path` is the one path the status listener answers: the health path
+/// this process serves on the shared port.
+fn is_status_path(state: &ServerState, path: &str) -> bool {
+    path == state.config.health.path
+}
+
+/// The answer to any other path on the status listener: the 404 of a disabled
+/// endpoint, which says nothing about the site.
+fn status_refusal() -> RequestOutcome {
+    let (code, headers, body) = health::not_found();
+    RequestOutcome::Ready(
+        code,
+        headers,
+        body,
+        health::HEALTH_BACKEND.to_string(),
+        None,
+    )
+}
+
+/// Deregister and free a connection token.
+fn close_conn_token(
+    token: Token,
+    state: &mut ServerState,
+    tcp: &mut Option<Http11Listener>,
+    h2c: &mut Option<H2cListener>,
+    registry: &m6_core::platform::Registry,
+) {
+    if let Source::TlsConn(slot) = *state.sources.get(token.0) {
+        if let Some(t) = tcp.as_mut() {
+            t.close_one(slot, registry);
+        }
+    } else if let Source::H2cConn(slot) = *state.sources.get(token.0) {
+        if let Some(h) = h2c.as_mut() {
+            h.close_one(slot, registry);
+        }
+    }
+    *state.sources.get_mut(token.0) = Source::Vacant;
+    state.sources.free(token.0);
+    state.read_timeouts.clear(token);
+    state.h2_idle_timeouts.clear(token);
+    state.upstream_timeouts.clear(token);
+    state.auth_timeouts.clear(token);
+}
+
+/// Store a parked request's waiter and context in the upstream slot it named.
+fn park(
+    state: &mut ServerState,
+    id: UpstreamId,
+    ctx: Box<forward::PendingUrlContext>,
+    waiter: Waiter,
+) {
+    match id {
+        UpstreamId::Slot(slot) => {
+            let e = state.upstreams.get_mut(slot);
+            e.waiter = Some(waiter);
+            e.ctx = Some(ctx);
+        }
+        UpstreamId::H2c { conn, stream } => {
+            state.h2c_pool.set_waiter(conn, stream, waiter, ctx);
+        }
+        UpstreamId::H2s { conn, stream } => {
+            state.h2s_pool.set_waiter(conn, stream, waiter, ctx);
+        }
+        // A `POST /genid` has no upstream yet: it waits on the change
+        // sequence, which the next loop turn starts. The context is unused.
+        UpstreamId::Genid => {
+            let _ = ctx;
+            if let Some(g) = state.genid.source_mut() {
+                g.post(waiter);
+            }
+        }
+    }
+}
+
+/// Finish a connection drive: touch timeouts and close the connection when the
+/// drive says it is done.
+fn after_conn_drive(
+    token: Token,
+    drive: &ConnDrive,
+    state: &mut ServerState,
+    tcp: &mut Option<Http11Listener>,
+    h2c: &mut Option<H2cListener>,
+    registry: &m6_core::platform::Registry,
+    now: Instant,
+) {
+    if drive.restarted {
+        state.read_timeouts.touch(token, now);
+    }
+    if drive.moved {
+        state.h2_idle_timeouts.touch(token, now);
+    }
+    if drive.done {
+        close_conn_token(token, state, tcp, h2c, registry);
+    }
+}
+
+/// Write a finished response straight into the waiting stream, in this turn.
+#[allow(clippy::too_many_arguments)] // one response's fields plus the stream, its priority and the loop's context
+fn write_waiter(
+    waiter: Waiter,
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    method: &str,
+    priority: priority::Priority,
+    genid: Option<u64>,
+    cx: &mut CompletionCtx<'_>,
+) {
+    match waiter {
+        Waiter::H1 { conn, gen } => {
+            // A stale waiter whose connection was reaped and whose token was
+            // reused carries an older generation: drop the reply.
+            if cx.state.generations.get(conn.0) != Some(&gen) {
+                return;
+            }
+            if let Source::TlsConn(slot) = *cx.state.sources.get(conn.0) {
+                if let Some(t) = cx.tcp {
+                    let drive =
+                        t.complete_h1(slot, status, &headers, body, method, genid, cx.registry);
+                    after_conn_drive(conn, &drive, cx.state, cx.tcp, cx.h2c, cx.registry, cx.now);
+                }
+            }
+        }
+        Waiter::H2 { conn, stream, gen } => {
+            if cx.state.generations.get(conn.0) != Some(&gen) {
+                return;
+            }
+            let done = match *cx.state.sources.get(conn.0) {
+                Source::TlsConn(slot) => cx.tcp.as_mut().is_some_and(|t| {
+                    t.complete_h2(
+                        slot,
+                        stream,
+                        (status, headers, body),
+                        method,
+                        genid,
+                        cx.registry,
+                    )
+                }),
+                Source::H2cConn(slot) => cx.h2c.as_mut().is_some_and(|h| {
+                    h.complete_h2(
+                        slot,
+                        stream,
+                        (status, headers, body),
+                        method,
+                        genid,
+                        cx.registry,
+                    )
+                }),
+                _ => false,
+            };
+            if done {
+                close_conn_token(conn, cx.state, cx.tcp, cx.h2c, cx.registry);
+            }
+        }
+        Waiter::H3 { conn_id, stream } => {
+            if let Some(qconn) = cx.connections.get_mut(&conn_id) {
+                send_h3_response(
+                    stream,
+                    qconn,
+                    priority,
+                    status,
+                    &headers,
+                    Bytes::from(body),
+                    method.eq_ignore_ascii_case("HEAD"),
+                    genid,
+                );
+                flush_conn(cx.udp, cx.batch, &mut cx.out[..], qconn);
+            }
+        }
+        Waiter::Background => {
+            // The finalize step already filled the cache; there is no client.
+        }
+        Waiter::Genid { .. } => {
+            // Intercepted in `complete_waiter`: a member's answer is a status
+            // for the sequence, not a response for a client.
+        }
+        Waiter::Heartbeat => {
+            // Intercepted in `complete_waiter`: a heartbeat's answer is an ID
+            // and a round trip, not a response for anyone.
+        }
+    }
+}
+
+/// Finish a backend reply: finalize it, then write it to the waiter, or re-park
+/// the same waiter on the upstream that fetches the custom error page.
+fn complete_waiter(
+    result: std::io::Result<forward::HttpResponse>,
+    ctx: Box<forward::PendingUrlContext>,
+    waiter: Waiter,
+    cx: &mut CompletionCtx<'_>,
+) {
+    // A check's answer is not a client response. Parse it into a decision and
+    // re-enter the request path with it, so the answer the client receives is
+    // produced by `handle_request` and its post-processing runs once.
+    if ctx.kind == forward::PendingKind::Auth {
+        complete_auth(result, ctx, waiter, cx);
+        return;
+    }
+    // A member's answer to a change sequence's `POST /genid` is not a client
+    // response: it is a verdict on that member. 204 is done, 404 and 405 say
+    // the backend has nothing to refresh, and anything else is a failure the
+    // advance still runs past. The failure is named against the member's
+    // socket, which is the one thing an operator needs to find it.
+    if let Waiter::Genid { member } = waiter {
+        let path = cx
+            .state
+            .genid
+            .source()
+            .and_then(|g| g.member_path(member))
+            .map(|p| p.display().to_string());
+        let ok = match &result {
+            Ok(response) => match response.status {
+                204 => true,
+                404 | 405 => {
+                    debug!(
+                        member = path.as_deref().unwrap_or(""),
+                        status = response.status,
+                        "genid: member has nothing to refresh"
+                    );
+                    true
+                }
+                status => {
+                    error!(
+                        member = path.as_deref().unwrap_or(""),
+                        status, "genid: member refresh failed"
+                    );
+                    false
+                }
+            },
+            Err(e) => {
+                error!(
+                    member = path.as_deref().unwrap_or(""),
+                    error = %e,
+                    "genid: member refresh failed"
+                );
+                false
+            }
+        };
+        if cx
+            .state
+            .genid
+            .source_mut()
+            .is_some_and(|g| g.member_done(ok))
+        {
+            genid_finish(cx);
+        }
+        return;
+    }
+    // A heartbeat's answer is an ID and a round trip, not a response: it
+    // updates the follower and is never finalised or written to anyone.
+    if let Waiter::Heartbeat = waiter {
+        let rtt = ctx.start.elapsed();
+        let outcome = match &result {
+            Ok(response) if response.status == 200 => {
+                match m6_core::headers::get(&response.headers[..], genid::GENID_HEADER)
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+                {
+                    Some(id) => Ok((id, rtt)),
+                    None => Err("no M6-Genid"),
+                }
+            }
+            Ok(_) => Err("status"),
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Err("timed out"),
+            Err(_) => Err("connect failed"),
+        };
+        follower_answered(cx.state, outcome, cx.now, false);
+        return;
+    }
+    let method = &ctx.req.method;
+    // The generation this reply carries is the one current when it was
+    // dispatched, not the one after a later advance. A synthesised 502 has no
+    // backend reply behind it, so it carries none. A cache node passes none:
+    // the upstream's own `M6-Genid` travels in the headers it forwards, and a
+    // cache hit writes the entry's ID through its own writer.
+    let genid = match &cx.state.genid {
+        genid::Role::Cache(_) => None,
+        genid::Role::Source(_) => result.as_ref().ok().map(|_| ctx.genid),
+    };
+    match finalize_url_response(result, &ctx, cx.quic_port, cx.state, cx.registry) {
+        Completion::Ready((status, headers, body, _)) => {
+            // A cache miss answered by a backend is counted here, where the
+            // answer arrives: this is the one point every protocol's fetched
+            // response passes through, and the only one where the final status
+            // and the miss latency are both known. A background refresh is not
+            // a visit and is not counted.
+            if !ctx.is_prefetch {
+                if let Some(chan) = waiter_channel(&waiter, cx.state) {
+                    let elapsed_ns = ctx.start.elapsed().as_nanos() as u64;
+                    cx.state.stats.record(
+                        elapsed_ns,
+                        CacheOutcome::FetchedMiss,
+                        status,
+                        chan,
+                        &ctx.backend_name,
+                    );
+                }
+            }
+            let priority = if matches!(waiter, Waiter::H3 { .. }) {
+                priority::from_headers(
+                    ctx.req
+                        .headers
+                        .iter()
+                        .map(|(name, value)| (name.as_bytes(), value.as_bytes())),
+                )
+            } else {
+                priority::Priority::default()
+            };
+            write_waiter(waiter, status, headers, body, method, priority, genid, cx);
+        }
+        Completion::Pending { id, ctx } => {
+            park(cx.state, id, ctx, waiter);
+        }
+    }
+}
+
+/// One gate's check request, with everything its pending context carries.
+struct CheckPlan<'a> {
+    req: &'a forward::HttpRequest,
+    client_ip: &'a str,
+    enc: &'a str,
+    auth_backend: String,
+    content_backend: String,
+    route_path: String,
+    route_cache: Option<String>,
+    cacheable: bool,
+    is_prefetch: bool,
+    from_internal: bool,
+    gate: forward::AuthGate,
+    require: String,
+}
+
+/// What resolving a gate's check produced.
+enum CheckResolution {
+    Decision(core_auth::Decision),
+    /// The request is parked on the authority; this is the answer to return.
+    Pending(RequestOutcome),
+}
+
+/// Resolve one gate's credential check.
+///
+/// A `pre_decided` answer for this gate is used as it is, which is the
+/// re-entry. Otherwise a request with no credential is refused here without a
+/// call, and a request with one parks on `POST /check`. Every launch failure is
+/// the authority being unreachable, so it answers 503 through
+/// `backend_unavailable`, never a 502 and never a 401.
+fn resolve_check(
+    plan: CheckPlan<'_>,
+    pre_decided: Option<PreDecided>,
+    state: &mut ServerState,
+    registry: &m6_core::platform::Registry,
+) -> CheckResolution {
+    if let Some(pre) = pre_decided {
+        return CheckResolution::Decision(if pre.gate == plan.gate {
+            pre.decision
+        } else {
+            core_auth::Decision::NoDecision
+        });
+    }
+    debug!("auth check");
+    let auth_header = m6_core::headers::get(&plan.req.headers[..], "authorization");
+    let cookie_header = auth::combined_cookie_header(&plan.req.headers);
+    let Some(credential) = auth::extract_token(auth_header, cookie_header.as_deref()) else {
+        return CheckResolution::Decision(core_auth::Decision::NoCredential);
+    };
+    let slot = match launch_socket_upstream(
+        state,
+        registry,
+        UpstreamSend::Check { credential },
+        plan.client_ip,
+        &plan.auth_backend,
+        auth::CHECK_DEADLINE,
+    ) {
+        Ok(slot) => slot,
+        Err(e) => {
+            note_check_reachability(state, false);
+            warn!(
+                backend = %plan.auth_backend,
+                route = %plan.route_path,
+                error = ?e,
+                "auth check dispatch failed"
+            );
+            return CheckResolution::Pending(backend_unavailable(
+                plan.req,
+                plan.client_ip,
+                state,
+                registry,
+                &plan.route_path,
+                &plan.auth_backend,
+                "auth check unavailable",
+            ));
+        }
+    };
+    let ctx = forward::PendingUrlContext {
+        req: plan.req.clone(),
+        client_ip: plan.client_ip.to_string(),
+        enc: plan.enc.to_string(),
+        backend_name: plan.content_backend,
+        kind: forward::PendingKind::Auth,
+        route_path: Some(plan.route_path),
+        auth_require: Some(plan.require),
+        auth_gate: Some(plan.gate),
+        from_internal: plan.from_internal,
+        route_cache: plan.route_cache,
+        cacheable: plan.cacheable,
+        is_prefetch: plan.is_prefetch,
+        start: m6_core::platform::now(),
+        error_status_override: None,
+        extra_headers: Vec::new(),
+        genid: state.genid.dispatched(),
+        genid_forward: false,
+    };
+    CheckResolution::Pending(RequestOutcome::Pending {
+        id: UpstreamId::Slot(slot),
+        ctx: Box::new(ctx),
+    })
+}
+
+/// The configured authority's backend name, or `[auth]` for an error context.
+fn auth_backend_name(state: &ServerState) -> String {
+    state
+        .config
+        .auth
+        .as_ref()
+        .map(|auth| auth.backend.clone())
+        .unwrap_or_else(|| "[auth]".to_string())
+}
+
+/// Record whether the authority answered, with one log line per change.
+///
+/// `answered` is false only when the check did not answer at all: a transport
+/// failure or the 50 ms deadline. A checker that answers 401, 403, 500 or 503
+/// is present and answering, so those leave the flag set. The flag is the
+/// `auth-checker` dependency's state for `/health`, and it is read and written
+/// here only: one bool, no timer and no probe.
+fn note_check_reachability(state: &mut ServerState, answered: bool) {
+    if state.auth_check_answered == answered {
+        return;
+    }
+    state.auth_check_answered = answered;
+    if answered {
+        info!(
+            dependency = "auth-checker",
+            "the check backend answered again"
+        );
+    } else {
+        warn!(
+            dependency = "auth-checker",
+            "the check backend did not answer"
+        );
+    }
+}
+
+/// Finish a check: apply the route's `require` to the identity, then re-enter
+/// `handle_request` with the decision.
+///
+/// A 200 with a complete identity is `Allow`, a 401 is `NoCredential`, and every
+/// other status, an unparsable 200, a timeout and a connect failure are
+/// `NoDecision`. The re-entry is `handle_request`, not `handle_request_inner`,
+/// because the Vary, Date, describedby and invalidation step runs only there
+/// and must run once, on the answer the client receives.
+fn complete_auth(
+    result: std::io::Result<forward::HttpResponse>,
+    ctx: Box<forward::PendingUrlContext>,
+    waiter: Waiter,
+    cx: &mut CompletionCtx<'_>,
+) {
+    note_check_reachability(cx.state, result.is_ok());
+    let decision = match (ctx.auth_require.as_deref(), &result) {
+        (Some(require), Ok(response)) => {
+            core_auth::parse_check(response.status, &response.body).decide(require)
+        }
+        // No require string can only mean the context was built by something
+        // other than the gate. Fail closed with the same 503 the authority's
+        // silence gets.
+        _ => core_auth::Decision::NoDecision,
+    };
+    let outcome = handle_request(
+        &ctx.req,
+        &ctx.client_ip,
+        &ctx.enc,
+        cx.state,
+        ctx.is_prefetch,
+        ctx.from_internal,
+        cx.registry,
+        Some(PreDecided {
+            gate: ctx.auth_gate.unwrap_or(forward::AuthGate::Route),
+            decision,
+        }),
+    );
+    let priority = if matches!(waiter, Waiter::H3 { .. }) {
+        priority::from_headers(
+            ctx.req
+                .headers
+                .iter()
+                .map(|(name, value)| (name.as_bytes(), value.as_bytes())),
+        )
+    } else {
+        priority::Priority::default()
+    };
+    match outcome {
+        RequestOutcome::Ready(status, mut headers, body, backend, genid) => {
+            // The re-entry writes its answer here, not through `finish_miss`,
+            // so it runs the two steps that tail runs. Without them the
+            // authority's 401, the browser's 302, the 403 and the 503 are the
+            // only answers this release writes without `Alt-Svc`, and none of
+            // them is counted as answered locally.
+            set_alt_svc(&mut headers, cx.quic_port);
+            if let Some(chan) = waiter_channel(&waiter, cx.state) {
+                cx.state.stats.record(
+                    ctx.start.elapsed().as_nanos() as u64,
+                    CacheOutcome::AnsweredLocally,
+                    status,
+                    chan,
+                    &backend,
+                );
+            }
+            write_waiter(
+                waiter,
+                status,
+                headers,
+                body,
+                &ctx.req.method,
+                priority,
+                genid,
+                cx,
+            );
+        }
+        // Allowing the request dispatches it to its own backend. The same
+        // waiter waits for that reply, and this is the one place it is
+        // re-parked, exactly as a custom error page does.
+        RequestOutcome::Pending { id, ctx: next } => park(cx.state, id, next, waiter),
+        // A `require` route never reads the shared cache. If one arrives, write
+        // it rather than dropping the request.
+        RequestOutcome::Cached { entry, .. } => {
+            write_waiter(
+                waiter,
+                entry.status,
+                entry.headers.to_pairs(),
+                entry.body.to_vec(),
+                &ctx.req.method,
+                priority,
+                Some(entry.genid),
+                cx,
+            );
+        }
+    }
+}
+
+/// The (version, interface) channel a parked request arrived on, read from the
+/// connection its waiter names.
+///
+/// The same lookup `write_waiter` uses to deliver the reply, so the figures are
+/// attributed to the connection that is actually answered. `None` for a waiter
+/// that is not a client request at all: a background refresh, a heartbeat or a
+/// change sequence, none of which is traffic.
+fn waiter_channel(waiter: &Waiter, state: &ServerState) -> Option<Channel> {
+    let (version, iface) = match waiter {
+        Waiter::H1 { conn, .. } => (HttpVersion::Http11, connection_iface(*conn, state)),
+        Waiter::H2 { conn, .. } => (HttpVersion::Http2, connection_iface(*conn, state)),
+        Waiter::H3 { .. } => (HttpVersion::Http3, state.tls_iface),
+        Waiter::Background | Waiter::Heartbeat | Waiter::Genid { .. } => return None,
+    };
+    Some(Channel::new(version, iface))
+}
+
+/// Which interface a client connection's socket was accepted on.
+fn connection_iface(conn: Token, state: &ServerState) -> Iface {
+    match state.sources.get(conn.0) {
+        Source::H2cConn(_) => state.h2c_iface,
+        _ => state.tls_iface,
+    }
+}
+
+/// Complete each finished h2 stream into the waiter it names.
+#[allow(clippy::too_many_arguments)] // the loop's whole context, as CompletionCtx::new takes it
+fn complete_h2_streams(
+    completions: Vec<H2Completion>,
+    state: &mut ServerState,
+    tcp: &mut Option<Http11Listener>,
+    h2c: &mut Option<H2cListener>,
+    registry: &m6_core::platform::Registry,
+    quic_port: u16,
+    udp: &UdpSocket,
+    batch: UdpBatch,
+    out: &mut [u8],
+    connections: &mut HashMap<Vec<u8>, QuicConn>,
+) {
+    for c in completions {
+        if let (Some(waiter), Some(ctx)) = (c.waiter, c.ctx) {
+            let mut cx = CompletionCtx::new(
+                state,
+                tcp,
+                h2c,
+                registry,
+                quic_port,
+                udp,
+                batch,
+                out,
+                connections,
+                m6_core::platform::now(),
+            );
+            complete_waiter(c.result, ctx, waiter, &mut cx);
+        }
+    }
+}
+
+/// Start one change sequence: collect every socket member, tell `Genid` how
+/// many owe an answer, and `POST /genid` to each on its own upstream slot.
+///
+/// A member whose connect fails before it is registered is counted as failed
+/// here, with its socket path in the log, so the sequence still finishes.
+fn start_genid_sequence(state: &mut ServerState, registry: &m6_core::platform::Registry) {
+    let members = state.pool_manager.socket_members();
+    if let Some(g) = state.genid.source_mut() {
+        g.start(&members);
+    }
+    let host = state.config.site.domain.clone();
+    for (index, path) in members.iter().enumerate() {
+        if launch_genid_member(state, registry, index as u32, path, &host).is_err() {
+            error!(
+                member = %path.display(),
+                "genid: member refresh failed to start"
+            );
+            if state
+                .genid
+                .source_mut()
+                .is_some_and(|g| g.member_done(false))
+            {
+                break;
+            }
+        }
+    }
+}
+
+/// Encode and start `POST /genid` on one member's own socket, outside the
+/// pool's member choice and in-flight count, and register it under its own
+/// token and deadline. The completion is a `Waiter::Genid`.
+fn launch_genid_member(
+    state: &mut ServerState,
+    registry: &m6_core::platform::Registry,
+    member: u32,
+    path: &std::path::Path,
+    host: &str,
+) -> Result<(), ()> {
+    let deadline = m6_core::platform::now()
+        + std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
+    let Some(owner) = state.upstreams.take() else {
+        return Err(());
+    };
+    let Some(token) = take_token(state) else {
+        state.upstreams.free(owner.key);
+        return Err(());
+    };
+    let req = forward::HttpRequest {
+        method: "POST".to_string(),
+        path: m6_core::site::GENID_PATH.to_string(),
+        query: None,
+        version: "HTTP/1.1".to_string(),
+        headers: Vec::new(),
+        body: Vec::new(),
+    };
+    let encoded = {
+        let entry = state.upstreams.get_mut(owner.key);
+        forward::encode_request(entry.upstream.request_buf(), &req, "127.0.0.1", host)
+    };
+    if encoded.is_err() {
+        state.upstreams.free(owner.key);
+        *state.sources.get_mut(token.0) = Source::Vacant;
+        state.sources.free(token.0);
+        return Err(());
+    }
+    let started = {
+        let entry = state.upstreams.get_mut(owner.key);
+        entry.addr = m6_core::client::Addr::Unix(path.to_path_buf());
+        entry.upstream.start(&entry.addr, None, false, deadline)
+    };
+    if started.is_err() {
+        state.upstreams.free(owner.key);
+        *state.sources.get_mut(token.0) = Source::Vacant;
+        state.sources.free(token.0);
+        return Err(());
+    }
+    let interest = {
+        let entry = state.upstreams.get_mut(owner.key);
+        let interest = entry.upstream.interest();
+        if registry
+            .register_fd(entry.upstream.fd(), token, interest)
+            .is_err()
+        {
+            entry.upstream.close();
+            state.upstreams.free(owner.key);
+            *state.sources.get_mut(token.0) = Source::Vacant;
+            state.sources.free(token.0);
+            return Err(());
+        }
+        interest
+    };
+    state
+        .upstream_timeouts
+        .touch(token, m6_core::platform::now());
+    *state.sources.get_mut(token.0) = Source::Upstream(owner.key);
+    let entry = state.upstreams.get_mut(owner.key);
+    entry.kind = UpstreamKind::Member;
+    entry.token = token;
+    entry.waiter = Some(Waiter::Genid { member });
+    entry.ctx = Some(forward::PendingUrlContext::for_genid());
+    entry.registered_interest = interest;
+    Ok(())
+}
+
+/// The change step, run in one turn once every member has answered or failed:
+/// rebuild the route table from the config loaded at start, swap the cache and
+/// the held error pages for empty ones in one step each, advance the ID, write
+/// it, and answer the covered POSTs.
+///
+/// The swap is the whole flush: no entry survives into the new generation. One
+/// assignment publishes each replacement, so a request sees the old generation
+/// or the new one and never a half-emptied cache. A request already holding an
+/// entry finishes on the clone it took.
+///
+/// A route-table build error keeps the old table and is logged. The ID is
+/// written before any POST is answered, so a publisher that sees 200 knows the
+/// new generation survives a restart.
+fn genid_finish(cx: &mut CompletionCtx<'_>) {
+    loop {
+        // A `[[route_group]]` glob is re-expanded here, so a publish that adds
+        // a file a glob matches gains its route. The config is the one loaded
+        // at start: a `site.toml` edit needs a restart.
+        match RouteTable::from_config(&cx.state.config) {
+            Ok(table) => cx.state.route_table = table,
+            Err(e) => error!(
+                error = %e,
+                "genid: route table rebuild failed; keeping the old table"
+            ),
+        }
+        drop(cx.state.cache.swap_generation());
+        cx.state.error_pages = HashMap::new();
+
+        let Some(finished) = cx.state.genid.source_mut().map(|g| g.finish()) else {
+            return;
+        };
+        let state_path = cx
+            .state
+            .genid
+            .source()
+            .and_then(|g| g.state_path())
+            .map(std::path::Path::to_path_buf);
+        let mut write_error = None;
+        if let Some(path) = state_path {
+            if let Err(e) = genid::write_state(&path, finished.id) {
+                error!(path = %path.display(), error = %e, "genid: state write failed");
+                write_error = Some(format!("{}: {e}", path.display()));
+            }
+        }
+        info!(
+            genid = finished.id,
+            members = finished.members,
+            failed = finished.failed,
+            elapsed_ms = finished.elapsed_ms,
+            "genid advanced"
+        );
+
+        let headers = vec![
+            ("Content-Type".to_string(), "application/json".to_string()),
+            ("Cache-Control".to_string(), "no-store".to_string()),
+        ];
+        let mut body = Vec::with_capacity(32);
+        body.extend_from_slice(b"{\"genid\":\"");
+        body.extend_from_slice(itoa::Buffer::new().format(finished.id).as_bytes());
+        body.extend_from_slice(b"\"}");
+        for waiter in finished.covered {
+            match &write_error {
+                None => write_waiter(
+                    waiter,
+                    200,
+                    headers.clone(),
+                    body.clone(),
+                    "POST",
+                    priority::Priority::default(),
+                    Some(finished.id),
+                    cx,
+                ),
+                Some(path) => {
+                    let body = format!("genid state write failed: {path}");
+                    write_waiter(
+                        waiter,
+                        500,
+                        headers.clone(),
+                        body.into_bytes(),
+                        "POST",
+                        priority::Priority::default(),
+                        Some(finished.id),
+                        cx,
+                    );
+                }
+            }
+        }
+
+        if !finished.again {
+            break;
+        }
+        start_genid_sequence(cx.state, cx.registry);
+        if !cx.state.genid.source().is_some_and(|g| g.finish_due()) {
+            break;
+        }
+    }
+}
+
+/// Run the sequence work a loop turn owes: start one when a POST asked for it,
+/// and complete one whose members have all answered without an event of their
+/// own (no members at all, or every connect failed at start).
+fn genid_pump(cx: &mut CompletionCtx<'_>) {
+    let start = cx
+        .state
+        .genid
+        .source_mut()
+        .is_some_and(|g| g.take_start_requested());
+    if start {
+        start_genid_sequence(cx.state, cx.registry);
+    }
+    if cx.state.genid.source().is_some_and(|g| g.finish_due()) {
+        genid_finish(cx);
+    }
+}
+
+/// What to do with one backend reply: store it under an ID, wake the heartbeat
+/// because it names a newer generation, or nothing.
+enum ReplyRule {
+    Store(u64),
+    Behind,
+    Nothing,
+}
+
+/// The ID an upstream stamped on a reply, parsed in place from the borrowed
+/// header value. No copy and no allocation.
+fn reply_id(headers: &[(String, String)]) -> Option<u64> {
+    m6_core::headers::get(headers, genid::GENID_HEADER)
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+/// Apply the store rule to one reply. The rule itself lives on the
+/// [`genid::Role`]: the source stores under the ID it dispatched under, and a
+/// cache node stores only a reply that carries the ID it holds.
+///
+/// A cache node also reads every reply's `M6-Genid` here, so a reply under
+/// another ID wakes the heartbeat at once. That is one borrowed header lookup
+/// and one parse for a reply, the cost the latency budget allows.
+fn reply_rule(
+    state: &ServerState,
+    ctx: &forward::PendingUrlContext,
+    status: u16,
+    headers: &[(String, String)],
+) -> ReplyRule {
+    let id = reply_id(headers);
+    if let Some(f) = state.genid.cache() {
+        if let Some(id) = id {
+            if Some(id) != f.current() {
+                return ReplyRule::Behind;
+            }
+        }
+        if !ctx.cacheable
+            || !request_permits_storage(&ctx.req.headers)
+            || !should_cache(status, headers)
+        {
+            return ReplyRule::Nothing;
+        }
+        return state
+            .genid
+            .may_store_parsed(ctx.genid, id)
+            .map_or(ReplyRule::Nothing, ReplyRule::Store);
+    }
+    if !ctx.cacheable
+        || !request_permits_storage(&ctx.req.headers)
+        || !should_cache(status, headers)
+    {
+        return ReplyRule::Nothing;
+    }
+    if let Some(g) = state.genid.source() {
+        if ctx.genid == g.current() {
+            return ReplyRule::Store(ctx.genid);
+        }
+    }
+    ReplyRule::Nothing
+}
+
+/// Encode the heartbeat's `GET /genid` once, at start. The authority is the
+/// backend's, as every URL forward is, and the token is the one from
+/// `[genid] token_file`.
+fn encode_heartbeat_request(host: &str, token: &str, out: &mut Vec<u8>) {
+    out.extend_from_slice(b"GET ");
+    out.extend_from_slice(m6_core::site::GENID_PATH.as_bytes());
+    out.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+    out.extend_from_slice(host.as_bytes());
+    out.extend_from_slice(b"\r\nAuthorization: Bearer ");
+    out.extend_from_slice(token.as_bytes());
+    out.extend_from_slice(b"\r\n\r\n");
+}
+
+/// Start one heartbeat on the upstream slot, from the bytes fixed at start.
+///
+/// `NoSlot` is the node being busy, not the upstream being down, so the caller
+/// leaves the heartbeat due and tries on the next turn.
+fn launch_heartbeat(
+    state: &mut ServerState,
+    registry: &m6_core::platform::Registry,
+) -> Result<(), UrlDispatchError> {
+    let Some(backend_idx) = state.heartbeat_backend else {
+        return Err(UrlDispatchError::NoSlot);
+    };
+    let (key, token, watched) = take_url_slot(state, backend_idx)?;
+    {
+        // Disjoint fields: the bytes copied from are fixed at start and this
+        // never allocates the slot's buffer beyond its first use.
+        let entry = state.upstreams.get_mut(key);
+        entry
+            .upstream
+            .request_buf()
+            .extend_from_slice(&state.heartbeat_request);
+    }
+    begin_url_slot(state, registry, backend_idx, key, token, watched, false)?;
+    let entry = state.upstreams.get_mut(key);
+    entry.waiter = Some(Waiter::Heartbeat);
+    entry.ctx = Some(forward::PendingUrlContext::for_heartbeat());
+    Ok(())
+}
+
+/// Start a cache node's heartbeat when one is due. One in flight at most, on
+/// the tick, with no timer of its own.
+fn heartbeat_pump(cx: &mut CompletionCtx<'_>) {
+    let due = cx
+        .state
+        .genid
+        .cache()
+        .is_some_and(|f| f.heartbeat_due(cx.now));
+    if !due {
+        return;
+    }
+    match launch_heartbeat(cx.state, cx.registry) {
+        Ok(()) => {
+            if let Some(f) = cx.state.genid.cache_mut() {
+                f.sent();
+            }
+        }
+        // A full upstream table retries on the next turn: the heartbeat is
+        // still due and nothing was started.
+        Err(UrlDispatchError::NoSlot) => {}
+        Err(UrlDispatchError::Failed(e)) => {
+            warn!(error = %e, "genid: heartbeat failed to start");
+            follower_answered(cx.state, Err("connect failed"), cx.now, true);
+        }
+    }
+}
+
+/// Apply one heartbeat or forwarded-request answer: the log line on the
+/// transition, the held flag, and on a new ID the flush.
+fn follower_answered(
+    state: &mut ServerState,
+    result: Result<(u64, std::time::Duration), &'static str>,
+    now: Instant,
+    behind: bool,
+) {
+    let (outcome, recovered) = {
+        let Some(f) = state.genid.cache_mut() else {
+            return;
+        };
+        let was_down = f.down();
+        let outcome = f.answered(result, now);
+        if behind {
+            f.behind(now);
+        }
+        (outcome, was_down && !f.down())
+    };
+    // The first answer settles a disk copy read at start. It is held aside
+    // rather than installed so the node never serves a generation the site
+    // has already left; the same equality the store rule uses decides it.
+    if let Some(loaded) = state.pending_disk.take() {
+        match genid::settle(loaded.id, &outcome) {
+            genid::Settle::Keep => {
+                let id = loaded.id;
+                state.cache = loaded.cache;
+                state.disk_state = disk_cache::LoadState::Kept;
+                info!(genid = id, "disk cache kept");
+            }
+            genid::Settle::Discard => {
+                state.disk_state = disk_cache::LoadState::Discarded;
+                info!("disk cache discarded: the site changed while this node was down");
+            }
+            genid::Settle::Unverified => {
+                let id = loaded.id;
+                state.cache = loaded.cache;
+                state.disk_state = disk_cache::LoadState::Unverified;
+                if let Some(f) = state.genid.cache_mut() {
+                    f.install_unverified(id);
+                }
+                if let Some(disk) = state.disk.as_mut() {
+                    disk.use_id(id);
+                }
+                warn!(
+                    genid = id,
+                    "disk cache served unverified: the upstream did not answer"
+                );
+            }
+        }
+    }
+    match outcome {
+        genid::Outcome::Down(reason) => {
+            state.cache.set_serve_held(true);
+            warn!(
+                reason,
+                "genid: upstream down; serving held content stale until it answers"
+            );
+        }
+        genid::Outcome::StillDown => {}
+        genid::Outcome::First(id) => {
+            state.cache.set_serve_held(false);
+            // The disk copy starts with the first ID. Nothing was stored
+            // before it, so this only creates the generation's directory. On
+            // a kept load the directory is the one already read, and this
+            // call leaves it alone.
+            if let Some(disk) = state.disk.as_mut() {
+                disk.use_id(id);
+            }
+            info!(genid = id, "genid: upstream answered; following its ID");
+        }
+        genid::Outcome::Same => {
+            state.cache.set_serve_held(false);
+            // A success after an unverified install confirms the disk copy:
+            // the ID is unchanged, so nothing is flushed. The operator saw the
+            // "served unverified" warning when the first answer timed out, so
+            // this transition writes the same "kept" line the settle path
+            // writes. Without it the metrics document says kept and the log
+            // never does.
+            if state.disk_state == disk_cache::LoadState::Unverified {
+                state.disk_state = disk_cache::LoadState::Kept;
+                if let Some(id) = state.genid.cache().and_then(|f| f.current()) {
+                    info!(genid = id, "disk cache kept");
+                }
+            }
+        }
+        genid::Outcome::Changed { from, to } => {
+            state.cache.set_serve_held(false);
+            // The change flushes the cache, so a load that was installed is
+            // no longer the content the node serves.
+            if matches!(
+                state.disk_state,
+                disk_cache::LoadState::Kept | disk_cache::LoadState::Unverified
+            ) {
+                state.disk_state = disk_cache::LoadState::Discarded;
+            }
+            follower_change(state, from, to);
+        }
+    }
+    if recovered {
+        info!("genid: upstream up");
+    }
+}
+
+/// A forwarded client request could not reach the upstream: mark it down, log
+/// the transition once, and serve held content from here on.
+fn follower_failed(state: &mut ServerState, reason: &'static str, now: Instant) {
+    let first = state.genid.cache_mut().is_some_and(|f| f.failed(now));
+    if !first {
+        return;
+    }
+    state.cache.set_serve_held(true);
+    warn!(
+        reason,
+        "genid: upstream down; serving held content stale until it answers"
+    );
+}
+
+/// The change on a cache node: the route table rebuilt from the config loaded
+/// at start, the cache and the held error pages swapped for empty ones in one
+/// assignment each, then the log line an operator reads a publish as. The
+/// cache refills on demand.
+///
+/// The swap and the reason for it are in [`Cache::swap_generation`]: no entry
+/// survives the generation, and a request already holding one finishes on its
+/// clone.
+fn follower_change(state: &mut ServerState, from: u64, to: u64) {
+    match RouteTable::from_config(&state.config) {
+        Ok(table) => state.route_table = table,
+        Err(e) => error!(
+            error = %e,
+            "genid: route table rebuild failed; keeping the old table"
+        ),
+    }
+    drop(state.cache.swap_generation());
+    state.error_pages = HashMap::new();
+    // The new generation gets its own directory. The queue and the size map
+    // are cleared and every other subdirectory is queued for removal over the
+    // ticks that follow. The swap above already emptied the memory cache, so
+    // no queued flag survives on a key this writer still holds.
+    if let Some(disk) = state.disk.as_mut() {
+        disk.use_id(to);
+    }
+    info!(from, to, "genid changed");
+}
+
+/// Drive the one upstream whose descriptor fired.
+fn drive_upstream_one(token: Token, cx: &mut CompletionCtx<'_>) {
+    let Source::Upstream(slot) = *cx.state.sources.get(token.0) else {
+        return;
+    };
+    let result = {
+        let entry = cx.state.upstreams.get_mut(slot);
+        let upstream = &mut entry.upstream;
+        match upstream.drive() {
+            Ok(true) => {
+                let mut slots: [std::mem::MaybeUninit<httparse::Header<'_>>;
+                    m6_core::client::MAX_HEADERS] =
+                    [const { std::mem::MaybeUninit::uninit() }; m6_core::client::MAX_HEADERS];
+                match upstream.reply(&mut slots) {
+                    Some(reply) => {
+                        cx.registry.deregister_fd(upstream.fd()).ok();
+                        Some(Ok(forward::HttpResponse::from_reply(&reply)))
+                    }
+                    None => {
+                        cx.registry.deregister_fd(upstream.fd()).ok();
+                        Some(Err(std::io::Error::other(
+                            "upstream reported a reply but none parsed",
+                        )))
+                    }
+                }
+            }
+            Ok(false) => {
+                // The request is not finished, and `drive` moved the phase on:
+                // Connecting waits for WRITABLE, then the request or the
+                // ClientHello is written and it waits for READABLE. The new
+                // interest is registered after the drive, because under epoll
+                // edge-triggering a mask written before it waits for an edge
+                // that may never arrive. Only a change costs a reregister.
+                let interest = upstream.interest();
+                if interest != entry.registered_interest {
+                    cx.registry
+                        .reregister_fd(upstream.fd(), token, interest)
+                        .ok();
+                    entry.registered_interest = interest;
+                }
+                None
+            }
+            Err(e) => {
+                cx.registry.deregister_fd(upstream.fd()).ok();
+                Some(Err(e))
+            }
+        }
+    };
+    let Some(result) = result else {
+        return;
+    };
+    let (waiter, ctx) = retire_upstream(token, slot, &result, cx);
+    if let (Some(waiter), Some(ctx)) = (waiter, ctx) {
+        complete_waiter(result, ctx, waiter, cx);
+    }
+}
+
+/// Take a finished upstream out of the loop: free its token, its deadline and
+/// its slot, and tell its owner how the request went.
+///
+/// A socket member needs no state updated: the pool carries no per-member
+/// health, and the next request takes the next member in turn. A URL backend
+/// whose reply left the connection reusable keeps its slot on that backend's
+/// idle list, still registered for read, so the backend closing it wakes the
+/// loop and the slot is dropped before any request can be handed the dead
+/// connection.
+fn retire_upstream(
+    token: Token,
+    slot: usize,
+    result: &std::io::Result<forward::HttpResponse>,
+    cx: &mut CompletionCtx<'_>,
+) -> (Option<Waiter>, Option<Box<forward::PendingUrlContext>>) {
+    let (kind, waiter, ctx, reusable) = {
+        let entry = cx.state.upstreams.get_mut(slot);
+        (
+            entry.kind,
+            entry.waiter.take(),
+            entry.ctx.take(),
+            entry.upstream.reusable(),
+        )
+    };
+    let mut kept = false;
+    match kind {
+        UpstreamKind::Member => {
+            cx.state.upstreams.get_mut(slot).upstream.close();
+            cx.state.upstreams.free(slot);
+        }
+        UpstreamKind::Url(idx) => {
+            kept = result.is_ok()
+                && reusable
+                && cx.state.pool_manager.url_backend_mut(idx).idle.push(slot);
+            if kept {
+                let entry = cx.state.upstreams.get_mut(slot);
+                entry.kind = UpstreamKind::IdleUrl(idx);
+                let interest = Interest::READABLE;
+                cx.registry
+                    .register_fd(entry.upstream.fd(), token, interest)
+                    .ok();
+                entry.registered_interest = interest;
+            } else {
+                cx.state.upstreams.get_mut(slot).upstream.close();
+                cx.state.upstreams.free(slot);
+            }
+        }
+        // An idle slot has no request to retire; its own event path drops it.
+        UpstreamKind::IdleUrl(_) => {
+            cx.state.upstreams.get_mut(slot).upstream.close();
+            cx.state.upstreams.free(slot);
+        }
+    }
+    if !kept {
+        *cx.state.sources.get_mut(token.0) = Source::Vacant;
+        cx.state.sources.free(token.0);
+    }
+    cx.state.upstream_timeouts.clear(token);
+    cx.state.auth_timeouts.clear(token);
+    (waiter, ctx)
+}
+
+/// Drop an idle URL connection whose descriptor fired.
+///
+/// It has no request, so a readable event means the backend closed it or sent
+/// something unexpected. Either way the connection is not reusable, and it is
+/// closed here so no request is handed it.
+fn drop_idle_url(
+    slot: usize,
+    backend_idx: usize,
+    state: &mut ServerState,
+    registry: &m6_core::platform::Registry,
+) {
+    let token = state.upstreams.get(slot).token;
+    registry
+        .deregister_fd(state.upstreams.get(slot).upstream.fd())
+        .ok();
+    state.upstreams.get_mut(slot).upstream.close();
+    state.upstreams.free(slot);
+    state
+        .pool_manager
+        .url_backend_mut(backend_idx)
+        .idle
+        .remove(slot);
+    *state.sources.get_mut(token.0) = Source::Vacant;
+    state.sources.free(token.0);
+    state.upstream_timeouts.clear(token);
+    state.auth_timeouts.clear(token);
+    debug!(
+        backend = %state.pool_manager.url_backend(backend_idx).name,
+        "idle url connection dropped"
+    );
+}
+
+/// Close the upstream whose deadline passed.
+fn expire_upstream(token: Token, cx: &mut CompletionCtx<'_>) {
+    let Source::Upstream(slot) = *cx.state.sources.get(token.0) else {
+        return;
+    };
+    cx.registry
+        .deregister_fd(cx.state.upstreams.get(slot).upstream.fd())
+        .ok();
+    let timed_out = Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "backend timed out",
+    ));
+    let (waiter, ctx) = retire_upstream(token, slot, &timed_out, cx);
+    if let (Some(waiter), Some(ctx)) = (waiter, ctx) {
+        complete_waiter(timed_out, ctx, waiter, cx);
+    }
+}
+
+/// Ensure an h2c pool connection exists for a URL backend, registering it under
+/// its own token. A token is taken first, so a full table fails before any
+/// connection is created, and every failure frees what it took.
+fn ensure_h2c_conn(
+    state: &mut ServerState,
+    backend_idx: usize,
+    registry: &m6_core::platform::Registry,
+) -> Result<(), UrlDispatchError> {
+    let Some(token) = take_token(state) else {
+        return Err(UrlDispatchError::NoSlot);
+    };
+    let created = {
+        let backend = state.pool_manager.url_backend(backend_idx);
+        state
+            .h2c_pool
+            .ensure_connection(&backend.url, backend.addr())
+    };
+    let created = match created {
+        Ok(c) => c,
+        Err(e) => {
+            *state.sources.get_mut(token.0) = Source::Vacant;
+            state.sources.free(token.0);
+            return Err(UrlDispatchError::Failed(e));
+        }
+    };
+    if !created {
+        // The connection already existed and is registered under its own token.
+        *state.sources.get_mut(token.0) = Source::Vacant;
+        state.sources.free(token.0);
+        return Ok(());
+    }
+    let registered = {
+        let backend = state.pool_manager.url_backend(backend_idx);
+        let conn = state
+            .h2c_pool
+            .connection_mut(&backend.url)
+            .expect("just created");
+        conn.set_token(token);
+        let interest = conn.phase_interest();
+        conn.set_interest(interest);
+        registry.register_fd(conn.raw_fd(), token, interest)
+    };
+    if let Err(e) = registered {
+        state.h2c_pool.remove_by_token(token, registry);
+        *state.sources.get_mut(token.0) = Source::Vacant;
+        state.sources.free(token.0);
+        return Err(UrlDispatchError::Failed(e));
+    }
+    *state.sources.get_mut(token.0) = Source::H2cUpstream;
+    Ok(())
+}
+
+/// Ensure an h2s pool connection exists for a URL backend, registering it under
+/// its own token. A token is taken first, so a full table fails before any
+/// connection is created, and every failure frees what it took.
+fn ensure_h2s_conn(
+    state: &mut ServerState,
+    backend_idx: usize,
+    registry: &m6_core::platform::Registry,
+) -> Result<(), UrlDispatchError> {
+    let Some(token) = take_token(state) else {
+        return Err(UrlDispatchError::NoSlot);
+    };
+    let created = {
+        let backend = state.pool_manager.url_backend(backend_idx);
+        let tls = backend
+            .tls
+            .as_ref()
+            .expect("an h2s backend's TLS client is built at start");
+        state
+            .h2s_pool
+            .ensure_connection(&backend.url, backend.addr(), tls)
+    };
+    let created = match created {
+        Ok(c) => c,
+        Err(e) => {
+            *state.sources.get_mut(token.0) = Source::Vacant;
+            state.sources.free(token.0);
+            return Err(UrlDispatchError::Failed(e));
+        }
+    };
+    if !created {
+        *state.sources.get_mut(token.0) = Source::Vacant;
+        state.sources.free(token.0);
+        return Ok(());
+    }
+    let registered = {
+        let backend = state.pool_manager.url_backend(backend_idx);
+        let conn = state
+            .h2s_pool
+            .connection_mut(&backend.url)
+            .expect("just created");
+        conn.set_token(token);
+        let interest = conn.phase_interest();
+        conn.set_interest(interest);
+        registry.register_fd(conn.raw_fd(), token, interest)
+    };
+    if let Err(e) = registered {
+        state.h2s_pool.remove_by_token(token, registry);
+        *state.sources.get_mut(token.0) = Source::Vacant;
+        state.sources.free(token.0);
+        return Err(UrlDispatchError::Failed(e));
+    }
+    *state.sources.get_mut(token.0) = Source::H2sUpstream;
+    Ok(())
+}
+
+/// Deregister both listeners so new clients wait in the kernel's backlog.
+fn deregister_listeners(poll: &Poll, tcp: Option<&Http11Listener>, h2c: Option<&H2cListener>) {
+    if let Some(t) = tcp {
+        poll.registry().deregister_fd(t.raw_fd()).ok();
+        if let Some(fd) = t.status_fd() {
+            poll.registry().deregister_fd(fd).ok();
+        }
+    }
+    if let Some(h) = h2c {
+        poll.registry().deregister_fd(h.raw_fd()).ok();
+    }
+}
+
+/// Re-register both listeners once a token slot has come free.
+fn register_listeners(poll: &Poll, tcp: Option<&Http11Listener>, h2c: Option<&H2cListener>) {
+    if let Some(t) = tcp {
+        poll.registry()
+            .register_fd(t.raw_fd(), TOKEN_TLS_LISTENER, Interest::READABLE)
+            .ok();
+        if let Some(fd) = t.status_fd() {
+            poll.registry()
+                .register_fd(fd, TOKEN_STATUS_LISTENER, Interest::READABLE)
+                .ok();
+        }
+    }
+    if let Some(h) = h2c {
+        poll.registry()
+            .register_fd(h.raw_fd(), TOKEN_H2C_LISTENER, Interest::READABLE)
+            .ok();
+    }
 }
 
 fn event_loop(
     io: EventLoopIo,
     state: &mut ServerState,
     quiche_config: &mut quiche::Config,
-    log_handle: &m6_core::log::LogHandle,
+    lifecycle: &mut m6_core::signal::Lifecycle,
 ) -> i32 {
     // Destructured rather than accessed through `io` throughout: the loop body
     // is long and reads better against the names it has always used.
     let EventLoopIo {
         udp,
+        udp_local,
+        udp_batch,
         mut tcp,
         mut h2c,
-        mut watcher,
-        mut reloader,
-        wake_reader,
+        mut signals,
     } = io;
-    let poller = match Poller::new() {
+    let mut poll = match Poll::new() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("poller init failed: {e}");
+            eprintln!("poll init failed: {e}");
             return 2;
         }
     };
 
-    if let Err(e) = poller.add(udp.as_raw_fd(), TOKEN_UDP) {
-        eprintln!("poller add UDP failed: {e}");
+    if let Err(e) = poll
+        .registry()
+        .register_fd(udp.as_raw_fd(), TOKEN_UDP, Interest::READABLE)
+    {
+        eprintln!("poll add UDP failed: {e}");
         return 2;
     }
     if let Some(ref t) = tcp {
-        let _ = poller.add(t.raw_fd(), TOKEN_TCP);
-    }
-    if let Some(ref h) = h2c {
-        let _ = poller.add(h.raw_fd(), TOKEN_H2C);
-    }
-    if let Some(ref w) = watcher {
-        if let Some(fd) = w.raw_fd() {
-            let _ = poller.add(fd, TOKEN_INOTIFY);
+        let _ = poll
+            .registry()
+            .register_fd(t.raw_fd(), TOKEN_TLS_LISTENER, Interest::READABLE);
+        if let Some(fd) = t.status_fd() {
+            let _ = poll
+                .registry()
+                .register_fd(fd, TOKEN_STATUS_LISTENER, Interest::READABLE);
         }
     }
-
-    if let Some(fd) = reloader.raw_fd() {
-        let _ = poller.add(fd, TOKEN_CONFIG);
+    if let Some(ref h) = h2c {
+        let _ = poll
+            .registry()
+            .register_fd(h.raw_fd(), TOKEN_H2C_LISTENER, Interest::READABLE);
     }
-
-    // Wake pipe: the shutdown hook writes to it so a blocked `wait()` returns
-    // at once. Created in `run` before signals were installed, so the first
-    // signal could never arrive with nowhere to write.
-    if let Err(e) = poller.add(wake_reader.as_raw_fd(), TOKEN_WAKE) {
-        error!(error = %e, "registering the shutdown wake pipe");
+    // Signals arrive on their own descriptor, under the number the wake pipe
+    // used to hold.
+    if let Err(e) = poll
+        .registry()
+        .register_fd(signals.raw_fd(), TOKEN_SIGNAL, Interest::READABLE)
+    {
+        error!(error = %e, "registering the signal descriptor");
         return 1;
     }
 
@@ -642,1003 +2973,852 @@ fn event_loop(
     let quic_port = udp.local_addr().map(|a| a.port()).unwrap_or(8443);
 
     let mut connections: HashMap<Vec<u8>, QuicConn> = HashMap::new();
-    // Maps the client's original Initial DCID (may be shorter than MAX_CONN_ID_LEN)
-    // to the 20-byte SCID under which the connection is stored.  Needed because
-    // quiche generates a 16-byte random Initial DCID on the client side, but
-    // Header::from_slice for short-header 1-RTT packets always reads MAX_CONN_ID_LEN
-    // (20) bytes.  Using a fresh 20-byte server SCID ensures all subsequent packets
-    // (Handshake + 1-RTT) carry a 20-byte DCID that matches the stored key.
     let mut conn_id_map: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
-    let mut recv_buf = vec![0u8; 65536];
-    let mut ev_buf = [Token(0); 64];
+    // One slot per receive, and a slot is sized for a coalesced read: Linux
+    // UDP GRO can hand back up to 64 KB in one `recvmmsg` entry, and a smaller
+    // slot would truncate it. A socket without GRO fills the same slots one
+    // datagram at a time.
+    let mut recv_buf = vec![0u8; MAX_BATCH * RECV_SLOT];
+    // One batch buffer for every flush in the loop. A flush packs into this
+    // and sends it once; reusing it keeps a flush free of allocation and of a
+    // 64 KB clear.
+    let mut flush_buf = vec![0u8; QUIC_BATCH_BYTES];
+    let mut events = Events::with_capacity(256);
+    // Wait time against work time, per kind of event that woke the loop. An
+    // iteration with events of several kinds is counted under its first event.
+    let mut trace = LoopTrace::new(&[
+        "accept", "conn", "upstream", "udp", "signal", "timeout", "log",
+    ]);
+    let mut last = m6_core::platform::now();
+    let mut last_log_tick = last;
+    // The accounting tick: flush the log buffers, check the heap's growth and
+    // read one host source, once a second. A debug build reads
+    // `M6_TEST_ACCOUNTING_TICK_SECS` to move it, so a test that counts
+    // allocations over a run can keep this periodic work out of its window. It
+    // is not request work, its cost depends on which host source the tick
+    // steps, and a longer run crosses more ticks, so leaving it in a window
+    // turns a per-run cost into a per-request figure that moves with the
+    // runner's speed.
+    let accounting_tick = test_accounting_tick();
 
-    // When no filesystem watcher is available (e.g. macOS), rescan backend
-    // socket globs every 2 seconds so new workers are picked up automatically.
-    let rescan_interval = std::time::Duration::from_secs(2);
-    // When the cache is to be emptied again after a `site.toml` reload.
-    let mut later_clears: [Option<std::time::Instant>; 2] = [None, None];
-    let mut last_rescan = std::time::Instant::now()
-        .checked_sub(rescan_interval)
-        .unwrap_or_else(std::time::Instant::now);
+    let mut accepting = tcp.is_some() || h2c.is_some();
+    // Set by a disk slice that found nothing it could do; see the slice below.
+    let mut disk_slice_stalled = false;
+    // Whether the QUIC socket is registered for writability because some
+    // connection is holding a batch the socket refused. Kept so the interest
+    // changes only when it has to: `reregister_fd` always issues the call.
+    let mut watching = false;
+    // The connections one `recvmmsg` batch fed. It is cleared when each batch
+    // is flushed, so its capacity survives the whole run.
+    let mut touched = Touched::default();
 
-    loop {
-        // Compute the soonest connection timeout
-        // Idle poll cap. Was 100ms originally — every async backend round trip
-        // (every cache-node→origin fetch) was silently paying up to that much
-        // in pure poll latency, since a response arriving mid-wait is only
-        // noticed on the *next* tick. A "0ms only while a dispatch is actually
-        // pending" version was tried and, on measurement, never actually
-        // engaged — the flat cap below was doing all the work both times it
-        // was tested. Rather than ship a conditional that doesn't do what it
-        // claims, this is a flat cap: verified to cut cache-node→origin
-        // latency from ~107ms to ~10-15ms, at the cost of ~100 wakeups/sec/
-        // process at genuine idle (vs ~10/sec at the original 100ms) — a
-        // real, small, quantified trade, not a hidden one.
-        let timeout_ms = connections
+    // Count this thread's allocations from the first iteration. The
+    // counter is read once at stop, after the loop, where ordinary logging may
+    // allocate and is not part of the run.
+    #[cfg(feature = "count-allocations")]
+    m6_core::testkit::alloc_count::arm();
+
+    // The counted window can begin after a run's warm-up, so the
+    // per-request figure is not polluted by the one TLS handshake every run
+    // makes. A handshake's own allocation count moves with the read sizes the
+    // peer's flight arrives in, and on the build host it moved by more than the
+    // one call the h1 hit budget allows. The test sets `M6_ALLOC_MARK_AFTER` to
+    // the request number to read the counter at, and `tests/allocations.rs`
+    // takes that reading as the row's baseline. `requests_total` is bumped
+    // where a response is decided and the write follows in the same turn, so a
+    // reading at the top of the next turn is after that response is on the wire
+    // and its allocations are in the count. Off unless the feature and the
+    // variable are both present.
+    #[cfg(feature = "count-allocations")]
+    let mark_after: Option<u64> = std::env::var("M6_ALLOC_MARK_AFTER")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|after| *after > 0);
+    #[cfg(feature = "count-allocations")]
+    let mut marked = mark_after.is_none();
+
+    'run: loop {
+        #[cfg(feature = "count-allocations")]
+        if !marked && state.stats.requests_total >= mark_after.unwrap_or(u64::MAX) {
+            marked = true;
+            let (calls, bytes) = m6_core::testkit::alloc_count::count();
+            info!(calls, bytes, "allocations at mark");
+        }
+        // The wait is the earliest of three bounds: the 1 s accounting tick,
+        // every deadline table (connections, upstreams and h2 streams), and
+        // quiche's own timeout over the QUIC connections. Nothing else needs a
+        // shorter wait: every reply arrives on a descriptor.
+        let tick = std::time::Duration::from_secs(1);
+        let now0 = m6_core::platform::now();
+        let mut poll_timeout = state.read_timeouts.timeout(now0, tick);
+        poll_timeout = poll_timeout.min(state.h2_idle_timeouts.timeout(now0, tick));
+        poll_timeout = poll_timeout.min(state.upstream_timeouts.timeout(now0, tick));
+        poll_timeout = poll_timeout.min(state.auth_timeouts.timeout(now0, tick));
+        poll_timeout = poll_timeout.min(state.h2c_pool.timeout(now0, tick));
+        poll_timeout = poll_timeout.min(state.h2s_pool.timeout(now0, tick));
+        let quic_timeout = connections
             .values()
             .filter_map(|c| c.conn.timeout())
             .min()
-            .map(|d| d.as_millis() as i32)
-            .unwrap_or(100)
-            .min(10);
+            .unwrap_or(tick)
+            .min(tick);
+        poll_timeout = poll_timeout.min(quic_timeout);
+        // A disk slice rides each idle turn: while the writer has work the
+        // loop polls with a zero timeout, so the next slice starts as soon as
+        // this turn's events are handled. A request on a descriptor is delayed
+        // by at most one slice. With the queue empty the normal wait returns.
+        if !disk_slice_stalled
+            && state
+                .disk
+                .as_ref()
+                .is_some_and(|disk| disk.has_work(&state.cache))
+        {
+            poll_timeout = std::time::Duration::ZERO;
+        }
+        // Edge-triggered: a capped accept leaves connections in the kernel
+        // queue that the h2c listener will not be reported for again. Drain
+        // before waiting, and do not block while more remain.
+        let mut h2c_full = false;
+        if let Some(h) = h2c.as_mut() {
+            if h.accept_again() {
+                let (full, again) = accept_h2c(h, state, poll.registry(), m6_core::platform::now());
+                h.set_accept_again(again);
+                if again {
+                    poll_timeout = std::time::Duration::ZERO;
+                }
+                h2c_full = full;
+            }
+        }
+        if h2c_full && accepting {
+            deregister_listeners(&poll, tcp.as_ref(), h2c.as_ref());
+            accepting = false;
+        }
 
-        let n = match poller.wait(&mut ev_buf, timeout_ms) {
-            Ok(n) => n,
+        match poll.poll(&mut events, Some(poll_timeout)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => {
-                error!(error = %e, "poller error");
+                error!(error = %e, "poll error");
                 return 1;
             }
-        };
-
-        if m6_core::signal::is_shutdown() {
-            break;
         }
+        let now = m6_core::platform::now();
+        trace.waited(now - last);
 
-        for ev in &ev_buf[..n] {
-            match *ev {
-                // Shutdown poke. Drained so one byte cannot spin the loop; the
-                // flag was already checked above, so there is nothing else to
-                // do here.
-                TOKEN_WAKE => {
-                    wake_reader.drain();
+        let first_trigger = events.iter().next().map(|ev| ev.token());
+        let first_index = trigger_index(first_trigger, &state.sources);
+        for ev in &events {
+            match ev.token() {
+                TOKEN_SIGNAL => {
+                    let mut stop = false;
+                    while let Some(sig) = signals.read() {
+                        if lifecycle.on_signal(sig) == m6_core::signal::Action::Stop {
+                            stop = true;
+                        }
+                    }
+                    if stop {
+                        break 'run;
+                    }
                 }
+                TOKEN_LOG => m6_core::log::flush(),
                 TOKEN_UDP => {
-                    drain_udp(
-                        &udp,
-                        &mut recv_buf,
-                        &mut connections,
-                        &mut conn_id_map,
-                        quiche_config,
-                        state,
-                        quic_port,
-                    );
-                }
-                TOKEN_TCP => {
-                    if let Some(ref mut t) = tcp {
-                        t.accept_pending(&poller, TOKEN_TCP);
+                    if ev.is_readable() {
+                        drain_udp(
+                            BoundUdp {
+                                socket: &udp,
+                                local: udp_local,
+                                batch: udp_batch,
+                                recv_buf: &mut recv_buf,
+                                flush_buf: &mut flush_buf,
+                                touched: &mut touched,
+                            },
+                            &mut connections,
+                            &mut conn_id_map,
+                            quiche_config,
+                            state,
+                            &H3Loop {
+                                registry: poll.registry(),
+                                quic_port,
+                            },
+                        );
+                    }
+                    // The socket buffer has room again: send what the batch it
+                    // refused left behind, and nothing on any other socket.
+                    if ev.is_writable() {
+                        flush_blocked(&udp, udp_batch, &mut flush_buf, &mut connections);
                     }
                 }
-                TOKEN_H2C => {
-                    if let Some(ref mut h) = h2c {
-                        h.accept_pending(&poller, TOKEN_H2C);
-                    }
-                }
-                TOKEN_CONFIG => reloader.on_readable(std::time::Instant::now()),
-                TOKEN_INOTIFY => {
-                    if let Some(ref mut w) = watcher {
-                        for event in w.read_events() {
-                            handle_fs_event(&event, state);
+                TOKEN_TLS_LISTENER => {
+                    if let Some(t) = tcp.as_mut() {
+                        let full = accept_tls(t, false, state, poll.registry(), now);
+                        if full && accepting {
+                            deregister_listeners(&poll, tcp.as_ref(), h2c.as_ref());
+                            accepting = false;
                         }
                     }
                 }
-                _ => {}
+                TOKEN_STATUS_LISTENER => {
+                    if let Some(t) = tcp.as_mut() {
+                        let full = accept_tls(t, true, state, poll.registry(), now);
+                        if full && accepting {
+                            deregister_listeners(&poll, tcp.as_ref(), h2c.as_ref());
+                            accepting = false;
+                        }
+                    }
+                }
+                TOKEN_H2C_LISTENER => {
+                    if let Some(h) = h2c.as_mut() {
+                        let (full, again) = accept_h2c(h, state, poll.registry(), now);
+                        h.set_accept_again(again);
+                        if full && accepting {
+                            deregister_listeners(&poll, tcp.as_ref(), h2c.as_ref());
+                            accepting = false;
+                        }
+                    }
+                }
+                Token(k) => match *state.sources.get(k) {
+                    Source::TlsConn(_) | Source::H2cConn(_) => {
+                        drive_conn_token(
+                            Token(k),
+                            state,
+                            &mut tcp,
+                            &mut h2c,
+                            poll.registry(),
+                            quic_port,
+                            now,
+                        );
+                    }
+                    Source::H2cUpstream => {
+                        if state.h2c_pool.drive_one(Token(k), poll.registry()) {
+                            state.h2c_pool.remove_by_token(Token(k), poll.registry());
+                            *state.sources.get_mut(k) = Source::Vacant;
+                            state.sources.free(k);
+                        }
+                        let completions = state.h2c_pool.drain_completions();
+                        complete_h2_streams(
+                            completions,
+                            state,
+                            &mut tcp,
+                            &mut h2c,
+                            poll.registry(),
+                            quic_port,
+                            &udp,
+                            udp_batch,
+                            &mut flush_buf,
+                            &mut connections,
+                        );
+                    }
+                    Source::H2sUpstream => {
+                        if state.h2s_pool.drive_one(Token(k), poll.registry()) {
+                            state.h2s_pool.remove_by_token(Token(k), poll.registry());
+                            *state.sources.get_mut(k) = Source::Vacant;
+                            state.sources.free(k);
+                        }
+                        let completions = state.h2s_pool.drain_completions();
+                        complete_h2_streams(
+                            completions,
+                            state,
+                            &mut tcp,
+                            &mut h2c,
+                            poll.registry(),
+                            quic_port,
+                            &udp,
+                            udp_batch,
+                            &mut flush_buf,
+                            &mut connections,
+                        );
+                    }
+                    Source::Upstream(slot) => {
+                        if let UpstreamKind::IdleUrl(backend_idx) = state.upstreams.get(slot).kind {
+                            drop_idle_url(slot, backend_idx, state, poll.registry());
+                        } else {
+                            let mut cx = CompletionCtx::new(
+                                &mut *state,
+                                &mut tcp,
+                                &mut h2c,
+                                poll.registry(),
+                                quic_port,
+                                &udp,
+                                udp_batch,
+                                &mut flush_buf,
+                                &mut connections,
+                                now,
+                            );
+                            drive_upstream_one(Token(k), &mut cx);
+                        }
+                    }
+                    Source::Vacant => {}
+                },
             }
         }
 
-        // Drive HTTP/1.1 connections. Per-connection fds are registered with TOKEN_TCP
-        // so this also runs on data-ready events, not only on the periodic tick.
-        if let Some(ref mut t) = tcp {
-            // Safety: on_request and on_response are called sequentially, never
-            // concurrently, so the two `&mut state` aliases never overlap.
-            let state_ptr = state as *mut ServerState;
-            let handshakes = t.drive_all(
-                |req, client_ip| {
-                    let state = unsafe { &mut *state_ptr };
-                    let ua = analytics::header(&req.headers, "user-agent");
-                    if let Some(blocked) = check_rate_limit(state, client_ip, &req.path, ua) {
-                        return blocked;
-                    }
-                    // Ahead of the cache lookup below: the key has no host
-                    // component, so a warm apex entry would answer a www
-                    // request and this redirect would never run.
-                    if let Some(redirect) = www_redirect(req, &state.config) {
-                        return redirect;
-                    }
-                    let enc_str =
-                        m6_core::headers::get(&req.headers[..], "accept-encoding").unwrap_or("");
-                    let start = std::time::Instant::now();
+        // A full stdout holds its bytes in the Sink. Watch it for writability
+        // only while it does, so the loop never waits on the log.
+        if let Err(e) = m6_core::log::watch(poll.registry(), TOKEN_LOG) {
+            error!(error = %e, "log descriptor registration failed");
+        }
 
-                    // ── Cache lookup — check before forwarding to backend ──────────
-                    // Routes with `require` are never served from cache: the
-                    // key has no identity component, so a hit would bypass the
-                    // auth check that runs later in handle_request.
-                    // Method gate as well as auth: only GET and HEAD may be
-                    // answered from cache, so an unsafe or unknown verb can
-                    // never be handed a cached entry.
-                    let cacheable = !state.route_table.requires_auth(&req.path)
-                        && m6_http_lib::cache::method_may_read_cache(&req.method);
-                    let mut key_buf = [0u8; 512];
-                    let lookup_key =
-                        make_lookup_key(&req.path, req.query.as_deref(), enc_str, &mut key_buf);
-                    let req_cc = m6_http_lib::cache::RequestDirectives::parse(&req.headers);
-                    let looked_up = if cacheable {
-                        state.cache.lookup_with(lookup_key, &req_cc)
-                    } else {
-                        m6_http_lib::cache::Lookup::Miss
-                    };
-                    // RFC 9111 5.2.1.7: `only-if-cached` means answer from
-                    // cache or not at all. Going to the backend anyway would
-                    // defeat the one thing the client asked for.
-                    if req_cc.only_if_cached
-                        && matches!(looked_up, m6_http_lib::cache::Lookup::Miss)
-                    {
-                        let mut headers: Vec<(String, String)> = Vec::new();
-                        set_date(&mut headers);
-                        return RequestOutcome::Ready(
-                            504,
-                            headers,
-                            Vec::new(),
-                            "cache".to_string(),
-                        );
-                    }
-                    // Serve stale immediately and refresh behind the request:
-                    // making this visitor wait on an origin round trip is the
-                    // thing the cache exists to avoid. Costs one stale serve.
-                    // A stale serve logs as STALE, not HIT: it is a hit for
-                    // latency purposes but the visitor got the previous
-                    // generation of the content, and that difference has to be
-                    // legible in the logs rather than hidden inside "HIT".
-                    let cache_state = if matches!(looked_up, m6_http_lib::cache::Lookup::Stale(..))
-                    {
-                        "STALE"
-                    } else {
-                        "HIT"
-                    };
-                    if let m6_http_lib::cache::Lookup::Stale(..) = looked_up {
-                        state.queue_refresh(Refresh {
-                            path: req.path.clone(),
-                            query: req.query.clone(),
-                            enc: enc_str.to_string(),
-                        });
-                    }
-                    if let m6_http_lib::cache::Lookup::Fresh(cached, age)
-                    | m6_http_lib::cache::Lookup::Stale(cached, age) = looked_up
-                    {
-                        let elapsed_ns = start.elapsed().as_nanos() as u64;
-                        // Version from the REQUEST, not the listener: h1 and
-                        // h2 share this TLS listener via ALPN.
-                        let chan =
-                            Channel::new(HttpVersion::from_wire(&req.version), state.tls_iface);
-
-                        let precond =
-                            evaluate_preconditions(&cached.headers, &req.headers, &req.method);
-                        // Recorded here, not before the precondition check.
-                        // A conditional request answered 304 (or 412) would
-                        // otherwise be counted as the cached 200, which is the
-                        // opposite of what a response-code breakdown is for --
-                        // revalidation traffic would be invisible.
-                        // `evaluate_preconditions` is pure, so hoisting it is safe.
-                        state.stats.record(
-                            elapsed_ns,
-                            true,
-                            match precond {
-                                Precondition::Failed => 412,
-                                Precondition::NotModified => 304,
-                                _ => cached.status,
-                            },
-                            chan,
-                            "cache",
-                        );
-                        if precond == Precondition::Failed {
-                            // RFC 9110 13.2.2 steps 1-2: the client asserted
-                            // something about the current representation that
-                            // is false (If-Match / If-Unmodified-Since), so the
-                            // request must not be applied and the cached copy
-                            // must not be served in its place.
-                            let mut headers: Vec<(String, String)> = Vec::new();
-                            set_date(&mut headers);
-                            analytics::finish_response(
-                                state.config.analytics.enabled,
-                                &mut headers,
-                                &req.headers,
-                                &analytics::Event {
-                                    node: &state.config.node.name,
-                                    path: &req.path,
-                                    status: 412,
-                                    cache_state,
-                                    client_ip,
-                                    latency_ns: Some(elapsed_ns),
-                                },
-                            );
-                            return RequestOutcome::Ready(
-                                412,
-                                headers,
-                                Vec::new(),
-                                "cache".to_string(),
-                            );
-                        }
-                        if precond == Precondition::NotModified {
-                            let mut headers = not_modified_headers(&cached.headers);
-                            // Vary and Date are applied AFTER the cache insert
-                            // (so `should_cache` sees the backend's own Vary),
-                            // which means the stored headers carry neither and
-                            // `not_modified_headers` has nothing to copy. Add
-                            // them here or the 304 goes out without the
-                            // metadata RFC 9110 15.4.5 requires -- and a client
-                            // updating its stored entry from it would lose the
-                            // knowledge that the response varies by encoding.
-                            set_vary_accept_encoding(&mut headers, true);
-                            set_age(&mut headers, age);
-                            set_date(&mut headers);
-                            debug!(
-                                path = %req.path,
-                                status = 304,
-                                version = %req.version,
-                                backend = "cache",
-                                latency_ns = elapsed_ns,
-                                cache_hit = true,
-                                "request complete"
-                            );
-                            analytics::finish_response(
-                                state.config.analytics.enabled,
-                                &mut headers,
-                                &req.headers,
-                                &analytics::Event {
-                                    node: &state.config.node.name,
-                                    path: &req.path,
-                                    status: 304,
-                                    cache_state,
-                                    client_ip,
-                                    latency_ns: Some(elapsed_ns),
-                                },
-                            );
-                            return RequestOutcome::Ready(
-                                304,
-                                headers,
-                                Vec::new(),
-                                "cache".to_string(),
-                            );
-                        }
-
-                        let mut headers: Vec<(String, String)> = (*cached.headers).clone();
-                        set_alt_svc(&mut headers, quic_port);
-                        set_vary_accept_encoding(&mut headers, true);
-                        set_age(&mut headers, age);
-                        set_describedby_link(&mut headers, &state.config.site.describedby);
-                        debug!(
-                            path = %req.path,
-                            status = cached.status,
-                            version = %req.version,
-                            backend = "cache",
-                            latency_ns = elapsed_ns,
-                            cache_hit = true,
-                            "request complete"
-                        );
-                        analytics::finish_response(
-                            state.config.analytics.enabled,
-                            &mut headers,
-                            &req.headers,
-                            &analytics::Event {
-                                node: &state.config.node.name,
-                                path: &req.path,
-                                status: cached.status,
-                                cache_state,
-                                client_ip,
-                                latency_ns: Some(elapsed_ns),
-                            },
-                        );
-                        return RequestOutcome::Ready(
-                            cached.status,
-                            headers,
-                            cached.body.to_vec(),
-                            "cache".to_string(),
-                        );
-                    } // end cache hit
-
-                    let mut outcome = handle_request(
-                        req, client_ip, enc_str, state, false, /* from_internal */ false,
-                    );
-                    if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome
-                    {
-                        set_alt_svc(headers, quic_port);
-                        // /health and /perf are separated inside
-                        // `Stats::record` now, not skipped here. See the
-                        // monitoring block in stats.rs: they are counted
-                        // apart from site traffic rather than discarded, so
-                        // requests_total is still a traffic-stall signal.
-                        // Record the cache MISS.
-                        //
-                        // This was missing, and the omission was invisible
-                        // because of where the only other miss-recording site
-                        // sits: the async URL-backend callback below. A cache
-                        // node's backend is the origin over h2c, which is
-                        // always async, so misses were counted there. The
-                        // ORIGIN's backends are unix sockets that complete
-                        // synchronously inside handle_request and return
-                        // Ready, so that callback never fires and no miss was
-                        // ever recorded on the origin.
-                        //
-                        // The consequence: cache_misses=0, miss_p50_ns=0, and
-                        // cache_hit_rate=1.0000 -- not a hit rate at all, but
-                        // "of the requests that were counted, all were hits",
-                        // because misses were never in the denominator.
-                        // requests_total undercounted by every miss, and
-                        // backend_errors_total could never rise on the origin
-                        // at all, since is_backend_error is only passed here
-                        // and in the async callback. A 500 from m6-html was
-                        // uncountable.
-                        //
-                        // Ready only. A Pending outcome is a URL backend whose
-                        // completion callback records it; recording here too
-                        // would double-count every edge miss.
-                        //
-                        // HTTP/3 already did this correctly, which is why the
-                        // gap survived: any check of the h3 path looked fine.
-                        let elapsed_ns = start.elapsed().as_nanos() as u64;
-                        let chan =
-                            Channel::new(HttpVersion::from_wire(&req.version), state.tls_iface);
-                        state.stats.record(elapsed_ns, false, status, chan, backend);
-                    }
-                    outcome
-                },
-                |http_result, ctx| {
-                    let state = unsafe { &mut *state_ptr };
-                    let (status, headers, body, backend_name) =
-                        finalize_url_response(http_result, ctx, quic_port, state);
-                    let elapsed_ns = ctx.start.elapsed().as_nanos() as u64;
-                    let chan =
-                        Channel::new(HttpVersion::from_wire(&ctx.req.version), state.tls_iface);
-                    state
-                        .stats
-                        .record(elapsed_ns, false, status, chan, &ctx.backend_name);
-                    debug!(
-                        path = %ctx.req.path,
-                        status,
-                        version = %ctx.req.version,
-                        backend = %backend_name,
-                        latency_ns = elapsed_ns,
-                        cache_hit = false,
-                        "request complete (async url backend)"
-                    );
-                    (status, headers, body, backend_name)
-                },
-                &poller,
+        // Close connections past their read or h2 idle deadline, and socket
+        // upstreams past their backend or check deadline.
+        while let Some(token) = state.read_timeouts.expired(m6_core::platform::now()) {
+            close_conn_token(token, state, &mut tcp, &mut h2c, poll.registry());
+        }
+        while let Some(token) = state.h2_idle_timeouts.expired(m6_core::platform::now()) {
+            close_conn_token(token, state, &mut tcp, &mut h2c, poll.registry());
+        }
+        while let Some(token) = state.upstream_timeouts.expired(m6_core::platform::now()) {
+            let mut cx = CompletionCtx::new(
+                &mut *state,
+                &mut tcp,
+                &mut h2c,
+                poll.registry(),
+                quic_port,
+                &udp,
+                udp_batch,
+                &mut flush_buf,
+                &mut connections,
+                now,
             );
-            // Handshakes completed on this wakeup, attributed by negotiated ALPN.
-            //
-            // Recorded here because this is where the stats live; the listener
-            // returns the samples rather than holding a stats handle of its own.
-            // The interface comes from the listener the connection arrived on, so
-            // a browser handshake and a backbone one land on different channels.
-            for hs in handshakes {
-                let v = if hs.is_h2 {
-                    HttpVersion::Http2
-                } else {
-                    HttpVersion::Http11
-                };
-                state.stats.record_handshake(
-                    hs.elapsed_ns,
-                    Channel::new(v, state.tls_iface),
-                    hs.resumed,
-                );
-            }
+            expire_upstream(token, &mut cx);
         }
-
-        // Drive H2C (HTTP/2 cleartext) connections.
-        if let Some(ref mut h) = h2c {
-            let state_ptr2 = state as *mut ServerState;
-            h.drive_all(
-                |req, client_ip| {
-                    let state = unsafe { &mut *state_ptr2 };
-                    let ua = analytics::header(&req.headers, "user-agent");
-                    if let Some(blocked) = check_rate_limit(state, client_ip, &req.path, ua) {
-                        return blocked;
-                    }
-                    // Ahead of the cache lookup below: the key has no host
-                    // component, so a warm apex entry would answer a www
-                    // request and this redirect would never run.
-                    if let Some(redirect) = www_redirect(req, &state.config) {
-                        return redirect;
-                    }
-                    let enc_str =
-                        m6_core::headers::get(&req.headers[..], "accept-encoding").unwrap_or("");
-                    let start = std::time::Instant::now();
-
-                    // ── Cache lookup — check before forwarding to backend ──────────
-                    // Routes with `require` are never served from cache: the
-                    // key has no identity component, so a hit would bypass the
-                    // auth check that runs later in handle_request.
-                    // Method gate as well as auth: only GET and HEAD may be
-                    // answered from cache, so an unsafe or unknown verb can
-                    // never be handed a cached entry.
-                    let cacheable = !state.route_table.requires_auth(&req.path)
-                        && m6_http_lib::cache::method_may_read_cache(&req.method);
-                    let mut key_buf = [0u8; 512];
-                    let lookup_key =
-                        make_lookup_key(&req.path, req.query.as_deref(), enc_str, &mut key_buf);
-                    let req_cc = m6_http_lib::cache::RequestDirectives::parse(&req.headers);
-                    let looked_up = if cacheable {
-                        state.cache.lookup_with(lookup_key, &req_cc)
-                    } else {
-                        m6_http_lib::cache::Lookup::Miss
-                    };
-                    // RFC 9111 5.2.1.7: `only-if-cached` means answer from
-                    // cache or not at all. Going to the backend anyway would
-                    // defeat the one thing the client asked for.
-                    if req_cc.only_if_cached
-                        && matches!(looked_up, m6_http_lib::cache::Lookup::Miss)
-                    {
-                        let mut headers: Vec<(String, String)> = Vec::new();
-                        set_date(&mut headers);
-                        return RequestOutcome::Ready(
-                            504,
-                            headers,
-                            Vec::new(),
-                            "cache".to_string(),
-                        );
-                    }
-                    // Serve stale now, refresh behind the request — see the
-                    // HTTP/1.1 path above for the reasoning.
-                    // A stale serve logs as STALE, not HIT: it is a hit for
-                    // latency purposes but the visitor got the previous
-                    // generation of the content, and that difference has to be
-                    // legible in the logs rather than hidden inside "HIT".
-                    let cache_state = if matches!(looked_up, m6_http_lib::cache::Lookup::Stale(..))
-                    {
-                        "STALE"
-                    } else {
-                        "HIT"
-                    };
-                    if let m6_http_lib::cache::Lookup::Stale(..) = looked_up {
-                        state.queue_refresh(Refresh {
-                            path: req.path.clone(),
-                            query: req.query.clone(),
-                            enc: enc_str.to_string(),
-                        });
-                    }
-                    if let m6_http_lib::cache::Lookup::Fresh(cached, age)
-                    | m6_http_lib::cache::Lookup::Stale(cached, age) = looked_up
-                    {
-                        let elapsed_ns = start.elapsed().as_nanos() as u64;
-                        let chan = Channel::new(HttpVersion::Http2, state.h2c_iface);
-                        // See the TLS path: the status must be the one actually
-                        // sent, so preconditions are evaluated first.
-                        let hit_status = match evaluate_preconditions(
-                            &cached.headers,
-                            &req.headers,
-                            &req.method,
-                        ) {
-                            Precondition::Failed => 412,
-                            Precondition::NotModified => 304,
-                            _ => cached.status,
-                        };
-                        state
-                            .stats
-                            .record(elapsed_ns, true, hit_status, chan, "cache");
-
-                        let precond =
-                            evaluate_preconditions(&cached.headers, &req.headers, &req.method);
-                        if precond == Precondition::Failed {
-                            // RFC 9110 13.2.2 steps 1-2: the client asserted
-                            // something about the current representation that
-                            // is false (If-Match / If-Unmodified-Since), so the
-                            // request must not be applied and the cached copy
-                            // must not be served in its place.
-                            let mut headers: Vec<(String, String)> = Vec::new();
-                            set_date(&mut headers);
-                            analytics::finish_response(
-                                state.config.analytics.enabled,
-                                &mut headers,
-                                &req.headers,
-                                &analytics::Event {
-                                    node: &state.config.node.name,
-                                    path: &req.path,
-                                    status: 412,
-                                    cache_state,
-                                    client_ip,
-                                    latency_ns: Some(elapsed_ns),
-                                },
-                            );
-                            return RequestOutcome::Ready(
-                                412,
-                                headers,
-                                Vec::new(),
-                                "cache".to_string(),
-                            );
-                        }
-                        if precond == Precondition::NotModified {
-                            let mut headers = not_modified_headers(&cached.headers);
-                            // Vary and Date are applied AFTER the cache insert
-                            // (so `should_cache` sees the backend's own Vary),
-                            // which means the stored headers carry neither and
-                            // `not_modified_headers` has nothing to copy. Add
-                            // them here or the 304 goes out without the
-                            // metadata RFC 9110 15.4.5 requires -- and a client
-                            // updating its stored entry from it would lose the
-                            // knowledge that the response varies by encoding.
-                            set_vary_accept_encoding(&mut headers, true);
-                            set_age(&mut headers, age);
-                            set_date(&mut headers);
-                            debug!(
-                                path = %req.path,
-                                status = 304,
-                                version = "HTTP/2",
-                                backend = "cache",
-                                latency_ns = elapsed_ns,
-                                cache_hit = true,
-                                "request complete"
-                            );
-                            analytics::finish_response(
-                                state.config.analytics.enabled,
-                                &mut headers,
-                                &req.headers,
-                                &analytics::Event {
-                                    node: &state.config.node.name,
-                                    path: &req.path,
-                                    status: 304,
-                                    cache_state,
-                                    client_ip,
-                                    latency_ns: Some(elapsed_ns),
-                                },
-                            );
-                            return RequestOutcome::Ready(
-                                304,
-                                headers,
-                                Vec::new(),
-                                "cache".to_string(),
-                            );
-                        }
-
-                        let mut headers: Vec<(String, String)> = (*cached.headers).clone();
-                        set_alt_svc(&mut headers, quic_port);
-                        set_vary_accept_encoding(&mut headers, true);
-                        set_age(&mut headers, age);
-                        set_describedby_link(&mut headers, &state.config.site.describedby);
-                        debug!(
-                            path = %req.path,
-                            status = cached.status,
-                            version = "HTTP/2",
-                            backend = "cache",
-                            latency_ns = elapsed_ns,
-                            cache_hit = true,
-                            "request complete"
-                        );
-                        analytics::finish_response(
-                            state.config.analytics.enabled,
-                            &mut headers,
-                            &req.headers,
-                            &analytics::Event {
-                                node: &state.config.node.name,
-                                path: &req.path,
-                                status: cached.status,
-                                cache_state,
-                                client_ip,
-                                latency_ns: Some(elapsed_ns),
-                            },
-                        );
-                        return RequestOutcome::Ready(
-                            cached.status,
-                            headers,
-                            cached.body.to_vec(),
-                            "cache".to_string(),
-                        );
-                    } // end cache hit
-
-                    let mut outcome = handle_request(
-                        req,
-                        client_ip,
-                        enc_str,
-                        state,
-                        false,
-                        state.h2c_iface == Iface::Internal,
-                    );
-                    if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome
-                    {
-                        set_alt_svc(headers, quic_port);
-                        // Same two notes as the HTTP/1.1 path above: /health and
-                        // /perf are separated inside `Stats::record`, and this
-                        // Ready path records the cache miss itself because the
-                        // async URL-backend callback never runs for it.
-                        let elapsed_ns = start.elapsed().as_nanos() as u64;
-                        // h2c is HTTP/2 by definition; the interface class comes
-                        // from its bind address (the private backbone here).
-                        let chan = Channel::new(HttpVersion::Http2, state.h2c_iface);
-                        state.stats.record(elapsed_ns, false, status, chan, backend);
-                    }
-                    outcome
-                },
-                |http_result, ctx| {
-                    let state = unsafe { &mut *state_ptr2 };
-                    let (status, headers, body, backend_name) =
-                        finalize_url_response(http_result, ctx, quic_port, state);
-                    let elapsed_ns = ctx.start.elapsed().as_nanos() as u64;
-                    let chan = Channel::new(HttpVersion::Http2, state.h2c_iface);
-                    state
-                        .stats
-                        .record(elapsed_ns, false, status, chan, &ctx.backend_name);
-                    debug!(
-                        path = %ctx.req.path,
-                        status,
-                        version = "HTTP/2",
-                        backend = %backend_name,
-                        latency_ns = elapsed_ns,
-                        cache_hit = false,
-                        "request complete (async url backend)"
-                    );
-                    (status, headers, body, backend_name)
-                },
-                &poller,
+        while let Some(token) = state.auth_timeouts.expired(m6_core::platform::now()) {
+            let mut cx = CompletionCtx::new(
+                &mut *state,
+                &mut tcp,
+                &mut h2c,
+                poll.registry(),
+                quic_port,
+                &udp,
+                udp_batch,
+                &mut flush_buf,
+                &mut connections,
+                now,
             );
-            // No handshake recording here, and that is not an omission. This is
-            // the H2C CLEARTEXT listener -- a different type from the TLS one
-            // above, with its own `drive_all` that returns nothing because there
-            // is no handshake to time. h2c is the backbone path from the cache
-            // nodes, which carry their own TLS to the visitor and reach the
-            // origin in the clear over the private backbone.
+            expire_upstream(token, &mut cx);
+        }
+        let now2 = m6_core::platform::now();
+        let (dead, completions) = state.h2c_pool.expire(now2, poll.registry());
+        for token in dead {
+            state.h2c_pool.remove_by_token(token, poll.registry());
+            *state.sources.get_mut(token.0) = Source::Vacant;
+            state.sources.free(token.0);
+        }
+        complete_h2_streams(
+            completions,
+            state,
+            &mut tcp,
+            &mut h2c,
+            poll.registry(),
+            quic_port,
+            &udp,
+            udp_batch,
+            &mut flush_buf,
+            &mut connections,
+        );
+        let (dead, completions) = state.h2s_pool.expire(now2, poll.registry());
+        for token in dead {
+            state.h2s_pool.remove_by_token(token, poll.registry());
+            *state.sources.get_mut(token.0) = Source::Vacant;
+            state.sources.free(token.0);
+        }
+        complete_h2_streams(
+            completions,
+            state,
+            &mut tcp,
+            &mut h2c,
+            poll.registry(),
+            quic_port,
+            &udp,
+            udp_batch,
+            &mut flush_buf,
+            &mut connections,
+        );
+
+        // The change sequence a POST asked for, and a sequence whose members
+        // have all answered without an event of their own. Nothing here blocks:
+        // it starts upstreams and hands their answers to the same loop.
+        {
+            let mut cx = CompletionCtx::new(
+                &mut *state,
+                &mut tcp,
+                &mut h2c,
+                poll.registry(),
+                quic_port,
+                &udp,
+                udp_batch,
+                &mut flush_buf,
+                &mut connections,
+                now,
+            );
+            genid_pump(&mut cx);
+            heartbeat_pump(&mut cx);
         }
 
-        // Drive connection timeouts and flush pending sends
-        flush_all(&udp, &mut connections);
-
-        // Drive outbound H2C and H2S client connections.
-        state.h2c_pool.drive_all(&poller, TOKEN_H2C_CLIENT);
-        state.h2s_pool.drive_all(&poller, TOKEN_H2S_CLIENT);
-
-        // Poll pending URL-backend responses for H3 streams.
-        for qconn in connections.values_mut() {
-            let sids: Vec<u64> = qconn.pending_url.keys().copied().collect();
-            for sid in sids {
-                use std::sync::mpsc::TryRecvError;
-                // rx sends io::Result<HttpResponse>, so try_recv() gives Result<io::Result<HttpResponse>, TryRecvError>.
-                let result: Option<std::io::Result<forward::HttpResponse>> =
-                    match qconn.pending_url.get(&sid) {
-                        Some((rx, _)) => match rx.try_recv() {
-                            Ok(r) => Some(r), // r is already io::Result<HttpResponse>
-                            Err(TryRecvError::Empty) => None,
-                            Err(TryRecvError::Disconnected) => Some(Err(std::io::Error::new(
-                                std::io::ErrorKind::BrokenPipe,
-                                "url backend thread died",
-                            ))),
-                        },
-                        None => None,
-                    };
-                if let Some(http_result) = result {
-                    let (_, ctx) = qconn.pending_url.remove(&sid).unwrap();
-                    let (status, resp_headers, body, _) =
-                        finalize_url_response(http_result, &ctx, quic_port, state);
-                    send_h3_response(
-                        sid,
-                        qconn,
-                        status,
-                        &resp_headers,
-                        Bytes::from(body),
-                        ctx.req.method.eq_ignore_ascii_case("HEAD"),
-                    );
-                }
-            }
+        // A slot came free while the token table was full: accept again.
+        if !accepting && !state.sources.is_full() {
+            register_listeners(&poll, tcp.as_ref(), h2c.as_ref());
+            accepting = true;
         }
 
-        // Remove closed/timed-out connections
+        // Drive the QUIC connections whose timer is due. The ones that received
+        // a packet this turn were flushed in drain_udp; an idle one needs nothing.
+        flush_due(&udp, udp_batch, &mut flush_buf, &mut connections, now2);
+
+        // Remove closed/timed-out connections. A connection that closed while
+        // it waited for the socket therefore stops holding the writable
+        // interest without anything to forget.
         connections.retain(|_, c| !c.conn.is_closed());
+        // A refused batch never waits for the loss timer, and an idle socket
+        // never wakes the loop. The interest is reregistered only when the
+        // answer changes.
+        watch_blocked(&udp, poll.registry(), &connections, &mut watching);
 
-        // Emit periodic stats (cheap check every iteration: compares one Instant)
-        state
-            .stats
-            .maybe_emit(state.pool_manager.total_active_members());
-
-        // Complete any background fetch whose reply has arrived. Runs through
-        // the same finalize_url_response as a real request, so the cache
-        // insert, header handling and hint extraction are identical -- the
-        // only difference is that the response body is discarded, there being
-        // no client to send it to.
-        if !state.background_pending.is_empty() {
-            use std::sync::mpsc::TryRecvError;
-            let mut done: Vec<(
-                std::io::Result<forward::HttpResponse>,
-                forward::PendingUrlContext,
-            )> = Vec::new();
-            let mut idx = 0;
-            while idx < state.background_pending.len() {
-                let got = match state.background_pending[idx].0.try_recv() {
-                    Ok(r) => Some(r),
-                    Err(TryRecvError::Empty) => None,
-                    // Backend thread died; take the entry so it cannot leak.
-                    Err(TryRecvError::Disconnected) => Some(Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "url backend thread died",
-                    ))),
-                };
-                match got {
-                    Some(result) => {
-                        let (_, ctx) = state.background_pending.remove(idx);
-                        done.push((result, ctx));
-                    }
-                    None => idx += 1,
-                }
-            }
-            for (result, ctx) in done {
-                let path = ctx.req.path.clone();
-                let _ = finalize_url_response(result, &ctx, quic_port, state);
-                debug!(path = %path, "background fetch: cache filled (async)");
-            }
+        // The accounting tick: flush the log buffers once a second, next to
+        // the loop trace's own accounting.
+        if now2.duration_since(last_log_tick) >= accounting_tick {
+            m6_core::log::tick(m6_core::platform::wall());
+            m6_core::alloc::note_growth();
+            // One host source a tick: one small file, never the whole block.
+            state.host.step();
+            last_log_tick = now2;
         }
 
-        // Drain one background fetch per loop iteration. Each is a synthetic
-        // GET to a backend, serving two purposes: warming hinted assets into
-        // the cache so they are ready when the browser requests them after a
-        // 103, and refreshing entries that have gone stale (which were served
-        // stale once, so this is what makes the *next* request fresh).
-        if let Some(r) = state.prefetch_queue.pop_front() {
-            let mut kbuf = [0u8; 512];
-            let lk = make_lookup_key(&r.path, r.query.as_deref(), &r.enc, &mut kbuf);
-            // `get` is fresh-only, so this skips entries some earlier fetch
-            // already refreshed and proceeds for stale ones — which is exactly
-            // the set still needing work.
-            if state.cache.get(lk).is_none() {
-                let synth = synth_refresh_request(&r);
-                match handle_request(
-                    &synth,
-                    "127.0.0.1",
+        // The disk cache's work: one slice of at most 1 ms per idle turn,
+        // never on the request path and never a whole queue. The writer takes
+        // the cache by `&mut`, so this is the only place it runs. The zero poll
+        // timeout above is what makes this an idle-turn slice while the queue
+        // is non-empty; the loop blocks normally again once it is empty.
+        if state
+            .disk
+            .as_ref()
+            .is_some_and(|disk| disk.has_work(&state.cache))
+        {
+            if let Some(disk) = state.disk.as_mut() {
+                let stats = disk.tick(&mut state.cache);
+                // A slice that found nothing it could do will not make
+                // progress by running again at once: a persistent removal
+                // error would spin the loop at a zero timeout. Let the normal
+                // wait run before the next attempt; a slice that does work
+                // clears the flag.
+                disk_slice_stalled =
+                    stats.written == 0 && stats.removed == 0 && disk.has_work(&state.cache);
+            }
+        } else {
+            disk_slice_stalled = false;
+        }
+
+        // Emit periodic stats (cheap check every iteration: compares one Instant).
+        // On the emit, copy the loop trace into the snapshot, then write the
+        // metrics line: the whole metrics document, to stdout, which
+        // journald carries like every other operational line.
+        //
+        // Order matters once: the event-loop figures are copied into the
+        // snapshot first, so the line carries this tick's figures rather than
+        // the previous tick's.
+        if state.stats.maybe_emit(state.pool_manager.total_members()) {
+            state.stats.set_event_loop(trace.report());
+            state.log_perf();
+        }
+
+        // The traffic summary has its own cadence: its report describes a
+        // sixty-minute window, so it is written once a minute by default
+        // rather than at the metrics line's interval.
+        if state.stats.maybe_emit_traffic() {
+            let report = health::build_report(&state.config.node.name, &state.traffic);
+            m6_http_lib::stats::log_traffic(&report);
+        }
+
+        // Drain one background fetch per loop iteration, unless this node has
+        // no ID yet or its upstream is down. A cache node with nothing to
+        // compare a reply against would store none of it, and a fetch while
+        // the source is unreachable is a guaranteed failure. The queue keeps
+        // its cap and drains once the upstream answers.
+        let drain = match &state.genid {
+            genid::Role::Cache(f) => f.current().is_some() && !f.down(),
+            genid::Role::Source(_) => true,
+        };
+        if drain {
+            if let Some(r) = state.prefetch_queue.pop_front() {
+                let lk = make_lookup_key(
+                    &r.path,
+                    r.query.as_deref(),
                     &r.enc,
-                    state,
-                    true,
-                    /* from_internal */ false,
-                ) {
-                    // Socket backend: already completed and inserted inline.
-                    RequestOutcome::Ready(..) => {
-                        debug!(path = %r.path, enc = %r.enc, "background fetch: cache filled");
-                    }
-                    // URL backend: the reply lands later. Park it so the poll
-                    // below can finish it; dropping it here is what made this
-                    // a no-op on cache nodes.
-                    RequestOutcome::Pending { rx, ctx } => {
-                        if state.background_pending.len() < MAX_REFRESH_QUEUE {
-                            state.background_pending.push((rx, ctx));
+                    &mut state.lookup_key_buf,
+                );
+                if state.cache.get(lk).is_none() {
+                    let synth = synth_refresh_request(&r);
+                    match handle_request(
+                        &synth,
+                        "127.0.0.1",
+                        &r.enc,
+                        state,
+                        true,
+                        /* from_internal */ false,
+                        poll.registry(),
+                        None,
+                    ) {
+                        RequestOutcome::Ready(..) => {
+                            debug!(path = %r.path, enc = %r.enc, "background fetch: cache filled");
+                        }
+                        RequestOutcome::Cached { .. } => {
+                            unreachable!("a background fetch is a miss, never a cached hit")
+                        }
+                        RequestOutcome::Pending { id, ctx } => {
+                            park(state, id, ctx, Waiter::Background);
                         }
                     }
                 }
             }
         }
 
-        // Periodic rescan of backend socket globs to pick up newly started or
-        // removed workers. On Linux, inotify also fires per-socket events, but
-        // the rescan is a cheap belt-and-suspenders check for any missed events.
-        let now = std::time::Instant::now();
-        if now.duration_since(last_rescan) >= rescan_interval {
-            state.pool_manager.rescan_all();
-            last_rescan = now;
-        }
+        // The clock read at the end of the work is also the start of the next
+        // wait: record the work under the iteration's first trigger, then loop.
+        last = m6_core::platform::now();
+        trace.worked(first_index, last - now);
+    }
 
-        // A change to `site.toml` or the system config. One clock read serves
-        // this and the rescan above; `tick` allocates nothing and costs two
-        // comparisons when nothing changed.
-        if let Some(changed) = reloader.tick(now) {
-            let r = handle_config_change(changed, state, quiche_config, tcp.as_mut(), log_handle);
-            if r.cache_cleared {
-                // From the end of the reload, not from before it: a slow
-                // reload must not use up the settle window.
-                let end = std::time::Instant::now();
-                for (slot, (after, _)) in later_clears.iter_mut().zip(CACHE_LATER_CLEARS) {
-                    *slot = Some(end + after);
-                }
-            }
-            if r.tls_failed {
-                let d = reloader.retry(
-                    Changed {
-                        site: false,
-                        process: true,
-                    },
-                    std::time::Instant::now(),
-                );
-                warn!(
-                    retry_s = d.as_secs(),
-                    "TLS reload failed after a process config change; trying again"
-                );
-            }
-        }
-        for (slot, (_, line)) in later_clears.iter_mut().zip(CACHE_LATER_CLEARS) {
-            if slot.is_some_and(|t| now >= t) {
-                state.cache.clear();
-                *slot = None;
-                info!("{line}");
-            }
-        }
+    // One operational line, which `tests/allocations.rs` reads from
+    // the child's output. It is written after the count is taken, so logging
+    // the number is not part of it.
+    #[cfg(feature = "count-allocations")]
+    {
+        let (calls, bytes) = m6_core::testkit::alloc_count::count();
+        info!(calls, bytes, "allocations during the run");
     }
 
     0
 }
+/// The loop context threaded down the h3 request path: the registry, for
+/// registering socket upstreams, and the QUIC port, for the Alt-Svc header.
+struct H3Loop<'a> {
+    registry: &'a m6_core::platform::Registry,
+    quic_port: u16,
+}
 
-// ── UDP receive + quiche dispatch ─────────────────────────────────────────────
+/// The QUIC socket, the local address it was bound to, its batch sender and
+/// the loop's two QUIC buffers.
+///
+/// The address is read once when the socket is created. It is the `to` of every
+/// `RecvInfo`; asking the kernel for it per datagram was one `getsockname` per
+/// received packet. The batch is probed once for the same reason: whether the
+/// kernel segments a batch is a property of the socket. Both buffers are the
+/// loop's, reused across turns, so a receive and a flush allocate nothing and
+/// clear nothing.
+struct BoundUdp<'a> {
+    socket: &'a UdpSocket,
+    local: SocketAddr,
+    batch: UdpBatch,
+    /// Receive slots, one datagram each. A slice, not `&mut Vec<u8>`: it never
+    /// grows or shrinks.
+    recv_buf: &'a mut [u8],
+    /// The batch a flush packs before one send.
+    flush_buf: &'a mut [u8],
+    /// The connections the receive batch being consumed has fed, in first-seen
+    /// order. Each is flushed once after the batch, not once per datagram.
+    /// Reused across batches, so steady state allocates nothing for the common
+    /// case of one connection. See [`Touched`].
+    touched: &'a mut Touched,
+}
 
 fn drain_udp(
-    udp: &UdpSocket,
-    // A slice, not `&mut Vec<u8>`: this never grows or shrinks the buffer, it
-    // fills it and reslices it to the datagram length.
-    recv_buf: &mut [u8],
+    udp: BoundUdp<'_>,
     connections: &mut HashMap<Vec<u8>, QuicConn>,
     conn_id_map: &mut HashMap<Vec<u8>, Vec<u8>>,
     quiche_config: &mut quiche::Config,
     state: &mut ServerState,
-    quic_port: u16,
+    h3: &H3Loop,
 ) {
+    // One readiness event drains the socket. Each receive takes in up to
+    // MAX_BATCH receives, one per slot, and `next` walks them before the next
+    // call. A receive is one datagram, or on Linux with UDP GRO a coalesced run
+    // from one sender, and every datagram in it goes to `conn.recv` on its own.
+    let slot = RECV_SLOT;
+    let mut metas = [RecvMeta::default(); MAX_BATCH];
+    let mut received = 0;
+    let mut next = 0;
     loop {
-        let (len, from) = match udp.recv_from(recv_buf) {
-            Ok(v) => v,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) => {
-                warn!(error = %e, "udp recv error");
+        if next == received {
+            // A batch is the unit the socket took datagrams in, so it is the
+            // unit one flush covers. In steady state each datagram is an ACK
+            // that frees one packet; flushing after every datagram sent that
+            // packet as a send of its own. `flush_conn` packs all the packets
+            // one batch frees into one batch send instead.
+            flush_received(
+                udp.socket,
+                udp.batch,
+                &mut *udp.flush_buf,
+                connections,
+                udp.touched,
+            );
+            udp.touched.clear();
+            received = match udp
+                .batch
+                .recv(udp.socket, &mut *udp.recv_buf, slot, &mut metas)
+            {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    warn!(error = %e, "udp recv error");
+                    break;
+                }
+            };
+            if received == 0 {
                 break;
             }
-        };
-
-        let pkt = &mut recv_buf[..len];
-        let local = match udp.local_addr() {
-            Ok(a) => a,
-            Err(e) => {
-                warn!(error = %e, "local_addr error");
-                continue;
-            }
-        };
-
-        // Parse QUIC header to get connection ID
-        let hdr = match quiche::Header::from_slice(pkt, quiche::MAX_CONN_ID_LEN) {
-            Ok(h) => h,
-            Err(e) => {
-                debug!("bad quic header: {}", e);
-                continue;
-            }
-        };
-
-        let conn_id = hdr.dcid.to_vec();
-
-        // Resolve the stored map key: direct hit, alias, or new connection.
-        // quiche::connect() generates a 16-byte Initial DCID.  The server stores
-        // connections under a fresh 20-byte SCID so that 1-RTT short-header
-        // packets (parsed with MAX_CONN_ID_LEN=20) always match the stored key.
-        let key: Vec<u8> = if connections.contains_key(&conn_id) {
-            conn_id.clone()
-        } else if let Some(k) = conn_id_map.get(&conn_id) {
-            k.clone()
-        } else if hdr.ty == quiche::Type::Initial {
-            // New connection: generate a fresh 20-byte SCID.
-            let mut scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
-            rand::thread_rng().fill_bytes(&mut scid_bytes);
-            let key = scid_bytes.to_vec();
-            let scid = quiche::ConnectionId::from_vec(key.clone());
-            let conn = match quiche::accept(&scid, None, local, from, quiche_config) {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!("quiche::accept error: {}", e);
-                    continue;
-                }
-            };
-            connections.insert(
-                key.clone(),
-                QuicConn {
-                    conn,
-                    h3_conn: None,
-                    pending: HashMap::new(),
-                    partial_responses: HashMap::new(),
-                    pending_url: HashMap::new(),
-                    client_addr: from,
-                    last_active: Instant::now(),
-                    created: Instant::now(),
-                    handshake_recorded: false,
-                },
-            );
-            // Alias the client's Initial DCID → our 20-byte key for retransmits.
-            if conn_id != key {
-                conn_id_map.insert(conn_id.clone(), key.clone());
-            }
-            key
-        } else {
-            debug!("non-initial packet for unknown conn");
-            continue;
-        };
-
-        let qconn = match connections.get_mut(&key) {
-            Some(c) => c,
+            next = 0;
+        }
+        let index = next;
+        next += 1;
+        let from = match metas[index].from {
+            Some(from) => from,
             None => continue,
         };
-        qconn.last_active = Instant::now();
+        let start = index * slot;
+        // A coalesced receive holds a run of datagrams that were separate on
+        // the wire. quiche's `recv` takes one QUIC packet, so each goes to it
+        // on its own, in the order it was sent.
+        for (offset, len) in metas[index].datagrams() {
+            let pkt = &mut udp.recv_buf[start + offset..start + offset + len];
 
-        let recv_info = quiche::RecvInfo { from, to: local };
-        if let Err(e) = qconn.conn.recv(pkt, recv_info) {
-            // REJECTING A PACKET IS NOT THE END OF THE WORK. quiche has already
-            // called close() internally and queued a CONNECTION_CLOSE carrying
-            // the right wire code, and the only way it reaches the peer is
-            // conn.send(), which here is flush_conn. This path used to
-            // `continue` straight past it.
-            //
-            // The close was not lost: the timer path calls on_timeout() and
-            // then flush_conn, so it went out one tick late. That is still a
-            // needless delay on the one packet whose job is to say why the
-            // connection is ending, so it goes out here instead.
-            //
-            // It does not move h3 conformance. The twelve h3spec failures are
-            // quiche's and are documented in tools/conformance-scores.txt.
-            warn!("conn.recv error: {}", e);
-            flush_conn(udp, qconn);
-            continue;
-        }
-
-        // The QUIC handshake is complete exactly here, the first time this is
-        // true. Guarded by a flag because this branch is reached on every packet
-        // for the life of the connection, and recording unguarded would turn one
-        // handshake into thousands of samples of a steadily growing duration.
-        if qconn.conn.is_established() && !qconn.handshake_recorded {
-            qconn.handshake_recorded = true;
-            // Resumed handshakes are counted apart from full ones. With 0-RTT
-            // enabled this is now the common case for a returning visitor, and a
-            // blended figure would drop as the returning share grew while neither
-            // cost had changed.
-            let resumed = qconn.conn.is_resumed();
-            state.stats.record_handshake(
-                qconn.created.elapsed().as_nanos() as u64,
-                Channel::new(HttpVersion::Http3, state.tls_iface),
-                resumed,
-            );
-        }
-
-        // Establish the H3 connection once the QUIC handshake is complete, OR as
-        // soon as early data arrives.
-        //
-        // The early-data half is what makes 0-RTT reach the application at all.
-        // With `is_established()` alone the requests in a client's first flight
-        // were accepted by QUIC and then had nowhere to go, because the h3
-        // connection that parses them did not exist until a round trip later --
-        // so the round trip 0-RTT exists to save was still being paid.
-        //
-        // quiche permits this: `h3::Connection::with_transport` gates on
-        // established-or-early-data for CLIENTS only, and this is the server.
-        //
-        // `handle_h3_request` decides what may actually be ANSWERED this early.
-        // Parsing a request in early data is not the risk; acting on it is.
-        if (qconn.conn.is_established() || qconn.conn.is_in_early_data()) && qconn.h3_conn.is_none()
-        {
-            let h3_config = match quiche::h3::Config::new() {
-                Ok(c) => c,
+            // Parse QUIC header to get connection ID
+            let hdr = match quiche::Header::from_slice(pkt, quiche::MAX_CONN_ID_LEN) {
+                Ok(h) => h,
                 Err(e) => {
-                    warn!("h3 Config::new error: {}", e);
-                    flush_conn(udp, qconn);
+                    debug!("bad quic header: {}", e);
                     continue;
                 }
             };
-            match quiche::h3::Connection::with_transport(&mut qconn.conn, &h3_config) {
-                Ok(h3) => {
-                    qconn.h3_conn = Some(h3);
+
+            let conn_id = hdr.dcid.to_vec();
+
+            // Resolve the stored map key: direct hit, alias, or new connection.
+            // quiche::connect() generates a 16-byte Initial DCID.  The server stores
+            // connections under a fresh 20-byte SCID so that 1-RTT short-header
+            // packets (parsed with MAX_CONN_ID_LEN=20) always match the stored key.
+            let key: Vec<u8> = if connections.contains_key(&conn_id) {
+                conn_id.clone()
+            } else if let Some(k) = conn_id_map.get(&conn_id) {
+                k.clone()
+            } else if hdr.ty == quiche::Type::Initial {
+                // New connection: generate a fresh 20-byte SCID.
+                let mut scid_bytes = [0u8; quiche::MAX_CONN_ID_LEN];
+                rand::thread_rng().fill_bytes(&mut scid_bytes);
+                let key = scid_bytes.to_vec();
+                let scid = quiche::ConnectionId::from_vec(key.clone());
+                let conn = match quiche::accept(&scid, None, udp.local, from, quiche_config) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!("quiche::accept error: {}", e);
+                        continue;
+                    }
+                };
+                connections.insert(
+                    key.clone(),
+                    QuicConn {
+                        conn,
+                        h3_conn: None,
+                        pending: HashMap::new(),
+                        partial_responses: HashMap::new(),
+                        client_addr: from,
+                        last_active: m6_core::platform::now(),
+                        created: m6_core::platform::now(),
+                        handshake_recorded: false,
+                        blocked: None,
+                    },
+                );
+                // Alias the client's Initial DCID → our 20-byte key for retransmits.
+                if conn_id != key {
+                    conn_id_map.insert(conn_id.clone(), key.clone());
                 }
-                Err(e) => {
-                    warn!("h3 init error: {}", e);
-                    flush_conn(udp, qconn);
-                    continue;
+                key
+            } else {
+                debug!("non-initial packet for unknown conn");
+                continue;
+            };
+
+            let qconn = match connections.get_mut(&key) {
+                Some(c) => c,
+                None => continue,
+            };
+            qconn.last_active = m6_core::platform::now();
+            // This connection is flushed once, after the whole batch. Marking it
+            // after the lookup means a datagram that found no connection never
+            // becomes a flush of one.
+            udp.touched.note(&key);
+
+            let recv_info = quiche::RecvInfo {
+                from,
+                to: udp.local,
+            };
+            if let Err(e) = qconn.conn.recv(pkt, recv_info) {
+                // REJECTING A PACKET IS NOT THE END OF THE WORK. quiche has already
+                // called close() internally and queued a CONNECTION_CLOSE carrying
+                // the right wire code, and the only way it reaches the peer is
+                // conn.send(), which here is flush_conn. This path used to
+                // `continue` straight past it.
+                //
+                // The close was not lost: the timer path calls on_timeout() and
+                // then flush_conn, so it went out one tick late. That is still a
+                // needless delay on the one packet whose job is to say why the
+                // connection is ending, so it goes out here instead.
+                //
+                // It does not move h3 conformance. The twelve h3spec failures are
+                // quiche's and are documented in tools/conformance-scores.txt.
+                warn!("conn.recv error: {}", e);
+                flush_conn(udp.socket, udp.batch, &mut *udp.flush_buf, qconn);
+                continue;
+            }
+
+            // The QUIC handshake is complete exactly here, the first time this is
+            // true. Guarded by a flag because this branch is reached on every packet
+            // for the life of the connection, and recording unguarded would turn one
+            // handshake into thousands of samples of a steadily growing duration.
+            if qconn.conn.is_established() && !qconn.handshake_recorded {
+                qconn.handshake_recorded = true;
+                // Resumed handshakes are counted apart from full ones. With 0-RTT
+                // enabled this is now the common case for a returning visitor, and a
+                // blended figure would drop as the returning share grew while neither
+                // cost had changed.
+                let resumed = qconn.conn.is_resumed();
+                state.stats.record_handshake(
+                    qconn.created.elapsed().as_nanos() as u64,
+                    Channel::new(
+                        HttpVersion::Http3,
+                        health::peer_iface(qconn.client_addr.ip()),
+                    ),
+                    resumed,
+                );
+            }
+
+            // Establish the H3 connection once the QUIC handshake is complete, OR as
+            // soon as early data arrives.
+            //
+            // The early-data half is what makes 0-RTT reach the application at all.
+            // With `is_established()` alone the requests in a client's first flight
+            // were accepted by QUIC and then had nowhere to go, because the h3
+            // connection that parses them did not exist until a round trip later --
+            // so the round trip 0-RTT exists to save was still being paid.
+            //
+            // quiche permits this: `h3::Connection::with_transport` gates on
+            // established-or-early-data for CLIENTS only, and this is the server.
+            //
+            // `handle_h3_request` decides what may actually be ANSWERED this early.
+            // Parsing a request in early data is not the risk; acting on it is.
+            if (qconn.conn.is_established() || qconn.conn.is_in_early_data())
+                && qconn.h3_conn.is_none()
+            {
+                let mut h3_config = match quiche::h3::Config::new() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!("h3 Config::new error: {}", e);
+                        flush_conn(udp.socket, udp.batch, &mut *udp.flush_buf, qconn);
+                        continue;
+                    }
+                };
+                // RFC 9114 4.2.2: the field section bound is advertised and the
+                // local decoder enforces it. It is the same number every other
+                // protocol uses.
+                h3_config.set_max_field_section_size(m6_core::headers::MAX_REQUEST_HEAD as u64);
+                match quiche::h3::Connection::with_transport(&mut qconn.conn, &h3_config) {
+                    Ok(h3) => {
+                        qconn.h3_conn = Some(h3);
+                    }
+                    Err(e) => {
+                        warn!("h3 init error: {}", e);
+                        flush_conn(udp.socket, udp.batch, &mut *udp.flush_buf, qconn);
+                        continue;
+                    }
                 }
             }
-        }
 
-        // Process H3 events
-        if qconn.h3_conn.is_some() {
-            process_h3(qconn, udp, state, quic_port);
-        }
+            // Process H3 events
+            if qconn.h3_conn.is_some() {
+                process_h3(qconn, &key, state, h3);
+            }
 
-        // Send any pending QUIC packets
-        flush_conn(udp, qconn);
+            // A packet may have carried the credit a saved response was waiting
+            // for: this is the one place that connection is driven this turn.
+            if !qconn.partial_responses.is_empty() {
+                drain_writable(qconn);
+            }
+        }
+    }
+}
+
+/// The connections one receive batch fed, in first-seen order.
+///
+/// The steady state is one connection, which can appear sixteen times in a
+/// batch of sixteen datagrams. The list is small, so it is checked linearly,
+/// and a connection that appears sixteen times is one entry here.
+///
+/// The entry buffers are kept across batches and only the live prefix is read:
+/// the first batch that feeds a connection copies its key into a buffer, and
+/// every batch after that copies into the same buffer. That is what the comment
+/// on [`BoundUdp::touched`] means by reusing the list: a batch allocates only
+/// when it feeds more distinct connections than any batch before it.
+#[derive(Default)]
+struct Touched {
+    /// Every entry the list has needed. Only the first `len` are live.
+    entries: Vec<Vec<u8>>,
+    /// How many entries the batch being consumed has fed.
+    len: usize,
+}
+
+impl Touched {
+    /// Start a new receive batch.
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// The connections this batch has fed, in first-seen order.
+    fn keys(&self) -> &[Vec<u8>] {
+        &self.entries[..self.len]
+    }
+
+    /// Remember that `key` took a datagram in this batch.
+    fn note(&mut self, key: &[u8]) {
+        if self.keys().iter().any(|seen| seen.as_slice() == key) {
+            return;
+        }
+        if self.len == self.entries.len() {
+            self.entries.push(Vec::new());
+        }
+        let entry = &mut self.entries[self.len];
+        entry.clear();
+        entry.extend_from_slice(key);
+        self.len += 1;
+    }
+}
+
+/// Flush every connection one receive batch fed, once each.
+///
+/// This is the only flush on the steady-state receive path. It runs after the
+/// batch's datagrams have all gone to `conn.recv`, so the packets they freed
+/// leave in one packed batch per connection instead of one send per datagram.
+///
+/// A refused batch stays on its connection and is retried on the writable
+/// event, which is the same mechanism the timer and error paths use: the
+/// request is in `flush_conn`, the retry is in `flush_blocked`, and a
+/// connection that is both in this batch and holding a refused batch is
+/// flushed by both without sending a packet twice, because the refused bytes
+/// are held on the connection until one of them sends them.
+fn flush_received(
+    udp: &UdpSocket,
+    batch: UdpBatch,
+    out: &mut [u8],
+    connections: &mut HashMap<Vec<u8>, QuicConn>,
+    touched: &Touched,
+) {
+    for key in touched.keys() {
+        if let Some(qconn) = connections.get_mut(key) {
+            flush_conn(udp, batch, out, qconn);
+        }
     }
 }
 
 // ── H3 event processing ───────────────────────────────────────────────────────
 
-fn process_h3(qconn: &mut QuicConn, _udp: &UdpSocket, state: &mut ServerState, quic_port: u16) {
+fn process_h3(qconn: &mut QuicConn, conn_id: &[u8], state: &mut ServerState, h3_loop: &H3Loop) {
     // client_ip is NOT computed here — deferred to cache-miss path in handle_h3_request.
 
     while let Some(h3) = qconn.h3_conn.as_mut() {
@@ -1661,7 +3841,7 @@ fn process_h3(qconn: &mut QuicConn, _udp: &UdpSocket, state: &mut ServerState, q
                 entry.headers_done = true;
                 if !more_frames {
                     // No body — process immediately
-                    handle_h3_request(stream_id, qconn, state, quic_port);
+                    handle_h3_request(stream_id, qconn, state, h3_loop, conn_id);
                     // After handle_h3_request qconn may be mutated; restart loop
                     continue;
                 }
@@ -1706,7 +3886,7 @@ fn process_h3(qconn: &mut QuicConn, _udp: &UdpSocket, state: &mut ServerState, q
             Ok((stream_id, quiche::h3::Event::Finished)) => {
                 // Body fully received (or no body) — process
                 if qconn.pending.contains_key(&stream_id) {
-                    handle_h3_request(stream_id, qconn, state, quic_port);
+                    handle_h3_request(stream_id, qconn, state, h3_loop, conn_id);
                     continue;
                 }
             }
@@ -1733,12 +3913,18 @@ fn handle_h3_request(
     stream_id: u64,
     qconn: &mut QuicConn,
     state: &mut ServerState,
-    quic_port: u16,
+    h3: &H3Loop,
+    conn_id: &[u8],
 ) {
     let req = match qconn.pending.remove(&stream_id) {
         Some(r) => r,
         None => return,
     };
+    let priority = priority::from_headers(
+        req.headers
+            .iter()
+            .map(|header| (header.name(), header.value())),
+    );
 
     // ── Phase 0: malformed-request check ─────────────────────────────────────
     // RFC 9114 4.1.2: a malformed request MUST be treated as a stream error of
@@ -1762,6 +3948,44 @@ fn handle_h3_request(
         let _ = qconn
             .conn
             .stream_shutdown(stream_id, quiche::Shutdown::Write, H3_MESSAGE_ERROR);
+        return;
+    }
+
+    // ── Request head limits, before routing or any backend ───────────────────
+    // The same two limits h1 and h2 enforce. The field-section total is the
+    // one quiche counts itself, so a section past `MAX_REQUEST_HEAD` never
+    // reaches this code: quiche answers it by closing the connection with
+    // H3_EXCESSIVE_LOAD. The total check stays as the guard for the day that
+    // changes, and the field and request-line checks are the ones that answer
+    // on this stream.
+    let list_size: usize = req
+        .headers
+        .iter()
+        .map(|h| h.name().len() + h.value().len() + m6_http_lib::fields::FIELD_OVERHEAD)
+        .sum();
+    if let Some(status) = m6_http_lib::fields::head_limit_status(
+        req.headers.iter().map(|h| (h.name(), h.value())),
+        list_size,
+    ) {
+        let is_head = req
+            .headers
+            .iter()
+            .any(|h| h.name() == b":method" && h.value().eq_ignore_ascii_case(b"HEAD"));
+        let mut headers: Vec<(String, String)> = vec![(
+            "Content-Type".to_string(),
+            "text/html; charset=utf-8".to_string(),
+        )];
+        set_date(&mut headers);
+        send_h3_response(
+            stream_id,
+            qconn,
+            priority,
+            status,
+            &headers,
+            Bytes::from(m6_http_lib::error::refusal_body(status)),
+            is_head,
+            None,
+        );
         return;
     }
 
@@ -1812,7 +4036,16 @@ fn handle_h3_request(
         // latency, and costs nothing on the reads that make up the page load.
         let mut headers: Vec<(String, String)> = Vec::new();
         set_date(&mut headers);
-        send_h3_response(stream_id, qconn, 425, &headers, Bytes::new(), false);
+        send_h3_response(
+            stream_id,
+            qconn,
+            priority,
+            425,
+            &headers,
+            Bytes::new(),
+            false,
+            None,
+        );
         debug!(
             stream_id,
             method = %String::from_utf8_lossy(method_bytes),
@@ -1821,7 +4054,7 @@ fn handle_h3_request(
         return;
     }
 
-    let start = Instant::now();
+    let start = m6_core::platform::now();
 
     // ── Rate limit — before cache lookup, routing, or any backend work ───────
     // HTTP/3 is not a side door: the same per-IP limit applies here as on
@@ -1836,17 +4069,19 @@ fn handle_h3_request(
                 .then(|| std::str::from_utf8(h.value()).ok().map(str::to_string))
                 .flatten()
         });
-        if let Some(RequestOutcome::Ready(status, headers, body, _)) =
+        if let Some(RequestOutcome::Ready(status, headers, body, _, _)) =
             check_rate_limit(state, &client_ip, path_str, ua_owned.as_deref())
         {
             // Rate-limit rejection: tiny body, but a HEAD still must not carry one.
             send_h3_response(
                 stream_id,
                 qconn,
+                priority,
                 status,
                 &headers,
                 Bytes::from(body),
                 method_bytes.eq_ignore_ascii_case(b"HEAD"),
+                None,
             );
             return;
         }
@@ -1868,25 +4103,66 @@ fn handle_h3_request(
             send_h3_response(
                 stream_id,
                 qconn,
+                priority,
                 301,
                 &www_redirect_headers(location),
                 Bytes::new(),
                 false,
+                None,
             );
             return;
         }
+        // The same policy as the h1 and h2 paths, and the same position: before
+        // the cache fast path, which has no host component in its key.
+        if let Some(location) =
+            state
+                .config
+                .server
+                .unmatched_host_redirect(authority.as_deref(), path_str, query_str)
+        {
+            send_h3_response(
+                stream_id,
+                qconn,
+                priority,
+                301,
+                &www_redirect_headers(location),
+                Bytes::new(),
+                false,
+                None,
+            );
+            return;
+        }
+    }
+
+    // A method the route does not answer is refused before the cache lookup,
+    // exactly as on h1 and h2. HTTP/3 has its own cache fast path, so it does
+    // not pass through `route_request`.
+    let method_str = std::str::from_utf8(method_bytes).unwrap_or("GET");
+    if let Some(outcome) = route_method_refusal(state, path_str, method_str) {
+        let RequestOutcome::Ready(status, headers, body, _, _) = outcome else {
+            unreachable!("a method refusal is ready")
+        };
+        send_h3_response(
+            stream_id,
+            qconn,
+            priority,
+            status,
+            &headers,
+            Bytes::from(body),
+            method_str.eq_ignore_ascii_case("HEAD"),
+            None,
+        );
+        return;
     }
 
     // ── Cache lookup — zero allocation ────────────────────────────────────────
     // Routes with `require` are never served from cache — see the HTTP/1.1
     // path for the reasoning.
     // Same method gate as the h1/h2 lookup sites above.
-    let method_str = std::str::from_utf8(method_bytes).unwrap_or("GET");
     let cacheable = !state.route_table.requires_auth(path_str)
         && m6_http_lib::cache::method_may_read_cache(method_str);
 
-    let mut key_buf = [0u8; 512];
-    let lookup_key = make_lookup_key(path_str, query_str, enc_str, &mut key_buf);
+    let lookup_key = make_lookup_key(path_str, query_str, enc_str, &mut state.lookup_key_buf);
 
     let req_cc = m6_http_lib::cache::RequestDirectives::parse(&owned_headers_for_cc(&req.headers));
     let looked_up = if cacheable {
@@ -1897,7 +4173,16 @@ fn handle_h3_request(
     if req_cc.only_if_cached && matches!(looked_up, m6_http_lib::cache::Lookup::Miss) {
         let mut headers: Vec<(String, String)> = Vec::new();
         set_date(&mut headers);
-        send_h3_response(stream_id, qconn, 504, &headers, Bytes::new(), false);
+        send_h3_response(
+            stream_id,
+            qconn,
+            priority,
+            504,
+            &headers,
+            Bytes::new(),
+            false,
+            None,
+        );
         return;
     }
 
@@ -1924,7 +4209,16 @@ fn handle_h3_request(
     if in_early_data && !matches!(looked_up, m6_http_lib::cache::Lookup::Fresh(..)) {
         let mut headers: Vec<(String, String)> = Vec::new();
         set_date(&mut headers);
-        send_h3_response(stream_id, qconn, 425, &headers, Bytes::new(), false);
+        send_h3_response(
+            stream_id,
+            qconn,
+            priority,
+            425,
+            &headers,
+            Bytes::new(),
+            false,
+            None,
+        );
         debug!(
             stream_id,
             path = path_str,
@@ -1934,12 +4228,10 @@ fn handle_h3_request(
     }
     // Serve stale now, refresh behind the request — see the HTTP/1.1 path for
     // the reasoning.
-    // See the HTTP/1.1 path: a stale serve is logged distinctly from a hit.
-    let cache_state = if matches!(looked_up, m6_http_lib::cache::Lookup::Stale(..)) {
-        "STALE"
-    } else {
-        "HIT"
-    };
+    // See the HTTP/1.1 path: a stale serve is logged distinctly from a hit,
+    // and the lookup's own variant is the validity this records.
+    let hit_is_valid = looked_up.is_fresh();
+    let cache_state = if hit_is_valid { "HIT" } else { "STALE" };
     if let m6_http_lib::cache::Lookup::Stale(..) = looked_up {
         state.queue_refresh(Refresh {
             path: path_str.to_string(),
@@ -1951,16 +4243,29 @@ fn handle_h3_request(
     | m6_http_lib::cache::Lookup::Stale(cached, age) = looked_up
     {
         let elapsed_ns = start.elapsed().as_nanos() as u64;
-        // QUIC shares the public bind, so it is external like TLS.
-        let chan = Channel::new(HttpVersion::Http3, state.tls_iface);
+        // QUIC shares the public bind, so the peer's address class separates a
+        // monitor poll from a visitor exactly as it does on TLS.
+        let chan = Channel::new(
+            HttpVersion::Http3,
+            health::peer_iface(qconn.client_addr.ip()),
+        );
 
         let method_str = std::str::from_utf8(method_bytes).unwrap_or("GET");
-        let precond = evaluate_preconditions(&cached.headers, &H3Headers(&req.headers), method_str);
+        let precond = evaluate_preconditions(
+            cached.status,
+            &cached.headers,
+            &H3Headers(&req.headers),
+            method_str,
+        );
         // See the h1/h2 paths: recorded after preconditions so a 304 is
         // counted as a 304 and not as the cached 200.
         state.stats.record(
             elapsed_ns,
-            true,
+            if hit_is_valid {
+                CacheOutcome::ValidHit
+            } else {
+                CacheOutcome::InvalidHit
+            },
             match precond {
                 Precondition::Failed => 412,
                 Precondition::NotModified => 304,
@@ -1973,7 +4278,16 @@ fn handle_h3_request(
             // Same rule as the h1/h2 paths; see the note there.
             let mut headers: Vec<(String, String)> = Vec::new();
             set_date(&mut headers);
-            send_h3_response(stream_id, qconn, 412, &headers, Bytes::new(), false);
+            send_h3_response(
+                stream_id,
+                qconn,
+                priority,
+                412,
+                &headers,
+                Bytes::new(),
+                false,
+                None,
+            );
             return;
         }
         if precond == Precondition::NotModified {
@@ -1989,16 +4303,20 @@ fn handle_h3_request(
                     client_ip: &client_ip,
                     latency_ns: Some(elapsed_ns),
                 },
+                &mut state.traffic,
             );
             let html = analytics::is_html_response(&cached.headers);
-            let mut headers = not_modified_headers(&cached.headers);
+            let mut headers = not_modified_headers(&cached.headers.to_pairs());
             // Same as the h1/h2 304 paths: Vary and Date are added post-insert
             // so the stored headers do not have them.
             set_vary_accept_encoding(&mut headers, true);
             set_age(&mut headers, age);
             set_date(&mut headers);
-            if let (Some(sc), true) = (set_cookie, html) {
-                headers.push(("Set-Cookie".to_string(), sc));
+            if let (Some(id), true) = (set_cookie, html) {
+                headers.push((
+                    "Set-Cookie".to_string(),
+                    analytics::session_cookie_header_value(id),
+                ));
             }
             debug!(
                 path = %path_str,
@@ -2009,7 +4327,16 @@ fn handle_h3_request(
                 cache_hit = true,
                 "request complete"
             );
-            send_h3_response(stream_id, qconn, 304, &headers, Bytes::new(), false);
+            send_h3_response(
+                stream_id,
+                qconn,
+                priority,
+                304,
+                &headers,
+                Bytes::new(),
+                false,
+                None,
+            );
             return;
         }
 
@@ -2040,28 +4367,34 @@ fn handle_h3_request(
                 client_ip: &client_ip,
                 latency_ns: Some(elapsed_ns),
             },
+            &mut state.traffic,
         );
         // Build headers with Link: preload / Vary / Set-Cookie appended as
         // needed. Vary is now always added on a cache hit (the cache key is
         // already segmented by encoding, so this just documents that to
         // downstream/shared caches), so this always takes the owned-Vec
         // branch rather than reusing `&cached.headers` unmodified.
-        let mut headers_with_links: Vec<(String, String)> = (*cached.headers).clone();
+        let mut headers_with_links: Vec<(String, String)> = cached.headers.to_pairs();
         set_vary_accept_encoding(&mut headers_with_links, true);
         set_age(&mut headers_with_links, age);
         set_describedby_link(&mut headers_with_links, &state.config.site.describedby);
-        set_alt_svc(&mut headers_with_links, quic_port);
-        if let (Some(sc), true) = (set_cookie, analytics::is_html_response(&headers_with_links)) {
-            headers_with_links.push(("Set-Cookie".to_string(), sc));
+        set_alt_svc(&mut headers_with_links, h3.quic_port);
+        if let (Some(id), true) = (set_cookie, analytics::is_html_response(&headers_with_links)) {
+            headers_with_links.push((
+                "Set-Cookie".to_string(),
+                analytics::session_cookie_header_value(id),
+            ));
         }
         let resp_headers: &[(String, String)] = &headers_with_links;
         send_h3_response(
             stream_id,
             qconn,
+            priority,
             cached.status,
             resp_headers,
             cached.body,
             method_str.eq_ignore_ascii_case("HEAD"),
+            Some(cached.genid),
         );
         return;
     } // end cache hit
@@ -2100,18 +4433,33 @@ fn handle_h3_request(
     };
 
     match handle_request(
-        &http_req, &client_ip, enc_str, state, false, /* from_internal */ false,
+        &http_req,
+        &client_ip,
+        enc_str,
+        state,
+        false, /* from_internal */
+        false,
+        h3.registry,
+        None,
     ) {
-        RequestOutcome::Ready(status, mut resp_headers, body, backend_name) => {
+        RequestOutcome::Ready(status, mut resp_headers, body, backend_name, genid) => {
             // Add alt-svc header.
-            set_alt_svc(&mut resp_headers, quic_port);
+            set_alt_svc(&mut resp_headers, h3.quic_port);
 
             let elapsed_ns = start.elapsed().as_nanos() as u64;
-            // /health and /perf are separated inside `Stats::record`.
-            let chan = Channel::new(HttpVersion::Http3, state.tls_iface);
-            state
-                .stats
-                .record(elapsed_ns, false, status, chan, &backend_name);
+            // /health is separated inside `Stats::record`, and a poll on any
+            // other path is separated here by the peer address.
+            let chan = Channel::new(
+                HttpVersion::Http3,
+                health::peer_iface(qconn.client_addr.ip()),
+            );
+            state.stats.record(
+                elapsed_ns,
+                CacheOutcome::AnsweredLocally,
+                status,
+                chan,
+                &backend_name,
+            );
             debug!(
                 path = %path,
                 status,
@@ -2124,15 +4472,29 @@ fn handle_h3_request(
             send_h3_response(
                 stream_id,
                 qconn,
+                priority,
                 status,
                 &resp_headers,
                 Bytes::from(body),
                 http_req.method.eq_ignore_ascii_case("HEAD"),
+                genid,
             );
         }
-        RequestOutcome::Pending { rx, ctx } => {
-            // URL backend dispatched async — store and poll later.
-            qconn.pending_url.insert(stream_id, (rx, ctx));
+        RequestOutcome::Cached { .. } => {
+            unreachable!("h3 handles its own cache hit inline, not through handle_request")
+        }
+        RequestOutcome::Pending { id, ctx } => {
+            // Store who waits in the upstream's slot; the completion writes the
+            // response straight into this stream.
+            park(
+                state,
+                id,
+                ctx,
+                Waiter::H3 {
+                    conn_id: conn_id.to_vec(),
+                    stream: stream_id,
+                },
+            );
         }
     }
 }
@@ -2154,13 +4516,21 @@ fn write_decimal(mut n: usize, buf: &mut [u8; 20]) -> &[u8] {
     &buf[pos..]
 }
 
+/// The quiche form of a request's RFC 9218 priority.
+fn quiche_priority(priority: priority::Priority) -> quiche::h3::Priority {
+    quiche::h3::Priority::new(priority.urgency, priority.incremental)
+}
+
+#[allow(clippy::too_many_arguments)] // one response's fields plus the stream, its priority and the generation
 fn send_h3_response(
     stream_id: u64,
     qconn: &mut QuicConn,
+    priority: priority::Priority,
     status: u16,
     headers: &[(String, String)],
     body: Bytes,
     is_head: bool,
+    genid: Option<u64>,
 ) {
     let h3 = match qconn.h3_conn.as_mut() {
         Some(h) => h,
@@ -2197,6 +4567,16 @@ fn send_h3_response(
         }
     }
     for (k, v) in headers {
+        // RFC 9114 4.2: a response must not carry connection-specific fields.
+        // They are HTTP/1.1 hop-by-hop metadata with no meaning on h3, and a
+        // client MUST treat a field section containing one as malformed:
+        // nghttp3 (curl) resets the stream and reads no body, so a page the
+        // backend answered with `Connection: close` arrived as 200 and zero
+        // bytes. HTTP/2 already drops the same set at its serialiser
+        // (`http2::is_hop_by_hop_or_length`); this path did not.
+        if m6_http_lib::fields::is_connection_specific(k) {
+            continue;
+        }
         // Omit content-length for non-empty bodies: quiche+ngtcp2 interop bug where
         // nghttp3 prematurely signals body-complete when content-length is present
         // alongside a separate DATA frame. Without it, nghttp3 reads until stream FIN.
@@ -2204,6 +4584,16 @@ fn send_h3_response(
             continue;
         }
         h3_headers.push(quiche::h3::Header::new(k.as_bytes(), v.as_bytes()));
+    }
+    if let Some(genid) = genid {
+        // quiche lower-cases a header name when it encodes the field section,
+        // so this spelling is not what made an h3 response valid. Writing the
+        // lower-case constant here means neither serialiser depends on a
+        // library's normalisation for RFC 9114 4.2.
+        h3_headers.push(quiche::h3::Header::new(
+            genid::GENID_HEADER_LOWER.as_bytes(),
+            itoa::Buffer::new().format(genid).as_bytes(),
+        ));
     }
     // RFC 9110 8.6: never on a 1xx/204, and on a 304 only if it equals the
     // 200's length. m6 emitted `content-length: 0` on every 304 across all
@@ -2214,7 +4604,13 @@ fn send_h3_response(
     }
 
     let fin = body.is_empty();
-    match h3.send_response(&mut qconn.conn, stream_id, &h3_headers, fin) {
+    match h3.send_response_with_priority(
+        &mut qconn.conn,
+        stream_id,
+        &h3_headers,
+        &quiche_priority(priority),
+        fin,
+    ) {
         Ok(()) => {}
         Err(quiche::h3::Error::StreamBlocked) => {
             // Not an error, just no flow-control credit yet — previously this
@@ -2225,9 +4621,10 @@ fn send_h3_response(
             // this routinely; Chrome's more conservative concurrency mostly
             // didn't. Save it and let drain_writable() retry once this stream
             // reports writable again.
-            qconn
-                .partial_responses
-                .insert(stream_id, PendingH3Response::Headers(h3_headers, body));
+            qconn.partial_responses.insert(
+                stream_id,
+                PendingH3Response::Headers(h3_headers, body, priority),
+            );
             return;
         }
         Err(e) => {
@@ -2310,17 +4707,6 @@ fn www_redirect_headers(location: String) -> Vec<(String, String)> {
     ]
 }
 
-fn www_redirect(req: &forward::HttpRequest, config: &config::Config) -> Option<RequestOutcome> {
-    let host = m6_core::headers::get(&req.headers[..], "host");
-    let location = www_redirect_location(host, &req.path, req.query.as_deref(), config)?;
-    Some(RequestOutcome::Ready(
-        301,
-        www_redirect_headers(location),
-        vec![],
-        "www-redirect".to_string(),
-    ))
-}
-
 /// Build the synthetic GET used for a background cache fill.
 ///
 /// **The `Accept-Encoding` header must match the cache key.** The encoding is
@@ -2367,6 +4753,16 @@ fn synth_refresh_request(r: &Refresh) -> forward::HttpRequest {
 /// inserts into the cache itself, so `should_cache` still inspects the exact
 /// `Vary` the backend sent, and a response varying on anything beyond encoding
 /// stays uncacheable.
+/// The authority's answer, carried back into the request path.
+struct PreDecided {
+    gate: forward::AuthGate,
+    decision: core_auth::Decision,
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the request path's fixed inputs, plus the decision a check re-entry carries"
+)]
 fn handle_request(
     req: &forward::HttpRequest,
     client_ip: &str,
@@ -2374,6 +4770,10 @@ fn handle_request(
     state: &mut ServerState,
     is_prefetch: bool,
     from_internal: bool,
+    registry: &m6_core::platform::Registry,
+    // A decision the auth check already produced, for the re-entry after
+    // `POST /check`. `None` on every first pass.
+    pre_decided: Option<PreDecided>,
 ) -> RequestOutcome {
     let describedby = state.config.site.describedby.clone();
     let mut outcome = handle_request_inner(
@@ -2383,8 +4783,10 @@ fn handle_request(
         state,
         is_prefetch,
         from_internal,
+        registry,
+        pre_decided,
     );
-    if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome {
+    if let RequestOutcome::Ready(status, ref mut headers, _, ref backend, _) = outcome {
         let compresses = state.config.backend_compresses(backend);
         set_vary_accept_encoding(headers, compresses);
         set_date(headers);
@@ -2414,6 +4816,455 @@ fn origin_host<'a>(req: &'a forward::HttpRequest, config: &'a config::Config) ->
         .unwrap_or(config.site.domain.as_str())
 }
 
+/// Why a URL dispatch failed, so the caller can answer it.
+enum UrlDispatchError {
+    /// No upstream slot came free: the process is at its open-file ceiling.
+    NoSlot,
+    Failed(std::io::Error),
+}
+
+/// Dispatch one request to a URL backend: an h2 stream for the h2 schemes, a
+/// loop-driven `client::Upstream` slot for http and https.
+fn dispatch_url_backend(
+    state: &mut ServerState,
+    registry: &m6_core::platform::Registry,
+    req: &forward::HttpRequest,
+    client_ip: &str,
+    backend_idx: usize,
+) -> Result<UpstreamId, UrlDispatchError> {
+    debug!(
+        backend = %state.pool_manager.url_backend(backend_idx).name,
+        "url backend dispatch"
+    );
+    match state.pool_manager.url_backend(backend_idx).scheme {
+        pool::UrlScheme::H2c => {
+            ensure_h2c_conn(state, backend_idx, registry)?;
+            let original_host = origin_host(req, &state.config).to_string();
+            let backend = state.pool_manager.url_backend(backend_idx);
+            let (conn, stream) = state
+                .h2c_pool
+                .dispatch(&backend.url, req, client_ip, &original_host, registry)
+                .map_err(UrlDispatchError::Failed)?;
+            Ok(UpstreamId::H2c { conn, stream })
+        }
+        pool::UrlScheme::H2s => {
+            ensure_h2s_conn(state, backend_idx, registry)?;
+            let original_host = origin_host(req, &state.config).to_string();
+            let backend = state.pool_manager.url_backend(backend_idx);
+            let (conn, stream) = state
+                .h2s_pool
+                .dispatch(&backend.url, req, client_ip, &original_host, registry)
+                .map_err(UrlDispatchError::Failed)?;
+            Ok(UpstreamId::H2s { conn, stream })
+        }
+        pool::UrlScheme::Http | pool::UrlScheme::Https => {
+            launch_url_upstream(state, registry, req, client_ip, backend_idx).map(UpstreamId::Slot)
+        }
+    }
+}
+
+/// Start one request to a URL backend on a loop-driven `client::Upstream`.
+///
+/// The request takes an idle slot whose connection to this backend is open and
+/// watched when one is free, and otherwise a free slot, which makes a new
+/// connection. The slot's key is returned so the caller can park the waiter
+/// there.
+fn launch_url_upstream(
+    state: &mut ServerState,
+    registry: &m6_core::platform::Registry,
+    req: &forward::HttpRequest,
+    client_ip: &str,
+    backend_idx: usize,
+) -> Result<usize, UrlDispatchError> {
+    let (key, token, watched) = take_url_slot(state, backend_idx)?;
+
+    let encoded = {
+        // Disjoint fields: the backend's authority and the request's origin are
+        // read while the slot's request buffer is written.
+        let backend = state.pool_manager.url_backend(backend_idx);
+        let original_host = origin_host(req, &state.config);
+        let entry = state.upstreams.get_mut(key);
+        forward::encode_url_request(
+            entry.upstream.request_buf(),
+            req,
+            &backend.host,
+            client_ip,
+            original_host,
+        )
+    };
+    if let Err(e) = encoded {
+        if watched {
+            // The connection is untouched, so keep it for the next request.
+            state
+                .pool_manager
+                .url_backend_mut(backend_idx)
+                .idle
+                .push(key);
+        } else {
+            state.upstreams.free(key);
+            *state.sources.get_mut(token.0) = Source::Vacant;
+            state.sources.free(token.0);
+        }
+        return Err(UrlDispatchError::Failed(e));
+    }
+    begin_url_slot(
+        state,
+        registry,
+        backend_idx,
+        key,
+        token,
+        watched,
+        req.method.eq_ignore_ascii_case("HEAD"),
+    )?;
+    Ok(key)
+}
+
+/// Take a slot for a request to a URL backend: an idle connection when one is
+/// free, otherwise a free slot and a token. The caller writes the request into
+/// the slot's buffer and calls [`begin_url_slot`].
+fn take_url_slot(
+    state: &mut ServerState,
+    backend_idx: usize,
+) -> Result<(usize, Token, bool), UrlDispatchError> {
+    // An idle connection first: its key is not in the free list, and its
+    // descriptor is registered under the token it kept while waiting.
+    match state.pool_manager.url_backend_mut(backend_idx).idle.take() {
+        Some(key) => {
+            let token = state.upstreams.get(key).token;
+            Ok((key, token, true))
+        }
+        None => {
+            let Some(token) = take_token(state) else {
+                return Err(UrlDispatchError::NoSlot);
+            };
+            let Some(taken) = state.upstreams.take() else {
+                *state.sources.get_mut(token.0) = Source::Vacant;
+                state.sources.free(token.0);
+                return Err(UrlDispatchError::NoSlot);
+            };
+            Ok((taken.key, token, false))
+        }
+    }
+}
+
+/// Start a request already written into `key`'s buffer, register its
+/// descriptor against `token`, and leave the slot for the caller to name its
+/// waiter and context. One request per slot either way.
+#[allow(clippy::too_many_arguments)] // the slot it was taken under, not a request
+fn begin_url_slot(
+    state: &mut ServerState,
+    registry: &m6_core::platform::Registry,
+    backend_idx: usize,
+    key: usize,
+    token: Token,
+    watched: bool,
+    head: bool,
+) -> Result<(), UrlDispatchError> {
+    let addr = state.pool_manager.url_backend(backend_idx).addr();
+    let now = m6_core::platform::now();
+    let deadline = now + std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
+
+    if watched {
+        // Drop the idle registration so a failed start cannot leave a stale
+        // one; the slot's descriptor is registered again below.
+        registry
+            .deregister_fd(state.upstreams.get(key).upstream.fd())
+            .ok();
+    }
+    let started = {
+        let tls = state.pool_manager.url_backend(backend_idx).tls.as_ref();
+        let entry = state.upstreams.get_mut(key);
+        entry
+            .upstream
+            .start(&m6_core::client::Addr::Tcp(addr), tls, head, deadline)
+            .map_err(UrlDispatchError::Failed)
+    };
+    if let Err(e) = started {
+        state.upstreams.get_mut(key).upstream.close();
+        state.upstreams.free(key);
+        *state.sources.get_mut(token.0) = Source::Vacant;
+        state.sources.free(token.0);
+        return Err(e);
+    }
+    let interest = state.upstreams.get_mut(key).upstream.interest();
+    let registered = registry.register_fd(state.upstreams.get(key).upstream.fd(), token, interest);
+    if let Err(e) = registered {
+        state.upstreams.get_mut(key).upstream.close();
+        state.upstreams.free(key);
+        *state.sources.get_mut(token.0) = Source::Vacant;
+        state.sources.free(token.0);
+        return Err(UrlDispatchError::Failed(e));
+    }
+    state.upstream_timeouts.touch(token, now);
+    *state.sources.get_mut(token.0) = Source::Upstream(key);
+    let entry = state.upstreams.get_mut(key);
+    entry.token = token;
+    entry.addr = m6_core::client::Addr::Tcp(addr);
+    entry.kind = UpstreamKind::Url(backend_idx);
+    entry.waiter = None;
+    entry.ctx = None;
+    entry.registered_interest = interest;
+    Ok(())
+}
+
+/// Why a socket-upstream launch failed, so the two callers can answer it their
+/// own way: the main socket branch answers 502 or 503, the custom-error-page
+/// branch falls back to the internal page.
+#[derive(Debug)]
+enum SocketLaunchError {
+    UnknownBackend,
+    BacklogFull,
+    Connect(std::io::Error),
+    Register(std::io::Error),
+}
+
+/// What one socket dispatch sends on its upstream slot.
+///
+/// A forwarded request is encoded the ordinary way. A check is the hand-built
+/// `POST /check`, because it is not a route on this node and has no
+/// `HttpRequest` of its own.
+#[derive(Clone, Copy)]
+enum UpstreamSend<'a> {
+    Forward(&'a forward::HttpRequest),
+    Check { credential: &'a str },
+}
+
+/// Encode the request into the slot's buffer, take the next pool member, start
+/// the non-blocking upstream, register it, and park it in `upstreams`.
+/// Returns the upstream's slot key, so the caller can store its waiter there.
+///
+/// A member whose connect fails is skipped for this request only: the next
+/// member is tried, so the request answers 502 only when every member has
+/// failed. The pool keeps every member in rotation, so a backend that comes
+/// back serves on its next turn.
+fn launch_socket_upstream(
+    state: &mut ServerState,
+    registry: &m6_core::platform::Registry,
+    send: UpstreamSend<'_>,
+    client_ip: &str,
+    backend_name: &str,
+    timeout: std::time::Duration,
+) -> Result<usize, SocketLaunchError> {
+    let member_count = match state.pool_manager.get_pool(backend_name) {
+        Some(pool) => pool.total_count(),
+        None => return Err(SocketLaunchError::UnknownBackend),
+    };
+    let deadline = m6_core::platform::now() + timeout;
+    let Some(owner) = state.upstreams.take() else {
+        return Err(SocketLaunchError::BacklogFull);
+    };
+    let Some(token) = take_token(state) else {
+        state.upstreams.free(owner.key);
+        return Err(SocketLaunchError::BacklogFull);
+    };
+    // Encode once: every attempt sends the same request, and the slot's buffer
+    // keeps its capacity.
+    let encoded = {
+        let entry = state.upstreams.get_mut(owner.key);
+        match send {
+            UpstreamSend::Forward(req) => {
+                let original_host = origin_host(req, &state.config);
+                forward::encode_request(entry.upstream.request_buf(), req, client_ip, original_host)
+            }
+            UpstreamSend::Check { credential } => {
+                auth::encode_check_request(entry.upstream.request_buf(), Some(credential));
+                Ok(())
+            }
+        }
+    };
+    if let Err(e) = encoded {
+        state.upstreams.free(owner.key);
+        *state.sources.get_mut(token.0) = Source::Vacant;
+        state.sources.free(token.0);
+        return Err(SocketLaunchError::Connect(e));
+    }
+
+    // Each attempt moves the next member's path into the slot's address, so
+    // the pool borrow ends before the slot is used and the path buffer is
+    // reused. The loop runs at most once per member, so it ends after every
+    // member has failed.
+    //
+    // A failed connect moves to the next member, and a full listen queue is a
+    // failed connect too. When every attempt has failed, the last real error
+    // is reported as 502. If every failure was a full queue, the members are
+    // alive and busy, so the answer is 503 instead.
+    let mut started = false;
+    let mut all_full = true;
+    let mut last_error = None;
+    for _ in 0..member_count {
+        let path = match state
+            .pool_manager
+            .get_pool_mut(backend_name)
+            .and_then(|pool| pool.take_member())
+        {
+            Some(path) => path,
+            None => {
+                // A configured pool always holds a member, so this cannot
+                // happen. Report it rather than register a slot whose
+                // upstream never started.
+                all_full = false;
+                last_error = Some(std::io::Error::other("socket pool has no members"));
+                break;
+            }
+        };
+        let entry = state.upstreams.get_mut(owner.key);
+        match &mut entry.addr {
+            m6_core::client::Addr::Unix(existing) => {
+                existing.clear();
+                existing.push(path);
+            }
+            m6_core::client::Addr::Tcp(_) => {
+                entry.addr = m6_core::client::Addr::Unix(path.to_path_buf());
+            }
+        }
+        let started_result = {
+            let entry = state.upstreams.get_mut(owner.key);
+            let method_is_head = matches!(send, UpstreamSend::Forward(req) if req.method.eq_ignore_ascii_case("HEAD"));
+            entry
+                .upstream
+                .start(&entry.addr, None, method_is_head, deadline)
+        };
+        match started_result {
+            Ok(()) => {
+                started = true;
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // The member is alive and its listen queue is full (E2, the
+                // kernel is the queue). That member failed this request, so
+                // the loop takes the next member. `all_full` stays true when
+                // every attempt ends this way.
+            }
+            Err(e) => {
+                all_full = false;
+                last_error = Some(e);
+            }
+        }
+    }
+    if !started {
+        state.upstreams.free(owner.key);
+        *state.sources.get_mut(token.0) = Source::Vacant;
+        state.sources.free(token.0);
+        return Err(if all_full {
+            SocketLaunchError::BacklogFull
+        } else {
+            SocketLaunchError::Connect(
+                last_error.unwrap_or_else(|| std::io::Error::other("every member failed")),
+            )
+        });
+    }
+
+    let interest = {
+        let entry = state.upstreams.get_mut(owner.key);
+        let interest = entry.upstream.interest();
+        if let Err(e) = registry.register_fd(entry.upstream.fd(), token, interest) {
+            entry.upstream.close();
+            state.upstreams.free(owner.key);
+            *state.sources.get_mut(token.0) = Source::Vacant;
+            state.sources.free(token.0);
+            return Err(SocketLaunchError::Register(e));
+        }
+        interest
+    };
+    // The check's deadline is 50 ms and a backend's is `backend_timeout_secs`,
+    // so the two go in two tables, each of one duration.
+    let now = m6_core::platform::now();
+    if matches!(send, UpstreamSend::Check { .. }) {
+        state.auth_timeouts.touch(token, now);
+    } else {
+        state.upstream_timeouts.touch(token, now);
+    }
+    *state.sources.get_mut(token.0) = Source::Upstream(owner.key);
+    let entry = state.upstreams.get_mut(owner.key);
+    entry.kind = UpstreamKind::Member;
+    entry.token = token;
+    entry.waiter = None;
+    entry.ctx = None;
+    entry.registered_interest = interest;
+    Ok(owner.key)
+}
+
+/// The 405 answer for a route that does not answer the request method.
+///
+/// RFC 9110 15.5.6 requires `Allow`, and RFC 9110 10.2.1 says it names the
+/// methods the target resource supports. The body is the same plain refusal
+/// the server-wide method check sends, because rendering the custom error page
+/// here would contact a backend and this answer exists to avoid that.
+fn method_refusal(allowed: m6_core::site::Methods) -> RequestOutcome {
+    method_refusal_value(allowed.allow_value())
+}
+
+/// The same 405 with an `Allow` value already built.
+fn method_refusal_value(allow: String) -> RequestOutcome {
+    let mut headers = vec![
+        (
+            "Content-Type".to_string(),
+            "text/plain; charset=utf-8".to_string(),
+        ),
+        ("Cache-Control".to_string(), "no-store".to_string()),
+        ("Allow".to_string(), allow),
+    ];
+    set_date(&mut headers);
+    RequestOutcome::Ready(
+        405,
+        headers,
+        b"Method Not Allowed".to_vec(),
+        "method-check".to_string(),
+        None,
+    )
+}
+
+/// The route's refusal for this request, if it has one.
+///
+/// `OPTIONS` is decided here rather than falling through. It asks what the
+/// target resource offers (RFC 9110 9.3.7), and m6 offers no options of its
+/// own, so the answer is the same 405 with `Allow` and the request never
+/// reaches a backend even when `[server] allowed_methods` names `OPTIONS`.
+/// `OPTIONS` is removed from that list here and in the header, so `Allow`
+/// never names a method the answer refuses.
+fn route_method_refusal(state: &ServerState, path: &str, method: &str) -> Option<RequestOutcome> {
+    // An invented method is 501, not 405 (RFC 9110 15.6.2). The server-wide
+    // check already draws that line; leaving these to it keeps the two
+    // answers distinct.
+    if !is_registered_method(method) {
+        return None;
+    }
+    if method == "OPTIONS" {
+        let route = state.route_table.at(path)?;
+        return route_refusal(route, method, &state.config);
+    }
+    let expected = state.route_table.refused_method(path, method)?;
+    Some(method_refusal(expected))
+}
+
+/// [`route_method_refusal`] for a route the caller already holds.
+fn route_refusal(
+    route: &m6_http_lib::router::RouteEntry,
+    method: &str,
+    config: &config::Config,
+) -> Option<RequestOutcome> {
+    if method == "OPTIONS" {
+        let allow = if route.methods == m6_core::site::Methods::ANY {
+            config
+                .server
+                .allowed_methods
+                .iter()
+                .filter(|m| !m.eq_ignore_ascii_case("OPTIONS"))
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            route.methods.allow_value()
+        };
+        return Some(method_refusal_value(allow));
+    }
+    (!route.methods.contains(method)).then(|| method_refusal(route.methods))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the request path's fixed inputs, plus the decision a check re-entry carries"
+)]
 fn handle_request_inner(
     req: &forward::HttpRequest,
     client_ip: &str,
@@ -2423,9 +5274,12 @@ fn handle_request_inner(
     // True when this request arrived on the h2c listener and [server]
     // internal_binds names it, meaning one of our own nodes over the backbone
     // rather than a public client. Granted by the listener, never by a header, so a public
-    // client cannot claim it. The error-path guard and the metrics gate read it.
+    // client cannot claim it. The error-path guard and the genid gate read it.
     from_internal: bool,
+    registry: &m6_core::platform::Registry,
+    pre_decided: Option<PreDecided>,
 ) -> RequestOutcome {
+    let mut pre_decided = pre_decided;
     // Prefetch requests are synthetic (no real client, client_ip is a
     // placeholder) and their response is discarded by the caller — logging
     // them as analytics would mint a session/log a "MISS" line for a visit
@@ -2443,7 +5297,7 @@ fn handle_request_inner(
     // a GET would — but it is method confusion, and on any site where a read
     // path and an action path share a URL that becomes a security problem
     // rather than a correctness one. TRACE is the one worth naming: answering
-    // it at all is a cross-site tracing vector.
+    // it at all is a cross-site tracking vector.
     //
     // The cache is already closed to these verbs at every lookup site (see
     // `cache::method_may_read_cache`); this closes the backend to them too.
@@ -2490,7 +5344,13 @@ fn handle_request_inner(
         } else {
             b"Not Implemented"
         };
-        return RequestOutcome::Ready(status, headers, body.to_vec(), "method-check".to_string());
+        return RequestOutcome::Ready(
+            status,
+            headers,
+            body.to_vec(),
+            "method-check".to_string(),
+            None,
+        );
     }
 
     // ── Health endpoint, ahead of routing/cache/backends ────────────────────
@@ -2505,17 +5365,14 @@ fn handle_request_inner(
     // It sits *after* method validation so a health path still refuses PUT
     // and friends like every other path, rather than becoming a hole in it.
     if state.config.health.enabled && req.path == state.config.health.path {
-        let pools: Vec<health::PoolHealth> = state
-            .pool_manager
-            .pool_health()
-            .into_iter()
-            .map(|(name, active, total)| health::PoolHealth {
-                name,
-                active,
-                total,
-            })
-            .collect();
-        let (code, report) = health::HealthReport::build(&state.config.node.name, &pools);
+        // The dependency flags this answer reads. A cache node's origin is the
+        // follower's own state, set where a heartbeat or a forwarded request
+        // already observes the failure and cleared by the next answer. No
+        // timer, no probe, no clock. A second dependency is one more term on
+        // this line: the auth checker's flag is ORed in beside it.
+        let degraded = health::origin_down(&state.genid);
+        let (code, mut report) = health::health_answer(degraded, &state.config.node.name);
+        report.process_index = state.config.server.process_index;
         let (code, headers, body) = report.into_response(code);
         // Recorded, not discarded. `message = "monitor"` keeps it out of the
         // site-traffic rows every consumer already filters for, so an uptime
@@ -2528,99 +5385,243 @@ fn handle_request_inner(
             code,
             client_ip,
             None,
+            &mut state.traffic,
         );
-        return RequestOutcome::Ready(code, headers, body, health::HEALTH_BACKEND.to_string());
+        return RequestOutcome::Ready(
+            code,
+            headers,
+            body,
+            health::HEALTH_BACKEND.to_string(),
+            None,
+        );
     }
 
-    // ── Metrics endpoint, deliberately a separate path from /health ─────────
-    // Percentiles mean sorting a 4096-sample reservoir. Serving them from the
-    // health path behind a conditional would leave the expensive branch one
-    // misconfigured header away from being taken on every check forever, so
-    // the split is what keeps the health answer cheap. `snapshot` is passed
-    // as a closure and is not called until authorisation passes.
-    if state.config.health.enabled && req.path == state.config.health.perf_path {
-        let outcome = match health::metrics_gate(
-            &state.config.health,
-            state.public_key.as_ref(),
-            &req.headers,
-            client_ip,
-            from_internal,
-        ) {
-            health::Gate::Refused(refused) => refused,
-            health::Gate::Open => {
-                // Pool occupancy is gathered here rather than on `/health`,
-                // which publishes neither, and only after the gate has passed.
-                // It costs a lock-free read of the pool manager, unlike the
-                // reservoir sort in `snapshot`.
-                let pools: Vec<health::PoolHealth> = state
-                    .pool_manager
-                    .pool_health()
-                    .into_iter()
-                    .map(|(name, active, total)| health::PoolHealth {
-                        name,
-                        active,
-                        total,
-                    })
-                    .collect();
-                health::PerfReport::build_authorised(
-                    health::PerfSubject {
-                        node: &state.config.node.name,
-                        uptime_s: state.started.elapsed().as_secs(),
-                        pools,
-                        url_backends: state.pool_manager.url_backend_names(),
-                        host_path: &state.config.site_dir,
+    // ── The site generation ID, ahead of routing and the cache ──────────────
+    // A source node owns the number that names the content its backends are
+    // serving. `GET` reads it, `POST` refreshes every backend and advances it.
+    // The path is reserved on every m6-http: a node with no `[genid]` has no
+    // entry here and falls through to the 404 any unknown path gets.
+    //
+    // Address and token before method, so a stranger learns nothing about
+    // which methods exist. Both claims absent is the endpoint not existing,
+    // which is also a 404.
+    if req.path == m6_core::site::GENID_PATH {
+        if let Some(genid_config) = state.config.genid.as_ref() {
+            // A cache node does not own an ID, so it forwards the caller's own
+            // request and token to the source. Only the address rule is its
+            // own: a stranger gets the 404 an unknown path gives, before
+            // anything is forwarded. The source authorises the call.
+            if let genid::Role::Cache(_) = &state.genid {
+                if !health::genid_address_ok(client_ip, from_internal) {
+                    let (code, headers, body) = health::not_found();
+                    return RequestOutcome::Ready(
+                        code,
+                        headers,
+                        body,
+                        health::GENID_BACKEND.to_string(),
+                        None,
+                    );
+                }
+                if !matches!(req.method.as_str(), "GET" | "HEAD" | "POST") {
+                    let headers = vec![
+                        ("Allow".to_string(), "GET, HEAD, POST".to_string()),
+                        ("Cache-Control".to_string(), "no-store".to_string()),
+                    ];
+                    return RequestOutcome::Ready(
+                        405,
+                        headers,
+                        Vec::new(),
+                        health::GENID_BACKEND.to_string(),
+                        None,
+                    );
+                }
+                let Some(backend_idx) = state.heartbeat_backend else {
+                    // `config::load` refused an upstream naming no URL
+                    // backend, so this is unreachable on a loaded config.
+                    let headers = vec![
+                        (
+                            "Content-Type".to_string(),
+                            "text/plain; charset=utf-8".to_string(),
+                        ),
+                        ("Cache-Control".to_string(), "no-store".to_string()),
+                    ];
+                    return RequestOutcome::Ready(
+                        502,
+                        headers,
+                        b"Bad Gateway".to_vec(),
+                        health::GENID_BACKEND.to_string(),
+                        None,
+                    );
+                };
+                let upstream = genid_config.upstream.clone().unwrap_or_default();
+                let ctx = forward::PendingUrlContext {
+                    req: req.clone(),
+                    client_ip: client_ip.to_string(),
+                    enc: String::new(),
+                    backend_name: upstream.clone(),
+                    kind: forward::PendingKind::Url,
+                    route_path: None,
+                    auth_require: None,
+                    auth_gate: None,
+                    from_internal,
+                    route_cache: None,
+                    cacheable: false,
+                    is_prefetch: false,
+                    start: m6_core::platform::now(),
+                    error_status_override: None,
+                    extra_headers: Vec::new(),
+                    genid: state.genid.dispatched(),
+                    genid_forward: true,
+                };
+                return match dispatch_url_backend(state, registry, req, client_ip, backend_idx) {
+                    Ok(id) => RequestOutcome::Pending {
+                        id,
+                        ctx: Box::new(ctx),
                     },
-                    || state.stats.snapshot(),
-                )
+                    Err(UrlDispatchError::NoSlot) => {
+                        let headers = vec![
+                            ("Retry-After".to_string(), "1".to_string()),
+                            ("Cache-Control".to_string(), "no-store".to_string()),
+                        ];
+                        RequestOutcome::Ready(
+                            503,
+                            headers,
+                            b"Service Unavailable".to_vec(),
+                            health::GENID_BACKEND.to_string(),
+                            None,
+                        )
+                    }
+                    Err(UrlDispatchError::Failed(e)) => {
+                        warn!(
+                            backend = %upstream,
+                            error = %e,
+                            "genid: forwarding to the upstream failed"
+                        );
+                        let headers = vec![
+                            (
+                                "Content-Type".to_string(),
+                                "text/plain; charset=utf-8".to_string(),
+                            ),
+                            ("Cache-Control".to_string(), "no-store".to_string()),
+                        ];
+                        RequestOutcome::Ready(
+                            502,
+                            headers,
+                            b"Bad Gateway".to_vec(),
+                            health::GENID_BACKEND.to_string(),
+                            None,
+                        )
+                    }
+                };
             }
-        };
-        let (code, headers, body) = outcome.into_response();
-        // Same treatment as /health above. A 401 here is worth seeing: it
-        // means something is probing the metrics endpoint without the token.
-        analytics::log_monitor(
-            state.config.analytics.enabled,
-            &req.headers,
-            &state.config.node.name,
-            &req.path,
-            code,
-            client_ip,
-            None,
-        );
-        return RequestOutcome::Ready(code, headers, body, health::PERF_BACKEND.to_string());
-    }
 
-    // ── Traffic summary, the third monitoring path ──────────────────────────
-    // Its own path for the same reason /perf is not /health: this one reads
-    // the tail of the analytics log, so its cost is a property of the path
-    // rather than of a header on a cheaper one. Cached, so a polling monitor
-    // cannot make the node re-read the log on every scrape.
-    if state.config.health.enabled && req.path == state.config.health.traffic_path {
-        let outcome = match health::metrics_gate(
-            &state.config.health,
-            state.public_key.as_ref(),
-            &req.headers,
-            client_ip,
-            from_internal,
-        ) {
-            health::Gate::Refused(refused) => refused,
-            health::Gate::Open => health::traffic_authorised(
-                &state.config.node.name,
-                &state.config.analytics.log_path,
-                60,
-                std::time::Duration::from_secs(state.config.health.traffic_cache_s),
-            ),
-        };
-        let (code, headers, body) = outcome.into_response();
-        analytics::log_monitor(
-            state.config.analytics.enabled,
-            &req.headers,
-            &state.config.node.name,
-            &req.path,
-            code,
-            client_ip,
-            None,
-        );
-        return RequestOutcome::Ready(code, headers, body, health::PERF_BACKEND.to_string());
+            let write = req.method == "POST";
+            match health::genid_gate(genid_config, client_ip, from_internal, write) {
+                health::Gate::Refused(code, headers, body) => {
+                    return RequestOutcome::Ready(
+                        code,
+                        headers,
+                        body,
+                        health::GENID_BACKEND.to_string(),
+                        None,
+                    );
+                }
+                health::Gate::Open => {}
+                health::Gate::Check(require) => {
+                    let auth_backend = auth_backend_name(state);
+                    let plan = CheckPlan {
+                        req,
+                        client_ip,
+                        enc: content_encoding,
+                        auth_backend: auth_backend.clone(),
+                        content_backend: health::GENID_BACKEND.to_string(),
+                        route_path: req.path.clone(),
+                        route_cache: None,
+                        cacheable: false,
+                        is_prefetch: false,
+                        from_internal,
+                        gate: forward::AuthGate::Genid,
+                        require,
+                    };
+                    let decision = match resolve_check(plan, pre_decided.take(), state, registry) {
+                        CheckResolution::Decision(decision) => decision,
+                        CheckResolution::Pending(outcome) => return outcome,
+                    };
+                    match decision {
+                        core_auth::Decision::Allow(_) => {}
+                        core_auth::Decision::NoDecision => {
+                            return backend_unavailable(
+                                req,
+                                client_ip,
+                                state,
+                                registry,
+                                &req.path,
+                                &auth_backend,
+                                "auth check unavailable",
+                            );
+                        }
+                        refusal => {
+                            let (code, headers, body) = refusal.refusal().expect("a refusal");
+                            return RequestOutcome::Ready(
+                                code,
+                                headers,
+                                body,
+                                "auth".to_string(),
+                                None,
+                            );
+                        }
+                    }
+                }
+            }
+            match req.method.as_str() {
+                "GET" | "HEAD" => {
+                    let id = state.genid.source().map(genid::Genid::current).unwrap_or(0);
+                    if req.method == "GET" {
+                        if let Ok(ip) = client_ip.parse::<std::net::IpAddr>() {
+                            if let Some(g) = state.genid.source_mut() {
+                                g.saw_peer(ip, m6_core::platform::now());
+                            }
+                        }
+                    }
+                    let headers = vec![
+                        ("Content-Type".to_string(), "application/json".to_string()),
+                        ("Cache-Control".to_string(), "no-store".to_string()),
+                    ];
+                    let mut body = Vec::with_capacity(32);
+                    body.extend_from_slice(b"{\"genid\":\"");
+                    body.extend_from_slice(itoa::Buffer::new().format(id).as_bytes());
+                    body.extend_from_slice(b"\"}");
+                    return RequestOutcome::Ready(
+                        200,
+                        headers,
+                        body,
+                        health::GENID_BACKEND.to_string(),
+                        Some(id),
+                    );
+                }
+                "POST" => {
+                    // Parked until every backend has the new content. The
+                    // sequence, not this request, writes the answer.
+                    return RequestOutcome::Pending {
+                        id: UpstreamId::Genid,
+                        ctx: forward::PendingUrlContext::for_genid(),
+                    };
+                }
+                _ => {
+                    let headers = vec![
+                        ("Allow".to_string(), "GET, HEAD, POST".to_string()),
+                        ("Cache-Control".to_string(), "no-store".to_string()),
+                    ];
+                    return RequestOutcome::Ready(
+                        405,
+                        headers,
+                        Vec::new(),
+                        health::GENID_BACKEND.to_string(),
+                        None,
+                    );
+                }
+            }
+        }
     }
 
     // The custom-error render route takes `status`/`from` (and optional
@@ -2643,8 +5644,7 @@ fn handle_request_inner(
     // so a public client cannot claim it -- the same rule that decides whether a
     // forwarded client address is trusted on that listener.
     if error::refuses_custom_error_path(&state.error_mode, &req.path, from_internal) {
-        let (s, h, b, n) = apply_error_mode(404, req, client_ip, state, None);
-        return RequestOutcome::Ready(s, h, b, n);
+        return request_error(404, req, client_ip, state, None, registry);
     }
 
     // Route lookup
@@ -2664,36 +5664,90 @@ fn handle_request_inner(
                     ("Location".to_string(), location),
                     ("Content-Type".to_string(), "text/html".to_string()),
                 ];
-                return RequestOutcome::Ready(301, headers, vec![], "redirect".to_string());
+                return RequestOutcome::Ready(301, headers, vec![], "redirect".to_string(), None);
             }
-            // Prefer fetching the real custom error page over the local
-            // socket-pool path (`apply_error_mode`/`forward_to_backend` only
-            // know how to reach Unix-socket backends). On a node whose error
+            // Prefer fetching the real custom error page. On a node whose error
             // backend is itself a URL/H2C/H2S backend — every cache node,
             // whose only backend is the origin — dispatch that fetch async
             // and let it resolve through the normal Pending machinery.
-            if let Some(outcome) = dispatch_custom_error_async(404, req, client_ip, state) {
+            if let Some(outcome) =
+                dispatch_custom_error_async(404, req, client_ip, state, registry, None)
+            {
                 return outcome;
             }
-            let (s, h, b, n) = apply_error_mode(404, req, client_ip, state, None);
-            return RequestOutcome::Ready(s, h, b, n);
+            return request_error(404, req, client_ip, state, None, registry);
         }
     };
 
-    // Verified JWT claims — populated during auth check, forwarded to backend.
-    let mut verified_claims: Option<auth::Claims> = None;
+    // The same refusal as `route_request`, reached here by a caller that did
+    // not go through it (a background refresh), and by every protocol on the
+    // miss path. The route is already in hand, so this costs one bit test.
+    if let Some(outcome) = route_refusal(&route, &req.method, &state.config) {
+        return outcome;
+    }
 
-    // Auth check — only if route has `require`
+    // The identity the authority answered, forwarded to the backend.
+    let mut verified_identity: Option<core_auth::Identity> = None;
+
+    // The route gate. It no longer verifies a token: with a `require` it asks
+    // `POST /check` on `[auth] backend` and parks the request until the answer
+    // arrives. The completion re-enters `handle_request` with the decision in
+    // `pre_decided`, so this block runs a second time with the authority's
+    // answer and no second check is sent.
+    //
+    // The representation is this block's only choice. An API caller gets the
+    // check's refusal unchanged, the same status, headers and body `/genid`
+    // answers. A browser is a route-level choice made on top of that decision:
+    // no credential redirects to login (or to the refresh path, when it still
+    // holds a refresh cookie), and a credential lacking the role gets the
+    // site's own 403 page rather than JSON.
     if let Some(ref require) = route.require {
-        if let Some(ref pk) = state.public_key {
-            debug!(path = %req.path, "auth check");
-            match auth::authorise(pk, &req.headers, require) {
-                Err(auth::Refusal::NoToken) => {
-                    warn!(path = %req.path, "auth: no token");
-                    let cookie_header_owned = auth::combined_cookie_header(&req.headers);
-                    let cookie_header = cookie_header_owned.as_deref();
-                    let accept_header = m6_core::headers::get(&req.headers[..], "accept");
-                    if auth::is_browser_request(accept_header) {
+        let auth_backend = auth_backend_name(state);
+        let plan = CheckPlan {
+            req,
+            client_ip,
+            enc: content_encoding,
+            auth_backend: auth_backend.clone(),
+            content_backend: route.backend.clone(),
+            route_path: route.path.clone(),
+            route_cache: route.cache.clone(),
+            cacheable: false,
+            is_prefetch,
+            from_internal,
+            gate: forward::AuthGate::Route,
+            require: require.clone(),
+        };
+        let decision = match resolve_check(plan, pre_decided.take(), state, registry) {
+            CheckResolution::Decision(decision) => decision,
+            CheckResolution::Pending(outcome) => return outcome,
+        };
+        match decision {
+            core_auth::Decision::Allow(identity) => verified_identity = Some(identity),
+            // The authority could not decide. That is a 503, never a 401: a
+            // 401 would tell a user with a valid credential to log in again.
+            core_auth::Decision::NoDecision => {
+                warn!(
+                    backend = %auth_backend,
+                    route = %route.path,
+                    "auth check returned no decision"
+                );
+                return backend_unavailable(
+                    req,
+                    client_ip,
+                    state,
+                    registry,
+                    &route.path,
+                    &auth_backend,
+                    "auth check unavailable",
+                );
+            }
+            refusal @ (core_auth::Decision::NoCredential | core_auth::Decision::Deny) => {
+                let accept_header = m6_core::headers::get(&req.headers[..], "accept");
+                if auth::is_browser_request(accept_header) {
+                    if matches!(refusal, core_auth::Decision::NoCredential) {
+                        warn!(path = %req.path, "auth: no token");
+                        let cookie_header_owned = auth::combined_cookie_header(&req.headers);
+                        let cookie_header = cookie_header_owned.as_deref();
                         let refresh = auth::extract_refresh_cookie(cookie_header);
                         let redirect_url = if refresh.is_some() {
                             "/auth/refresh".to_string()
@@ -2704,29 +5758,14 @@ fn handle_request_inner(
                             ("Location".to_string(), redirect_url),
                             ("Content-Type".to_string(), "text/html".to_string()),
                         ];
-                        return RequestOutcome::Ready(302, headers, vec![], "auth".to_string());
+                        return RequestOutcome::Ready(
+                            302,
+                            headers,
+                            vec![],
+                            "auth".to_string(),
+                            None,
+                        );
                     }
-                    let ctx = error::ErrorContext {
-                        route: Some(route.path.clone()),
-                        backend: Some(route.backend.clone()),
-                        detail: Some("no token".to_string()),
-                    };
-                    let (s, mut h, b, n) = apply_error_mode(401, req, client_ip, state, Some(&ctx));
-                    add_bearer_challenge(&mut h);
-                    return RequestOutcome::Ready(s, h, b, n);
-                }
-                Err(auth::Refusal::Invalid(e)) => {
-                    warn!(path = %req.path, error = %e, "auth: token verification failed");
-                    let ctx = error::ErrorContext {
-                        route: Some(route.path.clone()),
-                        backend: Some(route.backend.clone()),
-                        detail: Some(e.to_string()),
-                    };
-                    let (s, mut h, b, n) = apply_error_mode(401, req, client_ip, state, Some(&ctx));
-                    add_bearer_challenge(&mut h);
-                    return RequestOutcome::Ready(s, h, b, n);
-                }
-                Err(auth::Refusal::Insufficient) => {
                     warn!(
                         path = %req.path,
                         require = %require,
@@ -2737,20 +5776,21 @@ fn handle_request_inner(
                         backend: Some(route.backend.clone()),
                         detail: Some(format!("requires: {require}")),
                     };
-                    let (s, h, b, n) = apply_error_mode(403, req, client_ip, state, Some(&ctx));
-                    return RequestOutcome::Ready(s, h, b, n);
+                    return request_error(403, req, client_ip, state, Some(&ctx), registry);
                 }
-                // Forward verified claims to backend as X-Auth-Claims header
-                // (base64-encoded JSON so renderers can inspect them).
-                Ok(claims) => verified_claims = Some(claims),
+                warn!(path = %req.path, require = %require, "auth: refused");
+                let (code, headers, body) = refusal.refusal().expect("a refusal, by construction");
+                return RequestOutcome::Ready(code, headers, body, "auth".to_string(), None);
             }
         }
     }
 
-    // Build request with X-Auth-Claims injected if claims were verified.
+    // Build request with X-Auth-Claims injected when the authority answered an
+    // identity. The header carries the four documented fields and no token
+    // claim.
     let req_with_claims;
-    let req = if let Some(ref claims) = verified_claims {
-        let encoded = auth::encode_claims_header(claims);
+    let req = if let Some(ref identity) = verified_identity {
+        let encoded = core_auth::encode_claims_header(identity);
         let mut headers = req.headers.clone();
         headers.push(("X-Auth-Claims".to_string(), encoded));
         req_with_claims = forward::HttpRequest {
@@ -2778,177 +5818,171 @@ fn handle_request_inner(
         route.require.is_none() && m6_http_lib::cache::method_may_write_cache(&req.method);
     let backend_name = route.backend.clone();
 
-    // Check if URL backend — dispatch async.
-    let original_host = origin_host(req, &state.config);
-    let timeout = std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
-
-    if let Some((url, _tls_config, _)) = state.pool_manager.get_url_info(&backend_name) {
-        let url = url.to_string();
+    // A URL backend: an h2 stream, or a loop-driven upstream slot.
+    if let Some(backend_idx) = state.pool_manager.find_url(&backend_name) {
         let ctx = forward::PendingUrlContext {
             req: req.clone(),
             client_ip: client_ip.to_string(),
             enc: content_encoding.to_string(),
             backend_name: backend_name.clone(),
+            kind: forward::PendingKind::Url,
+            route_path: None,
+            auth_require: None,
+            auth_gate: None,
+            from_internal,
+            route_cache: route.cache.clone(),
             cacheable,
             is_prefetch,
-            start: std::time::Instant::now(),
+            start: m6_core::platform::now(),
             error_status_override: None,
+            extra_headers: Vec::new(),
+            genid: state.genid.dispatched(),
+            genid_forward: false,
         };
-
-        let rx = if url.starts_with("h2c://") {
-            // Persistent non-blocking H2C client — event-loop managed.
-            match state.h2c_pool.dispatch(&url, req, client_ip, original_host) {
-                Ok(rx) => rx,
-                Err(e) => {
-                    warn!(backend = %backend_name, error = %e, "h2c dispatch failed");
-                    let ctx = error::ErrorContext {
-                        route: Some(route.path.clone()),
-                        backend: Some(backend_name.clone()),
-                        detail: Some(e.to_string()),
-                    };
-                    let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&ctx));
-                    return RequestOutcome::Ready(s, h, b, n);
-                }
+        let id = match dispatch_url_backend(state, registry, req, client_ip, backend_idx) {
+            Ok(id) => id,
+            Err(UrlDispatchError::NoSlot) => {
+                return backend_unavailable(
+                    req,
+                    client_ip,
+                    state,
+                    registry,
+                    &route.path,
+                    &backend_name,
+                    "backend connection table full",
+                );
             }
-        } else if url.starts_with("h2s://") {
-            // Persistent non-blocking H2S (HTTP/2 over TLS) client — event-loop managed.
-            match state
-                .h2s_pool
-                .dispatch(&url, req, client_ip, original_host, _tls_config)
-            {
-                Ok(rx) => rx,
-                Err(e) => {
-                    warn!(backend = %backend_name, error = %e, "h2s dispatch failed");
-                    let ctx = error::ErrorContext {
-                        route: Some(route.path.clone()),
-                        backend: Some(backend_name.clone()),
-                        detail: Some(e.to_string()),
-                    };
-                    let (s, h, b, n) = apply_error_mode(502, req, client_ip, state, Some(&ctx));
-                    return RequestOutcome::Ready(s, h, b, n);
-                }
+            Err(UrlDispatchError::Failed(e)) => {
+                warn!(backend = %backend_name, error = %e, "url backend dispatch failed");
+                let err_ctx = error::ErrorContext {
+                    route: Some(route.path.clone()),
+                    backend: Some(backend_name.clone()),
+                    detail: Some(e.to_string()),
+                };
+                return request_error(502, req, client_ip, state, Some(&err_ctx), registry);
             }
-        } else {
-            forward::dispatch_url_request(
-                url,
-                req.clone(),
-                client_ip.to_string(),
-                original_host.to_string(),
-                Some(timeout),
-                _tls_config,
-            )
         };
-        return RequestOutcome::Pending { rx, ctx };
+        return RequestOutcome::Pending {
+            id,
+            ctx: Box::new(ctx),
+        };
     }
 
-    // Socket backend — synchronous (local, sub-ms).
-    let backend_start = std::time::Instant::now();
-    let (status, mut resp_headers, body, conn_err) =
-        match forward_to_backend(req, &backend_name, client_ip, state) {
-            Ok(mut http_resp) => {
-                // `request_permits_storage` is the request half of the
-                // decision (RFC 9111 5.2.1.5): a client that sent
-                // `Cache-Control: no-store` must not have its exchange
-                // retained and replayed to anyone else. Request directives
-                // were not parsed at all before this.
-                // Stamp Date BEFORE the cache decision so the STORED entry
-                // carries it. Applying it after the insert (as Vary is) meant
-                // a cache hit replayed headers with no Date at all, and adding
-                // a fresh one on the hit path would be worse: it would claim
-                // the response was generated just now while the Age header
-                // beside it said sixty seconds. Date is the generation time;
-                // it has to be captured at generation.
-                set_date(&mut http_resp.headers);
-                if cacheable
-                    && request_permits_storage(&req.headers)
-                    && should_cache(http_resp.status, &http_resp.headers)
-                {
-                    let key = CacheKey::new(&req.path, req.query.as_deref(), content_encoding);
-                    state.cache.insert(
-                        key,
-                        CachedResponse {
-                            status: http_resp.status,
-                            // strip_set_cookie: at this point in the socket-
-                            // backend path http_resp.headers is the backend's
-                            // (m6-html/m6-file/render-*) raw response, before
-                            // this request's own analytics Set-Cookie is even
-                            // added — so today this is a defensive no-op here.
-                            // Applied anyway (matching the async URL-backend
-                            // insert below, where it isn't a no-op) so cache
-                            // correctness doesn't depend on which code path a
-                            // future Set-Cookie-emitting backend happens to use.
-                            headers: std::sync::Arc::new(strip_set_cookie(&http_resp.headers)),
-                            body: Bytes::from(http_resp.body.clone()),
-                        },
-                    );
-                }
-                (
-                    http_resp.status,
-                    http_resp.headers,
-                    http_resp.body,
-                    None::<String>,
-                )
-            }
-            Err(e) => {
-                warn!(backend = %backend_name, error = %e, "backend error");
-                (502u16, vec![], vec![], Some(e))
-            }
-        };
+    // Socket backend: a non-blocking upstream driven by the loop. The reply
+    // arrives on the entry's channel and is finished by complete_socket_response
+    // (reached from finalize_url_response), which keeps the socket branch's own
+    // completion semantics.
+    let timeout = std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
+    let backend_start = m6_core::platform::now();
 
-    // If the response is an error (4xx/5xx) and not already an error response,
-    // apply the error mode: status, internal, or custom.
-    if status >= 400 {
-        let detail = conn_err.unwrap_or_else(|| format!("{backend_name} returned {status}"));
-        let ctx = error::ErrorContext {
-            route: Some(route.path.clone()),
-            backend: Some(backend_name.clone()),
-            detail: Some(detail),
-        };
-        let (s, mut h, b, n) = apply_error_mode(status, req, client_ip, state, Some(&ctx));
-        // The error page replaces the backend's response wholesale, so the
-        // headers that tell the client what to do next have to be carried over
-        // by hand. Without this, a backend's 429 arrived with no `Retry-After`
-        // and a backend's 401 with no `WWW-Authenticate`. See
-        // `error::PRESERVED_ERROR_HEADERS`.
-        error::preserve_actionable_headers(&resp_headers, &mut h);
-        // This early return must not skip analytics for backend-returned
-        // error statuses. Its async sibling (finalize_url_response)
-        // deliberately logs a backend-returned 4xx/5xx and skips only for a
-        // genuine connection failure, and no different reasoning applies here:
-        // a plain backend 404 belongs in analytics like any other request.
-        let backend_ns = backend_start.elapsed().as_nanos() as u64;
-        analytics::finish_response(
-            analytics_enabled,
-            &mut h,
-            &req.headers,
-            &analytics::Event {
-                node: &state.config.node.name,
-                path: &req.path,
-                status: s,
-                cache_state: "MISS",
+    let slot = match launch_socket_upstream(
+        state,
+        registry,
+        UpstreamSend::Forward(req),
+        client_ip,
+        &backend_name,
+        timeout,
+    ) {
+        Ok(slot) => slot,
+        Err(SocketLaunchError::UnknownBackend) => {
+            warn!(backend = %backend_name, "unknown backend");
+            let err_ctx = error::ErrorContext {
+                route: Some(route.path.clone()),
+                backend: Some(backend_name.clone()),
+                detail: Some(format!("unknown backend: {backend_name}")),
+            };
+            return request_error(502, req, client_ip, state, Some(&err_ctx), registry);
+        }
+        Err(SocketLaunchError::BacklogFull) => {
+            // Either every member's listen queue was full, or this service ran
+            // out of its own upstream slots or tokens. Both mean the node is
+            // busy rather than a backend being wrong, so the answer is 503 and
+            // the detail says which. The slot was released on the way here.
+            return backend_unavailable(
+                req,
                 client_ip,
-                latency_ns: Some(backend_ns),
-            },
-        );
-        return RequestOutcome::Ready(s, h, b, n);
+                state,
+                registry,
+                &route.path,
+                &backend_name,
+                "no upstream slot, or every backend listen queue full",
+            );
+        }
+        Err(SocketLaunchError::Connect(e)) => {
+            warn!(backend = %backend_name, error = %e, "backend error");
+            let err_ctx = error::ErrorContext {
+                route: Some(route.path.clone()),
+                backend: Some(backend_name.clone()),
+                detail: Some(e.to_string()),
+            };
+            return request_error(502, req, client_ip, state, Some(&err_ctx), registry);
+        }
+        Err(SocketLaunchError::Register(e)) => {
+            warn!(backend = %backend_name, error = %e, "registering socket upstream");
+            let err_ctx = error::ErrorContext {
+                route: Some(route.path.clone()),
+                backend: Some(backend_name.clone()),
+                detail: Some(e.to_string()),
+            };
+            return request_error(502, req, client_ip, state, Some(&err_ctx), registry);
+        }
+    };
+
+    let ctx = forward::PendingUrlContext {
+        req: req.clone(),
+        client_ip: client_ip.to_string(),
+        enc: content_encoding.to_string(),
+        backend_name,
+        kind: forward::PendingKind::Socket,
+        route_path: Some(route.path.clone()),
+        auth_require: None,
+        auth_gate: None,
+        from_internal,
+        route_cache: route.cache.clone(),
+        cacheable,
+        is_prefetch,
+        start: backend_start,
+        error_status_override: None,
+        extra_headers: Vec::new(),
+        genid: state.genid.dispatched(),
+        genid_forward: false,
+    };
+    RequestOutcome::Pending {
+        id: UpstreamId::Slot(slot),
+        ctx: Box::new(ctx),
     }
+}
 
-    let backend_ns = backend_start.elapsed().as_nanos() as u64;
-    analytics::finish_response(
-        analytics_enabled,
-        &mut resp_headers,
-        &req.headers,
-        &analytics::Event {
-            node: &state.config.node.name,
-            path: &req.path,
-            status,
-            cache_state: "MISS",
-            client_ip,
-            latency_ns: Some(backend_ns),
-        },
-    );
-
-    RequestOutcome::Ready(status, resp_headers, body, backend_name)
+/// Answer 503 with `Retry-After: 1` through the error mode.
+///
+/// An upstream the process cannot start a connection to right now answers
+/// this: a full upstream table for a URL backend, a full listen queue for a
+/// socket one. Both are transient, so the client is told to retry.
+fn backend_unavailable(
+    req: &forward::HttpRequest,
+    client_ip: &str,
+    state: &mut ServerState,
+    registry: &m6_core::platform::Registry,
+    route_path: &str,
+    backend_name: &str,
+    detail: &str,
+) -> RequestOutcome {
+    let err_ctx = error::ErrorContext {
+        route: Some(route_path.to_string()),
+        backend: Some(backend_name.to_string()),
+        detail: Some(detail.to_string()),
+    };
+    match apply_error_mode(503, req, client_ip, state, Some(&err_ctx), registry) {
+        ErrorOutcome::Ready(s, mut h, b, n) => {
+            h.push(("Retry-After".to_string(), "1".to_string()));
+            RequestOutcome::Ready(s, h, b, n, None)
+        }
+        ErrorOutcome::Pending { id, mut ctx } => {
+            ctx.extra_headers
+                .push(("Retry-After".to_string(), "1".to_string()));
+            RequestOutcome::Pending { id, ctx }
+        }
+    }
 }
 
 /// Check the per-IP rate limit ahead of everything else (cache lookup,
@@ -2969,7 +6003,13 @@ fn check_rate_limit(
         return None;
     }
     if state.config.analytics.enabled {
-        analytics::log_rate_limited(&state.config.node.name, path, client_ip, user_agent);
+        analytics::log_rate_limited(
+            &state.config.node.name,
+            path,
+            client_ip,
+            user_agent,
+            &mut state.traffic,
+        );
     }
     let headers = vec![
         (
@@ -2983,24 +6023,27 @@ fn check_rate_limit(
         headers,
         b"Too Many Requests".to_vec(),
         "rate-limit".to_string(),
+        None,
     ))
 }
 
-/// Try to fetch the configured `[errors] mode = "custom"` error page via an
-/// async URL/H2C/H2S backend dispatch, for cases where `apply_error_mode`'s
-/// synchronous `forward_to_backend` can't reach the error backend (it only
-/// knows how to reach Unix-socket pools; a cache node's only backend is the
-/// origin, an H2C URL backend).
+/// Try to fetch the configured `[errors] mode = "custom"` error page without
+/// blocking the loop: a URL/H2C/H2S backend is dispatched to its own thread or
+/// pool, and a socket backend to a non-blocking `client::Upstream`, both carrying
+/// `error_status_override` so the completion returns the fetched body under the
+/// original failing status.
 ///
-/// Returns `None` when there's no custom error path configured, the request
-/// already targets it (anti-recursion), or its backend turns out to be an
-/// ordinary socket pool anyway — the caller should fall back to the existing
-/// synchronous `apply_error_mode` in every `None` case.
+/// `error_ctx` supplies the route, backend and detail the error page renderer
+/// shows in verbose mode. Returns `None` when there is no custom error path
+/// configured, the request already targets it (anti-recursion), or the error
+/// backend cannot be reached -- the caller falls back to the internal page.
 fn dispatch_custom_error_async(
     status: u16,
     req: &forward::HttpRequest,
     client_ip: &str,
     state: &mut ServerState,
+    registry: &m6_core::platform::Registry,
+    error_ctx: Option<&error::ErrorContext>,
 ) -> Option<RequestOutcome> {
     let error_path = match &state.error_mode {
         ErrorMode::Custom { path } => path.clone(),
@@ -3024,41 +6067,48 @@ fn dispatch_custom_error_async(
         .map(|(_, h, b)| (h.clone(), b.clone()));
 
     if let Some((mut headers, body)) = served_locally {
-        // Logged here explicitly. Analytics for a route miss is recorded by
-        // the code around the dispatch, and returning early skips all of it --
-        // so without this, answering locally would have made every 404
-        // invisible in the request log. Trading origin round trips for
-        // blindness would be a bad bargain, and the visibility is the reason
-        // this shortcut is acceptable at all.
-        //
-        // `req.path` is the caller's real path, not whatever this body was
-        // rendered for, so the log still shows exactly what was asked for.
-        let latency_ns = std::time::Instant::now().elapsed().as_nanos() as u64;
+        let latency_ns = m6_core::platform::now().elapsed().as_nanos() as u64;
         analytics::finish_response(
             state.config.analytics.enabled,
             &mut headers,
             &req.headers,
-            &analytics::Event { node: &state.config.node.name, path: &req.path, status, cache_state: // Neither HIT nor MISS: the response cache was not consulted and
-            // no backend was contacted. Labelling it either would corrupt the
-            // hit rate in both directions.
-            "LOCAL", client_ip, latency_ns: Some(latency_ns) },
+            &analytics::Event {
+                node: &state.config.node.name,
+                path: &req.path,
+                status,
+                // Neither HIT nor MISS: the response cache was not consulted
+                // and no backend was contacted.
+                cache_state: "LOCAL",
+                client_ip,
+                latency_ns: Some(latency_ns),
+            },
+            &mut state.traffic,
         );
         return Some(RequestOutcome::Ready(
             status,
             headers,
             body,
             "error-local".to_string(),
+            None,
         ));
     }
 
     let backend_name = state.route_table.at(&error_path)?.backend.clone();
-    let (url, tls_config, _) = state.pool_manager.get_url_info(&backend_name)?;
-    let url = url.to_string();
-
-    let original_host = origin_host(req, &state.config);
+    let original_host = origin_host(req, &state.config).to_string();
     let timeout = std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
 
-    let error_query = format!("status={}&from={}", status, urlencoded(&req.path));
+    let mut error_query = format!("status={}&from={}", status, urlencoded(&req.path));
+    if let Some(c) = error_ctx {
+        if let Some(ref r) = c.route {
+            error_query.push_str(&format!("&route={}", urlencoded(r)));
+        }
+        if let Some(ref b) = c.backend {
+            error_query.push_str(&format!("&backend={}", urlencoded(b)));
+        }
+        if let Some(ref d) = c.detail {
+            error_query.push_str(&format!("&detail={}", urlencoded(d)));
+        }
+    }
     let error_req = forward::HttpRequest {
         method: "GET".to_string(),
         path: error_path,
@@ -3068,68 +6118,89 @@ fn dispatch_custom_error_async(
         body: vec![],
     };
 
+    // URL backend: an h2 stream, or a loop-driven upstream slot. A failed
+    // dispatch returns None, and the caller falls back to the internal page.
+    if let Some(backend_idx) = state.pool_manager.find_url(&backend_name) {
+        let ctx = forward::PendingUrlContext {
+            req: req.clone(),
+            client_ip: client_ip.to_string(),
+            enc: String::new(),
+            backend_name: backend_name.clone(),
+            kind: forward::PendingKind::Url,
+            route_path: None,
+            auth_require: None,
+            auth_gate: None,
+            from_internal: false,
+            route_cache: None,
+            cacheable: false,
+            is_prefetch: false,
+            start: m6_core::platform::now(),
+            error_status_override: Some(status),
+            extra_headers: Vec::new(),
+            genid: state.genid.dispatched(),
+            genid_forward: false,
+        };
+        let id = dispatch_url_backend(state, registry, &error_req, client_ip, backend_idx).ok()?;
+        return Some(RequestOutcome::Pending {
+            id,
+            ctx: Box::new(ctx),
+        });
+    }
+
+    // Socket backend: a non-blocking upstream, the same way the socket branch
+    // reaches a normal route.
+    let slot = launch_socket_upstream(
+        state,
+        registry,
+        UpstreamSend::Forward(&error_req),
+        client_ip,
+        &backend_name,
+        timeout,
+    )
+    .ok()?;
+
     let ctx = forward::PendingUrlContext {
         req: req.clone(),
         client_ip: client_ip.to_string(),
         enc: String::new(),
         backend_name: backend_name.clone(),
+        kind: forward::PendingKind::Socket,
+        route_path: None,
+        auth_require: None,
+        auth_gate: None,
+        from_internal: false,
+        route_cache: None,
         cacheable: false,
-        // A custom-error-page fetch on behalf of a real client, so it is not a
-        // background prefetch and its analytics line must still be written.
         is_prefetch: false,
-        start: std::time::Instant::now(),
+        start: m6_core::platform::now(),
         error_status_override: Some(status),
+        extra_headers: Vec::new(),
+        genid: state.genid.dispatched(),
+        genid_forward: false,
     };
-
-    let rx = if url.starts_with("h2c://") {
-        state
-            .h2c_pool
-            .dispatch(&url, &error_req, client_ip, original_host)
-            .ok()?
-    } else if url.starts_with("h2s://") {
-        state
-            .h2s_pool
-            .dispatch(&url, &error_req, client_ip, original_host, tls_config)
-            .ok()?
-    } else {
-        forward::dispatch_url_request(
-            url,
-            error_req,
-            client_ip.to_string(),
-            original_host.to_string(),
-            Some(timeout),
-            tls_config,
-        )
-    };
-    Some(RequestOutcome::Pending { rx, ctx })
-}
-
-/// RFC 9110 11.6.1: a 401 names the authentication scheme that would pass.
-/// Keeps a `WWW-Authenticate` a backend already supplied, since the error
-/// path preserves it.
-fn add_bearer_challenge(headers: &mut Vec<(String, String)>) {
-    if !headers
-        .iter()
-        .any(|(k, _)| k.eq_ignore_ascii_case("www-authenticate"))
-    {
-        headers.push(("WWW-Authenticate".to_string(), "Bearer".to_string()));
-    }
+    Some(RequestOutcome::Pending {
+        id: UpstreamId::Slot(slot),
+        ctx: Box::new(ctx),
+    })
 }
 
 /// Apply the configured error mode for a given status code.
 ///
-/// For `Custom` mode, performs an internal GET to `<errors.path>?status=N&from=/original-path`.
-/// Falls back to `Internal` mode if the fetch fails or the request is already to the error path.
+/// For `Custom` mode, when the error page is not already held locally, this
+/// starts an upstream carrying `error_status_override` and returns `Pending`,
+/// so the fetch never blocks the loop. Falls back to `Internal` mode if the
+/// fetch cannot be started or the request is already to the error path.
 fn apply_error_mode(
     status: u16,
     req: &forward::HttpRequest,
     client_ip: &str,
     state: &mut ServerState,
     ctx: Option<&error::ErrorContext>,
-) -> (u16, Vec<(String, String)>, Vec<u8>, String) {
+    registry: &m6_core::platform::Registry,
+) -> ErrorOutcome {
     let verbose = state.config.errors.verbose_fallback;
     match &state.error_mode {
-        ErrorMode::Status => (
+        ErrorMode::Status => ErrorOutcome::Ready(
             status,
             vec![("Content-Type".to_string(), "text/plain".to_string())],
             vec![],
@@ -3138,7 +6209,7 @@ fn apply_error_mode(
         ErrorMode::Internal => {
             let reason = error::status_reason(status);
             let body = error::internal_error_html(status, reason, verbose, &req.path, ctx);
-            (
+            ErrorOutcome::Ready(
                 status,
                 vec![(
                     "Content-Type".to_string(),
@@ -3155,7 +6226,7 @@ fn apply_error_mode(
             if req.path == error_path {
                 let reason = error::status_reason(status);
                 let body = error::internal_error_html(status, reason, verbose, &req.path, ctx);
-                return (
+                return ErrorOutcome::Ready(
                     status,
                     vec![(
                         "Content-Type".to_string(),
@@ -3166,62 +6237,17 @@ fn apply_error_mode(
                 );
             }
 
-            // Build error page request: GET <error_path>?status=N&from=/original-path[&route=...&backend=...&detail=...]
-            let mut error_query = format!("status={}&from={}", status, urlencoded(&req.path));
-            if let Some(c) = ctx {
-                if let Some(ref r) = c.route {
-                    error_query.push_str(&format!("&route={}", urlencoded(r)));
+            match dispatch_custom_error_async(status, req, client_ip, state, registry, ctx) {
+                Some(RequestOutcome::Ready(s, h, b, n, _)) => ErrorOutcome::Ready(s, h, b, n),
+                Some(RequestOutcome::Pending { id, ctx }) => ErrorOutcome::Pending { id, ctx },
+                Some(RequestOutcome::Cached { .. }) => {
+                    unreachable!("a custom error page is never a cached hit")
                 }
-                if let Some(ref b) = c.backend {
-                    error_query.push_str(&format!("&backend={}", urlencoded(b)));
-                }
-                if let Some(ref d) = c.detail {
-                    error_query.push_str(&format!("&detail={}", urlencoded(d)));
-                }
-            }
-            let error_req = forward::HttpRequest {
-                method: "GET".to_string(),
-                path: error_path.clone(),
-                query: Some(error_query),
-                version: "HTTP/3".to_string(),
-                headers: vec![(
-                    "Host".to_string(),
-                    m6_core::headers::get(&req.headers[..], "host")
-                        .unwrap_or_default()
-                        .to_string(),
-                )],
-                body: vec![],
-            };
-
-            // Look up the error backend via the route table.
-            let error_backend = match state.route_table.at(&error_path) {
-                Some(entry) => entry.backend.clone(),
                 None => {
-                    warn!(error_path = %error_path, "custom error: no route for error path, falling back to internal");
+                    warn!(error_path = %error_path, "custom error: cannot fetch the error page, falling back to internal");
                     let reason = error::status_reason(status);
                     let body = error::internal_error_html(status, reason, verbose, &req.path, ctx);
-                    return (
-                        status,
-                        vec![(
-                            "Content-Type".to_string(),
-                            "text/html; charset=utf-8".to_string(),
-                        )],
-                        body,
-                        "error".to_string(),
-                    );
-                }
-            };
-
-            match forward_to_backend(&error_req, &error_backend, client_ip, state) {
-                Ok(err_resp) => {
-                    // Return the error page body with the ORIGINAL status code.
-                    (status, err_resp.headers, err_resp.body, "error".to_string())
-                }
-                Err(e) => {
-                    warn!(error = %e, "custom error: error page fetch failed, falling back to internal");
-                    let reason = error::status_reason(status);
-                    let body = error::internal_error_html(status, reason, verbose, &req.path, ctx);
-                    (
+                    ErrorOutcome::Ready(
                         status,
                         vec![(
                             "Content-Type".to_string(),
@@ -3236,41 +6262,19 @@ fn apply_error_mode(
     }
 }
 
-fn forward_to_backend(
+/// Apply an error mode and turn the outcome straight into a request outcome, so
+/// the request path returns either a ready response or a parked fetch.
+fn request_error(
+    status: u16,
     req: &forward::HttpRequest,
-    backend_name: &str,
     client_ip: &str,
     state: &mut ServerState,
-) -> Result<HttpResponse, String> {
-    let original_host = origin_host(req, &state.config);
-
-    let timeout = std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
-
-    if let Some(pool) = state.pool_manager.get_pool_mut(backend_name) {
-        match pool.pick_socket() {
-            Ok((socket_path, member_idx)) => {
-                match forward::forward_request_timeout(
-                    &socket_path,
-                    req,
-                    client_ip,
-                    original_host,
-                    Some(timeout),
-                ) {
-                    Ok(resp) => {
-                        pool.release(member_idx);
-                        Ok(resp)
-                    }
-                    Err(e) => {
-                        pool.mark_failed(member_idx);
-                        Err(e.to_string())
-                    }
-                }
-            }
-            Err(pool::PoolError::Empty) => Err("pool empty".to_string()),
-            Err(pool::PoolError::ConnectFailed(e)) => Err(e.to_string()),
-        }
-    } else {
-        Err(format!("unknown backend: {}", backend_name))
+    ctx: Option<&error::ErrorContext>,
+    registry: &m6_core::platform::Registry,
+) -> RequestOutcome {
+    match apply_error_mode(status, req, client_ip, state, ctx, registry) {
+        ErrorOutcome::Ready(s, h, b, n) => RequestOutcome::Ready(s, h, b, n, None),
+        ErrorOutcome::Pending { id, ctx } => RequestOutcome::Pending { id, ctx },
     }
 }
 
@@ -3316,29 +6320,13 @@ fn set_vary_accept_encoding(headers: &mut Vec<(String, String)>, backend_compres
     if !backend_compresses && !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("vary")) {
         return;
     }
-    let mut fields: Vec<String> = Vec::new();
-    for (k, v) in headers.iter() {
-        if !k.eq_ignore_ascii_case("vary") {
-            continue;
-        }
-        // `Vary: *` means "unpredictable"; it cannot be narrowed by adding a
-        // field name to it, so leave such a response exactly as the backend
-        // wrote it.
-        if v.trim() == "*" {
-            return;
-        }
-        for f in v.split(',').map(str::trim).filter(|f| !f.is_empty()) {
-            if !fields.iter().any(|e| e.eq_ignore_ascii_case(f)) {
-                fields.push(f.to_string());
-            }
-        }
+    // The merge (including the `Vary: *` passthrough) is shared with the cached
+    // hit writer, so the two paths cannot disagree.
+    let merge = VaryMerge::new(&headers[..]);
+    if merge.is_star() {
+        return;
     }
-    if !fields
-        .iter()
-        .any(|f| f.eq_ignore_ascii_case("accept-encoding"))
-    {
-        fields.push("Accept-Encoding".to_string());
-    }
+    let fields: Vec<String> = merge.map(str::to_string).collect();
     headers.retain(|(k, _)| !k.eq_ignore_ascii_case("vary"));
     headers.push(("vary".to_string(), fields.join(", ")));
 }
@@ -3428,13 +6416,35 @@ fn invalidate_after_unsafe_method(
 /// which is required — restamping a cached response with the current time
 /// would make it look freshly generated and silently defeat the `Age` header
 /// sitting next to it.
+/// A route's `cache` replaces the backend's `Cache-Control`, as a per-location
+/// header does in nginx. It runs before the cache decision, so the stored copy
+/// and the reply to the client carry the same single field, and `no-store`
+/// stops the store. A miss pays one scan of the reply's headers; a hit never
+/// reaches here.
+///
+/// The override never weakens the backend's own refusal. RFC 9111 3.5 says a
+/// cache must not store a response it is not allowed to store, so a reply that
+/// carries `no-store` or `private` keeps that field untouched and the route
+/// value is not applied. `should_cache` reads every field line, so a reply that
+/// carried both would still be refused, but sending one field that names the
+/// backend's veto is clearer to every downstream cache than two that disagree.
+fn apply_route_cache(headers: &mut Vec<(String, String)>, route_cache: Option<&str>) {
+    let Some(value) = route_cache else { return };
+    let backend = CacheControl::parse(&headers[..]);
+    if backend.no_store || backend.private {
+        return;
+    }
+    headers.retain(|(k, _)| !k.eq_ignore_ascii_case("cache-control"));
+    headers.push(("Cache-Control".to_string(), value.to_string()));
+}
+
 fn set_date(headers: &mut Vec<(String, String)>) {
     if m6_core::headers::contains(&headers[..], "date") {
         return;
     }
     headers.push((
         "date".to_string(),
-        httpdate::fmt_http_date(std::time::SystemTime::now()),
+        httpdate::fmt_http_date(m6_core::platform::wall()),
     ));
 }
 
@@ -3521,28 +6531,251 @@ fn set_describedby_link(headers: &mut Vec<(String, String)>, target: &str) {
     ));
 }
 
-/// Called when a URL-backend I/O thread returns its result.  Handles cache
-/// insertion, alt-svc injection, and error mode application.
+/// The internal error page a failed custom-error-page fetch falls back to, for
+/// both the socket and URL override branches. Only the caller's warn label
+/// differs.
+fn error_page_fallback(
+    original_status: u16,
+    ctx: &forward::PendingUrlContext,
+    state: &mut ServerState,
+) -> FinalizedResponse {
+    let req = &ctx.req;
+    let analytics_on = state.config.analytics.enabled && !ctx.is_prefetch;
+    let latency_ns = ctx.start.elapsed().as_nanos() as u64;
+    let reason = error::status_reason(original_status);
+    let body = error::internal_error_html(
+        original_status,
+        reason,
+        state.config.errors.verbose_fallback,
+        &req.path,
+        None,
+    );
+    let mut headers = vec![(
+        "Content-Type".to_string(),
+        "text/html; charset=utf-8".to_string(),
+    )];
+    analytics::finish_response(
+        analytics_on,
+        &mut headers,
+        &req.headers,
+        &analytics::Event {
+            node: &state.config.node.name,
+            path: &req.path,
+            status: original_status,
+            cache_state: "MISS",
+            client_ip: &ctx.client_ip,
+            latency_ns: Some(latency_ns),
+        },
+        &mut state.traffic,
+    );
+    (original_status, headers, body, "error".to_string())
+}
+
+/// Finish a socket-backend reply with the socket branch's own completion
+/// semantics: cache insert, error mode for any status >= 400 (with actionable
+/// headers preserved), and `finish_response` analytics. A reply that needs a
+/// custom error page returns `Completion::Pending` with the error-page fetch.
+fn complete_socket_response(
+    result: std::io::Result<forward::HttpResponse>,
+    ctx: &forward::PendingUrlContext,
+    quic_port: u16,
+    state: &mut ServerState,
+    registry: &m6_core::platform::Registry,
+) -> Completion {
+    let req = &ctx.req;
+    let backend_name = &ctx.backend_name;
+    let content_encoding = &ctx.enc;
+    let analytics_enabled = state.config.analytics.enabled && !ctx.is_prefetch;
+
+    // A custom-error-page fetch on a socket backend: the fetched body returns
+    // under the ORIGINAL failing status, is held for reuse, and is never
+    // cached. Mirrors finalize_url_response_inner's override branch, but uses
+    // finish_response: a socket backend never sets _m6sid itself.
+    if let Some(original_status) = ctx.error_status_override {
+        let latency_ns = ctx.start.elapsed().as_nanos() as u64;
+        return match result {
+            Ok(http_resp) => {
+                let mut headers = http_resp.headers;
+                headers.extend(ctx.extra_headers.clone());
+                state.error_pages.insert(
+                    original_status,
+                    (
+                        m6_core::platform::now(),
+                        headers.clone(),
+                        http_resp.body.clone(),
+                    ),
+                );
+                analytics::finish_response(
+                    analytics_enabled,
+                    &mut headers,
+                    &req.headers,
+                    &analytics::Event {
+                        node: &state.config.node.name,
+                        path: &req.path,
+                        status: original_status,
+                        cache_state: "MISS",
+                        client_ip: &ctx.client_ip,
+                        latency_ns: Some(latency_ns),
+                    },
+                    &mut state.traffic,
+                );
+                Completion::Ready((
+                    original_status,
+                    headers,
+                    http_resp.body,
+                    "error".to_string(),
+                ))
+            }
+            Err(e) => {
+                warn!(backend = %ctx.backend_name, error = %e, "custom error page fetch failed (socket), falling back to internal");
+                Completion::Ready(error_page_fallback(original_status, ctx, state))
+            }
+        };
+    }
+
+    let (status, mut resp_headers, body, conn_err) = match result {
+        Ok(mut http_resp) => {
+            // Stamp Date BEFORE the cache decision so the stored entry carries
+            // the generation time.
+            set_date(&mut http_resp.headers);
+            apply_route_cache(&mut http_resp.headers, ctx.route_cache.as_deref());
+            match reply_rule(state, ctx, http_resp.status, &http_resp.headers) {
+                ReplyRule::Store(stored) => {
+                    let key = CacheKey::new(&req.path, req.query.as_deref(), content_encoding);
+                    // On a node with a disk writer the insert sets the entry's
+                    // queued flag in the same map write that stores it, so the
+                    // request path copies no key and pushes nothing. Nothing is
+                    // written here.
+                    let response = CachedResponse {
+                        genid: stored,
+                        status: http_resp.status,
+                        headers: strip_uncacheable(&http_resp.headers),
+                        body: Bytes::from(http_resp.body.clone()),
+                    };
+                    if state.disk.is_some() {
+                        state.cache.insert_queued(key, response);
+                    } else {
+                        state.cache.insert(key, response);
+                    }
+                }
+                ReplyRule::Behind => {
+                    if let Some(f) = state.genid.cache_mut() {
+                        f.behind(m6_core::platform::now());
+                    }
+                }
+                ReplyRule::Nothing => {}
+            }
+            (
+                http_resp.status,
+                http_resp.headers,
+                http_resp.body,
+                None::<String>,
+            )
+        }
+        Err(e) => {
+            warn!(backend = %backend_name, error = %e, "backend error");
+            (502u16, vec![], vec![], Some(e.to_string()))
+        }
+    };
+
+    // If the response is an error (4xx/5xx), apply the error mode. The error
+    // page replaces the backend's response wholesale, so the actionable headers
+    // carry over by hand (a backend's 429 keeps its Retry-After, a 401 its
+    // WWW-Authenticate).
+    if status >= 400 {
+        let detail = conn_err.unwrap_or_else(|| format!("{backend_name} returned {status}"));
+        let err_ctx = error::ErrorContext {
+            route: ctx.route_path.clone(),
+            backend: Some(backend_name.clone()),
+            detail: Some(detail),
+        };
+        match apply_error_mode(status, req, &ctx.client_ip, state, Some(&err_ctx), registry) {
+            ErrorOutcome::Ready(s, mut h, b, n) => {
+                error::preserve_actionable_headers(&resp_headers, &mut h);
+                // The old socket branch returned Ready and its h1/h2/h3 caller
+                // applied alt-svc, so an error response carried it too.
+                set_alt_svc(&mut h, quic_port);
+                let backend_ns = ctx.start.elapsed().as_nanos() as u64;
+                analytics::finish_response(
+                    analytics_enabled,
+                    &mut h,
+                    &req.headers,
+                    &analytics::Event {
+                        node: &state.config.node.name,
+                        path: &req.path,
+                        status: s,
+                        cache_state: "MISS",
+                        client_ip: &ctx.client_ip,
+                        latency_ns: Some(backend_ns),
+                    },
+                    &mut state.traffic,
+                );
+                Completion::Ready((s, h, b, n))
+            }
+            ErrorOutcome::Pending {
+                id,
+                ctx: mut new_ctx,
+            } => {
+                error::preserve_actionable_headers(&resp_headers, &mut new_ctx.extra_headers);
+                set_alt_svc(&mut new_ctx.extra_headers, quic_port);
+                Completion::Pending { id, ctx: new_ctx }
+            }
+        }
+    } else {
+        let backend_ns = ctx.start.elapsed().as_nanos() as u64;
+        analytics::finish_response(
+            analytics_enabled,
+            &mut resp_headers,
+            &req.headers,
+            &analytics::Event {
+                node: &state.config.node.name,
+                path: &req.path,
+                status,
+                cache_state: "MISS",
+                client_ip: &ctx.client_ip,
+                latency_ns: Some(backend_ns),
+            },
+            &mut state.traffic,
+        );
+        set_alt_svc(&mut resp_headers, quic_port);
+
+        Completion::Ready((status, resp_headers, body, backend_name.clone()))
+    }
+}
+
+/// Called when a pending backend reply arrives, whether from a URL-backend
+/// thread or a socket upstream the loop drove. Handles cache insertion, alt-svc
+/// injection, and error mode application.
 ///
 /// Wrapped for the same reason as `handle_request`: this is the async
 /// completion path, so it never passes through that wrapper, and a response
-/// forwarded from a URL backend needs `Vary: Accept-Encoding` exactly as much
-/// as a synchronous one. Applied after the inner call so `should_cache` still
-/// sees the backend's own `Vary`.
+/// forwarded from a backend needs `Vary: Accept-Encoding` exactly as much as a
+/// synchronous one. Applied after the inner call so `should_cache` still sees
+/// the backend's own `Vary`.
 fn finalize_url_response(
     http_result: std::io::Result<forward::HttpResponse>,
     ctx: &forward::PendingUrlContext,
     quic_port: u16,
     state: &mut ServerState,
-) -> FinalizedResponse {
+    registry: &m6_core::platform::Registry,
+) -> Completion {
     let describedby = state.config.site.describedby.clone();
-    let mut r = finalize_url_response_inner(http_result, ctx, quic_port, state);
-    let compresses = state.config.backend_compresses(&r.3);
-    set_vary_accept_encoding(&mut r.1, compresses);
-    set_date(&mut r.1);
-    set_describedby_link(&mut r.1, &describedby);
-    invalidate_after_unsafe_method(state, &ctx.req, r.0, &r.1);
-    r
+    let outcome = if ctx.kind == forward::PendingKind::Socket {
+        complete_socket_response(http_result, ctx, quic_port, state, registry)
+    } else {
+        finalize_url_response_inner(http_result, ctx, quic_port, state, registry)
+    };
+    match outcome {
+        Completion::Ready((s, mut h, b, n)) => {
+            let compresses = state.config.backend_compresses(&n);
+            set_vary_accept_encoding(&mut h, compresses);
+            set_date(&mut h);
+            set_describedby_link(&mut h, &describedby);
+            invalidate_after_unsafe_method(state, &ctx.req, s, &h);
+            Completion::Ready((s, h, b, n))
+        }
+        pending => pending,
+    }
 }
 
 fn finalize_url_response_inner(
@@ -3550,7 +6783,8 @@ fn finalize_url_response_inner(
     ctx: &forward::PendingUrlContext,
     quic_port: u16,
     state: &mut ServerState,
-) -> FinalizedResponse {
+    registry: &m6_core::platform::Registry,
+) -> Completion {
     let req = &ctx.req;
     let enc = &ctx.enc;
 
@@ -3568,31 +6802,15 @@ fn finalize_url_response_inner(
     // another error page on top of it — if even this fetch fails (backend
     // down), fall back to the plain internal page under the original status.
     if let Some(original_status) = ctx.error_status_override {
-        // Bug fix: this dispatch fetches a real error page for a real
-        // client's real failing request (ctx.req/ctx.client_ip belong to
-        // them, not a discarded synthetic probe) — skipping analytics here
-        // meant any node running `[errors] mode = "custom"` had zero
-        // visibility into who was hitting error pages, which is the entire
-        // point of that feature.
         let latency_ns = ctx.start.elapsed().as_nanos() as u64;
         return match http_result {
             Ok(http_resp) => {
-                // finish_proxied_response: the error-page backend can itself
-                // be another m6-http instance (a cache node fetching origin's
-                // rendered error page), same reasoning as the main MISS tail.
                 let mut headers = http_resp.headers;
-                // Hold this document so the next route miss -- on any path --
-                // is answered locally instead of crossing the link again.
-                //
-                // Stored BEFORE analytics stamps per-request headers onto it:
-                // finish_proxied_response mints a Set-Cookie session id, and
-                // replaying one visitor's session cookie to every later 404
-                // would hand them all the same session. The held copy must be
-                // the document, not this exchange.
+                headers.extend(ctx.extra_headers.clone());
                 state.error_pages.insert(
                     original_status,
                     (
-                        std::time::Instant::now(),
+                        m6_core::platform::now(),
                         headers.clone(),
                         http_resp.body.clone(),
                     ),
@@ -3609,72 +6827,51 @@ fn finalize_url_response_inner(
                         client_ip: &ctx.client_ip,
                         latency_ns: Some(latency_ns),
                     },
+                    &mut state.traffic,
                 );
-                (
+                Completion::Ready((
                     original_status,
                     headers,
                     http_resp.body,
                     "error".to_string(),
-                )
+                ))
             }
             Err(e) => {
                 warn!(backend = %ctx.backend_name, error = %e, "custom error page fetch failed (async), falling back to internal");
-                let reason = error::status_reason(original_status);
-                let body = error::internal_error_html(
-                    original_status,
-                    reason,
-                    state.config.errors.verbose_fallback,
-                    &req.path,
-                    None,
-                );
-                let mut headers = vec![(
-                    "Content-Type".to_string(),
-                    "text/html; charset=utf-8".to_string(),
-                )];
-                analytics::finish_response(
-                    analytics_on,
-                    &mut headers,
-                    &req.headers,
-                    &analytics::Event {
-                        node: &state.config.node.name,
-                        path: &req.path,
-                        status: original_status,
-                        cache_state: "MISS",
-                        client_ip: &ctx.client_ip,
-                        latency_ns: Some(latency_ns),
-                    },
-                );
-                (original_status, headers, body, "error".to_string())
+                Completion::Ready(error_page_fallback(original_status, ctx, state))
             }
         };
     }
 
     let (status, resp_headers, body, used_backend, is_connection_failure) = match http_result {
         Ok(mut http_resp) => {
-            // Same request-side gate as the synchronous path above.
             // Same as the synchronous path: Date is stamped before the cache
             // decision so the stored entry carries the generation time.
             set_date(&mut http_resp.headers);
-            if ctx.cacheable
-                && request_permits_storage(&ctx.req.headers)
-                && should_cache(http_resp.status, &http_resp.headers)
-            {
-                let key = CacheKey::new(&req.path, req.query.as_deref(), enc);
-                // strip_set_cookie matters here specifically: this backend
-                // can itself be another m6-http instance (a cache node's
-                // only backend is the origin), whose response may already
-                // carry a Set-Cookie IT minted for this one request. Caching
-                // it verbatim would replay that one visitor's session cookie
-                // to every future visitor who hits this same cache entry —
-                // the content is shared and cacheable, the cookie isn't.
-                state.cache.insert(
-                    key,
-                    CachedResponse {
+            apply_route_cache(&mut http_resp.headers, ctx.route_cache.as_deref());
+            match reply_rule(state, ctx, http_resp.status, &http_resp.headers) {
+                ReplyRule::Store(stored) => {
+                    let key = CacheKey::new(&req.path, req.query.as_deref(), enc);
+                    // The same store as the synchronous path: the flag rides
+                    // the insert, and the disk write itself waits for the tick.
+                    let response = CachedResponse {
+                        genid: stored,
                         status: http_resp.status,
-                        headers: std::sync::Arc::new(strip_set_cookie(&http_resp.headers)),
+                        headers: strip_uncacheable(&http_resp.headers),
                         body: Bytes::from(http_resp.body.clone()),
-                    },
-                );
+                    };
+                    if state.disk.is_some() {
+                        state.cache.insert_queued(key, response);
+                    } else {
+                        state.cache.insert(key, response);
+                    }
+                }
+                ReplyRule::Behind => {
+                    if let Some(f) = state.genid.cache_mut() {
+                        f.behind(m6_core::platform::now());
+                    }
+                }
+                ReplyRule::Nothing => {}
             }
             (
                 http_resp.status,
@@ -3686,9 +6883,65 @@ fn finalize_url_response_inner(
         }
         Err(e) => {
             warn!(backend = %ctx.backend_name, error = %e, "url backend error (async)");
-            (502u16, vec![], vec![], "error".to_string(), true)
+            // A forwarded `POST /genid` that misses the deadline answers 504:
+            // the source may still be completing the publish, and `GET /genid`
+            // then says whether it happened.
+            let status = if ctx.genid_forward && e.kind() == std::io::ErrorKind::TimedOut {
+                504u16
+            } else {
+                502u16
+            };
+            (status, vec![], vec![], "error".to_string(), true)
         }
     };
+
+    // A failed forward to the upstream tells a cache node two things: the
+    // upstream may be down, and the node may still hold content for this key.
+    // The held entry is served at any age, flagged stale, so a working site
+    // with old pages beats the error page.
+    if is_connection_failure && !ctx.is_prefetch && matches!(state.genid, genid::Role::Cache(_)) {
+        let reason = if status == 504 {
+            "timed out"
+        } else {
+            "connect failed"
+        };
+        follower_failed(state, reason, m6_core::platform::now());
+    }
+    if matches!(status, 502..=504)
+        && !ctx.is_prefetch
+        && matches!(state.genid, genid::Role::Cache(_))
+    {
+        let key = CacheKey::new(&req.path, req.query.as_deref(), enc);
+        if let Some((entry, age)) = state.cache.lookup_held(&key) {
+            let mut headers = entry.headers.to_pairs();
+            set_age(&mut headers, age);
+            headers.push((
+                genid::GENID_HEADER.to_string(),
+                itoa::Buffer::new().format(entry.genid).to_string(),
+            ));
+            let latency_ns = ctx.start.elapsed().as_nanos() as u64;
+            analytics::finish_proxied_response(
+                analytics_on,
+                &mut headers,
+                &req.headers,
+                &analytics::Event {
+                    node: &state.config.node.name,
+                    path: &req.path,
+                    status: entry.status,
+                    cache_state: "STALE",
+                    client_ip: &ctx.client_ip,
+                    latency_ns: Some(latency_ns),
+                },
+                &mut state.traffic,
+            );
+            return Completion::Ready((
+                entry.status,
+                headers,
+                entry.body.to_vec(),
+                "cache".to_string(),
+            ));
+        }
+    }
 
     // Only re-derive an error page for a genuine connection-level failure (no
     // body to show). A completed round trip to a URL/proxy backend — even
@@ -3703,61 +6956,179 @@ fn finalize_url_response_inner(
             backend: Some(ctx.backend_name.clone()),
             detail: Some(format!("backend returned {status}")),
         };
-        let (s, mut h, b, n) = apply_error_mode(status, req, &ctx.client_ip, state, Some(&err_ctx));
-        // Bug fix: this is the final 502/504 a real client actually receives
-        // when the backend is unreachable — arguably the single most
-        // operationally important case to have in analytics (a backend-down
-        // incident should show up in the request/status log, not just an
-        // operational warn!()), and the pre-fix code skipped it unconditionally.
+        match apply_error_mode(status, req, &ctx.client_ip, state, Some(&err_ctx), registry) {
+            ErrorOutcome::Ready(s, mut h, b, n) => {
+                let latency_ns = ctx.start.elapsed().as_nanos() as u64;
+                analytics::finish_response(
+                    analytics_on,
+                    &mut h,
+                    &req.headers,
+                    &analytics::Event {
+                        node: &state.config.node.name,
+                        path: &req.path,
+                        status: s,
+                        cache_state: "MISS",
+                        client_ip: &ctx.client_ip,
+                        latency_ns: Some(latency_ns),
+                    },
+                    &mut state.traffic,
+                );
+                Completion::Ready((s, h, b, n))
+            }
+            ErrorOutcome::Pending { id, ctx } => Completion::Pending { id, ctx },
+        }
+    } else {
+        let mut headers_with_altsvc = resp_headers;
+        set_alt_svc(&mut headers_with_altsvc, quic_port);
+
         let latency_ns = ctx.start.elapsed().as_nanos() as u64;
-        analytics::finish_response(
+        analytics::finish_proxied_response(
             analytics_on,
-            &mut h,
+            &mut headers_with_altsvc,
             &req.headers,
             &analytics::Event {
                 node: &state.config.node.name,
                 path: &req.path,
-                status: s,
+                status,
                 cache_state: "MISS",
                 client_ip: &ctx.client_ip,
                 latency_ns: Some(latency_ns),
             },
+            &mut state.traffic,
         );
-        return (s, h, b, n);
+
+        Completion::Ready((status, headers_with_altsvc, body, used_backend))
     }
-
-    let mut headers_with_altsvc = resp_headers;
-    set_alt_svc(&mut headers_with_altsvc, quic_port);
-
-    // finish_proxied_response, not finish_response: this backend may itself
-    // be another m6-http instance (a cache node's only backend is the
-    // origin), whose response can already carry a _m6sid the origin just
-    // minted for this same request — see the doc comment on
-    // finish_proxied_response for why that matters.
-    let latency_ns = ctx.start.elapsed().as_nanos() as u64;
-    analytics::finish_proxied_response(
-        analytics_on,
-        &mut headers_with_altsvc,
-        &req.headers,
-        &analytics::Event {
-            node: &state.config.node.name,
-            path: &req.path,
-            status,
-            cache_state: "MISS",
-            client_ip: &ctx.client_ip,
-            latency_ns: Some(latency_ns),
-        },
-    );
-
-    (status, headers_with_altsvc, body, used_backend)
 }
 
 // ── QUIC packet flush helpers ─────────────────────────────────────────────────
 
-fn flush_conn(udp: &UdpSocket, qconn: &mut QuicConn) {
-    let mut out = [0u8; MAX_DATAGRAM_SIZE];
+/// What one [`flush_batch`] did with the batch it was given.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum SendOutcome {
+    /// Every byte of the batch went on the wire.
+    Sent,
+    /// The socket took the first `sent` bytes and refused the next datagram,
+    /// so the rest is what a retry has to send.
+    Blocked { sent: usize },
+}
+
+/// One packed batch the socket refused, kept until the socket will take it.
+struct PendingChunk {
+    /// The packed datagrams, back to back, packed at `segment_size`.
+    bytes: Vec<u8>,
+    /// Every datagram before the last is this size, which is what
+    /// `UDP_SEGMENT` requires.
+    segment_size: usize,
+    /// Where the batch is for.
+    dest: SocketAddr,
+}
+
+/// The batches a flush packed and the socket refused, in the order quiche made
+/// them.
+///
+/// `quiche::Connection::send` hands the caller the bytes of a packet and drops
+/// its own copy of them. A refused send therefore puts nothing on the wire, and
+/// those frames are retransmitted only when quiche's loss timer fires. Keeping
+/// the batch is what lets the writable event send the very datagrams the socket
+/// refused, instead of the response waiting out a PTO.
+///
+/// A flush usually has one batch outside quiche's send queue when a send is
+/// refused: the one it packed. The `_` arm of [`flush_conn`]'s match is the
+/// exception. `conn.send` has already handed over the packet that could not
+/// join the pack, so that packet is a second batch and sits in the flush buffer
+/// after the first. Both are kept here and sent in order, so a refused send
+/// never strands a packet quiche has already given up.
+#[derive(Default)]
+struct PendingBatch {
+    /// The refused batches, oldest first.
+    chunks: Vec<PendingChunk>,
+}
+
+impl PendingBatch {
+    /// Keep `bytes` as the next batch to send.
+    fn keep(&mut self, bytes: &[u8], segment_size: usize, dest: SocketAddr) {
+        self.chunks.push(PendingChunk {
+            bytes: bytes.to_vec(),
+            segment_size,
+            dest,
+        });
+    }
+
+    /// Send the batches in order, dropping each one the socket takes. A batch
+    /// the socket refuses stays, and so does every batch behind it, so the
+    /// retry sends them in the order quiche made them. Returns whether every
+    /// byte went.
+    fn flush(&mut self, udp: &UdpSocket, batch: UdpBatch) -> bool {
+        let mut sent = 0;
+        while let Some(chunk) = self.chunks.get_mut(sent) {
+            match flush_batch(
+                udp,
+                batch,
+                &chunk.bytes,
+                chunk.segment_size,
+                Some(chunk.dest),
+            ) {
+                SendOutcome::Sent => sent += 1,
+                SendOutcome::Blocked { sent: taken } => {
+                    // Only the datagrams the socket did not take are retried.
+                    chunk.bytes.drain(..taken);
+                    break;
+                }
+            }
+        }
+        self.chunks.drain(..sent);
+        self.chunks.is_empty()
+    }
+}
+
+/// Send everything `qconn` has queued.
+///
+/// The packets are packed into one buffer while they have one destination and
+/// one size, then sent as one batch: one `sendmsg` carrying `UDP_SEGMENT` on a
+/// Linux socket that has it, and one datagram per call where it does not. The
+/// batch stops at [`QUIC_BATCH_BYTES`] and [`QUIC_BATCH_SEGMENTS`], which is
+/// what one UDP GSO send takes.
+///
+/// `out` is the loop's own buffer, reused across flushes: a batch is packed
+/// once into the bytes that go on the wire, with no copy between `send` and the
+/// system call. The copies it does make are of the batches the socket refused,
+/// which the connection keeps for the writable event: the batch it packed, and
+/// in the `_` arm also the packet quiche handed over after it.
+fn flush_conn(udp: &UdpSocket, batch: UdpBatch, out: &mut [u8], qconn: &mut QuicConn) {
+    // A batch refused last time goes first, so the packets leave in the order
+    // quiche made them.
+    if let Some(mut pending) = qconn.blocked.take() {
+        if !pending.flush(udp, batch) {
+            qconn.blocked = Some(pending);
+            return;
+        }
+    }
+    let capacity = out.len().min(QUIC_BATCH_BYTES);
+    debug_assert!(
+        capacity >= MAX_DATAGRAM_SIZE,
+        "a flush buffer holds one packet"
+    );
+    let out = &mut out[..capacity];
+    let mut pack = Pack::default();
+
     loop {
-        let (written, send_info) = match qconn.conn.send(&mut out) {
+        // Leave room for the largest datagram quiche can write into this
+        // batch. That room, and the segment count, are the only caps: the
+        // congestion window already bounds what `conn.send` yields.
+        //
+        // `conn.send_quantum()` used to be a third cap here. This quiche's
+        // legacy congestion module sets it to the initial window when the
+        // connection is made and never updates it, so the cap stayed at the
+        // 10-packet initial window while the congestion window on loopback
+        // grew to 72 packets. A batch therefore stopped at a seventh of what
+        // the window allowed, and no GSO send ever carried more than 13,500
+        // bytes.
+        if batch_is_full(&pack, capacity) && !send_pack(udp, batch, out, &mut pack, qconn) {
+            return;
+        }
+
+        let (written, send_info) = match qconn.conn.send(&mut out[pack.len..]) {
             Ok(v) => v,
             Err(quiche::Error::Done) => break,
             Err(e) => {
@@ -3765,12 +7136,321 @@ fn flush_conn(udp: &UdpSocket, qconn: &mut QuicConn) {
                 break;
             }
         };
-        if let Err(e) = udp.send_to(&out[..written], send_info.to) {
-            if e.kind() == std::io::ErrorKind::WouldBlock {
-                break;
+
+        // One decision for the packet just written: start a batch, join it,
+        // close it, or end the packed batch and start another with this packet.
+        match pack.count {
+            0 => {
+                pack.dest = Some(send_info.to);
+                pack.seg = written;
+                pack.len = written;
+                pack.count = 1;
             }
-            warn!("udp send error: {}", e);
+            _ if Some(send_info.to) == pack.dest && written == pack.seg => {
+                pack.len += written;
+                pack.count += 1;
+            }
+            _ if Some(send_info.to) == pack.dest && written < pack.seg => {
+                // The packet after a short one cannot be part of the same
+                // batch, and this one is its last segment.
+                pack.len += written;
+                if !send_pack(udp, batch, out, &mut pack, qconn) {
+                    return;
+                }
+            }
+            _ => {
+                // Another destination, or a packet larger than the batch's
+                // segment: send what is packed and start the batch with this
+                // one. The copy is needed because the send leaves `out` alone
+                // and the new packet sits after the bytes just sent. A refused
+                // send keeps the packed batch, and this packet too: it is
+                // outside the batch, so nothing else would send it.
+                let packed = pack.len;
+                if !send_pack(udp, batch, out, &mut pack, qconn) {
+                    keep_batch(
+                        qconn,
+                        &out[packed..packed + written],
+                        written,
+                        Some(send_info.to),
+                    );
+                    return;
+                }
+                out.copy_within(packed..packed + written, 0);
+                pack.len = written;
+                pack.seg = written;
+                pack.count = 1;
+                pack.dest = Some(send_info.to);
+            }
         }
+    }
+
+    send_pack(udp, batch, out, &mut pack, qconn);
+}
+
+/// Whether the batch has to be sent before another packet can join it.
+///
+/// Two limits, both the send's: the buffer holds at most `capacity` bytes, and
+/// one UDP GSO send carries at most [`QUIC_BATCH_SEGMENTS`] segments. A packet
+/// may be up to [`MAX_DATAGRAM_SIZE`], so room for one more is what keeps the
+/// pack from cutting a packet in half.
+fn batch_is_full(pack: &Pack, capacity: usize) -> bool {
+    pack.len + MAX_DATAGRAM_SIZE > capacity || pack.count == QUIC_BATCH_SEGMENTS
+}
+
+/// The bytes one flush has packed into a batch, and how they are packed.
+///
+/// A flush packs while the packets have one destination and one size, then
+/// sends them as one batch. `Pack::default()` is the empty batch, so starting
+/// the next one is the same statement in every branch.
+#[derive(Default)]
+struct Pack {
+    /// Bytes packed into the flush buffer, back to back.
+    len: usize,
+    /// Every datagram before the last is this size. That is the shape
+    /// `UDP_SEGMENT` requires.
+    seg: usize,
+    /// Datagrams packed.
+    count: usize,
+    /// Where the batch is for. `None` while nothing is packed.
+    dest: Option<SocketAddr>,
+}
+
+/// Send what `pack` holds and clear it. A batch the socket refuses stays on
+/// the connection for the writable event. Returns whether every byte went.
+fn send_pack(
+    udp: &UdpSocket,
+    batch: UdpBatch,
+    out: &[u8],
+    pack: &mut Pack,
+    qconn: &mut QuicConn,
+) -> bool {
+    if pack.len == 0 {
+        return true;
+    }
+    match flush_batch(udp, batch, &out[..pack.len], pack.seg, pack.dest) {
+        SendOutcome::Sent => {
+            *pack = Pack::default();
+            true
+        }
+        SendOutcome::Blocked { sent } => {
+            // The datagrams before `sent` are on the wire; keeping them would
+            // send them a second time on the writable event.
+            keep_batch(qconn, &out[sent..pack.len], pack.seg, pack.dest);
+            false
+        }
+    }
+}
+
+/// Keep the batch the socket refused, so the retry sends the datagrams quiche
+/// has already handed out rather than the ones still queued behind them.
+fn keep_batch(qconn: &mut QuicConn, bytes: &[u8], segment_size: usize, dest: Option<SocketAddr>) {
+    let Some(dest) = dest else {
+        return;
+    };
+    if bytes.is_empty() {
+        return;
+    }
+    // A remainder that holds only the short last datagram of a batch is packed
+    // at its own length, which is the single-segment shape.
+    let segment_size = segment_size.min(bytes.len());
+    qconn
+        .blocked
+        .get_or_insert_with(PendingBatch::default)
+        .keep(bytes, segment_size, dest);
+}
+
+/// Flush the connections whose batch the socket refused, on the writable
+/// event. One that blocks again keeps its batch, and the writable interest
+/// stays with it.
+fn flush_blocked(
+    udp: &UdpSocket,
+    batch: UdpBatch,
+    out: &mut [u8],
+    connections: &mut HashMap<Vec<u8>, QuicConn>,
+) {
+    for qconn in connections.values_mut() {
+        if qconn.blocked.is_some() {
+            flush_conn(udp, batch, out, qconn);
+        }
+    }
+}
+
+/// Ask the poller for writability exactly while a connection holds a batch the
+/// socket refused, and drop it once none does.
+///
+/// The answer is read from the connections each turn, which is where the
+/// refused batch lives: a connection that closed, or one whose retry went out,
+/// stops holding the interest without anything to forget. `watching` is the
+/// answer of the previous turn, so the interest is reregistered only when it
+/// changes: `reregister_fd` always issues the system call, and this runs on
+/// every turn of the loop.
+fn watch_blocked(
+    udp: &UdpSocket,
+    registry: &m6_core::platform::Registry,
+    connections: &HashMap<Vec<u8>, QuicConn>,
+    watching: &mut bool,
+) {
+    let any_blocked = connections.values().any(|c| c.blocked.is_some());
+    if any_blocked == *watching {
+        return;
+    }
+    let interest = if any_blocked {
+        Interest::READABLE | Interest::WRITABLE
+    } else {
+        Interest::READABLE
+    };
+    match registry.reregister_fd(udp.as_raw_fd(), TOKEN_UDP, interest) {
+        Ok(()) => *watching = any_blocked,
+        Err(e) => error!(error = %e, "watching the QUIC socket for writability"),
+    }
+}
+
+/// Send one packed batch, or one datagram per segment where the socket does not
+/// segment. A batch the socket would not take is a [`SendOutcome::Blocked`],
+/// which leaves it for the writable event, and the count says how much of it
+/// went: on the per-datagram path the socket can take a prefix and refuse the
+/// rest, and only the rest is worth sending again.
+///
+/// The `cfg(test)` arm is a seam, not a second path: it reports the refusal the
+/// kernel reports when its send buffer is full, before the count moves. A
+/// release build does not contain it.
+fn flush_batch(
+    udp: &UdpSocket,
+    batch: UdpBatch,
+    buf: &[u8],
+    segment_size: usize,
+    dest: Option<SocketAddr>,
+) -> SendOutcome {
+    let Some(dest) = dest else {
+        return SendOutcome::Sent;
+    };
+    #[cfg(test)]
+    if test_send_seam::refuse() {
+        return SendOutcome::Blocked { sent: 0 };
+    }
+    #[cfg(test)]
+    if let Some(datagrams) = test_send_seam::partial_after() {
+        // The socket took the first `datagrams` and refused the next: what
+        // the per-datagram path does when its buffer fills part way through.
+        let sent = (datagrams * segment_size).min(buf.len());
+        if sent > 0 {
+            let _ = batch.send(udp, &buf[..sent], segment_size, dest);
+        }
+        test_send_stats::record(sent, segment_size);
+        return SendOutcome::Blocked { sent };
+    }
+    #[cfg(test)]
+    test_send_stats::record(buf.len(), segment_size);
+    match batch.send(udp, buf, segment_size, dest) {
+        Ok(sent) if sent == buf.len() => SendOutcome::Sent,
+        Ok(sent) => SendOutcome::Blocked { sent },
+        // A socket that segments takes the batch or none of it, so a refusal
+        // here has sent nothing.
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => SendOutcome::Blocked { sent: 0 },
+        Err(e) => {
+            warn!("udp batch send error: {}", e);
+            SendOutcome::Sent
+        }
+    }
+}
+
+/// A refused batch, forced by a test.
+///
+/// A loopback socket's send buffer cannot be made to fill, so the one condition
+/// the writable retry exists for has to be produced here. It reports the
+/// refusal and then does exactly what the kernel does with a refused send:
+/// nothing. No production build compiles this module or its call.
+#[cfg(test)]
+mod test_send_seam {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// How many of this thread's next batch sends are refused.
+        static REFUSE: Cell<usize> = const { Cell::new(0) };
+        /// The datagram count this thread's next batch send stops at.
+        static PARTIAL: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Refuse this thread's next `count` batch sends.
+    pub(super) fn refuse_next_batches(count: usize) {
+        REFUSE.with(|left| left.set(count));
+    }
+
+    /// Refuse this thread's next batch send after `datagrams` datagrams.
+    pub(super) fn refuse_after(datagrams: usize) {
+        PARTIAL.with(|p| p.set(Some(datagrams)));
+    }
+
+    /// The datagram count this send stops at, taking the request off.
+    pub(super) fn partial_after() -> Option<usize> {
+        PARTIAL.with(|p| p.take())
+    }
+
+    /// Whether this send is refused, taking one off the count.
+    pub(super) fn refuse() -> bool {
+        REFUSE.with(|left| {
+            let count = left.get();
+            if count == 0 {
+                return false;
+            }
+            left.set(count - 1);
+            true
+        })
+    }
+}
+
+/// Count the platform sends one thread made, so a test can hold a batch to the
+/// number of send calls it costs.
+///
+/// The count is taken at the one call site that reaches `UdpBatch::send`, so a
+/// call here is a send call on every target: one `sendmsg` on Linux where the
+/// socket segments, one `sendto` per datagram on macOS where it does not. A
+/// datagram count is kept beside it, because M6's two targets make different
+/// calls for the same datagrams.
+///
+/// Thread-local because the test crate runs tests in parallel: a test reads its
+/// own thread's count, and no other test's sends can land in it.
+#[cfg(test)]
+mod test_send_stats {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Batch sends this thread has made.
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+        /// Datagrams those sends carried.
+        static DATAGRAMS: Cell<usize> = const { Cell::new(0) };
+        /// Datagrams in the largest single send.
+        static LARGEST: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Start counting this thread's sends from zero.
+    pub(super) fn reset() {
+        CALLS.with(|c| c.set(0));
+        DATAGRAMS.with(|c| c.set(0));
+        LARGEST.with(|c| c.set(0));
+    }
+
+    /// Record one send of `bytes`, packed as segments of `segment_size`.
+    pub(super) fn record(bytes: usize, segment_size: usize) {
+        let datagrams = bytes.div_ceil(segment_size);
+        CALLS.with(|c| c.set(c.get() + 1));
+        DATAGRAMS.with(|c| c.set(c.get() + datagrams));
+        LARGEST.with(|c| c.set(c.get().max(datagrams)));
+    }
+
+    /// Batch sends recorded since the last [`reset`].
+    pub(super) fn calls() -> usize {
+        CALLS.with(|c| c.get())
+    }
+
+    /// Datagrams recorded since the last [`reset`].
+    pub(super) fn datagrams() -> usize {
+        DATAGRAMS.with(|c| c.get())
+    }
+
+    /// Datagrams in the largest send since the last [`reset`].
+    pub(super) fn largest() -> usize {
+        LARGEST.with(|c| c.get())
     }
 }
 
@@ -3794,9 +7474,15 @@ fn drain_writable(qconn: &mut QuicConn) {
             None => continue,
         };
         match pending {
-            PendingH3Response::Headers(headers, body) => {
+            PendingH3Response::Headers(headers, body, priority) => {
                 let fin = body.is_empty();
-                match h3.send_response(&mut qconn.conn, stream_id, &headers, fin) {
+                match h3.send_response_with_priority(
+                    &mut qconn.conn,
+                    stream_id,
+                    &headers,
+                    &quiche_priority(priority),
+                    fin,
+                ) {
                     Ok(()) => {
                         if !body.is_empty() {
                             match h3.send_body(&mut qconn.conn, stream_id, &body, true) {
@@ -3818,9 +7504,10 @@ fn drain_writable(qconn: &mut QuicConn) {
                     }
                     Err(quiche::h3::Error::StreamBlocked) => {
                         // Still no credit — put it back for the next writable report.
-                        qconn
-                            .partial_responses
-                            .insert(stream_id, PendingH3Response::Headers(headers, body));
+                        qconn.partial_responses.insert(
+                            stream_id,
+                            PendingH3Response::Headers(headers, body, priority),
+                        );
                     }
                     Err(e) => warn!("h3 drain_writable send_response error: {}", e),
                 }
@@ -3850,236 +7537,30 @@ fn drain_writable(qconn: &mut QuicConn) {
     }
 }
 
-fn flush_all(udp: &UdpSocket, connections: &mut HashMap<Vec<u8>, QuicConn>) {
+/// Drive the connections whose quiche timer has expired: fire the timer, resume
+/// any response that was waiting for credit, and send what that produced.
+///
+/// Only those. A connection that received a packet this turn was driven and
+/// flushed in `drain_udp`, and an idle connection with a timer in the future
+/// has nothing to send. Driving every connection every turn (`on_timeout`,
+/// `drain_writable` and a `send` that returns `Done`) cost about half a
+/// microsecond per idle connection per turn, and a QUIC connection idles for
+/// 30 s after its client went away: with a thousand of them each loop turn
+/// spent longer sweeping than serving.
+fn flush_due(
+    udp: &UdpSocket,
+    batch: UdpBatch,
+    out: &mut [u8],
+    connections: &mut HashMap<Vec<u8>, QuicConn>,
+    now: Instant,
+) {
     for qconn in connections.values_mut() {
-        qconn.conn.on_timeout();
-        drain_writable(qconn);
-        flush_conn(udp, qconn);
-    }
-}
-
-// ── Filesystem event handling ─────────────────────────────────────────────────
-
-fn handle_fs_event(event: &FsEvent, state: &mut ServerState) {
-    match event.kind {
-        FsEventKind::SocketCreated => {
-            state.pool_manager.socket_appeared(&event.path);
-        }
-        FsEventKind::SocketDeleted => {
-            state.pool_manager.socket_disappeared(&event.path);
+        if qconn.conn.timeout_instant().is_some_and(|at| at <= now) {
+            qconn.conn.on_timeout();
+            drain_writable(qconn);
+            flush_conn(udp, batch, out, qconn);
         }
     }
-}
-
-/// What a config reload did that the event loop has to act on.
-#[derive(Default)]
-struct Reloaded {
-    /// The response cache was emptied.
-    cache_cleared: bool,
-    /// A process-config change asked for TLS to be re-read and the rebuild failed.
-    tls_failed: bool,
-}
-
-/// Apply a change to `site.toml`, to the system config, or to both.
-///
-/// A `site.toml` change rebuilds routes, pools, the invalidation map and the
-/// error mode and empties the cache, as it always has. A system-config change
-/// on its own takes only the keys that file owns (`take_process_owned`), keeps
-/// the cache, and re-reads TLS material on HTTP/1.1, HTTP/2 and HTTP/3. A
-/// change to both runs both.
-///
-/// A process-config change re-reads TLS even when the merged load fails: the
-/// touch means new material is on disk, and a `site.toml` that is mid-edit must
-/// not hold a renewal back. The paths in use are those already running.
-fn handle_config_change(
-    changed: Changed,
-    state: &mut ServerState,
-    quiche_config: &mut quiche::Config,
-    mut tcp: Option<&mut Http11Listener>,
-    log_handle: &m6_core::log::LogHandle,
-) -> Reloaded {
-    let start = std::time::Instant::now();
-    let mut out = Reloaded::default();
-
-    let loaded = match config::load(&state.config.site_dir, &state.system_config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(
-                error = %e,
-                site = changed.site,
-                process = changed.process,
-                "config reload: failed, keeping current config"
-            );
-            if changed.process {
-                out.tls_failed = !handle_tls_reload(state, quiche_config, tcp.as_deref_mut());
-            }
-            return out;
-        }
-    };
-
-    let mut new = if changed.site {
-        loaded
-    } else {
-        config::take_process_owned(&state.config, loaded)
-    };
-    for key in config::carry_restart_only(&state.config, &mut new) {
-        warn!("config reload: {key} changed; restart m6-http to apply it");
-    }
-
-    let mut site_items = None;
-    if changed.site {
-        // A reload is the likeliest moment for an inert `cache` key to be
-        // introduced: someone editing site.toml on the node.
-        config::warn_ignored_route_cache_keys(&new);
-        let route_table = match RouteTable::from_config(&new) {
-            Ok(t) => t,
-            Err(e) => {
-                warn!(error = %e, "config reload: route table error, keeping current config");
-                if changed.process {
-                    out.tls_failed = !handle_tls_reload(state, quiche_config, tcp.as_deref_mut());
-                }
-                return out;
-            }
-        };
-        site_items = Some((
-            route_table,
-            PoolManager::from_config(&new.backends),
-            router::build_invalidation_map(&new),
-            ErrorMode::from_config(&new.errors),
-        ));
-    }
-
-    let public_key = reload_public_key(state, &new);
-
-    if let Some((route_table, pools, inv_map, error_mode)) = site_items {
-        state.route_table = route_table;
-        state.pool_manager = pools;
-        state.invalidation_map = inv_map;
-        state.error_mode = error_mode;
-    }
-    state.public_key = public_key;
-    state.config = new;
-    config::warn_health_token(&state.config.health);
-    if changed.site {
-        m6_http_lib::security::configure(&state.config.security);
-        state.cache.clear();
-        out.cache_cleared = true;
-        log_handle.reload(&state.config.log.format, &state.config.log.level);
-    }
-
-    if changed.process {
-        out.tls_failed = !handle_tls_reload(state, quiche_config, tcp);
-    }
-
-    info!(
-        site = changed.site,
-        process = changed.process,
-        cache_cleared = out.cache_cleared,
-        elapsed_us = start.elapsed().as_micros() as u64,
-        "config reload: complete"
-    );
-    out
-}
-
-/// The verify key for `new`, read from its `[auth]` section.
-///
-/// Keeps the running key when the file cannot be read, so a half-written key
-/// does not turn every token away. Returns `None` when `new` has no `[auth]`.
-fn reload_public_key(state: &mut ServerState, new: &config::Config) -> Option<PublicKey> {
-    let auth_cfg = new.auth.as_ref()?;
-    let key_path = config::resolve_path(&new.site_dir, &auth_cfg.public_key);
-    match PublicKey::from_pem_file(&key_path) {
-        Ok(k) => Some(k),
-        Err(e) => {
-            warn!(error = %e, "config reload: auth key load failed, keeping current key");
-            state.public_key.take()
-        }
-    }
-}
-
-/// Rebuild every listener's TLS material, or none of it.
-///
-/// This used to rebuild the quiche configuration alone, so after a renewal
-/// HTTP/3 served the new certificate while HTTP/1.1 and HTTP/2 kept the old one
-/// until the process restarted. One server answered with two different
-/// certificates at the same time, chosen by the protocol the client negotiated,
-/// and the log said `TLS config reloaded`, which was true of the one protocol it
-/// had reloaded. m6 #210.
-///
-/// **Both configurations are built before either is installed.** A reload that
-/// swapped them one at a time would leave the protocols disagreeing whenever the
-/// second build failed, which is the state this function exists to end. On a
-/// failure every protocol keeps the material it already had, and the reload is
-/// tried again after a growing delay and at once on the next touch.
-///
-/// This runs when the system config changes, not when a certificate file does.
-/// A renewal writes the certificate and the key, then touches the system
-/// config, so the pair is complete when it is read. Each build reads the files
-/// itself, a moment apart, so material written between the two reads reaches
-/// one and not the other. A touch that arrives before the key is written fails
-/// the rustls pair check and keeps every protocol where it was, and the retry
-/// settles both on the finished pair. Returns `false` when nothing was
-/// installed.
-fn handle_tls_reload(
-    state: &ServerState,
-    quiche_config: &mut quiche::Config,
-    tcp: Option<&mut Http11Listener>,
-) -> bool {
-    info!("TLS config reload: system config changed");
-
-    // Both are Some outside redirect mode, which runs its own loop and never
-    // reaches here. Erroring keeps a config failure diagnosable instead of a
-    // panic if this ever moves.
-    let (cert_path, key_path) = match (&state.config.server.tls_cert, &state.config.server.tls_key)
-    {
-        (Some(c), Some(k)) => (c, k),
-        _ => {
-            warn!("TLS config reload: no certificate is configured, keeping old config");
-            return false;
-        }
-    };
-
-    let material = match load_tls_material(cert_path, key_path) {
-        Ok(m) => m,
-        Err(e) => {
-            warn!(error = %e, "TLS config reload failed for HTTP/1.1 and HTTP/2, keeping old config on every protocol");
-            return false;
-        }
-    };
-    let new_quiche = match make_quiche_config(&state.config.server) {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(error = %e, "TLS config reload failed for HTTP/3, keeping old config on every protocol");
-            return false;
-        }
-    };
-
-    // Installed together. Past this point nothing can fail.
-    *quiche_config = new_quiche;
-    let tls_listener_reloaded = match tcp {
-        Some(t) if t.terminates_tls() => {
-            t.replace_tls_config(material.config.clone());
-            true
-        }
-        // A node serving QUIC with no TLS listener is not a configuration this
-        // project runs, and recording still answers for what h3 is serving.
-        Some(_) | None => false,
-    };
-
-    // After the swap, so the reported expiry is the material being served
-    // rather than the material that was read off disk.
-    material.record(cert_path);
-
-    // The line names the protocols it actually replaced. Half of what #210 cost
-    // was a log that said `TLS config reloaded` for a reload that reached one
-    // protocol, so a success line claiming all three on the path that rebuilt
-    // one is the same defect moved a few lines down.
-    if tls_listener_reloaded {
-        info!("TLS config reloaded on HTTP/1.1, HTTP/2 and HTTP/3");
-    } else {
-        warn!("TLS config reloaded on HTTP/3 alone: there is no HTTP/1.1 TLS listener to rebuild");
-    }
-    true
 }
 
 // ── CLI ────────────────────────────────────────────────────────────────────────
@@ -4108,12 +7589,6 @@ fn parse_args(args: &[String]) -> anyhow::Result<Cli> {
             }
             "--dump-config" => {
                 dump_config = true;
-            }
-            // Its own parser, so the flag is added here too. See m6-core's
-            // `parse_invocation`.
-            "--version" | "-V" => {
-                println!("m6-http {}", env!("CARGO_PKG_VERSION"));
-                std::process::exit(0);
             }
             arg if arg.starts_with("--") => {
                 anyhow::bail!("unknown flag: {}", arg);
@@ -4156,20 +7631,260 @@ fn urlencoded(s: &str) -> String {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+/// How long one `[auth] backend` member has to answer the start probe.
+const AUTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Probe every member of the `[auth] backend` pool, once, before a listener
+/// binds.
+///
+/// A member that answers 401 or 503 serves checks, so the node may start. A
+/// member that answers 404 is something else behind the socket, and every
+/// protected request would be refused by it, so that stops the start. A member
+/// that cannot be reached or times out is a warning: a check process
+/// mid-restart is transient, and a node that carries public traffic must not
+/// fail to start because its checker is being replaced.
+///
+/// `Err` is a message for `main` to print on stderr and exit 2 with.
+fn probe_auth_backend(pool: &m6_http_lib::pool::BackendPool) -> Result<(), String> {
+    let mut any_checker = false;
+    let mut answered_other: Vec<(String, u16)> = Vec::new();
+    for member in pool.members() {
+        match probe_check_member(member) {
+            Ok(401 | 503) => {
+                info!(backend = %pool.name, socket = %member.display(), "auth backend member answers checks");
+                any_checker = true;
+            }
+            Ok(404) => {
+                return Err(format!(
+                    "m6-http: [auth] backend \"{}\": {} answered 404 to POST /check; that socket is not an m6-auth-server, and [auth] backend must name the backend that answers /check",
+                    pool.name,
+                    member.display()
+                ));
+            }
+            Ok(status) => {
+                eprintln!(
+                    "m6-http: [auth] backend \"{}\": {} answered {status} to POST /check, which is not 401 or 503; ignoring this member",
+                    pool.name,
+                    member.display()
+                );
+                answered_other.push((member.display().to_string(), status));
+            }
+            Err(e) => {
+                eprintln!(
+                    "m6-http: [auth] backend \"{}\": {} is not reachable at start ({e}); starting anyway, a check process mid-restart is transient",
+                    pool.name,
+                    member.display()
+                );
+            }
+        }
+    }
+    if any_checker {
+        return Ok(());
+    }
+    if answered_other.is_empty() {
+        // Every member refused the connection or timed out. Each is already
+        // warned about, and the node starts before its checker.
+        return Ok(());
+    }
+    let statuses: Vec<String> = answered_other
+        .iter()
+        .map(|(socket, status)| format!("{socket} answered {status}"))
+        .collect();
+    Err(format!(
+        "m6-http: [auth] backend \"{}\": no member answered 401 or 503 to POST /check ({}); [auth] backend must name the m6-auth-server that answers /check",
+        pool.name,
+        statuses.join(", ")
+    ))
+}
+
+/// One probe request to one socket, returning its status.
+///
+/// Start only, so a blocking connect and a socket deadline are the point. The
+/// request path never calls this: it uses the reactor.
+///
+/// The deadline is one wall clock for the write and every read, set from what
+/// is left of it before each operation. A peer that sends one byte every
+/// 100 ms cannot extend it. Before, `AUTH_PROBE_TIMEOUT` was a per-read socket
+/// timeout, so that peer held the start for 8192 bytes at 100 ms each.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "start-only probe: a blocking connect and a socket deadline are deliberate here"
+)]
+fn probe_check_member(member: &std::path::Path) -> std::io::Result<u16> {
+    use std::io::{Read, Write};
+
+    let deadline = m6_core::platform::now() + AUTH_PROBE_TIMEOUT;
+    let mut stream = m6_core::platform::net::connect_unix(member)?;
+    // `connect_unix` is the reactor's non-blocking connect. This probe reads
+    // one answer and exits, so it needs the blocking mode for the socket
+    // timeouts to mean anything.
+    stream.set_nonblocking(false)?;
+    let mut request = Vec::with_capacity(128);
+    auth::encode_check_request(&mut request, None);
+    // The read timeout is set before the write. macOS refuses `SO_RCVTIMEO`
+    // on a Unix socket whose peer has already closed, with EINVAL, and a fast
+    // checker can answer and close between the write and the first read.
+    let first = probe_remaining(deadline)?;
+    stream.set_read_timeout(Some(first))?;
+    stream.set_write_timeout(Some(first))?;
+    stream.write_all(&request)?;
+
+    let mut head = Vec::with_capacity(256);
+    let mut buf = [0u8; 256];
+    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+        if head.len() > 8192 {
+            break;
+        }
+        let left = probe_remaining(deadline)?;
+        match stream.set_read_timeout(Some(left)) {
+            Ok(()) => {}
+            // The peer closed before this read. Stop and parse what arrived.
+            // A complete head is still an answer, and an incomplete one is the
+            // same "no HTTP status" warning a peer that closed early gets.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => break,
+            Err(e) => return Err(e),
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => head.extend_from_slice(&buf[..n]),
+            // `SO_RCVTIMEO` reports the timeout as `WouldBlock` on one target
+            // and as `TimedOut` on the other. Both are this probe's deadline.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return Err(probe_deadline_error());
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let line = head.split(|byte| *byte == b'\n').next().unwrap_or(&[]);
+    let mut parts = line
+        .split(|byte| *byte == b' ')
+        .filter(|part| !part.is_empty());
+    let _version = parts.next();
+    let status = parts
+        .next()
+        .and_then(|status| std::str::from_utf8(status).ok()?.parse().ok());
+    status.ok_or_else(|| {
+        std::io::Error::other(format!(
+            "no HTTP status in {:?}",
+            String::from_utf8_lossy(&head)
+        ))
+    })
+}
+
+/// What is left of the probe's one deadline, as an error once it has passed.
+///
+/// `AUTH_PROBE_TIMEOUT` is a wall clock for the whole probe. A socket timeout
+/// is per operation, so every operation gets the time that is left rather than
+/// the whole bound.
+fn probe_remaining(deadline: std::time::Instant) -> std::io::Result<std::time::Duration> {
+    let left = deadline.saturating_duration_since(m6_core::platform::now());
+    if left.is_zero() {
+        return Err(probe_deadline_error());
+    }
+    Ok(left)
+}
+
+/// The probe's one deadline, as the error `probe_auth_backend` warns about.
+fn probe_deadline_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "the auth probe deadline passed",
+    )
+}
+
+/// The flags m6-http parses, as the start-up record declares them.
+const STARTUP_FLAGS: &[m6_core::startup::FlagDecl] = &[
+    m6_core::startup::FlagDecl {
+        name: "--log-level",
+        takes_value: true,
+        setting: Some("log.level"),
+        secret: false,
+    },
+    m6_core::startup::FlagDecl {
+        name: "--dump-config",
+        takes_value: false,
+        setting: None,
+        secret: false,
+    },
+    m6_core::startup::FlagDecl {
+        name: "--version",
+        takes_value: false,
+        setting: None,
+        secret: false,
+    },
+    m6_core::startup::FlagDecl {
+        name: "--version-full",
+        takes_value: false,
+        setting: None,
+        secret: false,
+    },
+];
+
+/// The environment variables m6-http reads that change its behaviour.
+///
+/// A release build does not read the test intervals, so they are not declared
+/// there: the record lists what this binary reads, not what a debug build of
+/// it might.
+fn startup_env() -> &'static [m6_core::startup::EnvDecl] {
+    #[cfg(debug_assertions)]
+    const ALL: &[m6_core::startup::EnvDecl] = &[
+        m6_core::startup::EnvDecl {
+            name: "M6_TEST_STATS_INTERVAL_SECS",
+            why: "shortens the stats tick in a test build",
+            setting: Some("stats.interval_s"),
+        },
+        m6_core::startup::EnvDecl {
+            name: "M6_TEST_ACCOUNTING_TICK_SECS",
+            why: "moves the accounting tick in a test build",
+            setting: None,
+        },
+    ];
+    #[cfg(not(debug_assertions))]
+    const ALL: &[m6_core::startup::EnvDecl] = &[];
+    ALL
+}
+
 fn main() {
-    // Block SIGTERM and SIGINT before anything else, including logging.
-    // The mask is inherited only by threads created after this point, and
-    // tracing-appender's writer thread would otherwise take the signal at its
-    // default disposition and kill the process. See m6_core::signal.
+    // `--version` and `--version-full` answer from constants fixed at build
+    // time, before a config path is required.
+    m6_core::version_flags!(m6_core::build_info::linked());
+
+    // Never hand freed memory back to the OS: the heap grows and does not shrink.
+    m6_core::alloc::never_return();
+    // Block SIGTERM and SIGINT before anything else. The mask is inherited
+    // only by threads created after this point, and the signal descriptor
+    // refuses to open without it. See m6_core::signal.
     m6_core::signal::block();
 
-    // rustls requires an explicit CryptoProvider when multiple are available
-    // (ring + aws-lc-rs both get pulled in transitively). Install ring first.
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .ok();
+    // rustls's provider is not installed here. Cargo.toml enables exactly one
+    // provider feature (aws-lc-rs), so the first config builder resolves and
+    // installs it. Nothing in this process builds a config before that.
+    //
+    // The profiler is held for the whole process so every
+    // allocation is attributed. `run` returns before the explicit drop, because
+    // `std::process::exit` does not run destructors and dhat writes its file on
+    // drop. The path is set by the test; a plain run writes dhat-heap.json in
+    // the working directory.
+    #[cfg(feature = "alloc-attribution")]
+    let profiler = dhat::Profiler::builder()
+        .file_name(
+            std::env::var_os("M6_DHAT_OUT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("dhat-heap.json")),
+        )
+        // 32 frames, not dhat's default 10: a `Vec::with_capacity` or a
+        // formatted `String` is more than ten allocator and iterator frames
+        // deep, and the caller is the whole point of this profile.
+        .trim_backtraces(Some(32))
+        .build();
     let args: Vec<String> = std::env::args().collect();
-    std::process::exit(run(args));
+    let code = run(args);
+    #[cfg(feature = "alloc-attribution")]
+    drop(profiler);
+    std::process::exit(code);
 }
 
 fn run(args: Vec<String>) -> i32 {
@@ -4179,52 +7894,61 @@ fn run(args: Vec<String>) -> i32 {
         Err(e) => {
             eprintln!("usage error: {}", e);
             eprintln!(
-                "Usage: m6-http <site-dir> <system-config> [--log-level <level>] [--dump-config]"
+                "Usage: m6-http <site-dir> <system-config> [--log-level <level>] [--dump-config] [--version] [--version-full]"
             );
             return 2;
         }
     };
 
-    // Fingerprint both config files before the first read of either, so a
-    // change between that read and the reloader's creation is reported on its
-    // first tick instead of lost.
-    let site_toml = cli.site_dir.join("site.toml");
-    let seen = Seen::read(&site_toml, &cli.system_config);
-
     // Load config before initialising logging so we can read [log] from site.toml.
-    let config = match config::load(&cli.site_dir, &cli.system_config) {
+    let (config, mut trace) = match config::load_traced(&cli.site_dir, &cli.system_config) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("config error: {}", e);
+            eprintln!("{e}");
             return 2;
         }
     };
 
-    // CLI --log-level overrides site.toml [log].level; format always comes from config.
-    let log_level = cli.log_level.as_deref().unwrap_or(&config.log.level);
-    let analytics_path = config
-        .analytics
-        .enabled
-        .then(|| PathBuf::from(&config.analytics.log_path));
-    let log_handle = match m6_core::log::init_with_analytics(
-        &config.log.format,
-        log_level,
-        analytics_path.as_deref(),
-    ) {
-        Ok(g) => g,
+    // The named limits every buffer and queue below follows, and the log's own,
+    // set before the log opens.
+    m6_http_lib::limits::init(&config.limits);
+    {
+        let (bytes, warning) = m6_http_lib::limits::heap_reserve(&config.limits);
+        if let Some(warning) = warning {
+            eprintln!("m6-http: {warning}");
+        }
+        m6_core::alloc::reserve(bytes);
+    }
+    for warning in config.limits.warnings() {
+        eprintln!("m6-http: {warning}");
+    }
+    {
+        use m6_core::limits::{LOG_BUFFER, LOG_FIELD};
+        let buffer = config.limits.get(&LOG_BUFFER);
+        m6_core::log::set_limits(m6_core::log::LogLimits {
+            buffer_start: buffer.start(),
+            buffer_max: buffer.max(),
+            field_max: config.limits.get(&LOG_FIELD).max(),
+            file: config.limits.file().display().to_string(),
+        });
+    }
+
+    // The CLI --log-level overrides site.toml [log].level.
+    let log_level = cli
+        .log_level
+        .as_deref()
+        .unwrap_or_else(|| config.log.level.as_deref().unwrap_or("info"));
+    let level = match m6_core::log::parse_level(log_level) {
+        Ok(level) => level,
         Err(e) => {
-            eprintln!("logging init error: {}", e);
-            return 1;
+            eprintln!("usage error: --log-level: {e}");
+            return 2;
         }
     };
-
-    config::warn_system_config_extra_keys(&cli.system_config);
-    config::warn_node_fallback(&cli.system_config);
-    for m in config::misplaced_keys(&cli.site_dir, &cli.system_config) {
-        warn!("{m}");
+    if let Err(e) = m6_core::log::init(level) {
+        eprintln!("m6-http: {e}");
+        return 2;
     }
-    config::warn_health_token(&config.health);
-    config::warn_ignored_route_cache_keys(&config);
 
     // --dump-config
     //
@@ -4233,6 +7957,17 @@ fn run(args: Vec<String>) -> i32 {
     // to it, and a redirect config that started a listener instead of printing
     // would hold :80 on the very node the deploy was still checking.
     if cli.dump_config {
+        // The dump goes through `println!`, so put stdout back to the blocking
+        // flag the process started with before writing it.
+        if let Err(e) = m6_core::log::stop() {
+            eprintln!("logging stop error: {}", e);
+            return 1;
+        }
+        // Start refuses a route table that does not build, so the dump does.
+        if let Err(e) = RouteTable::from_config(&config) {
+            eprintln!("route table error: {}", e);
+            return 2;
+        }
         match serde_json::to_string_pretty(&config) {
             Ok(s) => {
                 println!("{}", s);
@@ -4245,6 +7980,43 @@ fn run(args: Vec<String>) -> i32 {
         }
     }
 
+    // The recovery record: one call, after logging is up and after every
+    // start refusal that the config can decide. A redirect process records
+    // itself too, because it is a run an operator has to be able to explain.
+    {
+        let argv = args.clone();
+        let invocation =
+            m6_core::startup::Invocation::read(&argv, STARTUP_FLAGS, startup_env(), &mut trace);
+        trace.set_flag("site_dir", &cli.site_dir.display().to_string());
+        let mut sections = config.startup_sections(&trace);
+        m6_core::startup::record_log_level(&mut sections, level, &trace);
+        let record = m6_core::startup::Record::new("m6-http", argv)
+            .node_name(config.node.name.clone())
+            .invocation(invocation, trace.clone())
+            .sections(sections)
+            .limits(m6_core::startup::LimitsReport::read(&config.limits, &trace))
+            .decision("bind", config.server.bind.clone())
+            .decision(
+                "redirect_bind",
+                config
+                    .server
+                    .redirect_bind
+                    .clone()
+                    .map_or(serde_json::Value::Null, serde_json::Value::String),
+            )
+            .decision(
+                "h2c_bind",
+                config
+                    .server
+                    .h2c_bind
+                    .clone()
+                    .map_or(serde_json::Value::Null, serde_json::Value::String),
+            )
+            .decision("process_index", config.server.process_index.map(u64::from))
+            .decision("lock_memory", config.server.lock_memory);
+        record.emit();
+    }
+
     // Redirect mode: this process is the plain-HTTP :80 half of the pair, so
     // it returns here and never builds QUIC, TLS, backends, the cache or the
     // route table. Deliberately a separate process from the :443 instance
@@ -4252,25 +8024,43 @@ fn run(args: Vec<String>) -> i32 {
     // cannot stall TLS serving, because it is not sharing that event loop.
     if let Some(ref bind) = config.server.redirect_bind {
         info!(bind = %bind, node = %config.node.name, "starting in HTTP->HTTPS redirect mode");
-        if let Err(e) = m6_http_lib::redirect::run(bind) {
+        if let Err(e) = m6_http_lib::redirect::run(bind, &config) {
             error!(error = %e, "redirect listener failed");
             return 1;
         }
         return 0;
     }
 
-    // Load public key if auth declared
-    let public_key = if let Some(ref auth_cfg) = config.auth {
-        let key_path = config::resolve_path(&config.site_dir, &auth_cfg.public_key);
-        match PublicKey::from_pem_file(&key_path) {
-            Ok(k) => Some(k),
-            Err(e) => {
-                eprintln!("auth key load error: {}", e);
+    // The generation state, after the `--dump-config` and redirect-mode
+    // returns: a dump with `[genid]` and no StateDirectory prints and exits 0,
+    // because it is not about to serve. A cache node holds no file. A source
+    // reads its state file once here, and a source with no state fails the
+    // start rather than serving a generation that a restart would renumber.
+    let genid = match &config.genid {
+        None => genid::Role::Source(genid::Genid::new(0, None)),
+        Some(cfg) if cfg.upstream.is_some() => genid::Role::Cache(genid::Follower::new(
+            cfg.heartbeat,
+            m6_core::platform::now(),
+        )),
+        Some(_) => {
+            let Some(directory) =
+                m6_core::platform::state_directory().filter(|directory| directory.is_absolute())
+            else {
+                eprintln!(
+                    "config error: [genid] needs the unit's StateDirectory= ({})",
+                    m6_core::platform::STATE_DIR_UNSET
+                );
                 return 2;
+            };
+            let path = directory.join("genid");
+            match genid::read_state(&path) {
+                Ok(id) => genid::Role::Source(genid::Genid::new(id, Some(path))),
+                Err(e) => {
+                    eprintln!("config error: [genid] state file {}: {e}", path.display());
+                    return 2;
+                }
             }
         }
-    } else {
-        None
     };
 
     // Install security response headers before anything can serve a response.
@@ -4285,11 +8075,62 @@ fn run(args: Vec<String>) -> i32 {
         }
     };
 
-    // Build pool manager
-    let pool_manager = PoolManager::from_config(&config.backends);
+    // Build pool manager. Every URL backend's host is resolved here, once,
+    // before the loop: a name that does not resolve is a config error, and a
+    // change of address needs a restart.
+    let mut pool_manager = match PoolManager::from_config(&config.backends) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("config error: {e}");
+            return 2;
+        }
+    };
+    if let Err(e) = pool_manager.resolve() {
+        eprintln!("config error: {e}");
+        return 2;
+    }
 
-    // Build invalidation map
-    let invalidation_map = router::build_invalidation_map(&config);
+    // Probe the auth backend before any listener binds. A socket that is not a
+    // checker would make every protected request a 503, so a 404 stops the
+    // start. A member that is down only warns, so a node can start while its
+    // check process is being replaced.
+    if let Some(ref auth_cfg) = config.auth {
+        let backend = &auth_cfg.backend;
+        let Some(pool) = pool_manager.get_pool(backend) else {
+            eprintln!(
+                "m6-http: [auth] backend \"{backend}\" names no socket backend; [auth] backend must name a [[backend]] with `sockets`"
+            );
+            return 2;
+        };
+        if let Err(message) = probe_auth_backend(pool) {
+            eprintln!("{message}");
+            return 2;
+        }
+    }
+
+    // A cache node's heartbeat: the backend it asks, and the request bytes it
+    // copies into a slot, both fixed at start. `config::load` already refused
+    // an upstream that names no URL backend, so the index is always here.
+    let heartbeat_backend = config
+        .genid
+        .as_ref()
+        .and_then(|genid| genid.upstream.as_deref())
+        .and_then(|name| pool_manager.find_url(name));
+    let heartbeat_request = match (
+        heartbeat_backend,
+        config
+            .genid
+            .as_ref()
+            .and_then(|genid| genid.token.as_ref())
+            .map(|token| token.expose().as_str()),
+    ) {
+        (Some(idx), Some(token)) => {
+            let mut buf = Vec::with_capacity(256);
+            encode_heartbeat_request(pool_manager.url_backend(idx).host.as_str(), token, &mut buf);
+            buf
+        }
+        _ => Vec::new(),
+    };
 
     // Compute error mode
     let error_mode = ErrorMode::from_config(&config.errors);
@@ -4303,40 +8144,76 @@ fn run(args: Vec<String>) -> i32 {
         }
     };
 
-    // Bind UDP socket
-    let udp = match UdpSocket::bind(&config.server.bind) {
+    // The signal descriptor opens before any socket exists. The mask was
+    // blocked as the first statement of `main`, and this descriptor is what
+    // turns that block into a request the loop reads. A stop that arrives while
+    // the mask is blocked and no descriptor is open is discarded on macOS, so a
+    // caller that waits for this process's port and then sends SIGTERM could
+    // have the stop lost between the bind below and the open.
+    let signals = match Signals::new() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("bind error {}: {e}", config.server.bind);
+            eprintln!("signal init failed: {e}");
             return 2;
+        }
+    };
+
+    // This process's build identity is fixed at compile time, so reporting it
+    // reads no executable. Caching the running binary's name here, with the
+    // other start-time work and before any listener exists, keeps that one read
+    // off the accounting tick.
+    m6_core::monitoring::build_id();
+
+    // Bind the QUIC UDP socket. With [server] reuse_port the TLS listener is
+    // bound in the same call, so the two sockets that share the public port
+    // both carry SO_REUSEPORT: the option is set before bind, which is the only
+    // point it takes effect, and a second process must bind both halves.
+    let (shared_tcp, udp) = if config.server.reuse_port {
+        let addr = match resolve_bind(&config.server.bind) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("bind error {}: {e}", config.server.bind);
+                return 2;
+            }
+        };
+        match m6_core::platform::net::listen_shared(addr, config.server.reuse_port_processes) {
+            Ok((tcp, udp)) => (Some(tcp), udp),
+            Err(e) => {
+                eprintln!("bind error {}: {e}", config.server.bind);
+                return 2;
+            }
+        }
+    } else {
+        match UdpSocket::bind(&config.server.bind) {
+            Ok(s) => (None, s),
+            Err(e) => {
+                eprintln!("bind error {}: {e}", config.server.bind);
+                return 2;
+            }
         }
     };
     if let Err(e) = udp.set_nonblocking(true) {
         eprintln!("set_nonblocking error: {e}");
         return 2;
     }
-
-    // Wake pipe first, then signals: the shutdown hook needs somewhere to
-    // write before a signal can arrive.
-    let (wake_reader, wake_writer) = match Poller::wake_pipe() {
-        Ok(p) => p,
+    // A bound socket's local address cannot change, and every `RecvInfo` needs
+    // it. Read it once here, which is one `getsockname` for the socket rather
+    // than one per received datagram.
+    let udp_local = match udp.local_addr() {
+        Ok(a) => a,
         Err(e) => {
-            eprintln!("wake pipe init failed: {e}");
+            eprintln!("local_addr error: {e}");
             return 2;
         }
     };
-    let shutdown = setup_signals(&wake_writer);
+    // Whether this socket sends a batch as one segmented `sendmsg` is a
+    // property of the socket, asked once here with the other socket facts. The
+    // probe leaves the kernel option off, so a single datagram is still one
+    // send and only a flush asks for segmentation.
+    let udp_batch = UdpBatch::for_socket(&udp);
 
-    // Setup filesystem watcher
-    let watcher = match FsWatcher::new(&config) {
-        Ok(w) => Some(w),
-        Err(e) => {
-            info!(error = %e, "backend socket watch unavailable; the 2-second rescan finds sockets");
-            None
-        }
-    };
-
-    let reloader = ConfigReloader::new(&site_toml, &cli.system_config, seen);
+    let mut lifecycle = m6_core::signal::Lifecycle::new("m6-http", None);
+    lifecycle.started();
 
     // Build TLS config for HTTP/1.1 and bind TCP listener on the same port.
     // Both are Some on this path: redirect mode returned above, and every other
@@ -4350,35 +8227,88 @@ fn run(args: Vec<String>) -> i32 {
             return 2;
         }
     };
-    let tcp_listener = match make_tls_server_config(tls_cert, tls_key) {
-        Ok(tls_cfg) => match Http11Listener::bind(&config.server.bind, tls_cfg) {
-            Ok(l) => {
-                info!(bind = %config.server.bind, "HTTP/1.1 over TLS listener started");
-                Some(l)
-            }
-            // FATAL, not a warning. `bind` is configured on every node, so a
-            // failure to bind it is a node that cannot serve: systemd sees a
-            // running process, /health answers on whatever else is listening,
-            // and nothing is on 443. That is the shape this project keeps
-            // meeting -- artefact wrong, process healthy, failure deferred and
-            // invisible -- and `Restart=on-failure` already exists to handle
-            // the honest version.
-            //
-            // The distinction §3d asked for is between a listener that is
-            // configured and failed, and one that was never configured. This
-            // arm is the first. `h2c_bind` below is the second: absent on a
-            // cache node, which is not a failure to bind but an absence of a
-            // bind, and is left alone.
-            Err(e) => {
-                error!(bind = %config.server.bind, error = %e,
-                       "HTTP/1.1 TCP listener bind failed; refusing to run without it");
-                return 1;
-            }
-        },
+    let ceiling = match raise_fd_limit() {
+        Ok(c) => c,
         Err(e) => {
-            error!(error = %e, "HTTP/1.1 TLS config failed; refusing to run without it");
+            error!(error = %e, "raising the open-file limit failed");
             return 1;
         }
+    };
+    // The connection table follows the `connections` limit, and the open-file
+    // limit can lower its maximum.
+    let table = config.limits.get(&m6_core::limits::CONNECTIONS);
+    let ceiling = ceiling.min(table.max());
+    let initial_connections = table.start().min(ceiling);
+    let tcp_listener = match make_tls_server_config(tls_cert, tls_key) {
+        Ok(tls_cfg) => {
+            let bound = match shared_tcp {
+                Some(listener) => Http11Listener::from_shared(
+                    listener,
+                    tls_cfg,
+                    config.server.max_requests_per_connection,
+                    initial_connections,
+                    ceiling,
+                ),
+                None => Http11Listener::bind(
+                    &config.server.bind,
+                    tls_cfg,
+                    config.server.max_requests_per_connection,
+                    initial_connections,
+                    ceiling,
+                ),
+            };
+            match bound {
+                Ok(l) => {
+                    info!(bind = %config.server.bind, "HTTP/1.1 over TLS listener started");
+                    Some(l)
+                }
+                // FATAL, not a warning. `bind` is configured on every node, so a
+                // failure to bind it is a node that cannot serve: systemd sees a
+                // running process, /health answers on whatever else is listening,
+                // and nothing is on 443. That is the shape this project keeps
+                // meeting -- artefact wrong, process healthy, failure deferred and
+                // invisible -- and `Restart=on-failure` already exists to handle
+                // the honest version.
+                //
+                // The distinction §3d asked for is between a listener that is
+                // configured and failed, and one that was never configured. This
+                // arm is the first. `h2c_bind` below is the second: absent on a
+                // cache node, which is not a failure to bind but an absence of a
+                // bind, and is left alone.
+                Err(e) => {
+                    error!(bind = %config.server.bind, error = %e,
+                           "HTTP/1.1 TCP listener bind failed; refusing to run without it");
+                    return 1;
+                }
+            }
+        }
+        Err(e) => {
+            error!(error = %e, "HTTP/1.1 TLS config failed; refusing to run without it");
+            return 2;
+        }
+    };
+
+    // The per-process status listener joins the TLS listener's connection
+    // table. Configured and failed is fatal, as for the listeners above.
+    let tcp_listener = match (tcp_listener, config.server.status_bind.as_deref()) {
+        (Some(t), Some(bind)) => {
+            let index = config.server.process_index.unwrap_or_default();
+            let bound = config::status_addr(bind, index)
+                .and_then(|addr| Ok(m6_core::server::bind_tcp_reuseaddr(addr)?))
+                .and_then(|l| t.with_status(l));
+            match bound {
+                Ok(t) => {
+                    info!(bind = %bind, process_index = index, "status listener started");
+                    Some(t)
+                }
+                Err(e) => {
+                    error!(bind = %bind, error = %e,
+                           "status listener bind failed; it is configured, so refusing to run without it");
+                    return 1;
+                }
+            }
+        }
+        (t, _) => t,
     };
 
     let h2c_listener = if let Some(ref h2c_bind) = config.server.h2c_bind {
@@ -4386,7 +8316,7 @@ fn run(args: Vec<String>) -> i32 {
             .server
             .is_internal(h2c_bind)
             .then(|| config.server.internal_peers.clone());
-        match H2cListener::bind(h2c_bind, internal_peers) {
+        match H2cListener::bind(h2c_bind, internal_peers, initial_connections, ceiling) {
             Ok(l) => {
                 info!(bind = %h2c_bind, "H2C (HTTP/2 cleartext) listener started");
                 Some(l)
@@ -4428,46 +8358,213 @@ fn run(args: Vec<String>) -> i32 {
     } else {
         Iface::External
     };
+    let backend_timeout_secs = config.server.backend_timeout_secs;
+    let quic_port = udp.local_addr().map(|a| a.port()).unwrap_or(8443);
+    let alt_svc_line = std::sync::Arc::<[u8]>::from(
+        format!("alt-svc: h3=\":{quic_port}\"; ma=86400").into_bytes(),
+    );
+    let describedby_line = if config.site.describedby.is_empty() {
+        None
+    } else {
+        Some(std::sync::Arc::<[u8]>::from(
+            format!("link: <{}>; rel=\"describedby\"", config.site.describedby).into_bytes(),
+        ))
+    };
+    let cache = Cache::with_max_bytes(config.limits.get(&m6_core::limits::CACHE_BYTES).max());
+    // The disk writer shares the memory cache's bound, so a disk copy cannot
+    // outgrow the memory it shadows. Built at start, where a missing or
+    // unwritable directory is already an error.
+    let mut disk = match config.cache_dir.as_ref() {
+        Some(dir) => match DiskWriter::new(dir.clone(), cache.max_bytes()) {
+            Ok(writer) => Some(writer),
+            Err(e) => {
+                eprintln!("config error: [cache].dir {}: {e}", dir.display());
+                return 2;
+            }
+        },
+        None => None,
+    };
+    // The start-time load is the only place the disk is read. The entries are
+    // held aside, not installed: the first heartbeat decides whether the ID
+    // they carry is still the site's. The writer is told the ID now, so the
+    // generation's directory is kept and every other one is queued for
+    // removal over the slices that follow.
+    // The host block's one full read, at start, before the loop runs.
+    let host = m6_core::platform::host::HostReader::new(&config.site_dir);
+    let (pending_disk, loaded_entries, loaded_bad, disk_state) =
+        match (config.cache_dir.as_deref(), disk.as_mut()) {
+            (Some(dir), Some(writer)) => match disk_cache::load(dir, cache.max_bytes()) {
+                Ok(Some(mut loaded)) => {
+                    let (id, entries, bad) = (loaded.id, loaded.entries, loaded.bad);
+                    writer.use_id(id);
+                    writer.adopt(std::mem::take(&mut loaded.files));
+                    (Some(loaded), entries, bad, disk_cache::LoadState::None)
+                }
+                Ok(None) => (None, 0, 0, disk_cache::LoadState::None),
+                Err(e) => {
+                    eprintln!("config error: [cache].dir {}: {e}", dir.display());
+                    return 2;
+                }
+            },
+            _ => (None, 0, 0, disk_cache::LoadState::None),
+        };
+    // Read before the config moves into the state, because the stats tick is
+    // built from it and the line is written for the life of the process.
+    let stats_interval_s = config.stats.interval_s;
+    let traffic_interval_s = config.stats.traffic_interval_s;
     let mut state = ServerState {
         config,
-        system_config_path: cli.system_config.clone(),
         route_table,
         pool_manager,
-        cache: Cache::new(),
-        public_key,
-        invalidation_map,
+        cache,
+        disk,
+        pending_disk,
+        loaded_entries,
+        loaded_bad,
+        disk_state,
         error_mode,
-        stats: Stats::new(),
-        prefetch_queue: std::collections::VecDeque::new(),
-        background_pending: Vec::new(),
-        h2c_pool: H2cClientPool::new(),
-        h2s_pool: H2sTlsClientPool::new(),
+        stats: initial_stats(stats_interval_s, traffic_interval_s),
+        sources: Slots::new(initial_connections, ceiling, || Source::Vacant),
+        generations: vec![0; initial_connections],
+        prefetch_queue: m6_core::limits::Bounded::new(&m6_http_lib::limits::edge().refresh_queue),
+        refresh_refused: 0,
+        upstreams: Slots::new(initial_connections, ceiling, UpstreamEntry::empty),
+        read_timeouts: Timeouts::new(
+            initial_connections,
+            std::time::Duration::from_secs(READ_TIMEOUT_SECS),
+        ),
+        h2_idle_timeouts: Timeouts::new(
+            initial_connections,
+            std::time::Duration::from_secs(H2_IDLE_TIMEOUT_SECS),
+        ),
+        upstream_timeouts: Timeouts::new(
+            initial_connections,
+            std::time::Duration::from_secs(backend_timeout_secs),
+        ),
+        auth_timeouts: Timeouts::new(initial_connections, auth::CHECK_DEADLINE),
+        auth_check_answered: true,
+        h2c_pool: H2cClientPool::new(std::time::Duration::from_secs(backend_timeout_secs)),
+        h2s_pool: H2sTlsClientPool::new(std::time::Duration::from_secs(backend_timeout_secs)),
         tls_iface,
         h2c_iface,
         rate_limiter: RateLimiter::new(),
         error_pages: HashMap::new(),
-        started: std::time::Instant::now(),
+        started: m6_core::platform::now(),
+        host,
+        traffic: health::TrafficWindow::new(),
+        lookup_key_buf: String::with_capacity(512),
+        alt_svc_line,
+        describedby_line,
+        genid,
+        heartbeat_backend,
+        heartbeat_request,
     };
 
     if state.config.server.warm_on_start {
         seed_cache_warm(&mut state);
     }
 
+    // Pin the heap, after it is reserved and before the first request. Asked
+    // for and refused is a stop, not a quiet unpinned run.
+    let resident_before = m6_core::platform::process::resident_bytes();
+    if state.config.server.lock_memory {
+        if let Err(e) = m6_core::platform::process::lock_memory() {
+            eprintln!("m6-http: [server] lock_memory: {e}");
+            return 2;
+        }
+    }
+    let huge = m6_core::platform::process::huge_page_bytes();
+    info!(
+        huge_page_bytes = huge,
+        "heap: {} MiB on huge pages{}",
+        huge / (1024 * 1024),
+        if state.config.server.lock_memory {
+            ", memory pinned"
+        } else {
+            ", memory not pinned"
+        }
+    );
+    // What pinning did, in the two numbers that tell a pin of the pages a
+    // process holds from a pin of every mapping it has: the resident set, and
+    // the address space it sits in. Linux only, where /proc reports both.
+    if let (Some(mapped), Some(resident)) = (
+        m6_core::platform::process::virtual_bytes(),
+        m6_core::platform::process::resident_bytes(),
+    ) {
+        info!(
+            mapped_bytes = mapped,
+            resident_bytes = resident,
+            resident_before_pinning = resident_before,
+            "memory: {} MiB resident of {} MiB mapped ({} MiB resident before pinning)",
+            resident / (1024 * 1024),
+            mapped / (1024 * 1024),
+            resident_before.map_or(0, |bytes| bytes / (1024 * 1024)),
+        );
+    }
+
     let code = event_loop(
         EventLoopIo {
             udp,
+            udp_local,
+            udp_batch,
             tcp: tcp_listener,
             h2c: h2c_listener,
-            watcher,
-            reloader,
-            wake_reader,
+            signals,
         },
         &mut state,
         &mut quiche_config,
-        &log_handle,
+        &mut lifecycle,
     );
-    shutdown.complete();
+    lifecycle.complete();
+    if let Err(e) = m6_core::log::stop() {
+        // `stop` took the Sinks, so this line goes to stderr or nowhere.
+        eprintln!("log stop failed: {e}");
+        return 1;
+    }
     code
+}
+
+/// The accounting tick for this process.
+///
+/// The interval is `[stats].interval_s`, ten seconds by default, and
+/// `Stats::with_interval` builds the tick from it. Two integration suites
+/// assert on the tick and spawn this binary, so a `#[cfg(test)]` default
+/// cannot reach them. A debug build may shorten the tick through
+/// `M6_TEST_STATS_INTERVAL_SECS`, which also overrides the config key for those
+/// suites, and a release build does not read the variable at all.
+fn initial_stats(interval_s: u64, traffic_interval_s: u64) -> Stats {
+    #[cfg(debug_assertions)]
+    if let Some(secs) = std::env::var("M6_TEST_STATS_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+    {
+        return Stats::with_interval(std::time::Duration::from_secs(secs))
+            .with_traffic_interval(std::time::Duration::from_secs(secs));
+    }
+    Stats::with_interval(std::time::Duration::from_secs(interval_s))
+        .with_traffic_interval(std::time::Duration::from_secs(traffic_interval_s))
+}
+
+/// The accounting tick's period for this process.
+///
+/// One second: flush the log buffers, check the heap's growth and read one host
+/// source. That work is not request work, and one tick's own allocations depend
+/// on which host source it steps, so a test that counts allocations across a run
+/// keeps it out of the window by moving the period past the run through
+/// `M6_TEST_ACCOUNTING_TICK_SECS`. This is the same debug-only channel the stats
+/// tick has, and for the same reason: a `#[cfg(test)]` default cannot reach a
+/// spawned process. A release build does not read the variable.
+fn test_accounting_tick() -> std::time::Duration {
+    #[cfg(debug_assertions)]
+    if let Some(secs) = std::env::var("M6_TEST_ACCOUNTING_TICK_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+    {
+        return std::time::Duration::from_secs(secs);
+    }
+    std::time::Duration::from_secs(1)
 }
 
 #[cfg(test)]
@@ -4476,12 +8573,16 @@ mod www_redirect_tests {
 
     use m6_http_lib::config::{
         AnalyticsConfig, Config, ErrorsConfig, LogConfig, NodeConfig, RateLimitConfig,
-        SecurityConfig, ServerConfig, SiteConfig,
+        SecurityConfig, ServerConfig, SiteConfig, StatsConfig,
     };
     use std::path::PathBuf;
 
     fn cfg(domain: &str, redirect_www: bool) -> Config {
         Config {
+            genid: None,
+            cache_dir: None,
+            limits: Default::default(),
+            stats: StatsConfig::default(),
             site: SiteConfig {
                 name: "Test".to_string(),
                 domain: domain.to_string(),
@@ -4493,11 +8594,19 @@ mod www_redirect_tests {
                 tls_cert: Some("/tmp/cert.pem".to_string()),
                 tls_key: Some("/tmp/key.pem".to_string()),
                 backend_timeout_secs: 30,
+                max_requests_per_connection: 100,
+                reuse_port: false,
+                reuse_port_processes: None,
+                process_index: None,
+                status_bind: None,
                 h2c_bind: None,
                 internal_binds: Vec::new(),
                 internal_peers: Vec::new(),
                 redirect_bind: None,
+                served_hosts: Vec::new(),
+                redirect_unmatched_to: None,
                 warm_on_start: false,
+                lock_memory: false,
                 allowed_methods: vec!["GET".into(), "HEAD".into(), "POST".into()],
             },
             log: LogConfig::default(),
@@ -4641,6 +8750,87 @@ mod www_redirect_tests {
             );
         }
     }
+
+    fn host_policy(served: &[&str], target: Option<&str>) -> Config {
+        let mut c = cfg("example.com", true);
+        c.server.served_hosts = served.iter().map(|s| s.to_string()).collect();
+        c.server.redirect_unmatched_to = target.map(|s| s.to_string());
+        c
+    }
+
+    #[test]
+    fn a_host_outside_the_served_list_goes_to_the_canonical_name() {
+        let c = host_policy(&["edge-a.example.com"], Some("example.net"));
+        assert_eq!(
+            c.server.unmatched_host_redirect(
+                Some("other.example"),
+                "/capabilities",
+                Some("a=1&b=2")
+            ),
+            Some("https://example.net/capabilities?a=1&b=2".to_string())
+        );
+    }
+
+    #[test]
+    fn a_served_host_is_not_redirected() {
+        let c = host_policy(&["edge-a.example.com"], Some("example.net"));
+        for host in [
+            "edge-a.example.com",
+            "EDGE-A.Example.COM",
+            "edge-a.example.com:8443",
+        ] {
+            assert_eq!(
+                c.server.unmatched_host_redirect(Some(host), "/", None),
+                None,
+                "host {host:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absent_host_is_outside_the_list() {
+        let c = host_policy(&["edge-a.example.com"], Some("example.net"));
+        assert_eq!(
+            c.server.unmatched_host_redirect(None, "/", None),
+            Some("https://example.net/".to_string())
+        );
+    }
+
+    #[test]
+    fn the_target_is_built_from_config_never_from_the_host() {
+        let c = host_policy(&["edge-a.example.com"], Some("example.net"));
+        let location = c
+            .server
+            .unmatched_host_redirect(Some("evil.example"), "/x", None)
+            .unwrap();
+        assert!(location.starts_with("https://example.net/"), "{location}");
+        assert!(!location.contains("evil.example"), "{location}");
+    }
+
+    #[test]
+    fn an_unsafe_path_or_query_is_served_instead_of_echoed() {
+        let c = host_policy(&["edge-a.example.com"], Some("example.net"));
+        assert_eq!(
+            c.server
+                .unmatched_host_redirect(Some("other.example"), "/x\r\nX: 1", None),
+            None
+        );
+        assert_eq!(
+            c.server
+                .unmatched_host_redirect(Some("other.example"), "/x", Some("a=1\r\nX: 1")),
+            None
+        );
+    }
+
+    #[test]
+    fn the_policy_is_off_without_a_target() {
+        let c = host_policy(&["edge-a.example.com"], None);
+        assert_eq!(
+            c.server
+                .unmatched_host_redirect(Some("other.example"), "/", None),
+            None
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4715,8 +8905,8 @@ mod refresh_request_tests {
 
             // ...must be the same string the entry is keyed on. Both sides of
             // the comparison are built the way the event loop builds them.
-            let mut a = [0u8; 512];
-            let mut b = [0u8; 512];
+            let mut a = String::with_capacity(512);
+            let mut b = String::with_capacity(512);
             let key_from_refresh = make_lookup_key(&r.path, r.query.as_deref(), &r.enc, &mut a);
             let key_from_request = make_lookup_key(&req.path, req.query.as_deref(), sent, &mut b);
             assert_eq!(
@@ -4971,7 +9161,7 @@ mod error_page_holder_tests {
         let mut pages: HashMap<u16, CachedErrorPage> = HashMap::new();
         pages.insert(
             404,
-            (std::time::Instant::now(), vec![], b"not found".to_vec()),
+            (m6_core::platform::now(), vec![], b"not found".to_vec()),
         );
         for path in [
             "/.env",
@@ -4990,7 +9180,7 @@ mod error_page_holder_tests {
     #[test]
     fn statuses_do_not_share_a_document() {
         let mut pages: HashMap<u16, CachedErrorPage> = HashMap::new();
-        pages.insert(404, (std::time::Instant::now(), vec![], b"gone".to_vec()));
+        pages.insert(404, (m6_core::platform::now(), vec![], b"gone".to_vec()));
         assert!(
             !pages.contains_key(&500),
             "500 must not be answered by the 404 document"
@@ -5001,7 +9191,7 @@ mod error_page_holder_tests {
     /// redeployed error page would never reach the edges.
     #[test]
     fn a_stale_entry_is_not_served() {
-        let stale = std::time::Instant::now()
+        let stale = m6_core::platform::now()
             .checked_sub(ERROR_PAGE_TTL + std::time::Duration::from_secs(1))
             .expect("clock");
         let entry = (stale, Vec::<(String, String)>::new(), b"old".to_vec());
@@ -5128,5 +9318,1037 @@ mod cache_warm_tests {
         );
         // Any other policy is cacheable as far as this decision goes.
         assert!(is_warmable("/contact", Some("private, max-age=0"), None));
+    }
+}
+
+#[cfg(test)]
+mod quic_flush_tests {
+    use super::*;
+    use std::io::ErrorKind;
+    use std::time::Duration;
+
+    /// One server-side QUIC connection in the loop's table, with the client end
+    /// and the socket the client reads from.
+    struct Pair {
+        client: quiche::Connection,
+        client_udp: UdpSocket,
+    }
+
+    /// A config with the UDP payload size and the initial congestion
+    /// window the test needs. The server's real config sets both, so a test
+    /// that asks a connection to fill a batch has to as well.
+    fn config_with(
+        server: bool,
+        idle_ms: u64,
+        dir: &std::path::Path,
+        payload: usize,
+        cwnd_packets: usize,
+    ) -> quiche::Config {
+        let mut cfg = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("config");
+        if server {
+            let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+                .expect("certificate");
+            std::fs::write(dir.join("cert.pem"), cert.cert.pem()).expect("write cert");
+            std::fs::write(dir.join("key.pem"), cert.key_pair.serialize_pem()).expect("write key");
+            cfg.load_cert_chain_from_pem_file(dir.join("cert.pem").to_str().unwrap())
+                .expect("cert chain");
+            cfg.load_priv_key_from_pem_file(dir.join("key.pem").to_str().unwrap())
+                .expect("key");
+        } else {
+            cfg.verify_peer(false);
+        }
+        cfg.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .expect("alpn");
+        cfg.set_max_idle_timeout(idle_ms);
+        cfg.set_max_recv_udp_payload_size(payload);
+        cfg.set_max_send_udp_payload_size(payload);
+        cfg.set_initial_congestion_window_packets(cwnd_packets);
+        cfg.set_initial_max_data(10_000_000);
+        cfg.set_initial_max_stream_data_bidi_local(1_000_000);
+        cfg.set_initial_max_stream_data_bidi_remote(1_000_000);
+        cfg.set_initial_max_stream_data_uni(1_000_000);
+        cfg.set_initial_max_streams_bidi(10);
+        cfg.set_initial_max_streams_uni(10);
+        cfg.grease(false);
+        cfg
+    }
+
+    /// Hold a flight for `delay`: the path's round trip, which is what gives
+    /// quiche the RTT and the PTO this module's wait is bounded by.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "test code: the sleep is the path's round trip, not a wait for an event"
+    )]
+    fn hold(delay: Duration) {
+        std::thread::sleep(delay);
+    }
+
+    /// Hand every packet either end has queued to the other, in memory, until
+    /// neither has any, holding each flight for `delay` before it arrives.
+    ///
+    /// A zero delay is what a loopback pump is. A real path's round trip is the
+    /// size of the wait a stalled flush would serve, so a test that bounds that
+    /// wait gives the handshake one.
+    fn pump(
+        a: &mut quiche::Connection,
+        a_addr: SocketAddr,
+        b: &mut quiche::Connection,
+        b_addr: SocketAddr,
+        delay: Duration,
+    ) {
+        let mut buf = [0u8; MAX_DATAGRAM_SIZE];
+        loop {
+            let mut moved = false;
+            let mut flight = Vec::new();
+            while let Ok((n, _)) = a.send(&mut buf) {
+                flight.push(buf[..n].to_vec());
+            }
+            if !flight.is_empty() {
+                hold(delay);
+            }
+            for packet in flight {
+                let mut bytes = packet;
+                let info = quiche::RecvInfo {
+                    from: a_addr,
+                    to: b_addr,
+                };
+                b.recv(&mut bytes, info).expect("recv");
+                moved = true;
+            }
+            let mut flight = Vec::new();
+            while let Ok((n, _)) = b.send(&mut buf) {
+                flight.push(buf[..n].to_vec());
+            }
+            if !flight.is_empty() {
+                hold(delay);
+            }
+            for packet in flight {
+                let mut bytes = packet;
+                let info = quiche::RecvInfo {
+                    from: b_addr,
+                    to: a_addr,
+                };
+                a.recv(&mut bytes, info).expect("recv");
+                moved = true;
+            }
+            if !moved {
+                return;
+            }
+        }
+    }
+
+    /// An established connection the server end of which is a `QuicConn`.
+    fn established(idle_ms: u64, server_udp: &UdpSocket) -> (QuicConn, Pair) {
+        established_over(idle_ms, Duration::ZERO, server_udp)
+    }
+
+    /// The same, with the handshake's flights held for `delay` each way.
+    fn established_over(idle_ms: u64, delay: Duration, server_udp: &UdpSocket) -> (QuicConn, Pair) {
+        established_with(idle_ms, delay, server_udp, MAX_DATAGRAM_SIZE, 10)
+    }
+
+    /// The same, with the server's UDP payload size and initial congestion
+    /// window the test needs.
+    fn established_with(
+        idle_ms: u64,
+        delay: Duration,
+        server_udp: &UdpSocket,
+        payload: usize,
+        cwnd_packets: usize,
+    ) -> (QuicConn, Pair) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let client_udp = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        client_udp.set_nonblocking(true).expect("nonblocking");
+        // A test client reads only after its own flush, so a whole batch can
+        // outrun the socket's default receive buffer: Linux's
+        // `net.core.rmem_default` is 212,992 bytes, a 324,000-byte response
+        // overruns it, and nothing in these tests fires a loss timer to send
+        // the tail again. One megabyte holds the largest batch they send.
+        socket2::SockRef::from(&client_udp)
+            .set_recv_buffer_size(1 << 20)
+            .expect("client receive buffer");
+        let client_addr = client_udp.local_addr().expect("addr");
+        let server_addr = server_udp.local_addr().expect("addr");
+        let mut server_cfg = config_with(true, idle_ms, dir.path(), payload, cwnd_packets);
+        let mut client_cfg = config_with(false, idle_ms, dir.path(), MAX_DATAGRAM_SIZE, 10);
+        let cid = quiche::ConnectionId::from_ref(&[1u8; quiche::MAX_CONN_ID_LEN]);
+        let client_cid = quiche::ConnectionId::from_ref(&[2u8; quiche::MAX_CONN_ID_LEN]);
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &client_cid,
+            client_addr,
+            server_addr,
+            &mut client_cfg,
+        )
+        .expect("connect");
+        let mut server =
+            quiche::accept(&cid, None, server_addr, client_addr, &mut server_cfg).expect("accept");
+        pump(&mut client, client_addr, &mut server, server_addr, delay);
+        assert!(client.is_established() && server.is_established());
+        let now = m6_core::platform::now();
+        let qconn = QuicConn {
+            conn: server,
+            h3_conn: None,
+            pending: HashMap::new(),
+            partial_responses: HashMap::new(),
+            client_addr,
+            last_active: now,
+            created: now,
+            handshake_recorded: true,
+            blocked: None,
+        };
+        (qconn, Pair { client, client_udp })
+    }
+
+    /// Wait for a datagram on the client's socket, or report there is none.
+    fn datagram_arrived(udp: &UdpSocket) -> bool {
+        let mut buf = [0u8; 2048];
+        let deadline = m6_core::platform::now() + Duration::from_millis(500);
+        while m6_core::platform::now() < deadline {
+            if udp.recv_from(&mut buf).is_ok() {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn queue_data(qconn: &mut QuicConn) {
+        qconn
+            .conn
+            .stream_send(3, b"queued and not yet sent", false)
+            .expect("stream_send");
+    }
+
+    /// A connection whose timer has passed is driven: its idle timeout fires
+    /// and the connection closes. Without the drive it would stay in the table
+    /// for ever.
+    #[test]
+    fn a_connection_whose_timer_is_due_is_driven() {
+        let server_udp = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let batch = UdpBatch::for_socket(&server_udp);
+        let mut out = vec![0u8; QUIC_BATCH_BYTES];
+        let (qconn, _pair) = established(100, &server_udp);
+        let mut connections = HashMap::from([(vec![1u8], qconn)]);
+        let at = connections[&vec![1u8]]
+            .conn
+            .timeout_instant()
+            .expect("a timer is armed");
+        // quiche reads the real clock, so the timer has to really pass.
+        while m6_core::platform::now() < at {
+            std::hint::spin_loop();
+        }
+        assert!(!connections[&vec![1u8]].conn.is_closed());
+        flush_due(
+            &server_udp,
+            batch,
+            &mut out,
+            &mut connections,
+            m6_core::platform::now(),
+        );
+        assert!(
+            connections[&vec![1u8]].conn.is_closed(),
+            "a connection past its idle timeout was not driven"
+        );
+    }
+
+    /// A turn drives the connection whose timer is due and leaves the idle
+    /// ones alone: the idle connection's queued data is not sent, and it has
+    /// not been closed or had its timer fired.
+    #[test]
+    fn idle_connections_whose_timer_is_not_due_are_not_touched() {
+        let server_udp = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let batch = UdpBatch::for_socket(&server_udp);
+        let mut out = vec![0u8; QUIC_BATCH_BYTES];
+        let (mut idle, idle_pair) = established(30_000, &server_udp);
+        let (due, _due_pair) = established(100, &server_udp);
+        queue_data(&mut idle);
+        let due_at = due.conn.timeout_instant().expect("a timer is armed");
+        let idle_at = idle.conn.timeout_instant().expect("a timer is armed");
+        assert!(idle_at > due_at, "the idle connection's timer is later");
+        let mut connections = HashMap::from([(vec![1u8], idle), (vec![2u8], due)]);
+
+        while m6_core::platform::now() < due_at {
+            std::hint::spin_loop();
+        }
+        flush_due(
+            &server_udp,
+            batch,
+            &mut out,
+            &mut connections,
+            m6_core::platform::now(),
+        );
+
+        assert!(
+            connections[&vec![2u8]].conn.is_closed(),
+            "the connection whose timer was due was not driven"
+        );
+        let idle = connections.get_mut(&vec![1u8]).expect("idle connection");
+        assert!(!idle.conn.is_closed());
+        assert_eq!(idle.conn.timeout_instant(), Some(idle_at));
+        assert!(
+            !datagram_arrived(&idle_pair.client_udp),
+            "an idle connection sent on a turn its timer was not due"
+        );
+        let mut out = [0u8; MAX_DATAGRAM_SIZE];
+        assert!(
+            idle.conn.send(&mut out).is_ok(),
+            "the idle connection's queued data was consumed without a send"
+        );
+    }
+
+    /// Wait for one datagram on `udp`, or report there is none within `wait`.
+    fn datagram_within(udp: &UdpSocket, wait: Duration) -> Option<Vec<u8>> {
+        use std::os::fd::AsFd;
+
+        let mut buf = [0u8; 2048];
+        match udp.recv_from(&mut buf) {
+            Ok((n, _)) => return Some(buf[..n].to_vec()),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+            Err(e) => panic!("client receive: {e}"),
+        }
+        // One wait on the descriptor, not a sleep: a datagram is whole when
+        // the socket reports it readable.
+        if !m6_core::platform::wait_readable(udp.as_fd(), wait).expect("wait for the client socket")
+        {
+            return None;
+        }
+        match udp.recv_from(&mut buf) {
+            Ok((n, _)) => Some(buf[..n].to_vec()),
+            Err(e) => panic!("client receive after readability: {e}"),
+        }
+    }
+
+    /// A batch the socket refuses goes out on the writable event, not on the
+    /// loss timer.
+    ///
+    /// The datagrams the socket refused are the response: `quiche` has already
+    /// handed them out, so remembering only the connection and flushing it
+    /// again would send the packets queued behind them and leave the response
+    /// for the loss timer. The test holds the batch, reads the PTO the frames
+    /// would wait for, and then asserts the client has the response well inside
+    /// that PTO, from the writable event alone.
+    ///
+    /// Break: the refused batch is dropped, the connection is not remembered,
+    /// the socket is not watched for writability, or the interest is not
+    /// dropped once nothing is waiting.
+    #[test]
+    fn a_refused_batch_goes_out_on_the_writable_event() {
+        // A real path's round trip, so the PTO the frames would wait for is
+        // larger than this test's own bound. A loopback handshake gives quiche
+        // an RTT of microseconds and its PTO the 1 ms floor, which no bound can
+        // be well under.
+        const PATH_RTT: Duration = Duration::from_millis(100);
+        let server_udp = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let batch = UdpBatch::for_socket(&server_udp);
+        let mut out = vec![0u8; QUIC_BATCH_BYTES];
+        let (mut qconn, mut pair) = established_over(30_000, PATH_RTT, &server_udp);
+        queue_data(&mut qconn);
+        let key = vec![1u8];
+        let mut connections = HashMap::from([(key.clone(), qconn)]);
+
+        // The socket refuses the batch: nothing goes on the wire, and the
+        // datagrams it refused are held on the connection.
+        test_send_seam::refuse_next_batches(1);
+        flush_conn(
+            &server_udp,
+            batch,
+            &mut out,
+            connections.get_mut(&key).expect("connection"),
+        );
+        let qconn = connections.get_mut(&key).expect("connection");
+        assert!(
+            qconn.blocked.is_some(),
+            "the refused datagrams were dropped"
+        );
+        let pto = qconn
+            .conn
+            .timeout_instant()
+            .expect("the loss timer is armed")
+            .saturating_duration_since(m6_core::platform::now());
+        assert!(pto >= PATH_RTT, "the frames would wait {pto:?}, not a PTO");
+        assert!(
+            datagram_within(&pair.client_udp, Duration::ZERO).is_none(),
+            "a refused batch put a datagram on the wire"
+        );
+
+        // The poller reports the socket writable, and that event's flush sends
+        // the held batch, well inside the PTO.
+        let mut poll = Poll::new().expect("poll");
+        poll.registry()
+            .register_fd(server_udp.as_raw_fd(), TOKEN_UDP, Interest::READABLE)
+            .expect("register");
+        let mut watching = false;
+        watch_blocked(&server_udp, poll.registry(), &connections, &mut watching);
+        assert!(
+            watching,
+            "the blocked connection did not ask for writability"
+        );
+        let mut events = Events::with_capacity(8);
+        poll.poll(&mut events, Some(Duration::from_secs(5)))
+            .expect("poll");
+        let ready = events.iter().next().expect("no writable event");
+        assert_eq!(ready.token(), TOKEN_UDP);
+        assert!(
+            ready.is_writable(),
+            "the writable interest was not registered"
+        );
+        assert!(
+            !ready.is_readable(),
+            "the event came from a readable socket"
+        );
+
+        let started = m6_core::platform::now();
+        flush_blocked(&server_udp, batch, &mut out, &mut connections);
+        let packet = datagram_within(&pair.client_udp, pto / 2)
+            .expect("the refused batch did not go out on the writable event");
+        assert!(
+            started.elapsed() < pto / 2,
+            "the batch took {:?}, half the PTO was {:?}",
+            started.elapsed(),
+            pto / 2
+        );
+        assert!(
+            connections[&key].blocked.is_none(),
+            "the connection is still waiting for the socket"
+        );
+
+        // The bytes are the response, and the client reads it.
+        let from = server_udp.local_addr().expect("server address");
+        let to = pair.client_udp.local_addr().expect("client address");
+        let mut packet = packet;
+        pair.client
+            .recv(&mut packet, quiche::RecvInfo { from, to })
+            .expect("client receive");
+        let mut got = [0u8; 64];
+        let (n, _fin) = pair
+            .client
+            .stream_recv(3, &mut got)
+            .expect("the response did not arrive");
+        assert_eq!(&got[..n], b"queued and not yet sent");
+
+        // Nothing is waiting, so the socket stops being watched for writability.
+        watch_blocked(&server_udp, poll.registry(), &connections, &mut watching);
+        assert!(!watching, "an empty set still asks for writability");
+        let mut events = Events::with_capacity(8);
+        poll.poll(&mut events, Some(Duration::from_millis(100)))
+            .expect("poll");
+        assert!(
+            events.iter().next().is_none(),
+            "an empty set still watches writability"
+        );
+    }
+
+    /// The turn end changes the writable interest only when the answer
+    /// changes: with a refused batch and `watching` already true, it makes no
+    /// call at all.
+    ///
+    /// The socket is writable, so a reregister would report it at once. The
+    /// poll that finds nothing is the proof the call was skipped.
+    ///
+    /// Break: a reregister on every turn, which is a system call on every turn
+    /// for as long as one connection is blocked.
+    #[test]
+    fn watching_is_unchanged_when_nothing_changed() {
+        let server_udp = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let batch = UdpBatch::for_socket(&server_udp);
+        let mut out = vec![0u8; QUIC_BATCH_BYTES];
+        let (mut qconn, _pair) = established(30_000, &server_udp);
+        queue_data(&mut qconn);
+        let key = vec![1u8];
+        let mut connections = HashMap::from([(key.clone(), qconn)]);
+
+        test_send_seam::refuse_next_batches(1);
+        flush_conn(
+            &server_udp,
+            batch,
+            &mut out,
+            connections.get_mut(&key).expect("connection"),
+        );
+        assert!(connections[&key].blocked.is_some(), "no batch is waiting");
+
+        let mut poll = Poll::new().expect("poll");
+        poll.registry()
+            .register_fd(server_udp.as_raw_fd(), TOKEN_UDP, Interest::READABLE)
+            .expect("register");
+        // As the previous turn left it: watching, with a batch waiting.
+        let mut watching = true;
+        watch_blocked(&server_udp, poll.registry(), &connections, &mut watching);
+        assert!(watching);
+        let mut events = Events::with_capacity(8);
+        poll.poll(&mut events, Some(Duration::from_millis(100)))
+            .expect("poll");
+        assert!(
+            events.iter().next().is_none(),
+            "the interest was reregistered with nothing changed"
+        );
+    }
+
+    /// A packet that could not join a refused batch goes out on the writable
+    /// event too, ahead of everything behind it.
+    ///
+    /// A 60-byte response on stream 3 and a 12 KB one on stream 7 make quiche
+    /// write a small packet and then a full one. The full one cannot join the
+    /// batch, so `flush_conn` sends the small one and hands the full one over
+    /// as a second batch. When the socket refuses the small one, the full one
+    /// is outside the batch and quiche has already forgotten it: keeping the
+    /// pack alone strands it until the loss timer, and stream 7 then stops at
+    /// the gap.
+    ///
+    /// The bound is the PTO, as in the refused-batch test: a test that only
+    /// checked the bytes arrive would pass once the retransmission landed.
+    ///
+    /// Break: the second batch is dropped, the retry sends it out of order, or
+    /// the connection is not remembered.
+    #[test]
+    fn a_packet_after_a_refused_batch_goes_out_on_the_writable_event() {
+        const PATH_RTT: Duration = Duration::from_millis(100);
+        let server_udp = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let batch = UdpBatch::for_socket(&server_udp);
+        let mut out = vec![0u8; QUIC_BATCH_BYTES];
+        let (mut qconn, mut pair) = established_over(30_000, PATH_RTT, &server_udp);
+        // quiche writes the flushable streams in the order they became
+        // flushable, so the small packet comes first and the packet after it
+        // is full.
+        qconn
+            .conn
+            .stream_send(3, &[9u8; 60], true)
+            .expect("small stream");
+        qconn
+            .conn
+            .stream_send(7, &vec![7u8; 12_000], false)
+            .expect("large stream");
+
+        let key = vec![1u8];
+        let mut connections = HashMap::from([(key.clone(), qconn)]);
+
+        test_send_seam::refuse_next_batches(1);
+        flush_conn(
+            &server_udp,
+            batch,
+            &mut out,
+            connections.get_mut(&key).expect("connection"),
+        );
+        let qconn = connections.get_mut(&key).expect("connection");
+        let pto = qconn
+            .conn
+            .timeout_instant()
+            .expect("the loss timer is armed")
+            .saturating_duration_since(m6_core::platform::now());
+        assert!(pto >= PATH_RTT, "the frames would wait {pto:?}, not a PTO");
+        assert!(
+            datagram_within(&pair.client_udp, Duration::ZERO).is_none(),
+            "a refused flush put a datagram on the wire"
+        );
+
+        // The poller reports the socket writable, and that event's flush sends
+        // both held batches before packing anything new.
+        let mut poll = Poll::new().expect("poll");
+        poll.registry()
+            .register_fd(server_udp.as_raw_fd(), TOKEN_UDP, Interest::READABLE)
+            .expect("register");
+        let mut watching = false;
+        watch_blocked(&server_udp, poll.registry(), &connections, &mut watching);
+        assert!(
+            watching,
+            "the blocked connection did not ask for writability"
+        );
+        let mut events = Events::with_capacity(8);
+        poll.poll(&mut events, Some(Duration::from_secs(5)))
+            .expect("poll");
+        let ready = events.iter().next().expect("no writable event");
+        assert!(
+            ready.is_writable(),
+            "the writable interest was not registered"
+        );
+
+        let started = m6_core::platform::now();
+        flush_blocked(&server_udp, batch, &mut out, &mut connections);
+        assert!(
+            connections[&key].blocked.is_none(),
+            "the connection is still waiting for the socket"
+        );
+
+        // Everything that flush sent goes into the client, and then the long
+        // response is read in order. Its first packet was the one outside the
+        // refused batch, so without it stream 7 stops at the gap. The
+        // datagrams cross loopback after the socket is readable, so the read
+        // waits for the rest rather than assuming the first drain has them all.
+        let from = server_udp.local_addr().expect("server address");
+        let to = pair.client_udp.local_addr().expect("client address");
+        let mut buf = [0u8; 2048];
+        let mut datagrams = 0;
+        let mut body = Vec::new();
+        let deadline = started + pto / 2;
+        loop {
+            loop {
+                match pair.client_udp.recv_from(&mut buf) {
+                    Ok((n, _)) => {
+                        datagrams += 1;
+                        pair.client
+                            .recv(&mut buf[..n], quiche::RecvInfo { from, to })
+                            .expect("client receive");
+                    }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("client socket: {e}"),
+                }
+            }
+            let mut chunk = [0u8; 2048];
+            while let Ok((n, _fin)) = pair.client.stream_recv(7, &mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&chunk[..n]);
+            }
+            if body.len() >= 12_000 || m6_core::platform::now() > deadline {
+                break;
+            }
+            let _ = m6_core::platform::wait_readable(
+                std::os::fd::AsFd::as_fd(&pair.client_udp),
+                Duration::from_millis(20),
+            );
+        }
+        assert!(
+            started.elapsed() < pto / 2,
+            "the retry took {:?}, half the PTO was {:?}",
+            started.elapsed(),
+            pto / 2
+        );
+        assert_eq!(
+            body.len(),
+            12_000,
+            "{datagrams} datagrams arrived and stream 7 got {} bytes: the packet outside the refused batch is missing",
+            body.len()
+        );
+    }
+
+    /// A batch the socket takes part of is retried from the datagram that did
+    /// not go, not from the front.
+    ///
+    /// The per-datagram path sends one datagram per call, so a socket can take
+    /// a prefix of the batch and refuse the next. The kept bytes are the
+    /// measurement: they are shorter than the response, so the prefix is not
+    /// waiting to be sent again, and the client has the whole body after the
+    /// writable event regardless.
+    ///
+    /// Break: a partial refusal kept as a whole one, so the datagrams already
+    /// sent go out again.
+    #[test]
+    fn a_partial_batch_send_keeps_only_the_rest() {
+        let body: Vec<u8> = (0..5_000).map(|i| (i % 251) as u8).collect();
+        let server_udp = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let batch = UdpBatch::for_socket(&server_udp);
+        let mut out = vec![0u8; QUIC_BATCH_BYTES];
+        let (mut qconn, mut pair) = established(30_000, &server_udp);
+        qconn.conn.stream_send(3, &body, true).expect("stream_send");
+        let key = vec![1u8];
+        let mut connections = HashMap::from([(key.clone(), qconn)]);
+
+        // The socket takes two datagrams of the batch and refuses the next.
+        test_send_stats::reset();
+        test_send_seam::refuse_after(2);
+        flush_conn(
+            &server_udp,
+            batch,
+            &mut out,
+            connections.get_mut(&key).expect("connection"),
+        );
+        assert_eq!(
+            test_send_stats::datagrams(),
+            2,
+            "the socket took two datagrams"
+        );
+        let kept = connections
+            .get_mut(&key)
+            .expect("connection")
+            .blocked
+            .as_ref()
+            .expect("the rest was not kept");
+        assert_eq!(kept.chunks.len(), 1, "one batch is waiting");
+        assert!(
+            kept.chunks[0].bytes.len() < body.len(),
+            "the whole batch was kept, so the retry sends the prefix twice"
+        );
+
+        // The writable event sends the rest, and the body arrives whole.
+        flush_blocked(&server_udp, batch, &mut out, &mut connections);
+        assert!(
+            connections[&key].blocked.is_none(),
+            "the connection is still waiting for the socket"
+        );
+        // The datagrams the writable event sent cross loopback after the
+        // client's socket is readable, so read until the body is whole rather
+        // than assume the first drain has them all.
+        let deadline = m6_core::platform::now() + Duration::from_secs(5);
+        let (datagrams, got) = loop {
+            let (datagrams, got) = drain_pair(&mut pair, &server_udp);
+            if got.len() >= body.len() || m6_core::platform::now() > deadline {
+                break (datagrams, got);
+            }
+            let _ = m6_core::platform::wait_readable(
+                std::os::fd::AsFd::as_fd(&pair.client_udp),
+                Duration::from_millis(20),
+            );
+        };
+        assert_eq!(got, body, "{datagrams} datagrams did not carry the body");
+    }
+
+    /// Drain every datagram the server sent `pair`, feed it to the client and
+    /// return the datagram count and the client's stream 3.
+    fn drain_pair(pair: &mut Pair, server_udp: &UdpSocket) -> (usize, Vec<u8>) {
+        let from = server_udp.local_addr().expect("server address");
+        let to = pair.client_udp.local_addr().expect("client address");
+        let mut datagrams = 0;
+        let mut buf = [0u8; 2048];
+        loop {
+            match pair.client_udp.recv_from(&mut buf) {
+                Ok((n, _)) => {
+                    datagrams += 1;
+                    pair.client
+                        .recv(&mut buf[..n], quiche::RecvInfo { from, to })
+                        .expect("client receive");
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) => panic!("client socket: {e}"),
+            }
+        }
+        let mut body = Vec::new();
+        let mut chunk = [0u8; 2048];
+        while let Ok((n, _fin)) = pair.client.stream_recv(3, &mut chunk) {
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..n]);
+        }
+        (datagrams, body)
+    }
+
+    /// The touched list keeps the entry buffers it has used, so a batch after
+    /// the first copies into the same memory instead of allocating.
+    ///
+    /// The pointer is the measurement `Vec` gives: `clear` keeps the buffer,
+    /// and a `note` that fits in it leaves the pointer alone. A list that
+    /// pushed a fresh `Vec` per batch would move it.
+    ///
+    /// Break: `note` pushing a new entry for a key the live list does not
+    /// hold, or `clear` dropping the entries instead of their length.
+    #[test]
+    fn a_touched_list_reuses_the_entries_it_has_used() {
+        let mut touched = Touched::default();
+        touched.note(&[1u8; 20]);
+        assert_eq!(touched.keys().len(), 1);
+        let buffer = touched.entries[0].as_ptr();
+
+        touched.clear();
+        touched.note(&[2u8; 20]);
+        assert_eq!(touched.keys().len(), 1, "the new batch is a new list");
+        assert_eq!(touched.keys()[0], vec![2u8; 20], "the batch's own key");
+        assert_eq!(
+            touched.entries.len(),
+            1,
+            "the second batch added an entry rather than reusing one"
+        );
+        assert_eq!(
+            touched.entries[0].as_ptr(),
+            buffer,
+            "the second batch allocated a new entry buffer"
+        );
+
+        // A batch with more connections than any before it grows the list and
+        // still reads only the live prefix.
+        touched.clear();
+        touched.note(&[3u8; 20]);
+        touched.note(&[4u8; 20]);
+        assert_eq!(touched.keys(), &[vec![3u8; 20], vec![4u8; 20]]);
+        touched.clear();
+        touched.note(&[5u8; 20]);
+        assert_eq!(touched.keys(), &[vec![5u8; 20]], "a stale entry is live");
+    }
+
+    /// One receive batch flushes each connection it fed once, not once per
+    /// datagram, and every byte still arrives in order.
+    ///
+    /// The touched list is what `drain_udp` builds from one `recvmmsg` batch:
+    /// the same connection sixteen times is sixteen ACK datagrams. The defect
+    /// flushed inside the per-datagram loop, so this list cost one send per
+    /// entry. Flushing per batch costs one send per connection, here two.
+    ///
+    /// Break: a flush inside the per-datagram loop (calls would be 19), a
+    /// batch that drops a connection (a body would be short or missing), or a
+    /// batch whose segments are packed wrong (the bytes would differ).
+    #[test]
+    fn a_receive_batch_flushes_each_connection_once() {
+        let server_udp = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let batch = UdpBatch::for_socket(&server_udp);
+        let mut out = vec![0u8; QUIC_BATCH_BYTES];
+        let (mut first, mut first_pair) = established(30_000, &server_udp);
+        let (mut second, mut second_pair) = established(30_000, &server_udp);
+        let first_body: Vec<u8> = (0..12_000).map(|i| (i % 251) as u8).collect();
+        let second_body: Vec<u8> = (0..5_000).map(|i| (i % 199) as u8).collect();
+        assert_eq!(
+            first
+                .conn
+                .stream_send(3, &first_body, true)
+                .expect("queue the first body"),
+            first_body.len()
+        );
+        assert_eq!(
+            second
+                .conn
+                .stream_send(3, &second_body, true)
+                .expect("queue the second body"),
+            second_body.len()
+        );
+
+        let first_key = vec![1u8];
+        let second_key = vec![2u8];
+        let mut connections =
+            HashMap::from([(first_key.clone(), first), (second_key.clone(), second)]);
+        // Sixteen datagrams for the first connection and three for the second,
+        // which is what one full batch of ACKs and a short one look like. Each
+        // connection is noted once however many datagrams it took.
+        let mut touched = Touched::default();
+        for _ in 0..16 {
+            touched.note(&first_key);
+        }
+        for _ in 0..3 {
+            touched.note(&second_key);
+        }
+        assert_eq!(touched.keys().len(), 2, "one entry per connection");
+
+        test_send_stats::reset();
+        flush_received(&server_udp, batch, &mut out, &mut connections, &touched);
+        let calls = test_send_stats::calls();
+        let datagrams = test_send_stats::datagrams();
+        assert_eq!(
+            calls, 2,
+            "a batch of 19 datagrams over two connections took {calls} sends"
+        );
+        assert!(
+            datagrams > 10,
+            "the two sends carried only {datagrams} datagrams"
+        );
+        assert!(
+            connections.values().all(|c| c.blocked.is_none()),
+            "the loopback socket refused a batch"
+        );
+
+        let (first_datagrams, first_got) = drain_pair(&mut first_pair, &server_udp);
+        let (second_datagrams, second_got) = drain_pair(&mut second_pair, &server_udp);
+        assert_eq!(
+            first_datagrams + second_datagrams,
+            datagrams,
+            "the client read a different number of datagrams than the sends carried"
+        );
+        assert_eq!(first_got, first_body, "the first body is byte for byte");
+        assert_eq!(second_got, second_body, "the second body is byte for byte");
+    }
+
+    /// The batch caps are the send's, and the send quantum is not one of them.
+    ///
+    /// This quiche sets `send_quantum` to the initial congestion window when
+    /// the connection is made and never writes it again, so a cap on it stops
+    /// every batch at 10 packets for the connection's life while the window
+    /// grows. The two limits here are the kernel's: one UDP payload holds at
+    /// most 65,507 bytes, and one GSO send carries at most 64 segments.
+    ///
+    /// Break: a third cap, a cap on `send_quantum`, or a cap that lets a
+    /// packet straddle the end of the buffer.
+    #[test]
+    fn the_batch_caps_are_the_gso_limits() {
+        assert_eq!(QUIC_BATCH_SEGMENTS, 64, "one GSO send takes 64 segments");
+        assert_eq!(
+            QUIC_BATCH_BYTES, 65_507,
+            "one UDP payload holds 65,507 bytes"
+        );
+
+        // Room for exactly one more packet is not full. One byte less, or a
+        // packet taken whole, is.
+        let mut pack = Pack {
+            len: QUIC_BATCH_BYTES - MAX_DATAGRAM_SIZE,
+            ..Pack::default()
+        };
+        assert!(!batch_is_full(&pack, QUIC_BATCH_BYTES));
+        pack.len = QUIC_BATCH_BYTES - 1;
+        assert!(
+            batch_is_full(&pack, QUIC_BATCH_BYTES),
+            "a batch that cannot take a whole packet is full"
+        );
+
+        // The segment cap closes a batch that still has bytes left.
+        let mut pack = Pack {
+            len: MAX_DATAGRAM_SIZE,
+            count: QUIC_BATCH_SEGMENTS - 1,
+            ..Pack::default()
+        };
+        assert!(!batch_is_full(&pack, QUIC_BATCH_BYTES));
+        pack.count = QUIC_BATCH_SEGMENTS;
+        assert!(
+            batch_is_full(&pack, QUIC_BATCH_BYTES),
+            "64 segments is full whatever the byte count"
+        );
+    }
+
+    /// A batch passes the connection's send quantum, and stops at the byte cap.
+    ///
+    /// The connection is made with a 10-packet window, so its send quantum is
+    /// 10 packets and never moves. The test then runs a real ACK-driven
+    /// transfer: each flush sends what the window allows, the client ACKs over
+    /// the socket, and the window grows. The batch has to follow the window
+    /// past the quantum, and it has to stop at 65,507 bytes when the window is
+    /// wider than that.
+    ///
+    /// Break: a cap on `send_quantum` (no send would carry more than 10
+    /// packets, however far the window grew), a cap that packs past 65,507
+    /// bytes, or a flush that drops the packets after the cap.
+    #[test]
+    fn a_batch_passes_the_send_quantum_and_stops_at_the_byte_cap() {
+        let server_udp = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        server_udp.set_nonblocking(true).expect("nonblocking");
+        let batch = UdpBatch::for_socket(&server_udp);
+        let mut out = vec![0u8; QUIC_BATCH_BYTES];
+        let (mut qconn, mut pair) = established(30_000, &server_udp);
+        let server_addr = server_udp.local_addr().expect("server address");
+        let client_addr = pair.client_udp.local_addr().expect("client address");
+        let quantum = qconn.conn.send_quantum();
+        assert_eq!(
+            quantum,
+            10 * MAX_DATAGRAM_SIZE,
+            "the quantum is the initial window"
+        );
+
+        // 240 packets: enough for the window to grow past the byte cap.
+        let body: Vec<u8> = (0..240).flat_map(|i| [i as u8; 1350]).collect();
+
+        test_send_stats::reset();
+        let mut buf = [0u8; 2048];
+        let mut got = Vec::with_capacity(body.len());
+        let mut queued = 0;
+        let deadline = m6_core::platform::now() + Duration::from_secs(5);
+        while got.len() < body.len() {
+            assert!(
+                m6_core::platform::now() < deadline,
+                "the transfer stalled at {} of {} bytes",
+                got.len(),
+                body.len()
+            );
+            // Queue what the window has room for. `stream_send` stops at the
+            // congestion window, so the rest is queued on a later turn, the
+            // same way a real response body is.
+            if queued < body.len() {
+                match qconn.conn.stream_send(3, &body[queued..], true) {
+                    Ok(n) => queued += n,
+                    Err(quiche::Error::Done) => {}
+                    Err(e) => panic!("stream_send: {e}"),
+                }
+            }
+            // The server sends what the window allows.
+            flush_conn(&server_udp, batch, &mut out, &mut qconn);
+            // The client takes the flight and answers it.
+            loop {
+                match pair.client_udp.recv_from(&mut buf) {
+                    Ok((n, _)) => {
+                        pair.client
+                            .recv(
+                                &mut buf[..n],
+                                quiche::RecvInfo {
+                                    from: server_addr,
+                                    to: client_addr,
+                                },
+                            )
+                            .expect("client receive");
+                    }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("client socket: {e}"),
+                }
+            }
+            loop {
+                match pair.client.send(&mut buf) {
+                    Ok((n, _)) => {
+                        pair.client_udp
+                            .send_to(&buf[..n], server_addr)
+                            .expect("client ACK");
+                    }
+                    Err(quiche::Error::Done) => break,
+                    Err(e) => panic!("client send: {e}"),
+                }
+            }
+            // The server reads the ACKs, which is what moves its window.
+            loop {
+                match server_udp.recv_from(&mut buf) {
+                    Ok((n, from)) => {
+                        qconn
+                            .conn
+                            .recv(
+                                &mut buf[..n],
+                                quiche::RecvInfo {
+                                    from,
+                                    to: server_addr,
+                                },
+                            )
+                            .expect("server receive");
+                    }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("server socket: {e}"),
+                }
+            }
+            let mut chunk = [0u8; 2048];
+            while let Ok((n, _fin)) = pair.client.stream_recv(3, &mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&chunk[..n]);
+            }
+        }
+
+        assert_eq!(got, body, "the body is byte for byte");
+        let largest = test_send_stats::largest();
+        assert!(
+            largest > quantum / MAX_DATAGRAM_SIZE,
+            "the largest send was {largest} packets, the quantum allowed {}",
+            quantum / MAX_DATAGRAM_SIZE
+        );
+        assert_eq!(
+            largest,
+            QUIC_BATCH_BYTES / MAX_DATAGRAM_SIZE,
+            "the window passed the byte cap and the batch stopped at it"
+        );
+        assert!(
+            test_send_stats::datagrams() >= 240,
+            "every packet of the body went"
+        );
+        assert!(
+            test_send_stats::calls() < 24,
+            "240 packets took {} sends",
+            test_send_stats::calls()
+        );
+    }
+
+    /// A batch smaller than the cap is sent as it comes: one send, no wait to
+    /// fill the buffer.
+    #[test]
+    fn a_batch_smaller_than_the_cap_is_sent_as_it_comes() {
+        let server_udp = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let batch = UdpBatch::for_socket(&server_udp);
+        let mut out = vec![0u8; QUIC_BATCH_BYTES];
+        let (mut qconn, _pair) = established(30_000, &server_udp);
+        qconn
+            .conn
+            .stream_send(3, &[7u8; 3_000], true)
+            .expect("queue a short body");
+
+        test_send_stats::reset();
+        flush_conn(&server_udp, batch, &mut out, &mut qconn);
+        assert!(qconn.blocked.is_none(), "the short batch did not go out");
+        assert_eq!(test_send_stats::calls(), 1, "a short batch is one send");
+        assert!(test_send_stats::datagrams() > 1, "and it carries packets");
+        assert_eq!(
+            test_send_stats::largest(),
+            test_send_stats::datagrams(),
+            "the one send carried the whole short batch"
+        );
+        assert!(
+            test_send_stats::datagrams() < QUIC_BATCH_SEGMENTS,
+            "the short batch stayed under the cap"
+        );
     }
 }

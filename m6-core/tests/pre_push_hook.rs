@@ -30,7 +30,8 @@
 //! failure is about the hook's logic and not about which bash is on PATH.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 fn hook_path() -> PathBuf {
@@ -50,6 +51,12 @@ struct Outcome {
 /// One line per ref, in git's own format:
 /// `<local ref> <local sha> <remote ref> <remote sha>`.
 fn run(stdin_lines: &[&str], release: bool) -> Outcome {
+    run_with_path(stdin_lines, release, None)
+}
+
+/// Like [`run`], with `path_dir` prepended to the hook's PATH so the hook's
+/// own subprocess lookups find a stub there first.
+fn run_with_path(stdin_lines: &[&str], release: bool, path_dir: Option<&Path>) -> Outcome {
     let hook = hook_path();
     assert!(hook.is_file(), "{} does not exist", hook.display());
 
@@ -61,6 +68,13 @@ fn run(stdin_lines: &[&str], release: bool) -> Outcome {
         .stderr(Stdio::piped());
     if release {
         cmd.env("M6_RELEASE", "1");
+    }
+    if let Some(dir) = path_dir {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut joined = std::ffi::OsString::from(dir);
+        joined.push(":");
+        joined.push(path);
+        cmd.env("PATH", joined);
     }
 
     let mut child = cmd.spawn().expect("could not run bash");
@@ -411,29 +425,38 @@ fn scripts_named(line: &str) -> Vec<String> {
     found
 }
 
-/// The hook must be fast, and that is a correctness property rather than a
-/// preference.
-///
-/// It used to run the whole workspace test suite plus conformance, over ten
-/// minutes. **That broke pushing outright**: git opens its connection to the
-/// remote, runs the hook, then sends the pack. With a ten minute hook in the
-/// middle the server closes the idle connection, and git writes the pack to a
-/// dead socket -- killed by SIGPIPE, exit 141, no error message. From outside
-/// it looked exactly like a push that silently did nothing, while the checks
-/// printed "All checks passed".
-///
-/// Two seconds is far above what the branch rules need and far below anything
-/// that could idle out a connection.
+/// The hook must be cheap, and that is a correctness property rather than a
+/// preference: git runs the hook before sending the pack, and a slow hook
+/// makes git write its pack to a connection the server has already closed.
+/// The deterministic form of "cheap" is "no content check", so the hook never
+/// runs `cargo`. A `cargo` stub first on PATH records any call; the hook must
+/// finish without making one.
 #[test]
-fn the_hook_finishes_quickly() {
-    let start = std::time::Instant::now();
-    let r = run(&[&branch("develop")], false);
-    let elapsed = start.elapsed();
-    assert!(r.allowed);
+fn the_hook_runs_no_content_checks() {
+    // Under `target/`, because the hook EXECUTES this stub if it calls cargo,
+    // and a hardened host mounts `/tmp` `noexec`. That refusal would pass
+    // silently here: the test asserts the stub was not run, so an exec refused
+    // with "Permission denied" leaves the marker absent and the test passes for
+    // the wrong reason. `CARGO_TARGET_TMPDIR` is under `target/`, which is
+    // exec-capable wherever the build ran.
+    let dir = tempfile::Builder::new()
+        .prefix("m6-pre-push-path-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let marker = dir.path().join("cargo-called");
+    let cargo = dir.path().join("cargo");
+    std::fs::write(
+        &cargo,
+        format!("#!/bin/sh\nprintf x > '{}'\nexit 0\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let r = run_with_path(&[&branch("develop")], false, Some(dir.path()));
+    assert!(r.allowed, "develop was refused:\n{}", r.output);
     assert!(
-        elapsed < std::time::Duration::from_secs(2),
-        "the hook took {elapsed:?}. A slow pre-push hook does not fail loudly, \
-         it makes git write its pack to a connection the server has already \
-         closed. Content checks belong in CI, not here."
+        !marker.exists(),
+        "the hook ran cargo, so it is a content check, not branch rules only:\n{}",
+        r.output
     );
 }

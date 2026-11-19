@@ -27,6 +27,11 @@
 //! `handshake_kind()` is the protocol's own answer rather than a client's
 //! summary of it. A test that cannot measure must fail, not report reassurance.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
@@ -41,7 +46,7 @@ use m6_http_lib::http11::make_tls_server_config;
 fn install_provider() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     });
 }
 

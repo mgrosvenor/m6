@@ -9,8 +9,7 @@
 //! points (`http11::build_response`, `http2::encode_response_headers`,
 //! `send_h3_response`) sit below the layer that owns `Config`, and threading
 //! config through three protocol stacks to deliver five constant strings would
-//! be a poor trade. `configure()` is called once at startup and again on each
-//! `site.toml` reload.
+//! be a poor trade. `configure()` is called once at startup.
 
 use std::sync::RwLock;
 
@@ -31,8 +30,7 @@ static HEADERS: RwLock<Resolved> = RwLock::new(Resolved {
     h1_block: String::new(),
 });
 
-/// Install the header set derived from `[security]`. Called at startup and on
-/// config reload.
+/// Install the header set derived from `[security]`. Called at startup.
 pub fn configure(cfg: &crate::config::SecurityConfig) {
     let pairs = cfg.resolved_headers();
     let mut h1_block = String::new();
@@ -47,27 +45,20 @@ pub fn configure(cfg: &crate::config::SecurityConfig) {
     }
 }
 
-/// True if `existing` sets any header we would otherwise add.
-///
-/// Typically false, which is what makes the `memcpy` fast path in
-/// [`write_h1_headers`] worthwhile. Costs `existing.len() * pairs.len()` short
-/// case-insensitive comparisons with no allocation.
-fn any_overridden(existing: &[(String, String)], pairs: &[(String, String)]) -> bool {
-    existing
-        .iter()
-        .any(|(k, _)| pairs.iter().any(|(name, _)| k.eq_ignore_ascii_case(name)))
-}
-
 /// Write the security headers absent from `existing` into an HTTP/1.1 header
 /// block, as `name: value\r\n` lines. Allocation-free.
-pub fn write_h1_headers(out: &mut Vec<u8>, existing: &[(String, String)]) {
+pub fn write_h1_headers(out: &mut Vec<u8>, existing: &(impl m6_core::http::HeaderSource + ?Sized)) {
     let Ok(guard) = HEADERS.read() else { return };
-    if !any_overridden(existing, &guard.pairs) {
+    let overridden = guard
+        .pairs
+        .iter()
+        .any(|(name, _)| m6_core::http::HeaderSource::find(existing, name).is_some());
+    if !overridden {
         out.extend_from_slice(guard.h1_block.as_bytes());
         return;
     }
     for (name, value) in &guard.pairs {
-        if m6_core::headers::contains(existing, name) {
+        if m6_core::http::HeaderSource::find(existing, name).is_some() {
             continue;
         }
         out.extend_from_slice(name.as_bytes());
@@ -91,10 +82,10 @@ impl HeadersGuard {
     /// The configured headers not already present in `existing`.
     pub fn absent_from<'a>(
         &'a self,
-        existing: &'a [(String, String)],
+        existing: &'a (impl m6_core::http::HeaderSource + ?Sized),
     ) -> impl Iterator<Item = (&'a str, &'a str)> + 'a {
         self.0.pairs.iter().filter_map(move |(name, value)| {
-            let overridden = m6_core::headers::contains(existing, name);
+            let overridden = existing.find(name).is_some();
             (!overridden).then_some((name.as_str(), value.as_str()))
         })
     }

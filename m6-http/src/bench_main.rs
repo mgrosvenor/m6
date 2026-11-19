@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "a load generator, not a service: it measures from outside"
+)]
+
 /// m6-bench — loopback latency + throughput benchmark for m6-http.
 ///
 /// Modes (flags can be combined):
@@ -6,8 +11,12 @@
 ///   --http3-only        only run HTTP/3 suites
 ///   --h2c-only          only run H2C suites (HTTP/2 cleartext, for a private backbone)
 ///   --url-only          only run URL-backend suites (h2 inbound, http/https/h2c/h2s outbound)
+///   --h1-vs-h2          run HTTP/1.1 and HTTP/2 latency in one process and fail if the
+///                       keep-alive HTTP/1.1 p50 exceeds H1_VS_H2_P50_MAX_RATIO times h2's
 ///   --h2c               include H2C suites alongside the selected protocols
 ///   --url               include URL-backend suites alongside the selected protocols
+///   --mixed-handshake   hot-hit p50/p99 while full TLS handshakes arrive at a set rate
+///                       (--mixed-rates 0,50,100,200,500 --mixed-seconds 10 --mixed-path /)
 ///   --skip-verify       skip TLS certificate verification
 ///   --latency-n N       requests per latency run (default 2000)
 ///   --duration S        throughput run duration in seconds (default 10)
@@ -20,11 +29,13 @@
 /// Output: one result line per suite; exits non-zero if any threshold exceeded.
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, UdpSocket};
-use std::os::unix::io::AsRawFd;
+use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use m6_core::platform::net::{RecvMeta, UdpBatch, MAX_BATCH, RECV_SLOT};
+use m6_http_lib::probe;
 use rand::Rng;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::ClientConfig;
@@ -49,6 +60,19 @@ struct Args {
     rps_min: f64,
     addr: String,
     h2c_addr: String,
+    /// Run the handshake suite instead of the request suites.
+    handshake: bool,
+    /// `full`, `resumed` or `early` (QUIC 0-RTT).
+    handshake_kind: String,
+    handshake_n: usize,
+    /// Run the mixed hot-hit suite instead of the request suites.
+    mixed_handshake: bool,
+    /// Handshake arrival rates to run, in new full handshakes per second.
+    mixed_rates: Vec<u32>,
+    /// Seconds of hits and handshake load at each rate.
+    mixed_seconds: u64,
+    /// The hot path fetched on the kept-alive connection.
+    mixed_path: String,
 }
 
 impl Args {
@@ -70,6 +94,13 @@ impl Args {
             rps_min: 50.0,
             addr: "127.0.0.1:8443".into(),
             h2c_addr: "127.0.0.1:8080".into(),
+            handshake: false,
+            handshake_kind: "full".into(),
+            handshake_n: 1000,
+            mixed_handshake: false,
+            mixed_rates: vec![0, 50, 100, 200, 500],
+            mixed_seconds: 10,
+            mixed_path: "/".into(),
         };
         let raw: Vec<String> = std::env::args().skip(1).collect();
         let mut i = 0;
@@ -109,6 +140,35 @@ impl Args {
                     a.http3 = false;
                     a.h2c = false;
                     a.url = true;
+                }
+                "--h1-vs-h2" => {
+                    a.http11 = true;
+                    a.http2 = true;
+                    a.http3 = false;
+                    a.h2c = false;
+                    a.url = false;
+                }
+                "--handshake" => a.handshake = true,
+                "--mixed-handshake" => a.mixed_handshake = true,
+                "--mixed-rates" => {
+                    i += 1;
+                    a.mixed_rates = parse_rate_list(&raw[i]);
+                }
+                "--mixed-seconds" => {
+                    i += 1;
+                    a.mixed_seconds = raw[i].parse().expect("mixed-seconds");
+                }
+                "--mixed-path" => {
+                    i += 1;
+                    a.mixed_path = raw[i].clone();
+                }
+                "--handshake-kind" => {
+                    i += 1;
+                    a.handshake_kind = raw[i].clone();
+                }
+                "--handshake-n" => {
+                    i += 1;
+                    a.handshake_n = raw[i].parse().expect("handshake-n");
                 }
                 "--h2c" => a.h2c = true,
                 "--url" => a.url = true,
@@ -192,7 +252,7 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
+        rustls::crypto::aws_lc_rs::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }
@@ -253,12 +313,16 @@ fn parse_http11_status(resp: &[u8]) -> u16 {
 
 // ── Percentile helper ─────────────────────────────────────────────────────────
 
-fn percentile(mut v: Vec<f64>, pct: f64) -> f64 {
+fn percentile(mut v: Vec<f64>, pct: usize) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     if v.is_empty() {
         return 0.0;
     }
-    let idx = ((pct / 100.0) * (v.len() as f64 - 1.0)).round() as usize;
+    // Same rule as stats.rs: index (n-1)*pct/100 with integer arithmetic,
+    // truncating. Rounding the same fraction shifts p50 of ten samples from
+    // index 4 to 5, so the bench would disagree with the server's own
+    // metrics document.
+    let idx = (v.len() - 1) * pct / 100;
     v[idx.min(v.len() - 1)]
 }
 
@@ -283,8 +347,127 @@ fn bench_http11_latency_path(
         http11_get_path(addr, path, Arc::clone(&tls_cfg))?;
     }
     for _ in 0..n {
-        let t0 = Instant::now();
+        let t0 = m6_core::platform::now();
         let resp = http11_get_path(addr, path, Arc::clone(&tls_cfg))?;
+        let elapsed = t0.elapsed().as_secs_f64() * 1_000_000.0;
+        let status = parse_http11_status(&resp);
+        if status != 200 {
+            eprintln!("HTTP/1.1 non-200 ({path}): {status}");
+        }
+        latencies.push(elapsed);
+    }
+    Ok(latencies)
+}
+
+// ── HTTP/1.1 keep-alive latency ───────────────────────────────────────────────
+
+/// One TLS connection reused for many requests, like a browser. Blocking
+/// sockets with explicit `read_tls`/`write_tls`, as `rustls::Stream` stops
+/// reading once the handshake is done and the response is still in flight.
+struct H1Client {
+    conn: rustls::ClientConnection,
+    stream: TcpStream,
+    requests_done: usize,
+}
+
+/// The server closes a connection after `[server] max_requests_per_connection`
+/// (default 100) requests. Reconnect before that, outside the timed region.
+/// A cache hit over a kept-alive HTTP/1.1 connection costs about what one costs
+/// over HTTP/2 (measured 0.65 times, dev build, loopback). Twice is the bound
+/// above which something on the h1 path, such as Nagle, has regressed. A
+/// connection per request is a handshake, not a hit, and is not compared.
+const H1_VS_H2_P50_MAX_RATIO: f64 = 2.0;
+
+const H1_MAX_REQUESTS_PER_CONN: usize = 90;
+
+impl H1Client {
+    fn connect(addr: &str, tls_cfg: Arc<ClientConfig>) -> anyhow::Result<Self> {
+        let stream = TcpStream::connect(addr)?;
+        stream.set_nodelay(true)?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let server_name: ServerName<'static> = "localhost".try_into().unwrap();
+        let conn = rustls::ClientConnection::new(tls_cfg, server_name)?;
+        let mut c = H1Client {
+            conn,
+            stream,
+            requests_done: 0,
+        };
+        while c.conn.is_handshaking() {
+            c.pump()?;
+        }
+        Ok(c)
+    }
+
+    /// Flush pending TLS output, then read one batch of TLS records if the
+    /// connection wants input.
+    fn pump(&mut self) -> anyhow::Result<()> {
+        while self.conn.wants_write() {
+            self.conn.write_tls(&mut &self.stream)?;
+        }
+        if self.conn.wants_read() {
+            if self.conn.read_tls(&mut &self.stream)? == 0 {
+                anyhow::bail!("H1 server closed the connection");
+            }
+            self.conn.process_new_packets()?;
+        }
+        Ok(())
+    }
+
+    fn get(&mut self, path: &str) -> anyhow::Result<Vec<u8>> {
+        self.requests_done += 1;
+        let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        self.conn.writer().write_all(req.as_bytes())?;
+        while self.conn.wants_write() {
+            self.conn.write_tls(&mut &self.stream)?;
+        }
+        let mut resp = Vec::new();
+        let mut need: Option<usize> = None; // total bytes, once the head is parsed
+        loop {
+            let mut tmp = [0u8; 8192];
+            match self.conn.reader().read(&mut tmp) {
+                Ok(0) => anyhow::bail!("H1 server closed the connection"),
+                Ok(n) => resp.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e.into()),
+            }
+            if need.is_none() {
+                if let Some(end) = resp.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&resp[..end]).to_ascii_lowercase();
+                    let len = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    need = Some(end + 4 + len);
+                }
+            }
+            if need.is_some_and(|n| resp.len() >= n) {
+                return Ok(resp);
+            }
+            self.pump()?;
+        }
+    }
+}
+
+/// HTTP/1.1 over one kept-alive connection: the number to compare with h2,
+/// h3 and h2c, which also reuse their connection.
+fn bench_http11_keepalive_latency_path(
+    addr: &str,
+    path: &str,
+    n: usize,
+    tls_cfg: Arc<ClientConfig>,
+) -> anyhow::Result<Vec<f64>> {
+    let mut latencies = Vec::with_capacity(n);
+    let mut client = H1Client::connect(addr, Arc::clone(&tls_cfg))?;
+    for _ in 0..5 {
+        client.get(path)?;
+    }
+    for _ in 0..n {
+        if client.requests_done >= H1_MAX_REQUESTS_PER_CONN {
+            client = H1Client::connect(addr, Arc::clone(&tls_cfg))?;
+        }
+        let t0 = m6_core::platform::now();
+        let resp = client.get(path)?;
         let elapsed = t0.elapsed().as_secs_f64() * 1_000_000.0;
         let status = parse_http11_status(&resp);
         if status != 200 {
@@ -304,7 +487,7 @@ fn bench_http11_throughput(
     tls_cfg: Arc<ClientConfig>,
 ) -> anyhow::Result<f64> {
     let count = Arc::new(AtomicUsize::new(0));
-    let deadline = Instant::now() + Duration::from_secs(duration_s);
+    let deadline = m6_core::platform::now() + Duration::from_secs(duration_s);
     let addr = Arc::new(addr.to_string());
 
     let handles: Vec<_> = (0..concurrency)
@@ -313,7 +496,7 @@ fn bench_http11_throughput(
             let count = Arc::clone(&count);
             let addr = Arc::clone(&addr);
             std::thread::spawn(move || {
-                while Instant::now() < deadline {
+                while m6_core::platform::now() < deadline {
                     if http11_get(&addr, Arc::clone(&tls_cfg)).is_ok() {
                         count.fetch_add(1, Ordering::Relaxed);
                     }
@@ -321,7 +504,7 @@ fn bench_http11_throughput(
             })
         })
         .collect();
-    let t0 = Instant::now();
+    let t0 = m6_core::platform::now();
     for h in handles {
         h.join().ok();
     }
@@ -480,7 +663,7 @@ impl H2Client {
             .write_all(&make_h2_frame(0x4, 0x0, 0, &[]))?;
 
         // Drive TLS handshake: alternate writes and blocking reads until established.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = m6_core::platform::now() + Duration::from_secs(5);
         loop {
             c.flush_write()?;
             if !c.conn.is_handshaking() {
@@ -537,7 +720,7 @@ impl H2Client {
                     break; // got at least one TLS record
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let remaining = deadline.saturating_duration_since(m6_core::platform::now());
                     if remaining.is_zero() {
                         return Err(io::Error::new(io::ErrorKind::TimedOut, "deadline"));
                     }
@@ -545,14 +728,10 @@ impl H2Client {
                     // has our request before we block waiting for its response.
                     self.flush_write()?;
                     let timeout_ms = remaining.as_millis().min(100) as i32;
-                    unsafe {
-                        let mut pfd = libc::pollfd {
-                            fd: self.stream.as_raw_fd(),
-                            events: libc::POLLIN,
-                            revents: 0,
-                        };
-                        libc::poll(&mut pfd, 1, timeout_ms);
-                    }
+                    let _ = m6_core::platform::wait_readable(
+                        self.stream.as_fd(),
+                        Duration::from_millis(timeout_ms as u64),
+                    );
                 }
                 Err(e) => return Err(e),
             }
@@ -606,10 +785,10 @@ impl H2Client {
         self.flush_write()?;
 
         let mut body = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = m6_core::platform::now() + Duration::from_secs(5);
 
         loop {
-            if Instant::now() > deadline {
+            if m6_core::platform::now() > deadline {
                 anyhow::bail!("H2 response timeout");
             }
 
@@ -685,7 +864,7 @@ fn bench_http2_latency_path(
         if client.requests_done >= H2_MAX_REQUESTS_PER_CONN {
             client = H2Client::connect(addr, Arc::clone(&tls_cfg))?;
         }
-        let t0 = Instant::now();
+        let t0 = m6_core::platform::now();
         client.get(path)?;
         latencies.push(t0.elapsed().as_secs_f64() * 1_000_000.0);
     }
@@ -699,7 +878,7 @@ fn bench_http2_throughput(
     skip_verify: bool,
 ) -> anyhow::Result<f64> {
     let count = Arc::new(AtomicUsize::new(0));
-    let deadline = Instant::now() + Duration::from_secs(duration_s);
+    let deadline = m6_core::platform::now() + Duration::from_secs(duration_s);
     let addr = Arc::new(addr.to_string());
 
     let handles: Vec<_> = (0..concurrency)
@@ -710,7 +889,7 @@ fn bench_http2_throughput(
                 let tls_cfg = make_client_config_h2(skip_verify);
                 let result = (|| -> anyhow::Result<()> {
                     let mut client = H2Client::connect(&addr, Arc::clone(&tls_cfg))?;
-                    while Instant::now() < deadline {
+                    while m6_core::platform::now() < deadline {
                         if client.requests_done >= H2_MAX_REQUESTS_PER_CONN {
                             client = H2Client::connect(&addr, Arc::clone(&tls_cfg))?;
                         }
@@ -732,7 +911,7 @@ fn bench_http2_throughput(
         })
         .collect();
 
-    let t0 = Instant::now();
+    let t0 = m6_core::platform::now();
     for h in handles {
         h.join().ok();
     }
@@ -749,7 +928,7 @@ fn bench_http11_throughput_path(
     tls_cfg: Arc<ClientConfig>,
 ) -> anyhow::Result<f64> {
     let count = Arc::new(AtomicUsize::new(0));
-    let deadline = Instant::now() + Duration::from_secs(duration_s);
+    let deadline = m6_core::platform::now() + Duration::from_secs(duration_s);
     let addr = Arc::new(addr.to_string());
     let path = Arc::new(path.to_string());
 
@@ -760,7 +939,7 @@ fn bench_http11_throughput_path(
             let addr = Arc::clone(&addr);
             let path = Arc::clone(&path);
             std::thread::spawn(move || {
-                while Instant::now() < deadline {
+                while m6_core::platform::now() < deadline {
                     if http11_get_path(&addr, &path, Arc::clone(&tls_cfg)).is_ok() {
                         count.fetch_add(1, Ordering::Relaxed);
                     }
@@ -769,7 +948,7 @@ fn bench_http11_throughput_path(
         })
         .collect();
 
-    let t0 = Instant::now();
+    let t0 = m6_core::platform::now();
     for h in handles {
         h.join().ok();
     }
@@ -786,7 +965,7 @@ fn bench_http2_throughput_path(
     skip_verify: bool,
 ) -> anyhow::Result<f64> {
     let count = Arc::new(AtomicUsize::new(0));
-    let deadline = Instant::now() + Duration::from_secs(duration_s);
+    let deadline = m6_core::platform::now() + Duration::from_secs(duration_s);
     let addr = Arc::new(addr.to_string());
     let path = Arc::new(path.to_string());
 
@@ -799,7 +978,7 @@ fn bench_http2_throughput_path(
                 let tls_cfg = make_client_config_h2(skip_verify);
                 let result = (|| -> anyhow::Result<()> {
                     let mut client = H2Client::connect(&addr, Arc::clone(&tls_cfg))?;
-                    while Instant::now() < deadline {
+                    while m6_core::platform::now() < deadline {
                         if client.requests_done >= H2_MAX_REQUESTS_PER_CONN {
                             client = H2Client::connect(&addr, Arc::clone(&tls_cfg))?;
                         }
@@ -821,7 +1000,7 @@ fn bench_http2_throughput_path(
         })
         .collect();
 
-    let t0 = Instant::now();
+    let t0 = m6_core::platform::now();
     for h in handles {
         h.join().ok();
     }
@@ -859,10 +1038,10 @@ impl H2cClient {
         // Read frames until we receive the server's SETTINGS (non-ACK).
         let mut recv_buf: Vec<u8> = Vec::with_capacity(16_384);
         let mut tmp = [0u8; 8192];
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = m6_core::platform::now() + Duration::from_secs(5);
         let mut got_settings = false;
         while !got_settings {
-            if Instant::now() > deadline {
+            if m6_core::platform::now() > deadline {
                 anyhow::bail!("H2C setup timeout");
             }
             let n = (&stream).read(&mut tmp)?;
@@ -921,20 +1100,16 @@ impl H2cClient {
                     break;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let remaining = deadline.saturating_duration_since(m6_core::platform::now());
                     if remaining.is_zero() {
                         return Err(io::Error::new(io::ErrorKind::TimedOut, "deadline"));
                     }
                     self.flush_write()?;
                     let timeout_ms = remaining.as_millis().min(100) as i32;
-                    unsafe {
-                        let mut pfd = libc::pollfd {
-                            fd: self.stream.as_raw_fd(),
-                            events: libc::POLLIN,
-                            revents: 0,
-                        };
-                        libc::poll(&mut pfd, 1, timeout_ms);
-                    }
+                    let _ = m6_core::platform::wait_readable(
+                        self.stream.as_fd(),
+                        Duration::from_millis(timeout_ms as u64),
+                    );
                 }
                 Err(e) => return Err(e),
             }
@@ -953,10 +1128,10 @@ impl H2cClient {
         self.flush_write()?;
 
         let mut body = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = m6_core::platform::now() + Duration::from_secs(5);
 
         loop {
-            if Instant::now() > deadline {
+            if m6_core::platform::now() > deadline {
                 anyhow::bail!("H2C response timeout");
             }
 
@@ -1020,7 +1195,7 @@ fn bench_h2c_latency_path(addr: &str, path: &str, n: usize) -> anyhow::Result<Ve
         if client.requests_done >= H2C_MAX_REQUESTS_PER_CONN {
             client = H2cClient::connect(addr)?;
         }
-        let t0 = Instant::now();
+        let t0 = m6_core::platform::now();
         client.get(path)?;
         latencies.push(t0.elapsed().as_secs_f64() * 1_000_000.0);
     }
@@ -1029,7 +1204,7 @@ fn bench_h2c_latency_path(addr: &str, path: &str, n: usize) -> anyhow::Result<Ve
 
 fn bench_h2c_throughput(addr: &str, duration_s: u64, concurrency: usize) -> anyhow::Result<f64> {
     let count = Arc::new(AtomicUsize::new(0));
-    let deadline = Instant::now() + Duration::from_secs(duration_s);
+    let deadline = m6_core::platform::now() + Duration::from_secs(duration_s);
     let addr = Arc::new(addr.to_string());
 
     let handles: Vec<_> = (0..concurrency)
@@ -1039,7 +1214,7 @@ fn bench_h2c_throughput(addr: &str, duration_s: u64, concurrency: usize) -> anyh
             std::thread::spawn(move || {
                 let result = (|| -> anyhow::Result<()> {
                     let mut client = H2cClient::connect(&addr)?;
-                    while Instant::now() < deadline {
+                    while m6_core::platform::now() < deadline {
                         if client.requests_done >= H2C_MAX_REQUESTS_PER_CONN {
                             client = H2cClient::connect(&addr)?;
                         }
@@ -1061,7 +1236,7 @@ fn bench_h2c_throughput(addr: &str, duration_s: u64, concurrency: usize) -> anyh
         })
         .collect();
 
-    let t0 = Instant::now();
+    let t0 = m6_core::platform::now();
     for h in handles {
         h.join().ok();
     }
@@ -1073,21 +1248,7 @@ fn bench_h2c_throughput(addr: &str, duration_s: u64, concurrency: usize) -> anyh
 // ── HTTP/3 helpers ────────────────────────────────────────────────────────────
 
 fn make_quiche_client_config(skip_verify: bool) -> quiche::Config {
-    let mut cfg = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
-    cfg.verify_peer(!skip_verify);
-    cfg.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
-        .unwrap();
-    cfg.set_max_idle_timeout(5000);
-    cfg.set_max_recv_udp_payload_size(1350);
-    cfg.set_max_send_udp_payload_size(1350);
-    cfg.set_initial_max_data(10_000_000);
-    cfg.set_initial_max_stream_data_bidi_local(1_000_000);
-    cfg.set_initial_max_stream_data_bidi_remote(1_000_000);
-    cfg.set_initial_max_stream_data_uni(1_000_000);
-    cfg.set_initial_max_streams_bidi(100);
-    cfg.set_initial_max_streams_uni(100);
-    cfg.set_disable_active_migration(true);
-    cfg
+    probe::bench_quic_client_config(skip_verify).expect("building the QUIC client config")
 }
 
 fn new_scid() -> quiche::ConnectionId<'static> {
@@ -1113,89 +1274,74 @@ fn quic_flush(conn: &mut quiche::Connection, udp: &UdpSocket) {
     }
 }
 
-/// One HTTP/3 GET / on an existing H3 connection. Returns response body.
-fn h3_get(
-    conn: &mut quiche::Connection,
-    h3: &mut quiche::h3::Connection,
-    udp: &UdpSocket,
-    path: &[u8],
-) -> anyhow::Result<Vec<u8>> {
-    let req = vec![
-        quiche::h3::Header::new(b":method", b"GET"),
-        quiche::h3::Header::new(b":path", path),
-        quiche::h3::Header::new(b":scheme", b"https"),
-        quiche::h3::Header::new(b":authority", b"localhost"),
-    ];
-    // Use the stream ID assigned by quiche (not a manually tracked counter).
-    let stream_id = h3.send_request(conn, &req, true)?;
+/// Close the connection and put the close on the wire before dropping it.
+///
+/// Dropping a connection without this leaves the peer holding it until its idle
+/// timeout, and the bench client reconnects every [`H3_MAX_STREAMS_PER_CONN`]
+/// requests, so one idle connection per reconnect piles up on the server. A
+/// connection the peer already closed is not a failure to close.
+fn close_and_flush(conn: &mut quiche::Connection, udp: &UdpSocket) {
+    let _ = conn.close(true, 0x100, b"");
     quic_flush(conn, udp);
+}
 
-    let mut body = Vec::new();
-    let mut buf = [0u8; 65535];
-    let deadline = Instant::now() + Duration::from_secs(5);
+/// One receive slot in the bench client's batch.
+///
+/// A slot is sized for a coalesced read, not for one datagram: the server's
+/// socket segments a flush, and a Linux client with `UDP_GRO` takes the whole
+/// run in one slot. The slot is one datagram on macOS, which has no
+/// coalescing, and the room is unused there.
+const H3_RECV_SLOT: usize = RECV_SLOT;
 
-    loop {
-        if Instant::now() > deadline {
-            anyhow::bail!("HTTP/3 request timed out");
-        }
-        conn.on_timeout();
-        quic_flush(conn, udp);
+/// How long one turn waits for a datagram before the connection's timer is
+/// driven. This was the socket's read timeout before the receive was batched.
+const H3_TURN_WAIT: Duration = Duration::from_millis(100);
 
-        udp.set_read_timeout(Some(Duration::from_millis(100)))?;
-        let n = match udp.recv(&mut buf) {
-            Ok(n) => n,
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                if conn.is_closed() {
-                    break;
-                }
-                continue;
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let recv_info = quiche::RecvInfo {
-            from: udp.peer_addr()?,
-            to: udp.local_addr()?,
-        };
-        conn.recv(&mut buf[..n], recv_info)?;
-        quic_flush(conn, udp);
-
-        // Poll H3 events. Use the actual sid from each event to drain the
-        // correct stream; only accumulate body / return when it's our stream.
-        loop {
-            match h3.poll(conn) {
-                Ok((sid, quiche::h3::Event::Data)) => {
-                    while let Ok(read) = h3.recv_body(conn, sid, &mut buf) {
-                        if sid == stream_id {
-                            body.extend_from_slice(&buf[..read]);
-                        }
-                    }
-                }
-                Ok((sid, quiche::h3::Event::Finished)) if sid == stream_id => {
-                    return Ok(body);
-                }
-                Ok(_) => {}
-                Err(quiche::h3::Error::Done) => break,
-                Err(e) => return Err(e.into()),
-            }
-        }
-
-        if conn.is_closed() {
-            break;
-        }
+/// One turn's receive: wait up to `wait` for the socket, then take every
+/// datagram already queued, up to [`MAX_BATCH`].
+///
+/// `Ok(None)` is a read that timed out with no datagram, which is the only
+/// answer that drives the connection's timer. A turn that read anything has
+/// already driven the connection through `conn.recv`.
+fn receive_turn(
+    udp: &UdpSocket,
+    batch: &UdpBatch,
+    buf: &mut [u8],
+    metas: &mut [RecvMeta],
+    wait: Duration,
+) -> io::Result<Option<usize>> {
+    if !m6_core::platform::wait_readable(udp.as_fd(), wait)? {
+        return Ok(None);
     }
-    Ok(body)
+    match batch.recv(udp, buf, H3_RECV_SLOT, metas) {
+        Ok(n) => Ok(Some(n)),
+        // Readable and empty: a wake with nothing behind it. This is not a
+        // timeout, so the caller does not drive the timer on it.
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(Some(0)),
+        Err(e) => Err(e),
+    }
 }
 
 /// Establish one QUIC+H3 connection to addr.
 fn h3_connect(
     addr: &str,
     cfg: &mut quiche::Config,
-) -> anyhow::Result<(quiche::Connection, quiche::h3::Connection, UdpSocket)> {
+) -> anyhow::Result<(
+    quiche::Connection,
+    quiche::h3::Connection,
+    UdpSocket,
+    quiche::RecvInfo,
+)> {
     let udp = UdpSocket::bind("0.0.0.0:0")?;
     udp.connect(addr)?;
+    // The socket is connected, so both addresses are fixed for its life. One
+    // `getpeername` and one `getsockname` here replace two per datagram.
+    let recv_info = quiche::RecvInfo {
+        from: udp.peer_addr()?,
+        to: udp.local_addr()?,
+    };
+    // The turn's wait, not a deadline per datagram: set once per socket.
+    udp.set_read_timeout(Some(Duration::from_millis(100)))?;
     let scid = new_scid();
     let peer: std::net::SocketAddr = addr.parse()?;
     let local = udp.local_addr()?;
@@ -1205,9 +1351,9 @@ fn h3_connect(
 
     // Handshake loop
     let mut buf = [0u8; 65535];
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = m6_core::platform::now() + Duration::from_secs(5);
     loop {
-        if Instant::now() > deadline {
+        if m6_core::platform::now() > deadline {
             anyhow::bail!("QUIC handshake timed out");
         }
         conn.on_timeout();
@@ -1239,12 +1385,158 @@ fn h3_connect(
 
     let h3_cfg = quiche::h3::Config::new()?;
     let h3 = quiche::h3::Connection::with_transport(&mut conn, &h3_cfg)?;
-    Ok((conn, h3, udp))
+    // The handshake waits on a read timeout, one datagram at a time. From here
+    // the receive is a non-blocking batch taken after one readiness wait.
+    udp.set_nonblocking(true)?;
+    Ok((conn, h3, udp, recv_info))
 }
 
 // Maximum bidi streams per connection before reconnecting. Stays well under
 // the server's initial_max_streams_bidi(100) to avoid StreamLimit errors.
 const H3_MAX_STREAMS_PER_CONN: usize = 90;
+
+/// One bench client's HTTP/3 connection and the requests it has carried.
+///
+/// A run keeps opening connections because no connection may carry more than
+/// [`H3_MAX_STREAMS_PER_CONN`] requests, so every loop that sends them needs
+/// the same reconnect. It lives here rather than in each of them.
+struct H3Client {
+    conn: quiche::Connection,
+    h3: quiche::h3::Connection,
+    udp: UdpSocket,
+    recv_info: quiche::RecvInfo,
+    /// The socket's batch receive.
+    batch: UdpBatch,
+    /// The turn's receive slots, [`MAX_BATCH`] receives of [`H3_RECV_SLOT`]
+    /// bytes each. A receive is one datagram, or a coalesced run that
+    /// [`RecvMeta::datagrams`] splits. Allocated once per connection, not per
+    /// request.
+    recv_buf: Vec<u8>,
+    /// One length, source and split per receive slot.
+    recv_metas: [RecvMeta; MAX_BATCH],
+    /// Requests this connection has carried, which is what fills it up.
+    reqs: usize,
+}
+
+impl H3Client {
+    fn connect(addr: &str, cfg: &mut quiche::Config) -> anyhow::Result<Self> {
+        let (conn, h3, udp, recv_info) = h3_connect(addr, cfg)?;
+        let batch = UdpBatch::for_socket(&udp);
+        Ok(Self {
+            conn,
+            h3,
+            udp,
+            recv_info,
+            batch,
+            recv_buf: vec![0u8; MAX_BATCH * H3_RECV_SLOT],
+            recv_metas: [RecvMeta::default(); MAX_BATCH],
+            reqs: 0,
+        })
+    }
+
+    /// Open a new connection once this one has carried its stream limit.
+    ///
+    /// The old one is closed before it is dropped: dropping it would leave the
+    /// server holding it until its idle timeout.
+    fn rotate_if_full(&mut self, addr: &str, cfg: &mut quiche::Config) -> anyhow::Result<()> {
+        if self.reqs < H3_MAX_STREAMS_PER_CONN {
+            return Ok(());
+        }
+        close_and_flush(&mut self.conn, &self.udp);
+        *self = Self::connect(addr, cfg)?;
+        Ok(())
+    }
+
+    /// One GET on this connection.
+    ///
+    /// A turn reads a whole receive batch, feeds every datagram to the
+    /// connection, and flushes once. quiche coalesces the ACKs for the batch
+    /// into that one send, so the client answers sixteen datagrams with one
+    /// ACK datagram. The connection's timer is driven only by a read that
+    /// actually timed out.
+    fn get(&mut self, path: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let req = vec![
+            quiche::h3::Header::new(b":method", b"GET"),
+            quiche::h3::Header::new(b":path", path),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+        ];
+        // Use the stream ID assigned by quiche (not a manually tracked counter).
+        let stream_id = self.h3.send_request(&mut self.conn, &req, true)?;
+        quic_flush(&mut self.conn, &self.udp);
+
+        let mut body = Vec::new();
+        let mut buf = [0u8; 65535];
+        let deadline = m6_core::platform::now() + Duration::from_secs(5);
+
+        loop {
+            if m6_core::platform::now() > deadline {
+                anyhow::bail!("HTTP/3 request timed out");
+            }
+            match receive_turn(
+                &self.udp,
+                &self.batch,
+                &mut self.recv_buf,
+                &mut self.recv_metas,
+                H3_TURN_WAIT,
+            )? {
+                Some(n) => {
+                    for i in 0..n {
+                        let start = i * H3_RECV_SLOT;
+                        // A coalesced receive holds several datagrams that
+                        // were one run on the wire. quiche's `recv` takes one
+                        // QUIC packet, so each goes to it on its own, in the
+                        // order the server sent it.
+                        for (offset, len) in self.recv_metas[i].datagrams() {
+                            self.conn.recv(
+                                &mut self.recv_buf[start + offset..start + offset + len],
+                                self.recv_info,
+                            )?;
+                        }
+                    }
+                    // One flush covers the whole batch: every packet the batch
+                    // answered is acknowledged in this send, not one per read.
+                    quic_flush(&mut self.conn, &self.udp);
+                }
+                None => {
+                    // The read timed out, so the timer is the only thing that
+                    // can move the connection now.
+                    self.conn.on_timeout();
+                    quic_flush(&mut self.conn, &self.udp);
+                    if self.conn.is_closed() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+
+            // Poll H3 events. Use the actual sid from each event to drain the
+            // correct stream; only accumulate body / return when it's our stream.
+            loop {
+                match self.h3.poll(&mut self.conn) {
+                    Ok((sid, quiche::h3::Event::Data)) => {
+                        while let Ok(read) = self.h3.recv_body(&mut self.conn, sid, &mut buf) {
+                            if sid == stream_id {
+                                body.extend_from_slice(&buf[..read]);
+                            }
+                        }
+                    }
+                    Ok((sid, quiche::h3::Event::Finished)) if sid == stream_id => {
+                        return Ok(body);
+                    }
+                    Ok(_) => {}
+                    Err(quiche::h3::Error::Done) => break,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+
+            if self.conn.is_closed() {
+                break;
+            }
+        }
+        Ok(body)
+    }
+}
 
 // ── HTTP/3 latency ────────────────────────────────────────────────────────────
 
@@ -1252,34 +1544,21 @@ fn bench_http3_latency(addr: &str, n: usize, skip_verify: bool) -> anyhow::Resul
     let mut cfg = make_quiche_client_config(skip_verify);
     let mut latencies = Vec::with_capacity(n);
 
-    let (mut conn, mut h3, mut udp) = h3_connect(addr, &mut cfg)?;
-    let mut reqs: usize = 0; // count requests on this connection
+    let mut client = H3Client::connect(addr, &mut cfg)?;
 
     // Warmup: 5 requests
     for _ in 0..5 {
-        if reqs >= H3_MAX_STREAMS_PER_CONN {
-            let (c, h, u) = h3_connect(addr, &mut cfg)?;
-            conn = c;
-            h3 = h;
-            udp = u;
-            reqs = 0;
-        }
-        let _ = h3_get(&mut conn, &mut h3, &udp, b"/");
-        reqs += 1;
+        client.rotate_if_full(addr, &mut cfg)?;
+        let _ = client.get(b"/");
+        client.reqs += 1;
     }
 
     for _ in 0..n {
-        if reqs >= H3_MAX_STREAMS_PER_CONN {
-            let (c, h, u) = h3_connect(addr, &mut cfg)?;
-            conn = c;
-            h3 = h;
-            udp = u;
-            reqs = 0;
-        }
-        let t0 = Instant::now();
-        h3_get(&mut conn, &mut h3, &udp, b"/")?;
+        client.rotate_if_full(addr, &mut cfg)?;
+        let t0 = m6_core::platform::now();
+        client.get(b"/")?;
         latencies.push(t0.elapsed().as_secs_f64() * 1_000_000.0);
-        reqs += 1;
+        client.reqs += 1;
     }
     Ok(latencies)
 }
@@ -1293,7 +1572,7 @@ fn bench_http3_throughput(
     skip_verify: bool,
 ) -> anyhow::Result<f64> {
     let count = Arc::new(AtomicUsize::new(0));
-    let deadline = Instant::now() + Duration::from_secs(duration_s);
+    let deadline = m6_core::platform::now() + Duration::from_secs(duration_s);
     let addr = Arc::new(addr.to_string());
     let errors = Arc::new(Mutex::new(Vec::<String>::new()));
 
@@ -1305,18 +1584,11 @@ fn bench_http3_throughput(
             std::thread::spawn(move || {
                 let mut cfg = make_quiche_client_config(skip_verify);
                 let result = (|| -> anyhow::Result<()> {
-                    let (mut conn, mut h3, mut udp) = h3_connect(&addr, &mut cfg)?;
-                    let mut reqs: usize = 0;
-                    while Instant::now() < deadline {
-                        if reqs >= H3_MAX_STREAMS_PER_CONN {
-                            let (c, h, u) = h3_connect(&addr, &mut cfg)?;
-                            conn = c;
-                            h3 = h;
-                            udp = u;
-                            reqs = 0;
-                        }
-                        reqs += 1;
-                        match h3_get(&mut conn, &mut h3, &udp, b"/") {
+                    let mut client = H3Client::connect(&addr, &mut cfg)?;
+                    while m6_core::platform::now() < deadline {
+                        client.rotate_if_full(&addr, &mut cfg)?;
+                        client.reqs += 1;
+                        match client.get(b"/") {
                             Ok(_) => {
                                 count.fetch_add(1, Ordering::Relaxed);
                             }
@@ -1333,7 +1605,7 @@ fn bench_http3_throughput(
             })
         })
         .collect();
-    let t0 = Instant::now();
+    let t0 = m6_core::platform::now();
     for h in handles {
         h.join().ok();
     }
@@ -1350,7 +1622,7 @@ fn bench_h3_throughput_path(
     skip_verify: bool,
 ) -> anyhow::Result<f64> {
     let count = Arc::new(AtomicUsize::new(0));
-    let deadline = Instant::now() + Duration::from_secs(duration_s);
+    let deadline = m6_core::platform::now() + Duration::from_secs(duration_s);
     let addr = Arc::new(addr.to_string());
     let path = Arc::new(path.to_string());
     let errors = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -1364,18 +1636,11 @@ fn bench_h3_throughput_path(
             std::thread::spawn(move || {
                 let mut cfg = make_quiche_client_config(skip_verify);
                 let result = (|| -> anyhow::Result<()> {
-                    let (mut conn, mut h3, mut udp) = h3_connect(&addr, &mut cfg)?;
-                    let mut reqs: usize = 0;
-                    while Instant::now() < deadline {
-                        if reqs >= H3_MAX_STREAMS_PER_CONN {
-                            let (c, h, u) = h3_connect(&addr, &mut cfg)?;
-                            conn = c;
-                            h3 = h;
-                            udp = u;
-                            reqs = 0;
-                        }
-                        reqs += 1;
-                        match h3_get(&mut conn, &mut h3, &udp, path.as_bytes()) {
+                    let mut client = H3Client::connect(&addr, &mut cfg)?;
+                    while m6_core::platform::now() < deadline {
+                        client.rotate_if_full(&addr, &mut cfg)?;
+                        client.reqs += 1;
+                        match client.get(path.as_bytes()) {
                             Ok(_) => {
                                 count.fetch_add(1, Ordering::Relaxed);
                             }
@@ -1393,7 +1658,7 @@ fn bench_h3_throughput_path(
         })
         .collect();
 
-    let t0 = Instant::now();
+    let t0 = m6_core::platform::now();
     for h in handles {
         h.join().ok();
     }
@@ -1409,7 +1674,7 @@ fn bench_h2c_throughput_path(
     concurrency: usize,
 ) -> anyhow::Result<f64> {
     let count = Arc::new(AtomicUsize::new(0));
-    let deadline = Instant::now() + Duration::from_secs(duration_s);
+    let deadline = m6_core::platform::now() + Duration::from_secs(duration_s);
     let addr = Arc::new(addr.to_string());
     let path = Arc::new(path.to_string());
 
@@ -1421,7 +1686,7 @@ fn bench_h2c_throughput_path(
             std::thread::spawn(move || {
                 let result = (|| -> anyhow::Result<()> {
                     let mut client = H2cClient::connect(&addr)?;
-                    while Instant::now() < deadline {
+                    while m6_core::platform::now() < deadline {
                         if client.requests_done >= H2C_MAX_REQUESTS_PER_CONN {
                             client = H2cClient::connect(&addr)?;
                         }
@@ -1443,7 +1708,7 @@ fn bench_h2c_throughput_path(
         })
         .collect();
 
-    let t0 = Instant::now();
+    let t0 = m6_core::platform::now();
     for h in handles {
         h.join().ok();
     }
@@ -1474,13 +1739,13 @@ struct BenchResult {
 impl BenchResult {
     fn from_latencies(name: impl Into<String>, lats: Vec<f64>) -> Self {
         let count = lats.len();
-        let p0 = percentile(lats.clone(), 0.0);
-        let p1 = percentile(lats.clone(), 1.0);
-        let p25 = percentile(lats.clone(), 25.0);
-        let p50 = percentile(lats.clone(), 50.0);
-        let p75 = percentile(lats.clone(), 75.0);
-        let p99 = percentile(lats.clone(), 99.0);
-        let p100 = percentile(lats.clone(), 100.0);
+        let p0 = percentile(lats.clone(), 0);
+        let p1 = percentile(lats.clone(), 1);
+        let p25 = percentile(lats.clone(), 25);
+        let p50 = percentile(lats.clone(), 50);
+        let p75 = percentile(lats.clone(), 75);
+        let p99 = percentile(lats.clone(), 99);
+        let p100 = percentile(lats.clone(), 100);
         let iqr = p75 - p25;
         let range = p100 - p0;
         let avg = if count > 0 {
@@ -1612,33 +1877,20 @@ fn bench_h3_path_latency(
     const WARMUP: usize = 5;
     let mut cfg = make_quiche_client_config(skip_verify);
     let mut latencies = Vec::with_capacity(n);
-    let (mut conn, mut h3, mut udp) = h3_connect(addr, &mut cfg)?;
-    let mut reqs: usize = 0;
+    let mut client = H3Client::connect(addr, &mut cfg)?;
     let pb = path.as_bytes();
 
     for _ in 0..WARMUP {
-        if reqs >= H3_MAX_STREAMS_PER_CONN {
-            let (c, h, u) = h3_connect(addr, &mut cfg)?;
-            conn = c;
-            h3 = h;
-            udp = u;
-            reqs = 0;
-        }
-        h3_get(&mut conn, &mut h3, &udp, pb)?;
-        reqs += 1;
+        client.rotate_if_full(addr, &mut cfg)?;
+        client.get(pb)?;
+        client.reqs += 1;
     }
     for _ in 0..n {
-        if reqs >= H3_MAX_STREAMS_PER_CONN {
-            let (c, h, u) = h3_connect(addr, &mut cfg)?;
-            conn = c;
-            h3 = h;
-            udp = u;
-            reqs = 0;
-        }
-        let t0 = Instant::now();
-        h3_get(&mut conn, &mut h3, &udp, pb)?;
+        client.rotate_if_full(addr, &mut cfg)?;
+        let t0 = m6_core::platform::now();
+        client.get(pb)?;
         latencies.push(t0.elapsed().as_secs_f64() * 1_000_000.0);
-        reqs += 1;
+        client.reqs += 1;
     }
     Ok(latencies)
 }
@@ -1687,10 +1939,20 @@ fn run_path_benchmarks(
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .ok();
+    // `--version` and `--version-full` answer from constants fixed at build
+    // time, before any measurement arguments are required.
+    m6_core::version_flags!(m6_core::build_info::linked());
+
+    // The crate enables exactly one rustls provider feature (aws-lc-rs), so the
+    // first config builder resolves and installs it. `supported_verify_schemes`
+    // reads the provider directly and does not need an installed default.
     let args = Args::parse();
+    if args.handshake {
+        std::process::exit(run_handshake_suite(&args));
+    }
+    if args.mixed_handshake {
+        std::process::exit(run_mixed_handshake_suite(&args));
+    }
     let mut all_pass = true;
 
     let run_latency = !args.throughput_only && !args.path_only;
@@ -1703,12 +1965,36 @@ fn main() {
 
     // ── Latency ───────────────────────────────────────────────────────────────
     if run_latency {
+        let mut h1_keepalive_p50 = None;
+        let mut h2_p50 = None;
         if args.http11 {
             let tls_cfg = make_client_config(args.skip_verify);
+            match bench_http11_keepalive_latency_path(
+                &args.addr,
+                "/",
+                args.latency_n,
+                Arc::clone(&tls_cfg),
+            ) {
+                Ok(lats) => {
+                    h1_keepalive_p50 = Some(percentile(lats.clone(), 50));
+                    print_result(
+                        &BenchResult::from_latencies("HTTP/1.1 latency (keep-alive)", lats),
+                        f64::INFINITY,
+                        0.0,
+                    );
+                }
+                Err(e) => {
+                    eprintln!("HTTP/1.1 keep-alive latency error: {e}");
+                    all_pass = false;
+                }
+            }
             match bench_http11_latency(&args.addr, args.latency_n, Arc::clone(&tls_cfg)) {
                 Ok(lats) => {
                     print_result(
-                        &BenchResult::from_latencies("HTTP/1.1 latency", lats),
+                        &BenchResult::from_latencies(
+                            "HTTP/1.1 latency (new connection per request, includes TLS handshake)",
+                            lats,
+                        ),
                         f64::INFINITY,
                         0.0,
                     );
@@ -1722,6 +2008,7 @@ fn main() {
         if args.http2 {
             match bench_http2_latency(&args.addr, args.latency_n, args.skip_verify) {
                 Ok(lats) => {
+                    h2_p50 = Some(percentile(lats.clone(), 50));
                     if !print_result(
                         &BenchResult::from_latencies("HTTP/2 latency", lats),
                         args.p99_limit_us,
@@ -1735,6 +2022,15 @@ fn main() {
                     all_pass = false;
                 }
             }
+        }
+        if let (Some(h1), Some(h2)) = (h1_keepalive_p50, h2_p50) {
+            let ratio = h1 / h2;
+            let ok = ratio <= H1_VS_H2_P50_MAX_RATIO;
+            println!(
+                "{}   HTTP/1.1 keep-alive p50 / HTTP/2 p50 = {ratio:.2}  (limit {H1_VS_H2_P50_MAX_RATIO})",
+                if ok { "PASS" } else { "FAIL" }
+            );
+            all_pass &= ok;
         }
         if args.http3 {
             match bench_http3_latency(&args.addr, args.latency_n, args.skip_verify) {
@@ -1939,7 +2235,7 @@ fn main() {
                     let result: anyhow::Result<Vec<f64>> = match proto {
                         1 => {
                             let cfg = make_client_config(args.skip_verify);
-                            bench_http11_latency_path(addr, path, args.latency_n, cfg)
+                            bench_http11_keepalive_latency_path(addr, path, args.latency_n, cfg)
                         }
                         2 => bench_http2_latency_path(addr, path, args.latency_n, args.skip_verify),
                         3 => bench_h3_path_latency(addr, path, args.latency_n, args.skip_verify),
@@ -2024,5 +2320,660 @@ fn main() {
     } else {
         println!("One or more benchmarks FAILED.");
         std::process::exit(1);
+    }
+}
+
+// ── Handshake suite ───────────────────────────────────────────────────────────
+
+/// Handshakes only, one protocol per run, strictly sequential: the figures a
+/// visitor's first (`full`) and returning (`resumed`) connection pay, and for
+/// h3 the QUIC 0-RTT request (`early`).
+///
+/// TCP+TLS (h1, h2) times from after the TCP connect to the client's Finished on
+/// the wire, as `probe::tls_handshake` does. QUIC (h3) times from the first
+/// Initial, so it INCLUDES the transport round trip; the two are not comparable.
+///
+/// Prints one `HS` line a table can be built from, then `HANDSHAKES_SERVED n`:
+/// every handshake the server saw, warm-ups included, which `bench.sh` divides
+/// the server's CPU delta by. Returns the exit status: non-zero if any
+/// handshake failed or a `resumed` run never resumed.
+fn run_handshake_suite(args: &Args) -> i32 {
+    use m6_http_lib::probe;
+    use std::time::Duration;
+
+    let proto = if args.http3 && !args.http11 && !args.http2 {
+        "h3"
+    } else if args.http2 && !args.http11 {
+        "h2"
+    } else {
+        "h1"
+    };
+    let kind = args.handshake_kind.as_str();
+    let n = args.handshake_n;
+    let mut samples: Vec<Duration> = Vec::with_capacity(n);
+    let mut failures = 0usize;
+    let mut served = 0usize;
+    let mut resumed = 0usize;
+    let mut early_used = 0usize;
+    let mut too_early = 0usize;
+
+    match (proto, kind) {
+        ("h1" | "h2", "full" | "resumed") => {
+            let alpn: &[u8] = if proto == "h2" { b"h2" } else { b"http/1.1" };
+            let shared = probe::tls_config(alpn);
+            if kind == "resumed" {
+                // The first handshake earns the ticket and is not measured.
+                served += 1;
+                if probe::tls_handshake(&args.addr, Arc::clone(&shared)).is_err() {
+                    failures += 1;
+                }
+            }
+            for _ in 0..n {
+                let cfg = if kind == "resumed" {
+                    Arc::clone(&shared)
+                } else {
+                    probe::tls_config(alpn)
+                };
+                served += 1;
+                match probe::tls_handshake(&args.addr, cfg) {
+                    Ok(h) => {
+                        resumed += usize::from(h.resumed);
+                        samples.push(h.elapsed);
+                    }
+                    Err(e) => {
+                        failures += 1;
+                        eprintln!("handshake failed: {e}");
+                    }
+                }
+            }
+        }
+        ("h3", "full") => {
+            for _ in 0..n {
+                served += 1;
+                match probe::quic_handshake(&args.addr) {
+                    Ok(d) => samples.push(d),
+                    Err(e) => {
+                        failures += 1;
+                        eprintln!("handshake failed: {e}");
+                    }
+                }
+            }
+        }
+        ("h3", "early") => {
+            // Each round is one full handshake (to earn the ticket) and one
+            // resumed connection whose request goes in the first flight.
+            for _ in 0..n {
+                served += 2;
+                match probe::zero_rtt_h3(&args.addr, "/", "GET") {
+                    Ok(r) => {
+                        if let Some(d) = r.warm_to_response {
+                            samples.push(d);
+                            resumed += 1;
+                        }
+                        early_used += usize::from(r.early_data_used);
+                        too_early += usize::from(r.status == Some(425));
+                    }
+                    Err(e) => {
+                        failures += 1;
+                        eprintln!("0-RTT round failed: {e}");
+                    }
+                }
+            }
+        }
+        _ => {
+            eprintln!("no handshake suite for proto {proto} kind {kind} (h1/h2: full|resumed, h3: full|early)");
+            return 2;
+        }
+    }
+
+    let ok = samples.len();
+    let summary = probe::summarise(&mut samples);
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    match summary {
+        Some(s) => println!(
+            "HS {proto} {kind}: n={ok} failed={failures} resumed={resumed} early_data={early_used} \
+             status425={too_early} p50_ms={:.3} p90_ms={:.3} p99_ms={:.3} mean_ms={:.3}",
+            ms(s.p50),
+            ms(s.p90),
+            ms(s.p99),
+            ms(s.mean)
+        ),
+        None => println!("HS {proto} {kind}: no successful handshakes ({failures} failed)"),
+    }
+    println!("HANDSHAKES_SERVED {served}");
+    i32::from(failures > 0 || ok == 0 || (kind == "resumed" && resumed == 0))
+}
+
+// ── Mixed hot hits and full-handshake load ───────────────────────────────────
+//
+// The existing hot-hit number is measured on a warm cache with nothing else on
+// the server. A real edge serves those hits while new visitors arrive and do a
+// full TLS handshake. This mode runs the SAME hit client (`H1Client`, one
+// kept-alive connection, the same timer and `percentile` rule) while a second
+// thread opens new TCP connections and does a fresh full handshake at a set
+// arrival rate.
+//
+// What is held constant, so the only difference between rows is the load:
+//
+//   * the hit connection is opened and warmed BEFORE the clock starts, and is
+//     not reconnected during the window. A reconnect would inject a handshake
+//     the arrival rate does not account for, so the server's
+//     `max_requests_per_connection` is raised by bench.sh for this suite and
+//     any reconnect is counted and fails the run.
+//   * every load handshake uses a NEW `probe::tls_config` (and therefore a cold
+//     session store) on a NEW TCP connection. No ticket is offered, so these
+//     are full handshakes even though the server can resume (it installs a
+//     ticketer). The run prints the client's own `resumed` count, which must be
+//     zero, and a shared-config probe that shows the server would resume if a
+//     client offered a ticket.
+//
+// The arrival rate is scheduled against absolute deadlines, not "sleep between
+// calls": arrival i is due at start + i/rate. The achieved rate is the number of
+// completed full handshakes divided by the window, printed BESIDE the target,
+// and `reached=no` when it is more than 2% under. Handshake latency is measured
+// around the whole `probe::tls_handshake` call, so it includes TCP connect and
+// any accept-queue wait; a run that meets its rate only by queueing shows that
+// in the handshake p50/p99. (The server-side handshake figure excludes connect.)
+
+/// One rate's result. Latencies are microseconds for hits and milliseconds for
+/// handshakes, matching the rest of this file.
+struct MixedRate {
+    target: u32,
+    achieved: f64,
+    reached: bool,
+    hs: Vec<Duration>,
+    hs_resumed: usize,
+    hs_failed: usize,
+    hs_late: usize,
+    hs_scheduled: usize,
+    hits: Vec<f64>,
+    hits_with_age: usize,
+    non200: usize,
+    reconnects: usize,
+    window: Duration,
+}
+
+/// The load thread's half of one rate.
+struct MixedLoad {
+    samples: Vec<Duration>,
+    resumed: usize,
+    failed: usize,
+    late: usize,
+    scheduled: usize,
+}
+
+fn parse_rate_list(raw: &str) -> Vec<u32> {
+    raw.split(',')
+        .filter_map(|v| v.trim().parse::<u32>().ok())
+        .collect()
+}
+
+fn sleep_until(deadline: Instant) {
+    // The platform layer owns the clock; the gate refuses a direct read here.
+    let now = m6_core::platform::now();
+    if now < deadline {
+        std::thread::sleep(deadline - now);
+    }
+}
+
+/// Is `name` (including its colon) a header in the response head?
+///
+/// A cached hit is the only path that writes `Age`, so this is the hit-ratio
+/// signal. It runs AFTER the hit's latency is recorded and is not on the timed
+/// path.
+fn response_has_header(resp: &[u8], name: &[u8]) -> bool {
+    let head_end = resp
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or(resp.len());
+    let head = &resp[..head_end];
+    let mut at = 0;
+    while let Some(pos) = head[at..]
+        .windows(name.len())
+        .position(|w| w.eq_ignore_ascii_case(name))
+    {
+        let abs = at + pos;
+        if abs == 0 || head[abs - 1] == b'\n' {
+            return true;
+        }
+        at = abs + 1;
+        if at >= head.len() {
+            break;
+        }
+    }
+    false
+}
+
+/// Arrival-rate scheduled load: one new TCP connection and one fresh full TLS
+/// handshake per iteration, at most one in flight.
+fn handshake_load(addr: String, target: u32, start: Instant, window: Duration) -> MixedLoad {
+    let scheduled = (u64::from(target) * window.as_secs()) as usize;
+    let mut out = MixedLoad {
+        samples: Vec::with_capacity(scheduled),
+        resumed: 0,
+        failed: 0,
+        late: 0,
+        scheduled,
+    };
+    if target == 0 {
+        return out;
+    }
+    let interval = Duration::from_secs_f64(1.0 / f64::from(target));
+    let deadline = start + window;
+    for i in 0..scheduled {
+        sleep_until(start + interval * i as u32);
+        let issued = m6_core::platform::now();
+        if issued >= deadline {
+            break;
+        }
+        if issued.saturating_duration_since(start + interval * i as u32) > Duration::from_millis(1)
+        {
+            out.late += 1;
+        }
+        // A fresh config per handshake: no session store, so no ticket is
+        // offered and the handshake is full. A new TcpStream is opened inside
+        // `tls_handshake`.
+        let cfg = probe::tls_config(b"http/1.1");
+        let t0 = m6_core::platform::now();
+        match probe::tls_handshake(&addr, cfg) {
+            Ok(h) => {
+                out.resumed += usize::from(h.resumed);
+                // Around the whole call, so this includes TCP connect and any
+                // time the connection waited in the accept queue.
+                out.samples.push(t0.elapsed());
+            }
+            Err(e) => {
+                out.failed += 1;
+                if out.failed <= 3 {
+                    eprintln!("mixed: handshake load failed: {e}");
+                }
+            }
+        }
+    }
+    out
+}
+
+fn run_mixed_rate(
+    addr: &str,
+    path: &str,
+    target: u32,
+    seconds: u64,
+    tls_cfg: Arc<ClientConfig>,
+) -> anyhow::Result<MixedRate> {
+    let window = Duration::from_secs(seconds);
+    // The hit connection is opened and warmed before the window. Its handshake
+    // and the first requests fill the cache; neither is in the measurement.
+    let mut client = H1Client::connect(addr, Arc::clone(&tls_cfg))?;
+    for _ in 0..5 {
+        client.get(path)?;
+    }
+
+    // A short lead so the load thread is running before the first arrival.
+    let start = m6_core::platform::now() + Duration::from_millis(100);
+    let load = if target == 0 {
+        None
+    } else {
+        let addr = addr.to_string();
+        Some(std::thread::spawn(move || {
+            handshake_load(addr, target, start, window)
+        }))
+    };
+
+    sleep_until(start);
+    let deadline = start + window;
+    let mut hits: Vec<f64> = Vec::new();
+    let mut hits_with_age = 0usize;
+    let mut non200 = 0usize;
+    let mut reconnects = 0usize;
+
+    while m6_core::platform::now() < deadline {
+        let t0 = m6_core::platform::now();
+        let resp = match client.get(path) {
+            Ok(resp) => resp,
+            Err(e) => {
+                // A server that closes the kept-alive connection at its default
+                // 100 requests would inject extra handshakes. Count it; refuse
+                // the run rather than measure a rate that is not the target.
+                reconnects += 1;
+                eprintln!("mixed: hit connection closed ({e}); reconnecting");
+                client = H1Client::connect(addr, Arc::clone(&tls_cfg))?;
+                continue;
+            }
+        };
+        let elapsed = t0.elapsed().as_secs_f64() * 1_000_000.0;
+        hits.push(elapsed);
+        let status = parse_http11_status(&resp);
+        if status == 200 {
+            if response_has_header(&resp, b"age:") {
+                hits_with_age += 1;
+            }
+        } else {
+            non200 += 1;
+        }
+    }
+
+    let load = match load {
+        Some(h) => h
+            .join()
+            .map_err(|_| anyhow::anyhow!("handshake load thread panicked"))?,
+        None => MixedLoad {
+            samples: Vec::new(),
+            resumed: 0,
+            failed: 0,
+            late: 0,
+            scheduled: 0,
+        },
+    };
+
+    let achieved = load.samples.len() as f64 / window.as_secs_f64();
+    // The 2% tolerance applies to the count as well as the rate: the last
+    // scheduled arrival can still be in flight when the window closes.
+    let reached = target == 0
+        || (achieved >= f64::from(target) * 0.98
+            && load.failed == 0
+            && load.samples.len() >= (load.scheduled as f64 * 0.98) as usize);
+
+    Ok(MixedRate {
+        target,
+        achieved,
+        reached,
+        hs: load.samples,
+        hs_resumed: load.resumed,
+        hs_failed: load.failed,
+        hs_late: load.late,
+        hs_scheduled: load.scheduled,
+        hits,
+        hits_with_age,
+        non200,
+        reconnects,
+        window,
+    })
+}
+
+fn print_mixed_rate(r: &MixedRate) {
+    let mut hs = r.hs.clone();
+    let summary = probe::summarise(&mut hs);
+    let (hs_p50, hs_p99) = match summary {
+        Some(s) => (s.p50.as_secs_f64() * 1000.0, s.p99.as_secs_f64() * 1000.0),
+        None => (0.0, 0.0),
+    };
+    let hits_n = r.hits.len();
+    let hit_ratio = if hits_n == 0 {
+        0.0
+    } else {
+        r.hits_with_age as f64 / hits_n as f64
+    };
+    let hit_p50 = percentile(r.hits.clone(), 50);
+    let hit_p99 = percentile(r.hits.clone(), 99);
+    let hit_max = percentile(r.hits.clone(), 100);
+    println!(
+        "MIX target={} achieved={:.1} reached={} hs_n={} hs_scheduled={} hs_resumed={} \
+         hs_failed={} hs_late={} hs_p50_ms={:.3} hs_p99_ms={:.3} \
+         hits_n={} hit_rate={:.1} hit_p50_us={:.1} hit_p99_us={:.1} hit_max_us={:.1} \
+         hit_ratio={:.3} non200={} hit_reconnects={}",
+        r.target,
+        r.achieved,
+        if r.reached { "yes" } else { "no" },
+        r.hs.len(),
+        r.hs_scheduled,
+        r.hs_resumed,
+        r.hs_failed,
+        r.hs_late,
+        hs_p50,
+        hs_p99,
+        hits_n,
+        hits_n as f64 / r.window.as_secs_f64(),
+        hit_p50,
+        hit_p99,
+        hit_max,
+        hit_ratio,
+        r.non200,
+        r.reconnects
+    );
+}
+
+/// Hot-hit p50/p99 at each handshake arrival rate. Returns non-zero if a rate
+/// was not reached, a load handshake resumed or failed, the hit connection had
+/// to reconnect, or the responses were not cache hits.
+fn run_mixed_handshake_suite(args: &Args) -> i32 {
+    if args.mixed_rates.is_empty() {
+        eprintln!("mixed: --mixed-rates is empty");
+        return 2;
+    }
+    if args.mixed_seconds == 0 {
+        eprintln!("mixed: --mixed-seconds must be at least 1");
+        return 2;
+    }
+
+    println!(
+        "MIXED-HANDSHAKE addr={} path={} seconds={} rates={:?}",
+        args.addr, args.mixed_path, args.mixed_seconds, args.mixed_rates
+    );
+
+    // Resumption is configured on the server (http11.rs installs a ticketer), so
+    // prove it empirically with one client that DOES offer its ticket. The load
+    // below never does.
+    let shared = probe::tls_config(b"http/1.1");
+    let (mut proof_full, mut proof_resumed) = (0usize, 0usize);
+    for _ in 0..2 {
+        match probe::tls_handshake(&args.addr, Arc::clone(&shared)) {
+            Ok(h) => {
+                if h.resumed {
+                    proof_resumed += 1;
+                } else {
+                    proof_full += 1;
+                }
+            }
+            Err(e) => eprintln!("mixed: resumption probe failed: {e}"),
+        }
+    }
+    println!(
+        "RESUMPTION server=on ticketer=crypto::ticketer proof_full={proof_full} \
+         proof_resumed={proof_resumed} load=fresh-ClientConfig-per-handshake"
+    );
+
+    let tls_cfg = make_client_config(args.skip_verify);
+    let mut all_ok = true;
+    for &target in &args.mixed_rates {
+        match run_mixed_rate(
+            &args.addr,
+            &args.mixed_path,
+            target,
+            args.mixed_seconds,
+            Arc::clone(&tls_cfg),
+        ) {
+            Ok(r) => {
+                let ok = r.reached
+                    && r.hs_resumed == 0
+                    && r.hs_failed == 0
+                    && r.reconnects == 0
+                    && !r.hits.is_empty()
+                    && r.non200 == 0
+                    && r.hits_with_age == r.hits.len();
+                print_mixed_rate(&r);
+                if !ok {
+                    all_ok = false;
+                }
+            }
+            Err(e) => {
+                eprintln!("mixed: rate {target}: {e}");
+                all_ok = false;
+            }
+        }
+        // Let the server finish closing the last load connections before the
+        // next rate, so a rate does not inherit the previous one's backlog.
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    i32::from(!all_ok)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bench percentiles must match the server's own metrics document
+    /// figures.
+    /// stats.rs (`percentiles_n`) takes index `(n-1)*pct/100` with integer
+    /// arithmetic, truncating. Rounding the same fraction, as this bench did,
+    /// shifts p50 of ten samples from index 4 to 5, which reads as a false
+    /// server regression when the two are compared side by side.
+    #[test]
+    fn percentile_truncates_like_stats_rs() {
+        // Ten sorted samples: 10, 20, ... 100 microseconds.
+        let v: Vec<f64> = (1..=10).map(|x| x as f64 * 10.0).collect();
+        assert_eq!(percentile(v.clone(), 0), 10.0);
+        assert_eq!(percentile(v.clone(), 50), 50.0);
+        assert_eq!(percentile(v.clone(), 99), 90.0);
+        assert_eq!(percentile(v.clone(), 100), 100.0);
+    }
+
+    /// A close reaches the socket through the flush that follows it, which is
+    /// what stops a reconnect from leaving the server an idle connection until
+    /// its timeout.
+    ///
+    /// A connection with no authenticated packet from its peer sends no close
+    /// at all: quiche closes it locally, because there is nobody it can
+    /// authenticate the close to. So the closing end here is a real quiche
+    /// server that has read a client's Initial, and the check is that the
+    /// client, fed whatever the flush put on the wire, sees the connection
+    /// closed.
+    ///
+    /// Break: a close that quiche queues and nothing sends.
+    #[test]
+    fn a_close_reaches_the_socket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("certificate");
+        std::fs::write(dir.path().join("cert.pem"), cert.cert.pem()).expect("cert file");
+        std::fs::write(dir.path().join("key.pem"), cert.key_pair.serialize_pem())
+            .expect("key file");
+
+        let client_sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        client_sock.set_nonblocking(true).expect("nonblocking");
+        let client_addr = client_sock.local_addr().expect("client address");
+        let server_sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        server_sock
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("read timeout");
+        let server_addr = server_sock.local_addr().expect("server address");
+        client_sock.connect(server_addr).expect("connect");
+
+        let mut client_cfg = make_quiche_client_config(true);
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &new_scid(),
+            client_addr,
+            server_addr,
+            &mut client_cfg,
+        )
+        .expect("connect");
+        let mut buf = [0u8; 65535];
+        let (n, _) = client.send(&mut buf).expect("the client's Initial");
+        client_sock.send(&buf[..n]).expect("send the Initial");
+
+        let mut server_cfg = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("config");
+        server_cfg
+            .load_cert_chain_from_pem_file(dir.path().join("cert.pem").to_str().expect("path"))
+            .expect("cert chain");
+        server_cfg
+            .load_priv_key_from_pem_file(dir.path().join("key.pem").to_str().expect("path"))
+            .expect("private key");
+        server_cfg
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .expect("alpn");
+        let (n, from) = server_sock
+            .recv_from(&mut buf)
+            .expect("the Initial arrived");
+        let mut server =
+            quiche::accept(&new_scid(), None, server_addr, from, &mut server_cfg).expect("accept");
+        server
+            .recv(
+                &mut buf[..n],
+                quiche::RecvInfo {
+                    from,
+                    to: server_addr,
+                },
+            )
+            .expect("server read the Initial");
+        server_sock
+            .connect(from)
+            .expect("connect the server socket");
+
+        close_and_flush(&mut server, &server_sock);
+
+        // Feed the client whatever arrives, including any of the handshake
+        // flight still queued when the close was made, and wait for the close
+        // itself to reach it.
+        let mut buf = [0u8; 2048];
+        let deadline = m6_core::platform::now() + Duration::from_millis(500);
+        while m6_core::platform::now() < deadline && !(client.is_closed() || client.is_draining()) {
+            match client_sock.recv(&mut buf) {
+                Ok(n) => {
+                    client
+                        .recv(
+                            &mut buf[..n],
+                            quiche::RecvInfo {
+                                from: server_addr,
+                                to: client_addr,
+                            },
+                        )
+                        .ok();
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        assert!(
+            client.is_closed() || client.is_draining(),
+            "the peer saw the connection closed"
+        );
+    }
+
+    /// One turn takes every datagram already queued, and a read with nothing
+    /// behind it is reported as the timeout that happened.
+    ///
+    /// The client's whole receive loop is this function. Its `Some` arm feeds
+    /// the batch to the connection and flushes once, and its `None` arm is the
+    /// only place `on_timeout` is called.
+    ///
+    /// Break: a receive that takes one datagram per call (the count would be
+    /// 1), a read with nothing queued reported as a batch of zero (the timer
+    /// would never be driven), or a datagram dropped from the batch.
+    #[test]
+    fn a_receive_turn_takes_the_whole_batch_and_reports_a_timed_out_read() {
+        let a = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        a.set_nonblocking(true).expect("nonblocking");
+        let b = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let to = a.local_addr().expect("a address");
+        let batch = UdpBatch::without_gso();
+        let mut buf = vec![0u8; MAX_BATCH * H3_RECV_SLOT];
+        let mut metas = [RecvMeta::default(); MAX_BATCH];
+        for i in 0..3u8 {
+            b.send_to(&[i; 100], to).expect("send");
+        }
+
+        let n = receive_turn(&a, &batch, &mut buf, &mut metas, H3_TURN_WAIT)
+            .expect("receive")
+            .expect("a datagram was queued");
+        assert_eq!(n, 3, "one turn took all three datagrams");
+        for (i, meta) in metas.iter().take(3).enumerate() {
+            let start = i * H3_RECV_SLOT;
+            assert_eq!(meta.len, 100);
+            assert_eq!(&buf[start..start + 100], &[i as u8; 100]);
+            assert_eq!(meta.from, Some(b.local_addr().expect("b address")));
+        }
+
+        // Nothing is queued: the wait ends with no datagram, which is the one
+        // answer that drives the connection's timer.
+        let started = m6_core::platform::now();
+        let none = receive_turn(&a, &batch, &mut buf, &mut metas, Duration::from_millis(20))
+            .expect("receive");
+        assert_eq!(
+            none, None,
+            "an empty read is a timed-out read, not a batch of zero"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(15),
+            "the wait did not wait for the timeout it reported"
+        );
     }
 }

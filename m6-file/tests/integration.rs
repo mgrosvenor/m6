@@ -1,10 +1,17 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use m6_core::testkit::{binary, wait, Service};
+use m6_core::testkit::{
+    assert_app_lifecycle, binary, read_response_event, wait, Service, RESPONSE_BOUND,
+};
 
 /// A running `m6-file`, its socket, and the directory both live in.
 ///
@@ -40,7 +47,7 @@ fn config_path() -> PathBuf {
 /// `bind` creates the socket file, but the server does not accept until it has
 /// called `listen`, so the file appearing proves nothing.
 fn spawn_server(id: &str) -> (Server, PathBuf) {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     // Short name: a unix socket path is capped near 104 bytes on macOS, and
     // the temp directory already spends most of that.
     let socket_path = dir.path().join(format!("{id}.sock"));
@@ -52,9 +59,10 @@ fn spawn_server(id: &str) -> (Server, PathBuf) {
             .arg(config_path())
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
-    svc.wait_for_path(&socket_path, Duration::from_secs(10));
+    svc.wait_for_path(&socket_path, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
     assert!(
-        wait::for_unix(&socket_path, Duration::from_secs(10)),
+        wait::for_unix(&socket_path, m6_core::testkit::STARTUP_BOUND),
         "m6-file created {} but never accepted a connection",
         socket_path.display()
     );
@@ -66,15 +74,14 @@ fn spawn_server(id: &str) -> (Server, PathBuf) {
 fn http_request(socket_path: &Path, request: &str) -> String {
     let mut stream = UnixStream::connect(socket_path)
         .unwrap_or_else(|e| panic!("connect to {:?}: {}", socket_path, e));
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
     stream.write_all(request.as_bytes()).unwrap();
 
     // One response, not read-to-EOF. Backends keep the connection open now
-    // (RFC 9112 9.3), so waiting for a close waits for the idle timeout.
+    // (RFC 9112 9.3), so waiting for a close waits for the idle timeout. The
+    // wait is on the response event, with RESPONSE_BOUND as its ceiling.
     let method = request.split(' ').next().unwrap_or("");
-    let response = m6_core::testkit::read_one(&mut stream, method).expect("read one response");
+    let response =
+        read_response_event(stream, method, RESPONSE_BOUND).unwrap_or_else(|e| panic!("{e}"));
     String::from_utf8_lossy(&response).into_owned()
 }
 
@@ -90,6 +97,52 @@ fn l1_valid_config_starts_and_socket_appears() {
     );
 }
 
+/// A config that still asks for a thread pool is refused at start: the
+/// operator hears about it with exit 2, and no socket is left behind.
+#[test]
+fn a_thread_pool_section_is_refused_at_start() {
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
+    std::fs::write(dir.path().join("site.toml"), "").unwrap();
+    let config = dir.path().join("m6-file.conf");
+    std::fs::write(&config, "[thread_pool]\nsize = 4\n").unwrap();
+    let socket = dir.path().join("refused.sock");
+
+    let mut svc = Service::spawn(
+        "m6-file",
+        Command::new(binary("m6-file"))
+            .arg(dir.path())
+            .arg(&config)
+            .env("M6_SOCKET_OVERRIDE", &socket),
+    );
+    let status = svc
+        .wait_for_exit(Instant::now() + m6_core::testkit::STARTUP_BOUND)
+        .unwrap_or_else(|| {
+            panic!(
+                "m6-file did not refuse [thread_pool]\n--- output ---\n{}",
+                svc.output()
+            )
+        });
+    let output = svc.output();
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "m6-file should exit 2 for [thread_pool]\n--- output ---\n{output}"
+    );
+    assert!(
+        output.contains("[thread_pool]"),
+        "the error must name the table\n{output}"
+    );
+    assert!(
+        output.contains("run more instances"),
+        "the error must say what to do instead\n--- output ---\n{output}"
+    );
+    assert!(
+        !socket.exists(),
+        "a refused start must not leave a socket at {}",
+        socket.display()
+    );
+}
+
 #[test]
 fn l1_sigterm_exits_zero() {
     let (guard, socket_path) = spawn_server("l1-sigterm");
@@ -99,7 +152,7 @@ fn l1_sigterm_exits_zero() {
     // version signalled, slept, and dropped the guard without ever looking at
     // what the process did, which passed whatever happened.
     let mut guard = guard;
-    let status = guard.svc.terminate(Duration::from_secs(5));
+    let status = guard.svc.terminate(m6_core::testkit::STARTUP_BOUND);
     assert!(
         status.success(),
         "m6-file should exit 0 on SIGTERM, got {status}. A signal exit status means the \
@@ -116,6 +169,28 @@ fn l1_sigterm_exits_zero() {
         socket_path.display()
     );
     m6_core::testkit::assert_lifecycle_logged("m6-file", &guard.svc.output());
+}
+
+/// A request writes an access line at the default level, so a service that has
+/// not raised its level still has an access log.
+#[test]
+fn an_access_line_is_logged_at_the_default_level() {
+    let (guard, socket_path) = spawn_server("l2-access-log");
+
+    let req =
+        "GET /assets/css/main.css HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n";
+    let resp = http_request(&socket_path, req);
+    assert!(resp.contains("200 OK"), "expected 200, got:\n{resp}");
+
+    let logged = wait::until(m6_core::testkit::STARTUP_BOUND, || {
+        let output = guard.svc.output();
+        output.contains(r#""level":"INFO""#) && output.contains(r#""message":"request complete""#)
+    });
+    assert!(
+        logged,
+        "no access line at the default level\n--- output ---\n{}",
+        guard.svc.output()
+    );
 }
 
 // ─── L2 Path Resolution ───────────────────────────────────────────────────────
@@ -184,8 +259,8 @@ fn l2_query_relpath_cannot_replace_the_path_parameter() {
                Host: localhost\r\nAccept-Encoding: identity\r\n\r\n";
     let resp = http_request(&socket_path, req);
     assert!(
-        !resp.contains("[thread_pool]"),
-        "a query relpath served a file outside the root: {}",
+        !resp.contains("[compression]"),
+        "a query relpath served the service's config: {}",
         &resp[..resp.len().min(300)]
     );
     assert!(
@@ -321,8 +396,14 @@ fn l4_cache_control_public() {
 
     assert!(resp.contains("200 OK"), "expected 200");
     assert!(
-        resp.to_lowercase().contains("cache-control: public"),
-        "expected Cache-Control: public header, headers:\n{}",
+        resp.to_lowercase()
+            .contains("cache-control: public, max-age=0, must-revalidate, s-maxage=86400"),
+        "expected the browser-caching pattern, headers:\n{}",
+        &resp[..resp.find("\r\n\r\n").unwrap_or(resp.len().min(500))]
+    );
+    assert!(
+        resp.to_lowercase().contains("etag:"),
+        "an unversioned file needs an ETag to revalidate against, headers:\n{}",
         &resp[..resp.find("\r\n\r\n").unwrap_or(resp.len().min(500))]
     );
 }
@@ -422,6 +503,314 @@ fn l5_concurrent_requests() {
     }
 }
 
+/// A streamed body never stops the loop for another client.
+///
+/// The handler serves a 4 MiB identity file as a stream, so the loop writes it
+/// one chunk per writable turn. This client takes a 64 KiB receive buffer and
+/// reads nothing until a second request on another connection has been
+/// answered, which a blocking `write_all` of the body could never allow: the
+/// writer would fill 64 KiB and stop the process there.
+#[test]
+fn a_large_stream_body_to_a_slow_reader_does_not_block_the_process() {
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
+    let site = dir.path();
+    std::fs::create_dir_all(site.join("assets")).unwrap();
+    std::fs::write(site.join("site.toml"), "").unwrap();
+    // Not a text type: identity coding and no minification, so the body is the
+    // file on disk and the handler streams it.
+    let body: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    std::fs::write(site.join("assets").join("big.bin"), &body).unwrap();
+    std::fs::write(site.join("assets").join("a.txt"), b"asset").unwrap();
+    let config = site.join("m6-file.conf");
+    std::fs::write(&config, ASSETS_ROUTE).unwrap();
+
+    let socket_path = dir.path().join("stream.sock");
+    let mut svc = Service::spawn(
+        "m6-file",
+        Command::new(binary("m6-file"))
+            .arg(site)
+            .arg(&config)
+            .env("M6_SOCKET_OVERRIDE", &socket_path),
+    );
+    svc.wait_for_path(&socket_path, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
+    assert!(
+        wait::for_unix(&socket_path, m6_core::testkit::STARTUP_BOUND),
+        "m6-file never accepted a connection"
+    );
+
+    // The slow reader: a 64 KiB receive buffer, a request sent, nothing read.
+    let mut slow = UnixStream::connect(&socket_path).expect("connect the slow reader");
+    socket2::SockRef::from(&slow)
+        .set_recv_buffer_size(64 * 1024)
+        .expect("a 64 KiB receive buffer");
+    slow.write_all(
+        b"GET /assets/big.bin HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n",
+    )
+    .expect("send the slow reader's request");
+
+    // Wait until its response has started arriving, which is the signal that
+    // the server accepted it and is writing. `peek` reads nothing.
+    slow.set_nonblocking(true)
+        .expect("non-blocking slow reader");
+    let writing = wait::until(m6_core::testkit::STARTUP_BOUND, || {
+        let mut byte = [std::mem::MaybeUninit::<u8>::uninit(); 1];
+        matches!(socket2::SockRef::from(&slow).peek(&mut byte), Ok(n) if n > 0)
+    });
+    assert!(
+        writing,
+        "the 4 MiB response never started arriving\n--- output ---\n{}",
+        svc.output()
+    );
+
+    // A second connection must be answered while the first one's body is still
+    // held by this client, which is the whole test.
+    let started = Instant::now();
+    let mut probe = UnixStream::connect(&socket_path).expect("connect the probe");
+    probe
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("probe timeout");
+    probe
+        .write_all(
+            b"GET /assets/a.txt HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n",
+        )
+        .expect("send the probe's request");
+    let response = m6_core::testkit::read_one(&mut probe, "GET").unwrap_or_else(|e| {
+        panic!(
+            "a second request was not answered while a 4 MiB body waited for its reader: \
+             {e}\n--- output ---\n{}",
+            svc.output()
+        )
+    });
+    let (status, _, _) = split_response(&response);
+    assert!(status.contains("200"), "the probe was not served: {status}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the probe took {:?}, beyond the 2 s deadline",
+        started.elapsed()
+    );
+
+    // Now read the whole streamed body and check it arrived intact.
+    slow.set_nonblocking(false).expect("blocking slow reader");
+    slow.set_read_timeout(Some(Duration::from_secs(20)))
+        .expect("slow reader timeout");
+    let raw = m6_core::testkit::read_one(&mut slow, "GET").expect("the 4 MiB response");
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("the response has a header/body split");
+    let (status, headers, body_len) = split_response(&raw);
+    assert!(
+        status.contains("200"),
+        "the slow reader was not served: {status}"
+    );
+    assert!(
+        headers.contains(&format!("content-length: {}", body.len())),
+        "the response must promise the file's length, got {headers:?}"
+    );
+    assert_eq!(body_len, body.len(), "the streamed body was short");
+    assert!(
+        raw[split + 4..] == body[..],
+        "the streamed body did not match the file"
+    );
+
+    svc.assert_alive("after streaming a 4 MiB body to a slow reader");
+}
+
+/// A request pipelined behind a streamed body is answered after that body,
+/// not in the middle of it.
+///
+/// Both requests arrive in one write, so the second is already buffered when
+/// the first answer starts. The first answer is a 1 MiB streamed file and the
+/// client takes a 64 KiB receive buffer, so the loop's first flush blocks with
+/// the body still owed. The loop must finish that body before it reads and
+/// answers the second request: reading first would replace the body's reader
+/// and write the second answer's head into the first body.
+#[test]
+fn a_request_pipelined_behind_a_streamed_body_waits_for_the_body() {
+    const BIG: usize = 1024 * 1024;
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
+    let site = dir.path();
+    std::fs::create_dir_all(site.join("assets")).unwrap();
+    std::fs::write(site.join("site.toml"), "").unwrap();
+    let big: Vec<u8> = (0..BIG).map(|i| (i % 251) as u8).collect();
+    std::fs::write(site.join("assets").join("big.bin"), &big).unwrap();
+    std::fs::write(site.join("assets").join("small.txt"), b"small").unwrap();
+    let config = site.join("m6-file.conf");
+    std::fs::write(&config, ASSETS_ROUTE).unwrap();
+
+    let socket_path = dir.path().join("pipeline.sock");
+    let mut svc = Service::spawn(
+        "m6-file",
+        Command::new(binary("m6-file"))
+            .arg(site)
+            .arg(&config)
+            .env("M6_SOCKET_OVERRIDE", &socket_path),
+    );
+    svc.wait_for_path(&socket_path, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
+    assert!(
+        wait::for_unix(&socket_path, m6_core::testkit::STARTUP_BOUND),
+        "m6-file never accepted a connection"
+    );
+
+    let mut client = UnixStream::connect(&socket_path).expect("connect");
+    socket2::SockRef::from(&client)
+        .set_recv_buffer_size(64 * 1024)
+        .expect("a 64 KiB receive buffer");
+    client
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .expect("timeout");
+    client
+        .write_all(
+            b"GET /assets/big.bin HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n\
+              GET /assets/small.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .expect("send both requests in one write");
+
+    let first = m6_core::testkit::read_one(&mut client, "GET").expect("the first response");
+    let split = first
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("the first response has a header/body split");
+    let (status, headers, body_len) = split_response(&first);
+    assert!(status.contains("200"), "the first response was {status}");
+    assert!(
+        headers.contains(&format!("content-length: {BIG}")),
+        "the first response must promise the file's length, got {headers:?}"
+    );
+    assert_eq!(body_len, BIG, "the first body was not the whole file");
+    assert!(
+        first[split + 4..] == big[..],
+        "the first body did not match the file"
+    );
+
+    let second = m6_core::testkit::read_one(&mut client, "GET").expect("the second response");
+    let (status, _, body_len) = split_response(&second);
+    assert!(status.contains("200"), "the second response was {status}");
+    assert_eq!(body_len, 5, "the second body is the small file");
+    assert!(
+        second[second.len() - 5..] == *b"small",
+        "the second body did not match the file"
+    );
+
+    svc.assert_alive("after answering a request pipelined behind a streamed body");
+}
+
+/// A streamed file holds a second descriptor, so the table is half the
+/// descriptor budget. Under a hard limit of 64 the table is 24: twenty
+/// connections holding a 2 MiB stream each use 46 descriptors, and the next
+/// batch of connections must not reach the accept loop's descriptor limit.
+/// The service stays alive, never logs an accept error, and keeps answering
+/// on an existing connection. A table sized without the file descriptor
+/// reaches EMFILE when the second batch arrives.
+#[test]
+fn a_lowered_open_file_limit_leaves_room_for_every_streamed_file() {
+    const HARD: u64 = 64;
+    /// The descriptors `raise_open_file_limit` leaves after its 16 reserved.
+    const DESCRIPTORS: usize = HARD as usize - 16;
+    /// Held streams, so the accept pass that follows runs with their file
+    /// descriptors already in use.
+    const HELD: usize = 20;
+
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
+    let site = dir.path();
+    std::fs::create_dir_all(site.join("assets")).unwrap();
+    std::fs::write(site.join("site.toml"), "").unwrap();
+    // Large enough that an unread body cannot fit a socket buffer, so the
+    // streamed file's descriptor stays open behind its connection.
+    let big: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    std::fs::write(site.join("assets").join("big.bin"), &big).unwrap();
+    std::fs::write(site.join("assets").join("a.txt"), b"asset").unwrap();
+    let config = site.join("m6-file.conf");
+    std::fs::write(&config, ASSETS_ROUTE).unwrap();
+
+    let socket_path = dir.path().join("stream-limit.sock");
+    let mut command = m6_core::testkit::lowered_fd_limit_command(HARD, 0, binary("m6-file"));
+    command
+        .arg(site)
+        .arg(&config)
+        .env("M6_SOCKET_OVERRIDE", &socket_path);
+    let mut svc = Service::spawn("m6-file", &mut command);
+    svc.wait_for_path(&socket_path, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
+    assert!(
+        wait::for_unix(&socket_path, m6_core::testkit::STARTUP_BOUND),
+        "m6-file never accepted a connection"
+    );
+
+    let request =
+        b"GET /assets/big.bin HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n";
+    let mut held: Vec<UnixStream> = (0..HELD)
+        .map(|_| {
+            let mut client = UnixStream::connect(&socket_path).expect("connect");
+            client.write_all(request).expect("send the request");
+            client
+        })
+        .collect();
+
+    // Every held connection must be accepted and its file open: one byte of
+    // its body is the signal, and `peek` reads nothing.
+    let started = wait::until(m6_core::testkit::STARTUP_BOUND, || {
+        held.iter().all(|client| {
+            let mut byte = [std::mem::MaybeUninit::<u8>::uninit(); 1];
+            matches!(socket2::SockRef::from(client).peek(&mut byte), Ok(n) if n > 0)
+        })
+    });
+    assert!(
+        started,
+        "the first streams never started\n--- output ---\n{}",
+        svc.output()
+    );
+    svc.assert_alive("with twenty streams holding their files");
+
+    // A batch that cannot fit beside the held streams. With the whole
+    // descriptor budget the accept loop reaches EMFILE here.
+    let mut more: Vec<UnixStream> = (0..DESCRIPTORS)
+        .map(|_| {
+            let mut client = UnixStream::connect(&socket_path).expect("connect");
+            client.write_all(request).expect("send the request");
+            client
+        })
+        .collect();
+
+    // The loop keeps serving: finish one held body, then ask again on the
+    // same connection. A loop spinning in a failed accept answers neither,
+    // and a loop that exits answers nothing at all.
+    let mut first = held.remove(0);
+    first.set_nonblocking(false).expect("blocking");
+    first
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .expect("timeout");
+    let body = m6_core::testkit::read_one(&mut first, "GET").expect("the held streamed body");
+    let (status, headers, body_len) = split_response(&body);
+    assert!(status.contains("200"), "the held response was {status}");
+    assert!(
+        headers.contains(&format!("content-length: {}", big.len())),
+        "the response must promise the file's length, got {headers:?}"
+    );
+    assert_eq!(body_len, big.len(), "the streamed body was short");
+
+    first
+        .write_all(
+            b"GET /assets/a.txt HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n",
+        )
+        .expect("send the second request");
+    let second = m6_core::testkit::read_one(&mut first, "GET")
+        .expect("the loop did not answer on an existing connection");
+    let (status, _, body_len) = split_response(&second);
+    assert!(status.contains("200"), "the second response was {status}");
+    assert_eq!(body_len, 5, "the second body is the small file");
+
+    svc.assert_alive("after answering on an existing connection");
+    assert!(
+        !svc.output().contains("accept error"),
+        "the descriptor budget was not enough for a stream per connection\n--- output ---\n{}",
+        svc.output()
+    );
+    more.clear();
+}
+
 // ─── Conditional requests (RFC 9110 13.2.2) ───────────────────────────────────
 
 /// All four precondition steps, in order, against a real m6-file.
@@ -464,6 +853,10 @@ fn conditional_requests_follow_rfc9110_precedence() {
         .and_then(|l| l.split_once(':'))
         .map(|(_, v)| v.trim().to_string())
         .expect("m6-file must send an ETag");
+    // The same opaque validator without the `W/` prefix: the form a client
+    // would use when it wants a strong comparison. m6-file's tag is weak, so
+    // these two differ in meaning even though the opaque part is identical.
+    let opaque = etag.strip_prefix("W/").unwrap_or(&etag);
 
     // No preconditions.
     assert!(status(&get("")).contains("200"), "unconditional GET");
@@ -473,9 +866,13 @@ fn conditional_requests_follow_rfc9110_precedence() {
         status(&get("If-Match: \"nope\"\r\n")).contains("412"),
         "If-Match with a non-matching tag must be 412"
     );
+    // mtime+size is a weak validator (RFC 9110 8.8.1), and strong comparison
+    // is false when either side is weak (8.8.3.2), so even the current opaque
+    // value cannot satisfy If-Match. This handler serves GET and HEAD only
+    // (405 above), where If-Match is not how a write is authorised.
     assert!(
-        status(&get(&format!("If-Match: {etag}\r\n"))).contains("200"),
-        "If-Match with the current tag must proceed"
+        status(&get(&format!("If-Match: {etag}\r\n"))).contains("412"),
+        "a weak validator must not satisfy If-Match's strong comparison"
     );
 
     // 2. If-Unmodified-Since, only consulted when If-Match is absent.
@@ -488,12 +885,21 @@ fn conditional_requests_follow_rfc9110_precedence() {
     );
 
     // 3. If-None-Match uses WEAK comparison: W/"x" matches "x".
+    let not_modified = get(&format!("If-None-Match: {opaque}\r\n"));
     assert!(
-        status(&get(&format!("If-None-Match: {etag}\r\n"))).contains("304"),
+        status(&not_modified).contains("304"),
         "strong form of the current tag must be 304"
     );
+    // RFC 9110 8.6: a 304 must not claim the representation is empty. Core's
+    // writer used to add `Content-Length: 0` to every bodyless status.
     assert!(
-        status(&get(&format!("If-None-Match: W/{etag}\r\n"))).contains("304"),
+        !not_modified
+            .to_ascii_lowercase()
+            .contains("content-length:"),
+        "a 304 must carry no Content-Length:\n{not_modified}"
+    );
+    assert!(
+        status(&get(&format!("If-None-Match: W/{opaque}\r\n"))).contains("304"),
         "WEAK form of the current tag must also be 304 (RFC 9110 8.8.3.2) — \
          this is the assertion that was failing"
     );
@@ -649,9 +1055,10 @@ fn head_reports_exactly_what_get_would() {
 fn a_head_on_an_unreadable_file_still_answers() {
     use std::os::unix::fs::PermissionsExt;
 
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = dir.path();
     std::fs::create_dir_all(site.join("assets")).unwrap();
+    std::fs::write(site.join("site.toml"), "").unwrap();
 
     // Not a text type: no minification, no compression, so this is the shape
     // the fast path is for.
@@ -674,9 +1081,10 @@ fn a_head_on_an_unreadable_file_still_answers() {
             .arg(&config)
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
-    svc.wait_for_path(&socket_path, Duration::from_secs(10));
+    svc.wait_for_path(&socket_path, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
     assert!(
-        wait::for_unix(&socket_path, Duration::from_secs(10)),
+        wait::for_unix(&socket_path, m6_core::testkit::STARTUP_BOUND),
         "never accepted"
     );
 
@@ -767,4 +1175,44 @@ fn a_directory_is_404_for_both_methods() {
             );
         }
     }
+}
+
+// ─── Lifecycle ─────────────────────────────────────────────────────────────────
+
+const ASSETS_ROUTE: &str =
+    "[[route]]\npath = \"/assets/{*relpath}\"\nhandler = \"files\"\nroot = \"assets/\"\n";
+
+fn site_with_two_trees() -> tempfile::TempDir {
+    let site = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).unwrap();
+    std::fs::create_dir_all(site.path().join("assets")).unwrap();
+    std::fs::create_dir_all(site.path().join("files/deep")).unwrap();
+    std::fs::write(site.path().join("assets/a.txt"), b"asset").unwrap();
+    std::fs::write(site.path().join("files/deep/report.txt"), b"report").unwrap();
+    std::fs::write(site.path().join("site.toml"), "").unwrap();
+    site
+}
+
+fn write_config(path: &Path, routes: &str) {
+    std::fs::write(path, routes).unwrap();
+}
+
+/// The lifecycle contract, which m6-file gets from the same
+/// `assert_app_lifecycle` every service uses rather than from its own
+/// hand-written copy.
+#[test]
+fn lifecycle() {
+    let site = site_with_two_trees();
+    let config = site.path().join("m6-file.conf");
+    write_config(&config, ASSETS_ROUTE);
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).unwrap();
+    let socket = dir.path().join("lifecycle.sock");
+
+    assert_app_lifecycle(
+        "m6-file",
+        Command::new(binary("m6-file"))
+            .arg(site.path())
+            .arg(&config)
+            .env("M6_SOCKET_OVERRIDE", &socket),
+        &socket,
+    );
 }

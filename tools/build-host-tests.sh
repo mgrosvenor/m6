@@ -33,9 +33,8 @@
 #   M6_BUILD_ROOT      optional remote directory, relative to the login
 #                      directory unless absolute. Default m6-build.
 #   M6_ALLOW_DIRTY     optional. Skip the clean-tree guard, for local iteration.
-#   M6_EXAMPLES        optional path to the m6-examples checkout. Default: a
-#                      sibling directory named m6-examples. Set M6_SKIP_EXAMPLES=1
-#                      to run without it, knowing what that leaves unchecked.
+#   M6_SKIP_EXAMPLES   optional. Set to 1 to skip the examples (examples/ in this
+#                      repository), knowing what that leaves unchecked.
 #
 # THE BUILD HOST IS ASSUMED NOT TO BE BACKED UP. Nothing may exist only there, so
 # this refuses to run against a dirty tree: whatever it tested is then always
@@ -43,7 +42,7 @@
 #
 # ── Why the examples are built here ──────────────────────────────────────────
 #
-# m6-examples is the first place an m6 API change shows up, and for weeks nothing
+# The examples are the first place an m6 API change shows up, and for weeks nothing
 # built it. By 2026-09-14 it did not compile at all: every renderer crate still
 # pointed at `m6-render`, a crate m6 had deleted, and the binaries left in
 # `target/release` from before the deletion meant running an example still looked
@@ -57,18 +56,15 @@
 # are actually used. So they are built here, and their end-to-end test runs
 # against the binaries this script just built.
 #
-# It DOES run the performance check, as of 2026-09-14.
+# It DOES run the performance check, which is an A/B of the candidate against a
+# base build made on this same host in the same run. The base is M6_PERF_BASE
+# when set, otherwise the merge base of HEAD and origin/develop, and on develop
+# itself the commit before HEAD. Both arms render the same committed example
+# bytes in alternating order, each pinned to its own CPU, and the gate fails on
+# a consistent paired slowdown.
 #
-# It used to skip it, on the stated grounds that `tools/perfcheck.sh` measures
-# "rendering real content against a rendered config" and therefore belonged to a
-# deployment. That stopped being true the same day: perfcheck was repointed at the
-# examples, whose content is committed, so it measures m6 against bytes that are
-# the same on every machine.
-#
-# Until this was wired up, the two baselines recorded in perf-baseline.txt had
-# nothing checking them — a recorded number nobody compares against is a number
-# nobody will notice moving. And this is the only place it can run: a wall-clock
-# measurement needs a quiet machine, which a shared CI runner is not.
+# A wall-clock measurement needs a quiet machine, which a shared CI runner is
+# not, so this stays here rather than in CI.
 
 set -uo pipefail
 
@@ -105,51 +101,54 @@ BUILD_ROOT="${M6_BUILD_ROOT:-m6-build}"
 LOG=/tmp/m6-build-host-tests.log
 EXAMPLES_LOG=/tmp/m6-build-host-examples.log
 
+# Copy tools/perf-history.jsonl back from the build host, so the record perfcheck
+# appended there becomes part of the next commit. The sync sends the checkout's
+# history to the host, so the host's file is the checkout's file plus this run's
+# record and replaces it whole. The new file is written beside the old one and
+# renamed only if the local file is a byte prefix of it: perfcheck only appends,
+# so anything else means the local history changed during the run (a pull, a
+# branch switch) and replacing it would drop records. A failure never leaves a
+# partial history behind.
+copy_back() {
+    local src="$1"
+    local dst="$2"
+    local tmp
+    tmp="$(mktemp "$dst.XXXXXX")" || { echo "cannot make a temp file beside $dst" >&2; return 1; }
+    # shellcheck disable=SC2086
+    if rsync -az -e "ssh $SSH_OPTS" "$src" "$tmp" && [[ -s "$tmp" ]] \
+        && { [[ ! -s "$dst" ]] || cmp -s "$dst" <(head -c "$(( $(wc -c < "$dst") ))" "$tmp"); }; then
+        mv "$tmp" "$dst"
+    else
+        rm -f "$tmp"
+        echo "cannot copy $src back to $dst: the fetch failed, or the history here is not a prefix of the host's (it changed during the run)" >&2
+        return 1
+    fi
+}
+
 # ── Where the examples are ───────────────────────────────────────────────────
 #
-# The renderer crates reach m6 by relative path (`../../../../m6/m6-core`), which
-# resolves to a sibling directory. They are synced as siblings on the build host
-# for the same reason, so the path holds there without editing any manifest.
-EXAMPLES="${M6_EXAMPLES:-$(cd "$ROOT/.." 2>/dev/null && pwd)/m6-examples}"
+# examples/ in this repository, its own Cargo workspace. It is synced with the
+# rest of the tree, so the renderer crates reach m6-core by the same relative
+# path on the build host as here.
+EXAMPLES="$ROOT/examples"
 if [[ -n "${M6_SKIP_EXAMPLES:-}" ]]; then
     EXAMPLES=""
-elif [[ ! -f "$EXAMPLES/Cargo.toml" ]]; then
-    die "cannot find the examples repository at '$EXAMPLES'.
-
-  m6-examples is where m6's own interfaces are actually used, and it is the first
-  place an API change breaks. It went unbuilt long enough to stop compiling
-  entirely, so it is checked here rather than trusted.
-
-      export M6_EXAMPLES=/path/to/m6-examples
-
-  To run without it, knowing that leaves every example unchecked:
-
-      export M6_SKIP_EXAMPLES=1"
 fi
 
 # ── The git guard ────────────────────────────────────────────────────────────
+# The logs and generated data files the examples write while running are noise
+# rather than work, so they do not count as uncommitted changes.
+EXAMPLES_NOISE='^.. examples/.*(logs/|\.db(-shm|-wal)?$|/data/posts\.json$|/content/drafts/)'
 if [[ -z "${M6_ALLOW_DIRTY:-}" ]]; then
-    [[ -z "$(git -C "$ROOT" status --porcelain)" ]] || {
+    # The history file is exempt: the host's copy is regenerated from the checkout
+    # on every sync, so the gate can be rerun before the new record is committed.
+    [[ -z "$(git -C "$ROOT" status --porcelain -- . ':!tools/perf-history.jsonl' | grep -vE "$EXAMPLES_NOISE" || true)" ]] || {
         echo "${RED}ERROR:${RESET} $ROOT has uncommitted changes." >&2
-        git -C "$ROOT" status --short | head -10 >&2
+        git -C "$ROOT" status --short -- . ':!tools/perf-history.jsonl' | grep -vE "$EXAMPLES_NOISE" | head -10 >&2
         echo "  The build host is assumed not to be backed up. Commit first, or" >&2
         echo "  set M6_ALLOW_DIRTY=1." >&2
         exit 1; }
     ok "tree is clean (nothing will exist only on the build host)"
-
-    # The examples get the same guard: whatever ran there has to be recoverable
-    # from git too, and the logs and generated data files these examples write
-    # while running are noise rather than work, so they are excluded.
-    if [[ -n "$EXAMPLES" ]]; then
-        dirty=$(git -C "$EXAMPLES" status --porcelain 2>/dev/null \
-            | grep -vE '(logs/|\.db(-shm|-wal)?$|/data/posts\.json$|/content/drafts/)' || true)
-        [[ -z "$dirty" ]] || {
-            echo "${RED}ERROR:${RESET} $EXAMPLES has uncommitted changes." >&2
-            printf '%s\n' "$dirty" | head -10 >&2
-            echo "  Commit them, or set M6_ALLOW_DIRTY=1." >&2
-            exit 1; }
-        ok "examples tree is clean"
-    fi
 fi
 
 # ── Sync ─────────────────────────────────────────────────────────────────────
@@ -167,27 +166,44 @@ ssh $SSH_OPTS "$BUILD_HOST" \
     "find $BUILD_ROOT/m6 \\( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \\) -exec touch {} +"
 ok "source synced and restamped"
 
-if [[ -n "$EXAMPLES" ]]; then
-    info "syncing examples to $BUILD_HOST:$BUILD_ROOT/m6-examples"
-    # shellcheck disable=SC2086
-    rsync -az -e "ssh $SSH_OPTS" --delete --exclude 'target/' --exclude '.git/' \
-        --exclude 'logs/' "$EXAMPLES/" "$BUILD_HOST:$BUILD_ROOT/m6-examples/" \
-        || die "rsync of examples failed"
-    # shellcheck disable=SC2086
-    ssh $SSH_OPTS "$BUILD_HOST" \
-        "find $BUILD_ROOT/m6-examples \\( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \\) -exec touch {} +"
-    ok "examples synced and restamped"
+# ── The performance base ─────────────────────────────────────────────────────
+#
+# The candidate is compared against a build of its base commit made on this same
+# host in the same run, so both arms share the machine, the toolchain and the
+# content. M6_PERF_BASE picks a revision; otherwise the base is the merge base of
+# HEAD and origin/develop, and on develop itself the commit before HEAD.
+if [[ -n "${M6_PERF_BASE:-}" ]]; then
+  PERF_BASE_REF="$M6_PERF_BASE"
+else
+  [[ -n "$(git -C "$ROOT" rev-parse --verify origin/develop 2>/dev/null)" ]] \
+    || die "origin/develop is missing. Fetch it, or set M6_PERF_BASE."
+  PERF_BASE_REF="$(git -C "$ROOT" merge-base HEAD origin/develop)"
+  if [[ "$PERF_BASE_REF" == "$(git -C "$ROOT" rev-parse HEAD)" ]]; then
+    PERF_BASE_REF="HEAD^1"
+  fi
 fi
+PERF_BASE_COMMIT="$(git -C "$ROOT" rev-parse "$PERF_BASE_REF^{commit}")" \
+  || die "cannot resolve the performance base '$PERF_BASE_REF'"
+info "perf base: $PERF_BASE_REF $(git -C "$ROOT" rev-parse --short "$PERF_BASE_COMMIT")"
+
+# Ship the base tree beside the candidate so it can be built on the host.
+# shellcheck disable=SC2086
+git -C "$ROOT" archive --format=tar "$PERF_BASE_COMMIT" \
+  | ssh $SSH_OPTS "$BUILD_HOST" \
+      "rm -rf $BUILD_ROOT/m6-base && mkdir -p $BUILD_ROOT/m6-base && tar -x -C $BUILD_ROOT/m6-base" \
+  || die "cannot ship the performance base"
 
 # ── Run ──────────────────────────────────────────────────────────────────────
 info "m6: release build, warnings, clippy, cargo-deny, tests, conformance"
 # shellcheck disable=SC2086
 # PERF_COMMIT is read here, from the checkout being synced, because the remote
-# tree has no `.git`. PERF_DIRTY is 0 by construction: the clean-tree guard above
-# refuses to sync a dirty tree at all.
+# tree has no `.git`. PERF_DIRTY is 1 when the checkout differs from that commit
+# (possible only under M6_ALLOW_DIRTY), not counting the history file itself.
 PERF_COMMIT="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+PERF_DIRTY=0
+[[ -z "$(git -C "$ROOT" status --porcelain -- . ':!tools/perf-history.jsonl' 2>/dev/null)" ]] || PERF_DIRTY=1
 ssh $SSH_OPTS "$BUILD_HOST" \
-    "M6_DIR=$BUILD_ROOT/m6 M6_PERF_COMMIT=$PERF_COMMIT M6_PERF_DIRTY=0 bash -s" \
+    "M6_DIR=$BUILD_ROOT/m6 M6_PERF_COMMIT=$PERF_COMMIT M6_PERF_DIRTY=$PERF_DIRTY M6_PERF_BASE_COMMIT=$PERF_BASE_COMMIT bash -s" \
     > "$LOG" 2>&1 <<'REMOTE' || true
 set -uo pipefail
 # `/root/.local/bin` is where `uv` installs, and h1spec is delivered through
@@ -195,16 +211,59 @@ set -uo pipefail
 # not installed" while the binary sat on disk, and the skip was silent.
 export PATH=$PATH:$HOME/.cargo/bin:$HOME/.local/bin:/root/.cargo/bin:/root/.local/bin
 cd "$M6_DIR" || exit 1
+# This run's own files: another gate may be running on this host at the same
+# time, and fixed /tmp paths would let each read the other's logs. They sit
+# beside the checkout, not in /tmp, and are the run's TMPDIR: a hardened host
+# mounts /tmp noexec, and rustdoc runs each doctest as a binary built in
+# TMPDIR, so every doctest failed with "Permission denied" there.
+T="$(mktemp -d "$PWD/../tmp.XXXXXX")" || exit 1
+trap 'rm -rf -- "$T"' EXIT
+export TMPDIR="$T"
+# Several gates share this host (#344). tools/host-lock.sh holds the protocol:
+# this run holds the host shared, the test suite and conformance take the port
+# lock, and perfcheck gets the host to itself.
+# shellcheck source=tools/host-lock.sh
+. ./tools/host-lock.sh || exit 1
+host_enter_shared
 
 echo "### release build"
 cargo build --workspace --release 2>&1 | tail -3
 echo "RELEASE_WARNINGS=$(cargo build --workspace --release 2>&1 | grep -c '^warning' || true)"
 
+echo "### performance base build"
+# The base is built into its own target directory beside the candidate, and
+# skipped when the stamp matches. The stamp, not mtimes: git archive stamps
+# every file with the commit time, so cargo's mtime check would reuse a build
+# of another commit (the same trap the restamp above describes).
+if [ "$(cat ../target-base/BASE_COMMIT 2>/dev/null)" = "$M6_PERF_BASE_COMMIT" ]; then
+    BASE_BUILD_STATUS=0
+    echo "BASE_BUILD_STATUS=$BASE_BUILD_STATUS"
+else
+    (cd ../m6-base && CARGO_TARGET_DIR="$PWD/../target-base" cargo build --release -p m6-html)
+    BASE_BUILD_STATUS=$?
+    echo "BASE_BUILD_STATUS=$BASE_BUILD_STATUS"
+    if [ "$BASE_BUILD_STATUS" = "0" ]; then
+        mkdir -p ../target-base
+        echo "$M6_PERF_BASE_COMMIT" > ../target-base/BASE_COMMIT
+    fi
+fi
+
 echo "### clippy"
 # `-D warnings`, no ceiling. Prints its own line; CLIPPY_STATUS is what decides.
-./tools/clippy.sh > /tmp/clippy.out 2>&1
+./tools/clippy.sh > $T/clippy.out 2>&1
 echo "CLIPPY_STATUS=$?"
-tail -5 /tmp/clippy.out
+tail -5 $T/clippy.out
+
+echo "### rustdoc"
+# Broken intra-doc links are rustdoc warnings, and the zero-warnings rule counts
+# pre-existing warnings. `--all-features` as well, because `testkit` and the
+# opt-in core features are off by default and nothing else builds their docs.
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps > $T/rustdoc.out 2>&1
+echo "RUSTDOC_STATUS=$?"
+tail -5 $T/rustdoc.out
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features > $T/rustdoc-all.out 2>&1
+echo "RUSTDOC_ALL_STATUS=$?"
+tail -5 $T/rustdoc-all.out
 
 echo "### cargo-deny"
 # It used to run only in GitHub Actions, and that cost four hours once: a git
@@ -212,9 +271,9 @@ echo "### cargo-deny"
 # push, and the build-host checks kept reporting that everything passed. A check
 # that lives in one place only is not a check.
 if command -v cargo-deny >/dev/null 2>&1; then
-    cargo deny check > /tmp/deny.out 2>&1
+    cargo deny check > $T/deny.out 2>&1
     echo "DENY_STATUS=$?"
-    tail -4 /tmp/deny.out
+    tail -4 $T/deny.out
 else
     echo "DENY_STATUS=127"
     echo "cargo-deny is NOT INSTALLED here: cargo install cargo-deny --locked"
@@ -243,32 +302,54 @@ export M6_BACKENDS_REQUIRE_ALL=1
 # Captured in full, then reported. Grepping the pipe drops the assertion message,
 # leaving a bare `thread '<name>' panicked at <file>:<line>` with the text that
 # says WHY thrown away.
-cargo test --workspace > /tmp/m6-full.log 2>&1 || true
-grep -E '^test result:' /tmp/m6-full.log || true
+with_port_lock cargo test --workspace > "$T/m6-full.log" 2>&1 || true
+grep -E '^test result:' "$T/m6-full.log" || true
 echo "### failure detail"
-sed -n '/^failures:/,$p' /tmp/m6-full.log | head -60
+sed -n '/^failures:/,$p' "$T/m6-full.log" | head -60
 
 echo "### conformance"
 # WITHOUT --allow-missing-tools, deliberately. This box has all three testers,
 # and an absent one here is a failure rather than a skip. A laptop's pre-push
 # hook may pass that flag and say loudly what it did not test; this has no excuse
 # available to it.
-./tools/conformance.sh > /tmp/conformance.out 2>&1
+with_port_lock ./tools/conformance.sh > "$T/conformance.out" 2>&1
 echo "CONFORMANCE_STATUS=$?"
-tail -14 /tmp/conformance.out
+tail -14 "$T/conformance.out"
 
 echo "### performance"
-# Against the recorded numbers in tools/perf-baseline.txt, taken on this machine.
-# A run slower than its number by more than the margin fails; a faster one prints
-# the reading and asks for it to be recorded deliberately.
-# M6_PERF_COMMIT and M6_PERF_DIRTY arrive in the environment from the ssh
-# invocation, set from the checkout that synced. The tree up here has no `.git`,
-# so `git rev-parse` finds nothing, and a performance record that cannot name its
-# commit cannot be compared with anything later.
-./tools/perfcheck.sh > /tmp/perf.out 2>&1
-echo "PERF_STATUS=$?"
-grep -E 'render:|PASS|FAIL' /tmp/perf.out | tail -6
+# An A/B of the candidate against the base built above, both made on this host
+# in this run. M6_PERF_COMMIT, M6_PERF_DIRTY and M6_PERF_BASE_COMMIT arrive in
+# the environment from the ssh invocation, set from the checkout that synced.
+# The tree up here has no .git, so `git rev-parse` finds nothing, and a
+# performance record that cannot name its commit cannot be compared with
+# anything later.
+if [ "$BASE_BUILD_STATUS" = "0" ]; then
+    if host_alone; then
+        ./tools/perfcheck.sh --base-bin "$PWD/../target-base/release/m6-html" > "$T/perf.out" 2>&1
+        echo "PERF_STATUS=$?"
+        grep -E 'render:|PASS|FAIL|NOT MEASURED|ACCEPTED' "$T/perf.out" | tail -8
+    else
+        echo "PERF_STATUS=2"
+    fi
+else
+    echo "PERF_STATUS=2"
+    echo "the performance base failed to build, so nothing was measured"
+fi
 REMOTE
+
+# ── Bring the history back ───────────────────────────────────────────────────
+#
+# perfcheck appended one record to tools/perf-history.jsonl on the build host,
+# the only place it runs. Bring it back now, pass or fail, because a run that
+# failed is the one a later reader most wants the conditions for. Bookkeeping
+# never blocks the check: a failure is reported and fails the run at the end, but
+# the examples still run.
+COPY_BACK_FAILED=0
+if copy_back "$BUILD_HOST:$BUILD_ROOT/m6/tools/perf-history.jsonl" "$ROOT/tools/perf-history.jsonl"; then
+    info "commit tools/perf-history.jsonl to keep this run's record"
+else
+    COPY_BACK_FAILED=1
+fi
 
 # ── The examples ─────────────────────────────────────────────────────────────
 #
@@ -277,13 +358,27 @@ REMOTE
 # tree just synced, so this is the check that an m6 change did not break the
 # code that uses m6.
 if [[ -n "$EXAMPLES" ]]; then
-    info "m6-examples: build, warnings, clippy, tests, and the CMS end-to-end suite"
+    info "examples: build, warnings, clippy, tests, and the CMS end-to-end suite"
     # shellcheck disable=SC2086
-    ssh $SSH_OPTS "$BUILD_HOST" "EG_DIR=$BUILD_ROOT/m6-examples M6_DIR=$BUILD_ROOT/m6 bash -s" \
+    ssh $SSH_OPTS "$BUILD_HOST" "EG_DIR=$BUILD_ROOT/m6/examples M6_DIR=$BUILD_ROOT/m6 bash -s" \
         > "$EXAMPLES_LOG" 2>&1 <<'REMOTE_EG' || true
 set -uo pipefail
 export PATH=$PATH:$HOME/.cargo/bin:$HOME/.local/bin:/root/.cargo/bin:/root/.local/bin
+# M6_DIR arrives relative to the login directory (BUILD_ROOT defaults to a
+# relative path), and this half changes directory before it uses it, so it is
+# made absolute first. Without this every example step, and the lock helper
+# below, looked for m6 in a directory that does not exist.
+M6_DIR="$(cd "$M6_DIR" && pwd)" || exit 1
 cd "$EG_DIR" || exit 1
+# This run's own files (see the m6 half above).
+T="$(mktemp -d)" || exit 1
+trap 'rm -rf -- "$T"' EXIT
+# The host lock shared for the whole run (#344, tools/host-lock.sh). The builds
+# and clippy below bind nothing; from the unit tests on, every step binds fixed
+# loopback ports (8443 among them), so the port lock is held from there.
+# shellcheck source=tools/host-lock.sh
+. "$M6_DIR/tools/host-lock.sh" || exit 1
+host_enter_shared
 
 echo "### examples release build"
 cargo build --release 2>&1 | tail -3
@@ -299,51 +394,29 @@ echo "### examples clippy"
 # reported as a stack that never answered. The wasted disk is worth more than a
 # failure that points at the wrong thing.
 CARGO_TARGET_DIR=target/clippy cargo clippy --workspace --all-targets --release 2>&1 \
-    | grep -c '^warning' > /tmp/eg-clippy.count
-echo "EG_CLIPPY_WARNINGS=$(cat /tmp/eg-clippy.count)"
+    | grep -c '^warning' > $T/eg-clippy.count
+echo "EG_CLIPPY_WARNINGS=$(cat $T/eg-clippy.count)"
 CARGO_TARGET_DIR=target/clippy cargo clippy --workspace --all-targets --release 2>&1 \
     | grep '^warning' | head -5
 
+# Everything the remaining steps run is built first, outside the port lock, so
+# the lock covers running and not compiling. The later builds are then no-ops.
+cargo test --workspace --no-run > "$T/eg-testbuild.log" 2>&1 || true
+cargo build --release -p render-cms > /dev/null 2>&1 || true
+(cd "$M6_DIR" && cargo build --workspace --release > /dev/null 2>&1) || true
+port_hold
 echo "### examples unit tests"
 # Not blog_site_end_to_end: it needs certificates and example 05's stack, and
 # fails without them. It runs below, after that stack is up.
-cargo test --workspace -- --skip blog_site_end_to_end > /tmp/eg-tests.log 2>&1
+cargo test --workspace -- --skip blog_site_end_to_end > $T/eg-tests.log 2>&1
 echo "EG_TEST_STATUS=$?"
-grep -E '^test result:' /tmp/eg-tests.log || true
-sed -n '/^failures:/,$p' /tmp/eg-tests.log | head -40
+grep -E '^test result:' $T/eg-tests.log || true
+sed -n '/^failures:/,$p' $T/eg-tests.log | head -40
 
 echo "### development certificates"
-# A fresh checkout has no keys/: they are gitignored, and each example's dev.sh
-# generates them. The config parse below validates that tls_cert exists, so
-# without this every example is rejected for a missing file. This passed here only
-# because rsync carried the developer's own untracked keys.
-for d in examples/*/; do
-    [ -f "$d/dev.sh" ] || continue
-    mkdir -p "$d/keys"
-    if [ ! -f "$d/keys/dev.pem" ]; then
-        openssl req -x509 -newkey rsa:2048 -sha256 -days 365 -nodes \
-            -keyout "$d/keys/dev-key.pem" -out "$d/keys/dev.pem" \
-            -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
-    fi
-    # Five examples need an auth signing keypair too; their setup.sh makes it.
-    if [ ! -f "$d/keys/auth.pub" ]; then
-        # PKCS#8 (`genpkey`), not SEC1 (`ecparam -genkey`). m6-auth-server
-        # refuses SEC1 with "invalid private key (tried EC and RSA):
-        # InvalidKeyFormat" and exits, and pre-creating one here made dev.sh
-        # skip generating a good one — 33 of 98 checks failed with 502s
-        # because the auth server was never up.
-        # `ec_param_enc:named_curve` too. It is the default for OpenSSL, so it
-        # changes nothing here, but LibreSSL -- which is what macOS ships as
-        # /usr/bin/openssl -- writes explicit curve parameters instead of the
-        # prime256v1 OID, and the token signer refuses those with "JWT encode
-        # error: InvalidEcdsaKey" at every login. Stated here so the two sides
-        # of the check generate the same key.
-        openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -pkeyopt ec_param_enc:named_curve -out "$d/keys/auth.pem" 2>/dev/null
-        openssl pkey -in "$d/keys/auth.pem" -pubout -out "$d/keys/auth.pub" 2>/dev/null
-        chmod 600 "$d/keys/auth.pem" 2>/dev/null || true
-    fi
-done
-mkdir -p examples/09-global-deployment/certs
+# A fresh checkout has no keys: dev-keys.sh writes them to /tmp/m6/dev,
+# which the config parse below needs.
+./dev-keys.sh
 echo "certificates present"
 
 echo "### every example's config parses"
@@ -357,7 +430,7 @@ echo "### every example's config parses"
 # nine of eleven and read exactly like eleven of eleven.
 EG_CONFIG_BAD=0
 EG_CONFIG_UNEXPLAINED=0
-for d in examples/*/; do
+for d in */; do
     name=$(basename "$d")
     case "$name" in
         data) continue ;;   # shared fixtures, not an example
@@ -365,12 +438,12 @@ for d in examples/*/; do
             printf '  %-24s not parsed: systemd units only, it has no site config\n' "$name"
             continue ;;
         09-global-deployment)
-            # Its configs name /etc/letsencrypt paths for five real cache nodes,
-            # so m6-http rejects them here for a missing certificate rather than
-            # for anything wrong with the config. Its own integration test in
-            # examples/09-global-deployment/integration-test covers it instead,
+            # It holds one system config per node and one site config per role,
+            # so it has no single configs/system-dev.toml for this loop to parse.
+            # Its own integration test in
+            # 09-global-deployment/integration-test covers it instead,
             # and that test ran above.
-            printf '  %-24s not parsed: production configs name letsencrypt paths; its integration test covers it\n' "$name"
+            printf '  %-24s not parsed: per-node configs, no single system-dev.toml; its integration test covers it\n' "$name"
             continue ;;
     esac
     sys="$d/configs/system-dev.toml"
@@ -401,7 +474,7 @@ echo "### 05-cms end-to-end"
 cargo build --release -p render-cms 2>&1 | tail -1
 (cd "$M6_DIR" && cargo build --workspace --release 2>&1 | tail -1)
 
-cd examples/05-cms || exit 1
+cd 05-cms || exit 1
 
 # ── The port has to be ours ───────────────────────────────────────────────────
 #
@@ -422,8 +495,14 @@ if ss -ltnH 'sport = :8443' 2>/dev/null | grep -q .; then
     exit 0
 fi
 
-M6="$M6_DIR" M6_NO_BROWSER=1 ./dev.sh --no-open > /tmp/eg-cms-dev.log 2>&1 &
+# Its processes do not inherit the locks, so one that outlives this run cannot
+# hold the host or the ports. While this run lasts it holds the port lock itself,
+# so no other run's tests bind ports beside the stack; a stack left over after a
+# failed run is caught by the 8443 check above on the next examples run, which a
+# wedged lock would not be.
+M6="$M6_DIR" M6_NO_BROWSER=1 ./dev.sh --no-open > $T/eg-cms-dev.log 2>&1 6<&- 7<&- 8<&- &
 DEV_PID=$!
+DEV_START=$(ps -o lstart= -p "$DEV_PID" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)
 up=0
 # 180 seconds. Six services have to bind, and m6-md regenerates posts.json from
 # twelve markdown files first.
@@ -435,7 +514,7 @@ done
 if [ "$up" != "1" ]; then
     echo "EG_CMS_STATUS=1"
     echo "the 05-cms stack never answered in 180s; dev.sh output:"
-    tail -30 /tmp/eg-cms-dev.log
+    tail -30 $T/eg-cms-dev.log
     echo "--- service logs ---"
     tail -20 logs/*.log 2>/dev/null
 # A 200 says something is serving, not that it is the thing under test. Prove it
@@ -446,24 +525,24 @@ elif ! curl -sk --http1.1 https://127.0.0.1:8443/ 2>/dev/null | grep -q 'Recent 
     echo "something answered 200 on 8443 but it is not 05-cms, so nothing here was measured:"
     ss -ltnpH 'sport = :8443' 2>/dev/null | sed 's/^/    /'
 else
-    ./test.sh > /tmp/eg-cms-test.log 2>&1
+    ./test.sh > $T/eg-cms-test.log 2>&1
     cms_rc=$?
-    grep -E 'passed|FAIL' /tmp/eg-cms-test.log | sed 's/\x1b\[[0-9;]*m//g' | tail -25
+    grep -E 'passed|FAIL' $T/eg-cms-test.log | sed 's/\x1b\[[0-9;]*m//g' | tail -25
     # The Rust end-to-end test needs this stack, so it runs here and its
     # failure counts into the same status.
     echo "### 05-cms rust end-to-end"
-    cargo test -p render-cms --test integration > /tmp/eg-cms-rust.log 2>&1
+    cargo test -p render-cms --test integration > $T/eg-cms-rust.log 2>&1
     rust_rc=$?
     # A test that cannot start its stack prints SKIP and passes; count it as a failure.
-    if grep -q '^SKIP' /tmp/eg-cms-rust.log; then
+    if grep -q '^SKIP' $T/eg-cms-rust.log; then
         echo "rust end-to-end skipped:"
-        grep '^SKIP' /tmp/eg-cms-rust.log
+        grep '^SKIP' $T/eg-cms-rust.log
         rust_rc=1
     fi
     # No "test result:" line is echoed: the report below sums those lines for the
     # unit-test count and takes the last "N passed" as the suite's count.
     echo "rust end-to-end exit status $rust_rc"
-    grep -E '^test .* FAILED|panicked' /tmp/eg-cms-rust.log | grep -v '^test result:' | tail -25
+    grep -E '^test .* FAILED|panicked' $T/eg-cms-rust.log | grep -v '^test result:' | tail -25
     if [ "$cms_rc" != "0" ] || [ "$rust_rc" != "0" ]; then
         echo "EG_CMS_STATUS=1"
     else
@@ -471,22 +550,44 @@ else
     fi
 fi
 kill $DEV_PID 2>/dev/null
-# The stack's own children: dev.sh's trap handles them, but it is not given long
-# here, so anything still holding the site directory is cleaned up by name of
-# path rather than by process name. Killing by name would reach other m6
-# instances on this box.
-for pid in $(pgrep -f "$(pwd)" 2>/dev/null || true); do
-    [ "$pid" = "$$" ] && continue
-    kill "$pid" 2>/dev/null || true
+# dev.sh stops the services it recorded when its EXIT trap runs. Reap those
+# recorded pids too, because a SIGKILL or a crash would leave the trap unrun.
+# This used to sweep `pgrep -f "$(pwd)"`, which matched anything whose command
+# line mentioned the directory, and that is another run's stack as easily as
+# this one.
+if [ -f ../own.sh ]; then
+    . ../own.sh
+    own_init "$(pwd)" stack
+    own_stop_records
+    own_forget
+fi
+i=0
+while [ "$i" -lt 50 ]; do
+    kill -0 "$DEV_PID" 2>/dev/null || break
+    # A child this shell has not reaped is a zombie: kill -0 still succeeds.
+    st=$(ps -o stat= -p "$DEV_PID" 2>/dev/null | tr -d ' ' || true)
+    case "$st" in Z*) break ;; esac
+    sleep 0.1
+    i=$((i + 1))
 done
+if kill -0 "$DEV_PID" 2>/dev/null; then
+    now=$(ps -o lstart= -p "$DEV_PID" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)
+    if [ "${DEV_START:--}" != "-" ] && [ -n "$now" ] && [ "$now" != "$DEV_START" ]; then
+        echo "dev.sh pid $DEV_PID is a different process now; leaving it alone"
+    else
+        kill -9 "$DEV_PID" 2>/dev/null || true
+    fi
+fi
 REMOTE_EG
 fi
 
 # ── Report ───────────────────────────────────────────────────────────────────
-FAILED=0
+FAILED=$COPY_BACK_FAILED
 rw=$(num_after RELEASE_WARNINGS "$LOG");  rw="${rw:-?}"
 tw=$(num_after TESTBUILD_WARNINGS "$LOG"); tw="${tw:-?}"
 cl=$(num_after CLIPPY_STATUS "$LOG");      cl="${cl:-?}"
+rd=$(num_after RUSTDOC_STATUS "$LOG");     rd="${rd:-?}"
+ra=$(num_after RUSTDOC_ALL_STATUS "$LOG"); ra="${ra:-?}"
 dn=$(num_after DENY_STATUS "$LOG");        dn="${dn:-?}"
 cf=$(num_after CONFORMANCE_STATUS "$LOG"); cf="${cf:-?}"
 read -r passed failed < <(awk '/^test result:/{p+=$4; f+=$6} END{print p+0, f+0}' "$LOG")
@@ -495,6 +596,10 @@ read -r passed failed < <(awk '/^test result:/{p+=$4; f+=$6} END{print p+0, f+0}
 [[ "$tw" == "0" ]] || { echo "${RED}   $tw test-build warning(s) on Linux${RESET}" >&2; FAILED=1; }
 [[ "$cl" == "0" ]] || { echo "${RED}   clippy is not silent on Linux${RESET}" >&2
                         grep -A6 '^### clippy' "$LOG" >&2; FAILED=1; }
+[[ "$rd" == "0" ]] || { echo "${RED}   rustdoc: a broken intra-doc link (default features)${RESET}" >&2
+                        sed -n '/^### rustdoc/,/^### cargo-deny/p' "$LOG" >&2; FAILED=1; }
+[[ "$ra" == "0" ]] || { echo "${RED}   rustdoc: a broken intra-doc link (--all-features)${RESET}" >&2
+                        sed -n '/^### rustdoc/,/^### cargo-deny/p' "$LOG" >&2; FAILED=1; }
 [[ "$dn" == "0" ]] || { echo "${RED}   cargo-deny failed (advisories/licences/sources)${RESET}" >&2
                         sed -n '/^### cargo-deny/,/^### backend runtimes/p' "$LOG" >&2; FAILED=1; }
 missing=$(sed -n 's/^BACKEND_RUNTIMES_MISSING=//p' "$LOG" | tail -1)
@@ -512,7 +617,7 @@ pf=$(num_after PERF_STATUS "$LOG"); pf="${pf:-?}"
     sed -n '/^### failure detail/,$p' "$LOG" >&2; FAILED=1; }
 
 if [[ $FAILED -eq 0 ]]; then
-    ok "m6: $passed passed, 0 failed, 0 warnings (release + test), clippy silent, cargo-deny ok, h1+h2+h3 ok, performance ok"
+    ok "m6: $passed passed, 0 failed, 0 warnings (release + test), clippy silent, rustdoc silent, cargo-deny ok, h1+h2+h3 ok, performance ok"
 else
     echo
     echo "${RED}m6's own checks FAILED on $BUILD_HOST. Full log: $LOG${RESET}" >&2

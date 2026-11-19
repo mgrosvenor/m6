@@ -8,13 +8,19 @@
 ///
 /// Frame format (RFC 9113 §4.1):
 ///   [length: u24][type: u8][flags: u8][stream_id: u31][payload: length bytes]
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
+use std::ops::Bound::{Excluded, Unbounded};
+use std::ops::Range;
 use std::time::Instant;
 
-use crate::fields::validate_request_headers;
-use crate::forward::{HttpRequest, HttpResponse, PendingUrlContext};
-use crate::http11::RequestOutcome;
+use crate::cache::CachedResponse;
+use crate::fields::{validate_request_header_bytes, FIELD_OVERHEAD};
+use crate::forward::{HttpRequest, PendingDispatch};
+use crate::http11::{HitHeaders, RequestOutcome};
+use crate::priority::Priority;
+use m6_core::headers::MAX_REQUEST_HEAD;
+use m6_core::log::error;
 
 /// I/O abstraction: TLS (HTTPS) or plain TCP (H2C over a private backbone).
 pub enum H2Io<'a> {
@@ -25,6 +31,14 @@ pub enum H2Io<'a> {
     Plain {
         stream: &'a std::net::TcpStream,
     },
+}
+
+impl H2Io<'_> {
+    /// Whether rustls holds encrypted bytes the socket has not taken, which is
+    /// the socket refusing more.
+    fn tls_pending(&self) -> bool {
+        matches!(self, H2Io::Tls { tls, .. } if tls.wants_write())
+    }
 }
 
 // ── Frame type constants ──────────────────────────────────────────────────────
@@ -58,16 +72,27 @@ const FRAME_HDR: usize = 9;
 
 const DEFAULT_WINDOW: u32 = 65_535;
 const DEFAULT_MAX_FRAME: u32 = 16_384;
+
+/// How many unsent bytes `flush_pending_streams` may leave in `send_buf`
+/// before it stops and waits for the next writable event: the `h2_send`
+/// limit's `start`. On Linux the kernel is asked to report writability at the
+/// same mark (TCP_NOTSENT_LOWAT), so the frames enter the socket in the order
+/// this connection chose and roughly one queue's worth at a time.
 const MAX_CONCURRENT: u32 = 100;
 
-/// Hard ceiling on a single buffered HTTP/2 request body.
-///
-/// Not an RFC requirement -- a robustness one. Request bodies were accumulated
-/// with no bound while flow-control credit was handed straight back, so a peer
-/// could stream indefinitely and grow the process until it was killed. Any cap
-/// removes that; this one is above the 16 MiB multipart limit the renderers
-/// already enforce, so it never trips before their own check does.
-const MAX_H2_BODY: usize = 20 * 1024 * 1024;
+/// How many retired streams one connection keeps for reuse. A connection only
+/// needs one per stream it has open at once, and the cap bounds the body buffers
+/// a peer could park here by opening and closing large uploads.
+const FREE_STREAMS: usize = MAX_CONCURRENT as usize;
+
+// The ceiling on a single buffered HTTP/2 request body is the `h2_stream_body`
+// limit's maximum.
+//
+// Not an RFC requirement -- a robustness one. Request bodies were accumulated
+// with no bound while flow-control credit was handed straight back, so a peer
+// could stream indefinitely and grow the process until it was killed. Any cap
+// removes that; this one is above the 16 MiB multipart limit the renderers
+// already enforce, so it never trips before their own check does.
 
 /// Largest inbound frame payload we will accept, RFC 9113 4.2.
 ///
@@ -80,43 +105,32 @@ const MAX_H2_BODY: usize = 20 * 1024 * 1024;
 /// the limit we are obliged to enforce (F-005, defect 1).
 const MAX_FRAME_SIZE: usize = 16_384;
 
-/// Ceiling on one request's accumulated header block, across HEADERS plus
-/// every CONTINUATION that follows it.
-///
-/// This is the CONTINUATION-flood bound (CVE-2024-27316 class, F-005 defect
-/// 2). Header bytes accumulated with no limit at all: `MAX_H2_BODY` caps the
-/// request *body* and `MAX_REQUEST_BYTES` caps the HTTP/1.1 read buffer, and
-/// neither touches this buffer.
-///
-/// Why the flood evades every other defence: the per-IP rate limiter runs
-/// inside the request handler, and the handler is only reached once a request
-/// completes. A sequence that never sets END_HEADERS never dispatches, so the
-/// limiter never sees it, while the idle timeout is reset by each frame
-/// received. One connection, unauthenticated, grows memory until the process
-/// is OOM-killed.
-///
-/// 256 KiB is generous for real traffic (a large browser request is a few KiB)
-/// and matches the order other servers use.
-const MAX_HEADER_BLOCK: usize = 256 * 1024;
+// The ceiling on one request's accumulated header block, across HEADERS plus
+// every CONTINUATION that follows it, is the `h2_header_block` limit's maximum.
+//
+// This is the CONTINUATION-flood bound (CVE-2024-27316 class, F-005 defect
+// 2). Header bytes accumulated with no limit at all: the `h2_stream_body` limit caps the
+// request *body* and the `edge_request` limit caps the HTTP/1.1 read buffer, and
+// neither touches this buffer.
+//
+// Why the flood evades every other defence: the per-IP rate limiter runs
+// inside the request handler, and the handler is only reached once a request
+// completes. A sequence that never sets END_HEADERS never dispatches, so the
+// limiter never sees it, while the idle timeout is reset by each frame
+// received. One connection, unauthenticated, grows memory until the process
+// is OOM-killed.
+//
+// 256 KiB is generous for real traffic (a large browser request is a few KiB)
+// and matches the order other servers use.
 
-/// The largest decoded header list a peer may send, and the value advertised
-/// as SETTINGS_MAX_HEADER_LIST_SIZE (RFC 9113 6.5.2).
-///
-/// `MAX_HEADER_BLOCK` bounds the compressed block only. HPACK lets one byte
-/// refer to a table entry of up to 4096 bytes, so a block under that cap can
-/// still decode to hundreds of megabytes of header fields (an HPACK bomb). The
-/// size is counted as the RFC defines it: name length plus value length plus
-/// 32 for every field. A block over it is refused with 431 on its own stream
-/// (RFC 9113 4.3.1), after it has been decoded in full so the HPACK table stays
-/// in step with the peer's. It is not a connection error: the fault is in one
-/// request, and COMPRESSION_ERROR would punish every other stream.
-///
-/// 64 KiB is a quarter of the compressed cap, so nothing larger is a plausible
-/// request. A browser request, cookies included, is a few KiB.
-const MAX_HEADER_LIST_SIZE: usize = 64 * 1024;
-
-/// Per-field overhead in the header list size (RFC 9113 6.5.2).
-const HEADER_FIELD_OVERHEAD: usize = 32;
+// The decoded head is bounded by `m6_core::headers::MAX_REQUEST_HEAD`, the one
+// number the HTTP/1.1 parser and both backends use. The `h2_header_block` limit bounds
+// the compressed block only: HPACK lets one byte refer to a table entry of up
+// to 4096 bytes, so a block under that cap can still decode to hundreds of
+// megabytes of fields (an HPACK bomb), and the decoded bound closes that
+// expansion. It is refused on its own stream after the block has been decoded
+// in full, so the HPACK table stays in step with the peer's. The fault is in
+// one request, and COMPRESSION_ERROR would punish every other stream.
 
 const ERR_NO_ERROR: u32 = 0x0;
 const ERR_PROTOCOL_ERROR: u32 = 0x1;
@@ -139,11 +153,12 @@ const HPACK_MAX_TABLE_SIZE: usize = 4096;
 
 /// How many recently-reset stream ids to remember. See `recently_reset`.
 ///
-/// Deliberately above `MAX_CONCURRENT`, because these entries are also what
-/// makes the concurrency cap bind against Rapid Reset (see `RESET_DECAY`). At
-/// or below the cap, a peer could evict its own reset records by resetting
-/// enough streams and win back the slots that way.
-const RESET_MEMORY: usize = 128;
+/// Twice `MAX_CONCURRENT`, derived from it so the memory stays above the
+/// concurrency cap whatever the cap is. These entries are also what makes the
+/// cap bind against Rapid Reset (see `RESET_DECAY`). At or below the cap, a
+/// peer could evict its own reset records by resetting enough streams and win
+/// back the slots that way.
+const RESET_MEMORY: usize = 2 * MAX_CONCURRENT as usize;
 
 /// How long a stream terminated by RST_STREAM keeps occupying a concurrency
 /// slot. Rapid Reset, CVE-2023-44487.
@@ -249,11 +264,175 @@ struct H2Response {
     status: u16,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    /// The source's site generation, written as `M6-Genid`. `None` for an
+    /// answer this node generated itself.
+    genid: Option<u64>,
+}
+
+/// One decoded request field: a name and a value, each a range into
+/// `Http2Conn::decode_buf`.
+///
+/// HTTP/2 decodes a header block into the connection's own buffer once, and
+/// every later view (validation, the cache key, the forwarded request) is a
+/// range into it rather than a `String`. A view that must outlive the decode
+/// call (a stream parked across loop turns) keeps these ranges and re-borrows
+/// the bytes when it is read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct H2Field {
+    name: Range<u32>,
+    value: Range<u32>,
+}
+
+/// The forwarded header list of an HTTP/2 request, as borrowed name/value
+/// views into the connection's `decode_buf`.
+///
+/// Pseudo-headers and proxy-owned inbound headers are filtered out at lookup,
+/// and `Host` is `:authority` when the client sent no explicit one. Nothing is
+/// copied into a `String`, a `Vec` or a `HeaderMap`: a cache hit reads the key
+/// and the list it needs straight out of the read buffer.
+pub struct H2Headers<'a> {
+    fields: &'a [H2Field],
+    buf: &'a [u8],
+    authority: Option<&'a str>,
+}
+
+/// One request decoded on an HTTP/2 connection.
+///
+/// Every field is a view of the connection's buffers. `into_owned` is called
+/// only when a miss hands the request to a backend, which is the slow path; a
+/// cache hit is answered from these views and allocates nothing.
+pub struct H2Request<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    pub query: Option<&'a str>,
+    headers: H2Headers<'a>,
+    body: Vec<u8>,
+}
+
+/// What an `on_request` callback was handed: the owned request of the HTTP/1.1
+/// body path, or the borrowed request of an HTTP/2 connection.
+pub enum RequestRef<'a> {
+    Owned(&'a HttpRequest),
+    H2(H2Request<'a>),
+}
+
+impl<'a> H2Headers<'a> {
+    fn new(fields: &'a [H2Field], buf: &'a [u8]) -> H2Headers<'a> {
+        let authority = fields
+            .iter()
+            .find(|f| field_name(buf, f) == ":authority")
+            .map(|f| field_value(buf, f));
+        H2Headers {
+            fields,
+            buf,
+            authority,
+        }
+    }
+
+    /// Every field that may be forwarded, in wire order.
+    fn forwarded(&self) -> impl Iterator<Item = (&'a str, &'a str)> + '_ {
+        fields(self.fields, self.buf)
+            .filter(|(k, _)| !k.starts_with(':') && !crate::forward::is_untrusted_inbound(k))
+    }
+
+    fn has_explicit_host(&self) -> bool {
+        self.forwarded()
+            .any(|(k, _)| k.eq_ignore_ascii_case("host"))
+    }
+}
+
+impl m6_core::http::HeaderSource for H2Headers<'_> {
+    fn find(&self, name: &str) -> Option<&str> {
+        match self.forwarded().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
+            Some((_, v)) => Some(v),
+            // RFC 9113 8.3.1: :authority is HTTP/2's Host. Present it only when
+            // the client did not send an explicit Host, exactly as the owned
+            // path did when it filled one in.
+            None if name.eq_ignore_ascii_case("host") => self.authority,
+            None => None,
+        }
+    }
+
+    fn find_all<'a>(&'a self, name: &str) -> impl Iterator<Item = &'a str> {
+        let authority = if name.eq_ignore_ascii_case("host") && !self.has_explicit_host() {
+            self.authority
+        } else {
+            None
+        };
+        self.forwarded()
+            .filter(move |(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v)
+            .chain(authority)
+    }
+
+    fn is_empty(&self) -> bool {
+        // The fields this source presents: the forwarded ones plus `:authority`
+        // when it stands in for Host.
+        self.forwarded().next().is_none() && self.authority.is_none()
+    }
+}
+
+impl<'a> H2Request<'a> {
+    fn new(list: &'a [H2Field], buf: &'a [u8], body: Vec<u8>) -> H2Request<'a> {
+        let mut method = "";
+        let mut path = "";
+        let mut query = None;
+        for (k, v) in fields(list, buf) {
+            match k {
+                ":method" => method = v,
+                ":path" => match v.find('?') {
+                    Some(q) => {
+                        path = &v[..q];
+                        query = Some(&v[q + 1..]);
+                    }
+                    None => path = v,
+                },
+                _ => {}
+            }
+        }
+        H2Request {
+            method,
+            path,
+            query,
+            headers: H2Headers::new(list, buf),
+            body,
+        }
+    }
+
+    /// The forwarded header list, borrowed from the connection's buffer.
+    pub fn headers(&self) -> &H2Headers<'a> {
+        &self.headers
+    }
+
+    /// The owned request the miss path hands to a backend.
+    ///
+    /// This is the one place a request becomes `String`s, and only a miss
+    /// reaches it. The bytes are the same ones the old `build_request` copied:
+    /// same fields, same order, same synthesized `Host`.
+    pub fn into_owned(self) -> HttpRequest {
+        let mut headers = Vec::with_capacity(self.headers.fields.len());
+        for (k, v) in self.headers.forwarded() {
+            headers.push((k.to_string(), v.to_string()));
+        }
+        if let Some(authority) = self.headers.authority {
+            if !m6_core::headers::contains(&headers[..], "host") {
+                headers.push(("Host".to_string(), authority.to_string()));
+            }
+        }
+        HttpRequest {
+            method: self.method.to_string(),
+            path: self.path.to_string(),
+            query: self.query.map(str::to_string),
+            version: "HTTP/2".to_string(),
+            headers,
+            body: self.body,
+        }
+    }
 }
 
 struct H2Stream {
     state: StreamState,
-    headers: Vec<(String, String)>,
+    headers: Vec<H2Field>,
     body: Vec<u8>,
     headers_done: bool,
     send_window: i32,
@@ -265,28 +444,78 @@ struct H2Stream {
     // Buffered response body for flow-controlled delivery.
     // None  = request not yet dispatched.
     // Some  = response queued; resp_sent bytes already flushed.
-    resp_body: Option<Vec<u8>>,
+    resp_body: Option<bytes::Bytes>,
     resp_sent: usize,
-    /// Pending URL-backend request: set by maybe_dispatch when backend is async.
-    pending_rx: Option<(
-        std::sync::mpsc::Receiver<std::io::Result<HttpResponse>>,
-        PendingUrlContext,
-    )>,
+    /// Pending backend request: set by maybe_dispatch when backend is async.
+    pending: bool,
+    /// Whether our END_STREAM has gone out. The stream state cannot say: the
+    /// peer's END_STREAM turns half-closed (local) into half-closed (remote),
+    /// and without this flag the flusher would owe the stream a second
+    /// END_STREAM and send DATA after it.
+    end_stream_sent: bool,
+    /// The RFC 9218 priority this request asked for. The flush sends this
+    /// stream's response in the order it names.
+    priority: Priority,
 }
 
 impl H2Stream {
     fn new(initial_send_window: i32) -> Self {
         H2Stream {
             state: StreamState::Open,
-            headers: Vec::new(),
+            // A request's decoded head is a handful of fields; sizing the
+            // list for one means the decode does not grow it field by field.
+            headers: Vec::with_capacity(16),
             body: Vec::new(),
             headers_done: false,
             send_window: initial_send_window,
             recv_window: DEFAULT_WINDOW as i32,
             resp_body: None,
             resp_sent: 0,
-            pending_rx: None,
+            pending: false,
+            end_stream_sent: false,
+            priority: Priority::default(),
         }
+    }
+
+    /// Reset a retired stream for the next stream id, keeping its allocations.
+    fn reset(&mut self, initial_send_window: i32) {
+        self.state = StreamState::Open;
+        self.headers.clear();
+        if self.body.capacity() > 64 * 1024 {
+            self.body = Vec::new();
+        } else {
+            self.body.clear();
+        }
+        self.headers_done = false;
+        self.send_window = initial_send_window;
+        self.recv_window = DEFAULT_WINDOW as i32;
+        self.resp_body = None;
+        self.resp_sent = 0;
+        self.pending = false;
+        // A reused stream owes its own END_STREAM again, and the priority
+        // belongs to the request that has just arrived, not the retired one.
+        self.end_stream_sent = false;
+        self.priority = Priority::default();
+    }
+
+    /// Whether the flusher owes this stream a frame: the END_STREAM of an
+    /// empty body, which needs no window, or body bytes both send windows
+    /// allow. False once the stream's own END_STREAM has gone out.
+    fn can_send(&self, conn_send_window: i32) -> bool {
+        if self.end_stream_sent {
+            return false;
+        }
+        let Some(body) = self.resp_body.as_ref() else {
+            return false;
+        };
+        body.len() == self.resp_sent || (conn_send_window > 0 && self.send_window > 0)
+    }
+
+    /// Record the RFC 9218 priority this request asked for. The caller reads it
+    /// from the borrowed field views the branch decodes into the connection's
+    /// buffer, so no owned name or value pair is built for it.
+    fn record_priority(&mut self, priority: Priority) {
+        self.priority = priority;
     }
 }
 
@@ -305,11 +534,34 @@ enum Phase {
 pub struct Http2Conn {
     phase: Phase,
     recv_buf: Vec<u8>,
-    send_buf: Vec<u8>,
-    /// Updated on every received frame; drives the idle timeout.
-    last_active: Instant,
-
-    streams: HashMap<u32, H2Stream>,
+    /// Unsent response bytes. `start` is the pacing mark and `max` the hard
+    /// ceiling the pacing keeps it below.
+    send_buf: m6_core::limits::Bounded<u8>,
+    /// Decoded request fields, appended by `decode_hpack` as the HPACK
+    /// callback hands over name and value bytes. Every `H2Field` in a stream
+    /// is a range into this buffer. It is cleared only when no stream holds a
+    /// range, so the bytes are reused across streams on one connection.
+    decode_buf: Vec<u8>,
+    /// Lowercased header names and merged `Vary` values for response
+    /// encoding, reused across responses. One field's bytes are appended,
+    /// then borrowed as a slice, so a response costs no `String` per field.
+    hdr_scratch: Vec<u8>,
+    /// Ordered so the response flusher can walk it by stream id without
+    /// collecting the ids into a `Vec` every time: a stream may be reaped
+    /// while it is being visited, and an ordered map stays valid across that.
+    streams: BTreeMap<u32, H2Stream>,
+    /// Retired stream state, reused so a request does not allocate its decoded
+    /// field list and body buffer on every stream. Bounded by FREE_STREAMS.
+    free_streams: Vec<H2Stream>,
+    /// The decoded field list of the request just dispatched, kept so the next
+    /// stream's decode reuses its capacity. The dispatch path takes the list out
+    /// of its stream (the ranges have to outlive the stream's borrow), and this
+    /// is where it goes back to rather than being freed per request.
+    spare_headers: Option<Vec<H2Field>>,
+    /// The last stream the flusher served. The next response is taken after
+    /// this id, which is how incremental responses at one urgency take turns;
+    /// a non-incremental response keeps the id until its body ends.
+    flush_cursor: u32,
     hpack_dec: hpack::Decoder<'static>,
     hpack_enc: hpack::Encoder<'static>,
 
@@ -371,6 +623,10 @@ pub struct Http2Conn {
     goaway_sent: bool,
     continuation_stream_id: Option<u32>,
     header_block_buf: Vec<u8>,
+    /// Requests this connection dispatched to a backend, drained by `drive`
+    /// into the loop owner's buffer. Reused so a turn that parks allocates
+    /// nothing.
+    pending_dispatch: Vec<PendingDispatch>,
 
     peer_initial_window: i32,
     peer_max_frame: u32,
@@ -396,10 +652,18 @@ impl Http2Conn {
     pub fn new() -> Self {
         Http2Conn {
             phase: Phase::Preface,
-            recv_buf: Vec::with_capacity(16_384),
-            send_buf: Vec::with_capacity(16_384),
-            last_active: Instant::now(),
-            streams: HashMap::new(),
+            recv_buf: Vec::with_capacity(crate::limits::edge().h2_recv.start()),
+            send_buf: {
+                let mut buf = m6_core::limits::Bounded::new(&crate::limits::edge().h2_send);
+                buf.set_what("an HTTP/2 response");
+                buf
+            },
+            decode_buf: Vec::with_capacity(MAX_REQUEST_HEAD.min(16 * 1024)),
+            hdr_scratch: Vec::with_capacity(8 * 1024),
+            streams: BTreeMap::new(),
+            free_streams: Vec::new(),
+            spare_headers: None,
+            flush_cursor: 0,
             hpack_dec: hpack::Decoder::new(),
             hpack_enc: hpack::Encoder::new(),
             last_stream_id: 0,
@@ -410,6 +674,7 @@ impl Http2Conn {
             goaway_sent: false,
             continuation_stream_id: None,
             header_block_buf: Vec::new(),
+            pending_dispatch: Vec::with_capacity(16),
             peer_initial_window: DEFAULT_WINDOW as i32,
             peer_max_frame: DEFAULT_MAX_FRAME,
             conn_recv_window: DEFAULT_WINDOW as i32,
@@ -433,49 +698,59 @@ impl Http2Conn {
         self.phase == Phase::Done
     }
 
-    /// Drive one step: pump I/O, parse frames, dispatch requests.
-    pub fn drive<F, G>(
+    /// Whether the connection still owes the peer DATA, so it asks for write
+    /// readiness. A stream's bytes count even after `send_buf` has just been
+    /// drained into the socket: the writable event is what refills the bounded
+    /// send queue and continues that stream. A stream whose END_STREAM has gone
+    /// out counts too, so the next flush frees its slot.
+    pub fn has_pending_send(&self) -> bool {
+        !self.send_buf.is_empty() || self.more_to_flush()
+    }
+
+    /// Whether a stream still has DATA the windows allow, or has sent its
+    /// END_STREAM and waits to be reaped.
+    fn more_to_flush(&self) -> bool {
+        self.streams
+            .values()
+            .any(|stream| stream.can_send(self.conn_send_window) || stream.end_stream_sent)
+    }
+
+    /// Drive one step: pump I/O, parse frames, dispatch requests. Returns
+    /// whether any bytes were received, so the loop touches the idle timeout.
+    /// Requests dispatched to a backend are appended to `pending`, for the
+    /// loop's owner to park.
+    pub fn drive<S, F>(
         &mut self,
         mut io: H2Io<'_>,
         client_ip: &str,
+        state: &mut S,
         on_request: &mut F,
-        on_response: &mut G,
-    ) where
-        F: FnMut(&HttpRequest, &str) -> RequestOutcome,
-        G: FnMut(
-            std::io::Result<HttpResponse>,
-            &PendingUrlContext,
-        ) -> (u16, Vec<(String, String)>, Vec<u8>, String),
+        hit: Option<&HitHeaders>,
+        pending: &mut Vec<PendingDispatch>,
+    ) -> bool
+    where
+        F: FnMut(&mut S, RequestRef<'_>, &str) -> RequestOutcome,
     {
         if self.phase == Phase::Done {
-            return;
+            return false;
         }
 
-        // Poll any pending URL-backend receivers before processing new frames.
-        self.poll_pending_url(on_response);
-
-        // Idle timeout: kill only if no frames have arrived for H2_IDLE_TIMEOUT_SECS.
-        // H2 connections are long-lived (reused across many requests), so we
-        // reset the clock on every received frame rather than from creation time.
-        if self.last_active.elapsed().as_secs() > crate::http11::H2_IDLE_TIMEOUT_SECS {
-            self.send_goaway(ERR_NO_ERROR);
-            self.flush_io(&mut io).ok();
-            self.phase = Phase::Done;
-            return;
-        }
-
-        if let Err(e) = self.fill_recv(&mut io) {
-            tracing::trace!("h2 fill_recv: {e}");
-            self.phase = Phase::Done;
-            return;
+        let mut moved = false;
+        match self.fill_recv(&mut io) {
+            Ok(m) => moved |= m,
+            Err(e) => {
+                m6_core::log::trace!("h2 fill_recv: {e}");
+                self.phase = Phase::Done;
+                return moved;
+            }
         }
 
         loop {
-            match self.process_frame(on_request, client_ip) {
+            match self.process_frame(state, on_request, client_ip, hit) {
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(e) => {
-                    tracing::warn!("http2 error: {e}");
+                    m6_core::log::warn!("http2 error: {e}");
                     // Only if nothing more specific has already been said.
                     // Handlers that detect a connection error send their own
                     // GOAWAY with the code the RFC names -- ENHANCE_YOUR_CALM
@@ -496,14 +771,16 @@ impl Http2Conn {
             }
         }
 
-        // Flush any response data that became unblocked this iteration
-        // (e.g. a WINDOW_UPDATE was processed inside the frame loop above).
-        self.flush_pending_streams();
-
-        if let Err(e) = self.flush_io(&mut io) {
-            tracing::trace!("h2 flush_io: {e}");
+        // Send any response data that became unblocked this iteration (e.g. a
+        // WINDOW_UPDATE was processed inside the frame loop above).
+        if let Err(e) = self.send_until_blocked(&mut io) {
+            m6_core::log::trace!("h2 flush_io: {e}");
             self.phase = Phase::Done;
         }
+
+        // Hand the requests this turn dispatched to a backend up to the loop's
+        // owner, which stores each waiter in the upstream slot it names.
+        pending.append(&mut self.pending_dispatch);
 
         if self.phase == Phase::GoingAway
             && self
@@ -513,19 +790,26 @@ impl Http2Conn {
         {
             self.phase = Phase::Done;
         }
+        moved
     }
 
     // ── TLS I/O ───────────────────────────────────────────────────────────────
 
-    fn fill_recv(&mut self, io: &mut H2Io<'_>) -> io::Result<()> {
+    fn fill_recv(&mut self, io: &mut H2Io<'_>) -> io::Result<bool> {
+        let mut moved = false;
         match io {
             H2Io::Tls { tls, stream } => {
                 loop {
                     match tls.read_tls(&mut &**stream) {
-                        Ok(0) => {
-                            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed"))
-                        }
+                        // A peer that has gone is the ordinary end of a
+                        // connection, and it is not worth an allocation. An
+                        // error built from a kind is a plain value, where
+                        // `io::Error::new` with a message boxes one, so a
+                        // teardown inside a counting run would add a call whose
+                        // number moves with when the shutdown lands.
+                        Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
                         Ok(_) => {
+                            moved = true;
                             tls.process_new_packets().map_err(|e| {
                                 io::Error::new(io::ErrorKind::InvalidData, e.to_string())
                             })?;
@@ -539,22 +823,18 @@ impl Http2Conn {
                         // exactly the SETTINGS_MAX_FRAME_SIZE we advertise,
                         // which RFC 9113 4.2 requires us to accept.
                         //
-                        // Treating it as an error closed the connection with no
-                        // GOAWAY, so a 16 KiB upload died mid-flight and the
-                        // peer could not tell why. `advance_tls` in http11.rs
-                        // has handled this since H1 hit the same wall; the fix
-                        // was never ported here.
-                        //
-                        // Stop pumping ciphertext for this round exactly like
-                        // WouldBlock: the drain loop below empties the reader,
-                        // and the next (level-triggered) poller wakeup resumes,
-                        // because the rest of the record is still in the kernel
-                        // socket buffer.
+                        // The socket is edge-triggered, so it is reported once
+                        // per change: drain the plaintext into the receive
+                        // buffer and read on in the same turn, or the rest of
+                        // the record stays in the kernel unread.
                         Err(e)
                             if e.kind() == io::ErrorKind::Other
                                 && e.to_string().contains("received plaintext buffer full") =>
                         {
-                            break
+                            if crate::http11::drain_tls_plaintext(tls, &mut self.recv_buf)? == 0 {
+                                break;
+                            }
+                            moved = true;
                         }
                         Err(e) => return Err(e),
                     }
@@ -565,35 +845,62 @@ impl Http2Conn {
                         Ok(0) => break,
                         Ok(n) => {
                             self.recv_buf.extend_from_slice(&tmp[..n]);
-                            self.last_active = Instant::now();
+                            moved = true;
                         }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                         Err(e) => return Err(e),
                     }
                 }
-                Ok(())
             }
             H2Io::Plain { stream } => {
                 let mut tmp = [0u8; 8192];
                 loop {
                     match stream.read(&mut tmp) {
-                        Ok(0) => {
-                            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed"))
-                        }
+                        // The plain path's end of connection, for the same
+                        // reason: no allocation on the way out.
+                        Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
                         Ok(n) => {
                             self.recv_buf.extend_from_slice(&tmp[..n]);
-                            self.last_active = Instant::now();
+                            moved = true;
                         }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                         Err(e) => return Err(e),
                     }
                 }
-                Ok(())
             }
         }
+        // Past the maximum the connection is refused, never read on: the
+        // frames wait in this buffer for the next turn's parse, and a peer
+        // that sends more than the maximum between two turns is not an
+        // HTTP/2 peer.
+        self.check_recv_room()?;
+        Ok(moved)
+    }
+
+    /// Refuse the connection when its input buffer has passed the `h2_recv`
+    /// maximum, with an error that names the key.
+    fn check_recv_room(&self) -> io::Result<()> {
+        let limit = &crate::limits::edge().h2_recv;
+        if self.recv_buf.len() > limit.max() {
+            let refusal = limit.exceeded(self.recv_buf.len(), "an HTTP/2 connection's input");
+            error!("{refusal}");
+            return Err(io::Error::other(refusal));
+        }
+        Ok(())
     }
 
     fn flush_io(&mut self, io: &mut H2Io<'_>) -> io::Result<()> {
+        // A frame refused at the `h2_send` maximum left the queue without a
+        // whole frame, so nothing more may be sent: the connection closes.
+        // Only a peer that stops reading while it asks for more gets here.
+        if let Some(needed) = self.send_buf.overflow() {
+            let refusal = self
+                .send_buf
+                .limit()
+                .exceeded(needed, "an HTTP/2 connection's output");
+            error!("{refusal}");
+            return Err(io::Error::other(refusal));
+        }
         match io {
             H2Io::Tls { tls, stream } => {
                 // Write send_buf to rustls in a loop, draining encrypted records to the
@@ -618,19 +925,21 @@ impl Http2Conn {
                                 break;
                             }
                             Err(e) => {
-                                self.send_buf.drain(..pos);
+                                self.send_buf.drain_front(pos);
                                 return Err(e);
                             }
                         }
                     }
 
                     if n == 0 && socket_full {
-                        // Both rustls buffer and TCP socket buffer are full; give up and
-                        // retry on the next drive() call (100 ms at most).
+                        // Both rustls buffer and TCP socket buffer are full:
+                        // stop and ask for write readiness. The next writable
+                        // event resumes the flush, so `send_buf` keeps the bytes
+                        // still owed.
                         break;
                     }
                 }
-                self.send_buf.drain(..pos);
+                self.send_buf.drain_front(pos);
 
                 // Final drain of any remaining encrypted records.
                 loop {
@@ -654,12 +963,12 @@ impl Http2Conn {
                         }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                         Err(e) => {
-                            self.send_buf.drain(..pos);
+                            self.send_buf.drain_front(pos);
                             return Err(e);
                         }
                     }
                 }
-                self.send_buf.drain(..pos);
+                self.send_buf.drain_front(pos);
                 Ok(())
             }
         }
@@ -667,13 +976,15 @@ impl Http2Conn {
 
     // ── Frame dispatch ────────────────────────────────────────────────────────
 
-    fn process_frame<F>(
+    fn process_frame<S, F>(
         &mut self,
+        state: &mut S,
         on_request: &mut F,
         client_ip: &str,
+        hit: Option<&HitHeaders>,
     ) -> Result<bool, &'static str>
     where
-        F: FnMut(&HttpRequest, &str) -> RequestOutcome,
+        F: FnMut(&mut S, RequestRef<'_>, &str) -> RequestOutcome,
     {
         if self.phase == Phase::Preface {
             if self.recv_buf.len() < CLIENT_PREFACE.len() {
@@ -714,9 +1025,52 @@ impl Http2Conn {
             return Ok(false);
         }
 
-        let payload: Vec<u8> = self.recv_buf[FRAME_HDR..FRAME_HDR + length].to_vec();
-        self.recv_buf.drain(..FRAME_HDR + length);
+        // One buffer, two offsets. The frame's payload is a slice of the
+        // connection's receive buffer, and the bytes after it are the tail of
+        // the same Vec, never a second one. The buffer is moved out of `self`
+        // only so the payload can be borrowed as a slice while the frame
+        // handlers borrow `self` mutably; it goes back with the consumed frame
+        // drained from the front, which keeps the Vec's capacity (so the next
+        // `fill_recv` appends instead of reallocating) and copies no payload.
+        let mut frame = std::mem::take(&mut self.recv_buf);
+        let end = FRAME_HDR + length;
+        let outcome = self.run_frame(
+            &frame[FRAME_HDR..end],
+            length,
+            ftype,
+            flags,
+            stream_id,
+            state,
+            on_request,
+            client_ip,
+            hit,
+        );
+        if matches!(outcome, Ok(true)) {
+            frame.drain(..end);
+        }
+        self.recv_buf = frame;
+        outcome
+    }
 
+    /// Dispatch one complete frame whose payload is `payload`, a slice of the
+    /// receive buffer. The caller owns moving the buffer back and consuming the
+    /// frame, so every early return here leaves the buffer with its caller.
+    #[allow(clippy::too_many_arguments)] // a frame's header fields plus the dispatch context
+    fn run_frame<S, F>(
+        &mut self,
+        payload: &[u8],
+        length: usize,
+        ftype: u8,
+        flags: u8,
+        stream_id: u32,
+        state: &mut S,
+        on_request: &mut F,
+        client_ip: &str,
+        hit: Option<&HitHeaders>,
+    ) -> Result<bool, &'static str>
+    where
+        F: FnMut(&mut S, RequestRef<'_>, &str) -> RequestOutcome,
+    {
         // Is a header block still being assembled? RFC 9113 6.10: a HEADERS
         // frame and the CONTINUATION frames that follow it are "a single
         // logical unit". State transitions therefore apply to the completed
@@ -757,7 +1111,7 @@ impl Http2Conn {
             }
             FrameVerdict::StreamError(code) => {
                 self.push_frame(TYPE_RST_STREAM, 0, stream_id, &code.to_be_bytes());
-                self.streams.remove(&stream_id);
+                self.retire_stream(stream_id);
                 self.note_reset(stream_id);
                 return Ok(true);
             }
@@ -780,15 +1134,17 @@ impl Http2Conn {
             }
             FrameVerdict::StreamError(code) => {
                 self.push_frame(TYPE_RST_STREAM, 0, stream_id, &code.to_be_bytes());
-                self.streams.remove(&stream_id);
+                self.retire_stream(stream_id);
                 return Ok(true);
             }
         }
 
         match ftype {
-            TYPE_DATA => self.handle_data(stream_id, flags, &payload, on_request, client_ip)?,
+            TYPE_DATA => {
+                self.handle_data(stream_id, flags, payload, state, on_request, client_ip, hit)?
+            }
             TYPE_HEADERS => {
-                self.handle_headers(stream_id, flags, &payload, on_request, client_ip)?
+                self.handle_headers(stream_id, flags, payload, state, on_request, client_ip, hit)?
             }
             TYPE_PRIORITY => {
                 // RFC 9113 5.3.1: "A stream cannot depend on itself. An
@@ -804,7 +1160,7 @@ impl Http2Conn {
                         stream_id,
                         &ERR_PROTOCOL_ERROR.to_be_bytes(),
                     );
-                    self.streams.remove(&stream_id);
+                    self.retire_stream(stream_id);
                     self.note_reset(stream_id);
                 }
             }
@@ -815,13 +1171,13 @@ impl Http2Conn {
                 // sending DATA on it would have read as idle -- a connection
                 // error -- instead of closed. Bumping last_stream_id keeps the
                 // derivation honest.
-                self.streams.remove(&stream_id);
+                self.retire_stream(stream_id);
                 self.last_stream_id = self.last_stream_id.max(stream_id);
                 self.note_reset(stream_id);
             }
-            TYPE_SETTINGS => self.handle_settings(flags, &payload)?,
+            TYPE_SETTINGS => self.handle_settings(flags, payload)?,
             TYPE_PUSH_PROMISE => return Err("client sent PUSH_PROMISE"),
-            TYPE_PING => self.handle_ping(flags, &payload),
+            TYPE_PING => self.handle_ping(flags, payload),
             TYPE_GOAWAY => {
                 // NOT `phase = GoingAway`. That is our own teardown, and taking
                 // it here meant closing the connection the instant no streams
@@ -836,16 +1192,52 @@ impl Http2Conn {
                 // timeout fires. Both already drive us to Done.
                 self.peer_goaway = true;
             }
-            TYPE_WINDOW_UPDATE => self.handle_window_update(stream_id, &payload)?,
-            TYPE_CONTINUATION => {
-                self.handle_continuation(stream_id, flags, &payload, on_request, client_ip)?
-            }
+            TYPE_WINDOW_UPDATE => self.handle_window_update(stream_id, payload)?,
+            TYPE_CONTINUATION => self.handle_continuation(
+                stream_id, flags, payload, state, on_request, client_ip, hit,
+            )?,
+            // PRIORITY_UPDATE (RFC 9218 section 7, type 0x10) is ignored along
+            // with every other unknown type: this trial measures the header
+            // alone.
             _ => {}
         }
         Ok(true)
     }
 
     // ── Stream state machine (RFC 9113 5.1) ───────────────────────────────────
+
+    /// A stream for a new id, from the retired pool when there is one. The
+    /// allocations (the field list and the body buffer) are reused rather than
+    /// made per request.
+    fn new_stream(&mut self, initial_send_window: i32) -> H2Stream {
+        let mut stream = match self.free_streams.pop() {
+            Some(stream) => stream,
+            None => H2Stream::new(initial_send_window),
+        };
+        if let Some(list) = self.spare_headers.take() {
+            stream.headers = list;
+        }
+        stream.reset(initial_send_window);
+        stream
+    }
+
+    /// Retire a stream, keeping its allocations for the next one on this
+    /// connection. The list and body are cleared when the stream is reused, and
+    /// a body buffer larger than 64 KiB is dropped so a peer cannot park one.
+    fn retire_stream(&mut self, stream_id: u32) {
+        let Some(mut stream) = self.streams.remove(&stream_id) else {
+            return;
+        };
+        if self.free_streams.len() < FREE_STREAMS {
+            stream.headers.clear();
+            if stream.body.capacity() > 64 * 1024 {
+                stream.body = Vec::new();
+            } else {
+                stream.body.clear();
+            }
+            self.free_streams.push(stream);
+        }
+    }
 
     /// Drop a stream that has just been answered, remembering its send window.
     ///
@@ -854,7 +1246,7 @@ impl Http2Conn {
     /// one round trip, not an unbounded history.
     fn close_stream_remembering_window(&mut self, stream_id: u32) {
         let window = self.streams.get(&stream_id).map(|s| s.send_window);
-        self.streams.remove(&stream_id);
+        self.retire_stream(stream_id);
         if let Some(w) = window {
             if self.closed_windows.len() >= RESET_MEMORY {
                 self.closed_windows.pop_front();
@@ -868,7 +1260,8 @@ impl Http2Conn {
         if self.recently_reset.len() >= RESET_MEMORY {
             self.recently_reset.pop_front();
         }
-        self.recently_reset.push_back((stream_id, Instant::now()));
+        self.recently_reset
+            .push_back((stream_id, m6_core::platform::now()));
     }
 
     fn was_reset(&self, stream_id: u32) -> bool {
@@ -1104,7 +1497,7 @@ impl Http2Conn {
                 // SETTINGS_HEADER_TABLE_SIZE = 0xFFFFFFFF and m6 would size its
                 // own dynamic table cap at 4 GiB, then fill it with indexed
                 // literals across many header blocks -- the table lives for the
-                // whole connection, so MAX_HEADER_BLOCK's per-block cap does not
+                // whole connection, so the `h2_header_block` per-block cap does not
                 // bound the total. That is an out-of-memory vector, and it costs
                 // an attacker one SETTINGS frame.
                 //
@@ -1191,7 +1584,7 @@ impl Http2Conn {
                     stream_id,
                     &ERR_FLOW_CONTROL.to_be_bytes(),
                 );
-                self.streams.remove(&stream_id);
+                self.retire_stream(stream_id);
                 self.note_reset(stream_id);
                 return Ok(());
             }
@@ -1224,16 +1617,19 @@ impl Http2Conn {
         Ok(())
     }
 
-    fn handle_headers<F>(
+    #[allow(clippy::too_many_arguments)] // a frame's fields, its stream, the state and the dispatch context
+    fn handle_headers<S, F>(
         &mut self,
         stream_id: u32,
         flags: u8,
         payload: &[u8],
+        state: &mut S,
         on_request: &mut F,
         client_ip: &str,
+        hit: Option<&HitHeaders>,
     ) -> Result<(), &'static str>
     where
-        F: FnMut(&HttpRequest, &str) -> RequestOutcome,
+        F: FnMut(&mut S, RequestRef<'_>, &str) -> RequestOutcome,
     {
         if stream_id == 0 {
             return Err("HEADERS on stream 0");
@@ -1280,7 +1676,7 @@ impl Http2Conn {
         // full inline dispatch, while the count it was measured by stayed at
         // zero. Recently-reset streams keep their slot for `RESET_DECAY` so the
         // cap counts streams *started*, not streams still open.
-        if self.active_streams(Instant::now()) >= MAX_CONCURRENT as usize {
+        if self.active_streams(m6_core::platform::now()) >= MAX_CONCURRENT as usize {
             self.push_frame(
                 TYPE_RST_STREAM,
                 0,
@@ -1369,31 +1765,51 @@ impl Http2Conn {
         }
         let header_block = &payload[pos..payload.len() - pad];
 
-        let stream = self
-            .streams
-            .entry(stream_id)
-            .or_insert_with(|| H2Stream::new(self.peer_initial_window));
+        if !self.streams.contains_key(&stream_id) {
+            let stream = self.new_stream(self.peer_initial_window);
+            self.streams.insert(stream_id, stream);
+        }
+        let stream = self.streams.get_mut(&stream_id).expect("just inserted");
         if flags & FLAG_END_STREAM != 0 {
             stream.state = StreamState::HalfClosedRemote;
         }
 
         if flags & FLAG_END_HEADERS != 0 {
-            let mut combined = self.header_block_buf.clone();
+            // The header block is assembled by moving the continuation buffer
+            // out and back rather than cloning it, so its capacity survives
+            // the frame. The decoded fields go straight into the stream's
+            // list, as ranges into the connection's decode buffer: nothing is
+            // copied into a String here.
+            let mut combined = std::mem::take(&mut self.header_block_buf);
             combined.extend_from_slice(header_block);
-            self.header_block_buf.clear();
             self.continuation_stream_id = None;
             self.check_hpack_block(&combined)?;
-            let dec = &mut self.hpack_dec;
-            let stream = self.streams.get_mut(&stream_id).unwrap();
-            // A second complete header block on a stream is a TRAILER section
-            // (RFC 9113 8.1). Decode it separately so it can be checked on its
-            // own: trailers carry no pseudo-headers, and merging first would
-            // make one indistinguishable from a legitimate leading field.
-            let is_trailers = stream.headers_done;
-            let mut block = Vec::new();
-            let list_size = decode_hpack(dec, &combined, &mut block)?;
-            if list_size > MAX_HEADER_LIST_SIZE {
-                self.refuse_oversize_header_list(stream_id);
+            self.begin_header_block();
+            let (is_trailers, first, list_size) = {
+                let stream = self.streams.get_mut(&stream_id).unwrap();
+                let is_trailers = stream.headers_done;
+                let first = stream.headers.len();
+                let list_size = decode_hpack(
+                    &mut self.hpack_dec,
+                    &combined,
+                    &mut self.decode_buf,
+                    &mut stream.headers,
+                );
+                (is_trailers, first, list_size)
+            };
+            self.header_block_buf = combined;
+            self.header_block_buf.clear();
+            let list_size = list_size?;
+            let status = {
+                let stream = &self.streams[&stream_id];
+                crate::fields::head_limit_status(
+                    field_byte_pairs(&stream.headers[first..], &self.decode_buf),
+                    list_size,
+                )
+            };
+            if let Some(status) = status {
+                let method = self.refusal_method(stream_id, &[]);
+                self.refuse_head(stream_id, status, &method);
                 return Ok(());
             }
             if is_trailers {
@@ -1412,98 +1828,177 @@ impl Http2Conn {
                 // connection-wide, so skipping a block would desynchronise every
                 // later one on a healthy stream.
                 if flags & FLAG_END_STREAM == 0 {
-                    tracing::debug!(stream_id, "h2: second HEADERS frame without END_STREAM");
+                    m6_core::log::debug!(stream_id, "h2: second HEADERS frame without END_STREAM");
                     self.push_frame(
                         TYPE_RST_STREAM,
                         0,
                         stream_id,
                         &ERR_PROTOCOL_ERROR.to_be_bytes(),
                     );
-                    self.streams.remove(&stream_id);
+                    self.retire_stream(stream_id);
                     return Ok(());
                 }
-                if let Some((name, _)) = block.iter().find(|(k, _)| k.starts_with(':')) {
-                    tracing::debug!(stream_id, field = %name, "h2: pseudo-header in trailers");
+                let pseudo = {
+                    let stream = &self.streams[&stream_id];
+                    stream.headers[first..]
+                        .iter()
+                        .find(|f| field_name(&self.decode_buf, f).starts_with(':'))
+                        .map(|f| field_name(&self.decode_buf, f).to_string())
+                };
+                if let Some(name) = pseudo {
+                    m6_core::log::debug!(stream_id, field = %name, "h2: pseudo-header in trailers");
                     self.push_frame(
                         TYPE_RST_STREAM,
                         0,
                         stream_id,
                         &ERR_PROTOCOL_ERROR.to_be_bytes(),
                     );
-                    self.streams.remove(&stream_id);
+                    self.retire_stream(stream_id);
                     return Ok(());
                 }
             }
-            let stream = self.streams.get_mut(&stream_id).unwrap();
-            stream.headers.extend(block);
-            stream.headers_done = true;
+            // The stream's priority is read from its request's HEADERS. The
+            // branch decodes those fields as ranges into the connection's
+            // buffer, so the priority is read from the borrowed views and no
+            // owned pair is built for it. Trailers carry no priority.
+            let priority = if is_trailers {
+                None
+            } else {
+                Some(crate::priority::from_headers(field_byte_pairs(
+                    &self.streams[&stream_id].headers[first..],
+                    &self.decode_buf,
+                )))
+            };
+            if let Some(stream) = self.streams.get_mut(&stream_id) {
+                if let Some(priority) = priority {
+                    stream.record_priority(priority);
+                }
+                stream.headers_done = true;
+            }
         } else {
-            if self.header_block_buf.len() + header_block.len() > MAX_HEADER_BLOCK {
+            let limit = &crate::limits::edge().h2_header_block;
+            if self.header_block_buf.len() + header_block.len() > limit.max() {
+                error!(
+                    "{}",
+                    limit.exceeded(
+                        self.header_block_buf.len() + header_block.len(),
+                        "an HTTP/2 header block"
+                    )
+                );
                 self.send_goaway(ERR_ENHANCE_YOUR_CALM);
                 self.phase = Phase::GoingAway;
-                return Err("header block exceeds MAX_HEADER_BLOCK");
+                return Err("header block exceeds the h2_header_block maximum");
             }
             self.header_block_buf.extend_from_slice(header_block);
             self.continuation_stream_id = Some(stream_id);
         }
 
-        self.maybe_dispatch(stream_id, on_request, client_ip);
+        self.maybe_dispatch(stream_id, state, on_request, client_ip, hit);
         Ok(())
     }
 
-    fn handle_continuation<F>(
+    #[allow(clippy::too_many_arguments)] // a frame's fields, its stream, the state and the dispatch context
+    fn handle_continuation<S, F>(
         &mut self,
         stream_id: u32,
         flags: u8,
         payload: &[u8],
+        state: &mut S,
         on_request: &mut F,
         client_ip: &str,
+        hit: Option<&HitHeaders>,
     ) -> Result<(), &'static str>
     where
-        F: FnMut(&HttpRequest, &str) -> RequestOutcome,
+        F: FnMut(&mut S, RequestRef<'_>, &str) -> RequestOutcome,
     {
         // The flood bound. Checked on every CONTINUATION, not merely at the end
         // of the block: the whole point of the attack is that the block never
         // ends, so a check that only runs at END_HEADERS never runs at all.
-        if self.header_block_buf.len() + payload.len() > MAX_HEADER_BLOCK {
+        let limit = &crate::limits::edge().h2_header_block;
+        if self.header_block_buf.len() + payload.len() > limit.max() {
+            error!(
+                "{}",
+                limit.exceeded(
+                    self.header_block_buf.len() + payload.len(),
+                    "an HTTP/2 header block"
+                )
+            );
             self.send_goaway(ERR_ENHANCE_YOUR_CALM);
             self.phase = Phase::GoingAway;
-            return Err("header block exceeds MAX_HEADER_BLOCK");
+            return Err("header block exceeds the h2_header_block maximum");
         }
         self.header_block_buf.extend_from_slice(payload);
         if flags & FLAG_END_HEADERS != 0 {
             self.continuation_stream_id = None;
-            let all = self.header_block_buf.clone();
-            self.header_block_buf.clear();
+            let all = std::mem::take(&mut self.header_block_buf);
             self.check_hpack_block(&all)?;
+            self.begin_header_block();
+            // A stream reset while its header block was still arriving: the
+            // block must still be decoded so the HPACK table stays in step,
+            // but there is no stream to keep the fields on.
+            let Some(stream) = self.streams.get_mut(&stream_id) else {
+                let mut scratch = Vec::new();
+                let result = decode_hpack(
+                    &mut self.hpack_dec,
+                    &all,
+                    &mut self.decode_buf,
+                    &mut scratch,
+                );
+                self.header_block_buf = all;
+                self.header_block_buf.clear();
+                result?;
+                return Ok(());
+            };
+            let first = stream.headers.len();
+            let list_size = decode_hpack(
+                &mut self.hpack_dec,
+                &all,
+                &mut self.decode_buf,
+                &mut stream.headers,
+            );
+            self.header_block_buf = all;
+            self.header_block_buf.clear();
+            let list_size = list_size?;
+            let status = {
+                let stream = &self.streams[&stream_id];
+                crate::fields::head_limit_status(
+                    field_byte_pairs(&stream.headers[first..], &self.decode_buf),
+                    list_size,
+                )
+            };
+            if let Some(status) = status {
+                let method = self.refusal_method(stream_id, &[]);
+                self.refuse_head(stream_id, status, &method);
+                return Ok(());
+            }
             if let Some(stream) = self.streams.get_mut(&stream_id) {
-                let dec = &mut self.hpack_dec;
-                // Can't call decode_hpack with self.hpack_dec while stream borrowed.
-                // Decode into a temp vec and extend.
-                let mut tmp = Vec::new();
-                let list_size = decode_hpack(dec, &all, &mut tmp)?;
-                if list_size > MAX_HEADER_LIST_SIZE {
-                    self.refuse_oversize_header_list(stream_id);
-                    return Ok(());
+                if !stream.headers_done {
+                    let priority = crate::priority::from_headers(field_byte_pairs(
+                        &stream.headers[first..],
+                        &self.decode_buf,
+                    ));
+                    stream.record_priority(priority);
                 }
-                stream.headers.extend(tmp);
                 stream.headers_done = true;
             }
-            self.maybe_dispatch(stream_id, on_request, client_ip);
+            self.maybe_dispatch(stream_id, state, on_request, client_ip, hit);
         }
         Ok(())
     }
 
-    fn handle_data<F>(
+    #[allow(clippy::too_many_arguments)] // a frame's fields, its stream, the state and the dispatch context
+    fn handle_data<S, F>(
         &mut self,
         stream_id: u32,
         flags: u8,
         payload: &[u8],
+        state: &mut S,
         on_request: &mut F,
         client_ip: &str,
+        hit: Option<&HitHeaders>,
     ) -> Result<(), &'static str>
     where
-        F: FnMut(&HttpRequest, &str) -> RequestOutcome,
+        F: FnMut(&mut S, RequestRef<'_>, &str) -> RequestOutcome,
     {
         if stream_id == 0 {
             return Err("DATA on stream 0");
@@ -1554,11 +2049,26 @@ impl Http2Conn {
             if s.recv_window < 0 {
                 return Err("stream flow control exceeded");
             }
-            if s.body.len() + data_len > MAX_H2_BODY {
+            let limit = &crate::limits::edge().h2_stream_body;
+            if s.body.len() + data_len > limit.max() {
+                error!(
+                    "{}",
+                    limit.exceeded(s.body.len() + data_len, "an HTTP/2 request body")
+                );
                 over_cap = true;
                 false
             } else {
+                if s.body.capacity() == 0 {
+                    s.body.reserve_exact(limit.start());
+                }
+                let before = s.body.capacity();
                 s.body.extend_from_slice(data);
+                crate::limits::log_growth(
+                    limit,
+                    before,
+                    s.body.capacity(),
+                    "an HTTP/2 request body",
+                );
                 if flags & FLAG_END_STREAM != 0 {
                     s.state = StreamState::HalfClosedRemote;
                 }
@@ -1572,7 +2082,7 @@ impl Http2Conn {
             false
         };
         if over_cap {
-            self.streams.remove(&stream_id);
+            self.retire_stream(stream_id);
             self.push_frame(
                 TYPE_RST_STREAM,
                 0,
@@ -1586,16 +2096,34 @@ impl Http2Conn {
         }
 
         if should_dispatch {
-            self.maybe_dispatch(stream_id, on_request, client_ip);
+            self.maybe_dispatch(stream_id, state, on_request, client_ip, hit);
         }
         Ok(())
     }
 
     // ── Request dispatch ──────────────────────────────────────────────────────
 
-    fn maybe_dispatch<F>(&mut self, stream_id: u32, on_request: &mut F, peer_ip: &str)
-    where
-        F: FnMut(&HttpRequest, &str) -> RequestOutcome,
+    /// Start decoding a new header block into the connection's buffer.
+    ///
+    /// The buffer is per connection and reused across streams. Its bytes can
+    /// only be cleared when no stream still holds a range into it: a stream
+    /// waiting for the rest of its body keeps its decoded head there across
+    /// loop turns, and so does a trailer block.
+    fn begin_header_block(&mut self) {
+        if self.streams.values().all(|s| s.headers.is_empty()) {
+            self.decode_buf.clear();
+        }
+    }
+
+    fn maybe_dispatch<S, F>(
+        &mut self,
+        stream_id: u32,
+        state: &mut S,
+        on_request: &mut F,
+        peer_ip: &str,
+        hit: Option<&HitHeaders>,
+    ) where
+        F: FnMut(&mut S, RequestRef<'_>, &str) -> RequestOutcome,
     {
         let ready = self
             .streams
@@ -1603,10 +2131,10 @@ impl Http2Conn {
             .map(|s| {
                 s.headers_done
                 && (s.state == StreamState::HalfClosedRemote
-                    || is_headersonly(&s.headers))
+                    || is_headersonly(&s.headers, &self.decode_buf))
                 && s.state != StreamState::Closed
                 && s.resp_body.is_none()  // not already dispatched
-                && s.pending_rx.is_none() // not already waiting on async
+                && !s.pending // not already waiting on async
             })
             .unwrap_or(false);
 
@@ -1614,28 +2142,42 @@ impl Http2Conn {
             return;
         }
 
-        // Clone what we need, then drop the immutable borrow.
-        let (headers, body) = {
-            let s = &self.streams[&stream_id];
-            (s.headers.clone(), s.body.clone())
+        // Take the request out of the stream so the fields and body move rather
+        // than clone. They are read in place by the borrowed view below; a miss
+        // moves the body into its owned request, and a parked dispatch keeps
+        // the owned request in `ctx.req`.
+        let (mut headers, body) = {
+            let s = self.streams.get_mut(&stream_id).unwrap();
+            (std::mem::take(&mut s.headers), std::mem::take(&mut s.body))
         };
 
         // RFC 9113 8.3.1 -- reject a malformed request rather than serving it.
         // Stream error, not connection error: the fault is in this request's
         // header list, and the connection (and its HPACK dynamic table) stay
         // valid for other streams.
-        // RFC 9113 8.1.2.6: a declared content-length that disagrees with the
-        // DATA actually received is a malformed request. This is not only a
-        // conformance point -- a length mismatch between what a message claims
-        // and what it carries is the same class of ambiguity that makes request
-        // smuggling work, and here m6 is the one that would forward it on.
-        if let Some(declared) = headers
-            .iter()
-            .find(|(k, _)| k == "content-length")
-            .and_then(|(_, v)| v.trim().parse::<usize>().ok())
-        {
-            if declared != body.len() {
-                tracing::debug!(
+        // RFC 9113 8.1.2.6 and RFC 9110 8.6: a declared content-length must be
+        // `1*DIGIT` and must agree with the DATA actually received. Both are
+        // malformed requests. This is not only a conformance point -- a length
+        // mismatch between what a message claims and what it carries is the
+        // same class of ambiguity that makes request smuggling work, and here
+        // m6 is the one that would forward it on.
+        match declared_content_length(&headers, &self.decode_buf) {
+            Err(()) => {
+                m6_core::log::debug!(
+                    stream_id,
+                    "h2: content-length is not 1*DIGIT, which RFC 9110 8.6 requires"
+                );
+                self.push_frame(
+                    TYPE_RST_STREAM,
+                    0,
+                    stream_id,
+                    &ERR_PROTOCOL_ERROR.to_be_bytes(),
+                );
+                self.retire_stream(stream_id);
+                return;
+            }
+            Ok(Some(declared)) if declared != body.len() => {
+                m6_core::log::debug!(
                     stream_id,
                     declared,
                     actual = body.len(),
@@ -1647,55 +2189,94 @@ impl Http2Conn {
                     stream_id,
                     &ERR_PROTOCOL_ERROR.to_be_bytes(),
                 );
-                self.streams.remove(&stream_id);
+                self.retire_stream(stream_id);
                 return;
             }
+            Ok(_) => {}
         }
 
-        if let Err(why) = validate_request_headers(&headers) {
-            tracing::debug!(stream_id, reason = why, "h2: malformed request headers");
+        if let Err(why) =
+            validate_request_header_bytes(field_byte_pairs(&headers, &self.decode_buf))
+        {
+            m6_core::log::debug!(stream_id, reason = why, "h2: malformed request headers");
             self.push_frame(
                 TYPE_RST_STREAM,
                 0,
                 stream_id,
                 &ERR_PROTOCOL_ERROR.to_be_bytes(),
             );
-            self.streams.remove(&stream_id);
+            self.retire_stream(stream_id);
             return;
         }
 
-        let (req, forwarded_for) = build_request(&headers, body);
+        // A request parked across loop turns stores ranges into the connection's
+        // buffer (the decoded fields above); the view built here re-borrows them
+        // for this call only. A cached hit is answered from the view, so nothing
+        // is copied into a String, Vec or HeaderMap on that path.
+        let is_head = fields(&headers, &self.decode_buf)
+            .find(|(k, _)| *k == ":method")
+            .is_some_and(|(_, v)| v.eq_ignore_ascii_case("HEAD"));
 
         // Per REQUEST, not per connection. One backbone connection from a
         // cache node is long-lived and multiplexes requests from many
         // different visitors, so a connection-level address would attribute
-        // all of them to whoever opened it.
-        let client_ip = crate::forward::attributed_client_ip(
-            forwarded_for.as_deref(),
-            peer_ip,
-            self.forwarded_trust,
-        )
-        .to_string();
+        // all of them to whoever opened it. The value is stripped from the
+        // forwarded list either way.
+        let forwarded_for = fields(&headers, &self.decode_buf)
+            .filter(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-for"))
+            .map(|(_, v)| v)
+            .last();
+        let client_ip =
+            crate::forward::attributed_client_ip(forwarded_for, peer_ip, self.forwarded_trust);
 
-        match on_request(&req, &client_ip) {
-            RequestOutcome::Ready(status, resp_headers, resp_body, _) => {
-                let method = req.method.clone();
+        let req = H2Request::new(&headers, &self.decode_buf, body);
+        match on_request(state, RequestRef::H2(req), client_ip) {
+            RequestOutcome::Ready(status, resp_headers, resp_body, _, genid) => {
                 self.dispatch_h2_response(
                     stream_id,
                     H2Response {
                         status,
                         headers: resp_headers,
                         body: resp_body,
+                        genid,
                     },
-                    &method,
+                    is_head,
                 );
             }
-            RequestOutcome::Pending { rx, ctx } => {
+            RequestOutcome::Cached {
+                entry,
+                age,
+                set_cookie,
+            } => {
+                // A cache hit is written from the entry's own bytes: the
+                // header strings and the body are borrowed, never cloned.
+                let hit = hit.expect("a cache hit carries the hit headers");
+                self.dispatch_cached_h2_response(
+                    stream_id,
+                    &entry,
+                    age,
+                    set_cookie.as_deref(),
+                    hit,
+                    is_head,
+                );
+            }
+            RequestOutcome::Pending { id, ctx } => {
                 if let Some(s) = self.streams.get_mut(&stream_id) {
-                    s.pending_rx = Some((rx, ctx));
+                    s.pending = true;
                 }
+                self.pending_dispatch.push(PendingDispatch {
+                    stream: Some(stream_id),
+                    id,
+                    ctx,
+                });
             }
         }
+        // The view borrowed this list; it is ours again now. Keeping it means
+        // the next stream decodes into the same allocation instead of growing a
+        // fresh `Vec` field by field. Cleared, so no range into `decode_buf`
+        // outlives the request it belongs to.
+        headers.clear();
+        self.spare_headers = Some(headers);
     }
 
     /// Complete a synchronous (Ready) H2 response: send server push, encode headers,
@@ -1703,11 +2284,12 @@ impl Http2Conn {
     /// `on_request` and `client_ip` were parameters until 2026-09-18: push
     /// re-entered the request handler to fetch each hinted asset. With push gone
     /// this only writes the response it was handed. See issue #93.
-    fn dispatch_h2_response(&mut self, stream_id: u32, resp: H2Response, method: &str) {
+    fn dispatch_h2_response(&mut self, stream_id: u32, resp: H2Response, is_head: bool) {
         let H2Response {
             status,
             headers: resp_headers,
             body: resp_body,
+            genid,
         } = resp;
         // ── No server push, and no 103 Early Hints ───────────────────────
         //
@@ -1750,13 +2332,12 @@ impl Http2Conn {
         // is what made HTTP/2 abort the stream with INTERNAL_ERROR: the DATA
         // frames disagreed with the framing the client had been promised.
         let advertised_len = resp_body.len();
-        let resp_body = if method.eq_ignore_ascii_case("HEAD") {
-            Vec::new()
+        let resp_body = if is_head {
+            bytes::Bytes::new()
         } else {
-            resp_body
+            bytes::Bytes::from(resp_body)
         };
-        let header_block = self.encode_response_headers(status, &resp_headers, advertised_len);
-        self.push_frame(TYPE_HEADERS, FLAG_END_HEADERS, stream_id, &header_block);
+        self.push_response_headers(stream_id, status, &resp_headers, advertised_len, genid);
 
         // Store response body for flow-controlled delivery. An empty body sends
         // a bare DATA + END_STREAM, which closes the stream cleanly.
@@ -1769,206 +2350,312 @@ impl Http2Conn {
         self.flush_pending_streams();
     }
 
-    /// Poll all streams that have a pending URL-backend receiver.
-    fn poll_pending_url<G>(&mut self, on_response: &mut G)
-    where
-        G: FnMut(
-            std::io::Result<HttpResponse>,
-            &PendingUrlContext,
-        ) -> (u16, Vec<(String, String)>, Vec<u8>, String),
-    {
-        use std::sync::mpsc::TryRecvError;
-        let stream_ids: Vec<u32> = self.streams.keys().copied().collect();
-        for sid in stream_ids {
-            // Check without taking ownership first.
-            // rx sends io::Result<HttpResponse>, so try_recv() gives Result<io::Result<HttpResponse>, TryRecvError>.
-            let result: Option<std::io::Result<HttpResponse>> = match self.streams.get(&sid) {
-                Some(s) => match &s.pending_rx {
-                    Some((rx, _)) => match rx.try_recv() {
-                        Ok(r) => Some(r), // r is already io::Result<HttpResponse>
-                        Err(TryRecvError::Empty) => None,
-                        Err(TryRecvError::Disconnected) => Some(Err(std::io::Error::new(
-                            std::io::ErrorKind::BrokenPipe,
-                            "url backend thread died",
-                        ))),
-                    },
-                    None => None,
-                },
-                None => None,
-            };
-            if let Some(http_result) = result {
-                // Move out the pending context.
-                let ctx = self
-                    .streams
-                    .get_mut(&sid)
-                    .and_then(|s| s.pending_rx.take())
-                    .map(|(_, ctx)| ctx);
-                if let Some(ctx) = ctx {
-                    let (status, resp_headers, resp_body, _) = on_response(http_result, &ctx);
-                    // Same HEAD framing as the sync path above.
-                    let advertised_len = resp_body.len();
-                    let resp_body = if ctx.req.method.eq_ignore_ascii_case("HEAD") {
-                        Vec::new()
-                    } else {
-                        resp_body
-                    };
-                    let header_block =
-                        self.encode_response_headers(status, &resp_headers, advertised_len);
-                    self.push_frame(TYPE_HEADERS, FLAG_END_HEADERS, sid, &header_block);
-                    if let Some(s) = self.streams.get_mut(&sid) {
-                        s.resp_body = Some(resp_body);
-                        s.resp_sent = 0;
-                    }
-                    self.flush_pending_streams();
-                }
-            }
+    /// Write a finished backend response into a waiting stream and flush the
+    /// connection now, so the reply starts leaving in this turn. A stream that
+    /// is gone (reset by the client) is a no-op, so a stale completion drops
+    /// its result rather than writing to a closed stream.
+    #[allow(clippy::too_many_arguments)] // one response's five fields plus the writer's
+    pub fn complete_stream(
+        &mut self,
+        io: &mut H2Io<'_>,
+        stream_id: u32,
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        method: &str,
+        genid: Option<u64>,
+    ) {
+        if !self.streams.get(&stream_id).is_some_and(|s| s.pending) {
+            return;
+        }
+        if let Some(s) = self.streams.get_mut(&stream_id) {
+            s.pending = false;
+        }
+        self.dispatch_h2_response(
+            stream_id,
+            H2Response {
+                status,
+                headers,
+                body,
+                genid,
+            },
+            method.eq_ignore_ascii_case("HEAD"),
+        );
+        if self.send_until_blocked(io).is_err() {
+            self.phase = Phase::Done;
         }
     }
 
     // ── Flow-controlled response flusher ─────────────────────────────────────
 
-    /// Send buffered response DATA frames for all streams, respecting both the
-    /// connection-level and per-stream send windows.  Called after dispatching
-    /// a request and after every WINDOW_UPDATE.
+    /// Frame DATA and write it, again and again, until the socket would block
+    /// or nothing is left that the windows allow.
+    ///
+    /// The send queue is bounded at the `h2_send` limit's `start`, so one pass frames one
+    /// queue's worth and a body of any length needs many. The loop is
+    /// edge-triggered: a socket that took everything it was given reports no new
+    /// writable edge, because it never stopped being writable, so a pass that
+    /// frames one queue and returns waits for an event that never comes. Writing
+    /// until the socket refuses is what makes the next edge certain: it arrives
+    /// when the kernel drains below the mark, and that event runs this again.
+    /// On a link slow enough to refuse, the bound and the kernel's own mark are
+    /// what keep the order m6's; on one that never refuses, there is no queue
+    /// for an order to matter in.
+    fn send_until_blocked(&mut self, io: &mut H2Io<'_>) -> io::Result<()> {
+        loop {
+            self.flush_pending_streams();
+            self.flush_io(io)?;
+            if !self.send_buf.is_empty() || io.tls_pending() || !self.more_to_flush() {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Frame response DATA for the streams that have some, until the send
+    /// queue holds the `h2_send` `start` or nothing is left that the windows
+    /// allow. Called after dispatching a response, after every WINDOW_UPDATE,
+    /// and on every writable event: the bound stops a whole body reaching the
+    /// kernel at once, so the next writable event picks up where this one
+    /// stopped and m6, rather than the kernel, decides what leaves first.
+    ///
+    /// The next frame comes from the lowest urgency that has a response ready
+    /// (RFC 9218 section 10). Within it the responses are taken in stream-id
+    /// order: a non-incremental response is sent to its end before the next
+    /// one starts, and an incremental response takes one frame and yields to
+    /// its peers, because the client can use the beginning as it arrives.
     fn flush_pending_streams(&mut self) {
-        let stream_ids: Vec<u32> = self.streams.keys().copied().collect();
         let max = self.peer_max_frame as usize;
+        self.reap_ended_streams();
+        while self.send_buf.len() < self.send_buf.limit().start() {
+            let Some(stream_id) = self.next_sendable_stream() else {
+                break;
+            };
+            if self
+                .streams
+                .get(&stream_id)
+                .is_some_and(|stream| stream.priority.incremental)
+            {
+                self.frame_data(stream_id, max);
+            } else {
+                self.flush_stream(stream_id, max);
+            }
+            self.flush_cursor = stream_id;
+        }
+    }
 
-        'outer: for stream_id in stream_ids {
-            loop {
-                // Determine how many bytes we can send right now.
-                let (to_send, is_last) = {
-                    let s = match self.streams.get(&stream_id) {
-                        Some(s) => s,
-                        None => continue 'outer,
-                    };
-                    let body = match &s.resp_body {
-                        Some(b) => b,
-                        None => continue 'outer, // not dispatched yet
-                    };
-                    let remaining = body.len() - s.resp_sent;
-                    if remaining == 0 {
-                        // Body fully consumed (or empty); send END_STREAM and reap.
-                        (0usize, true)
-                    } else {
-                        if self.conn_send_window <= 0 || s.send_window <= 0 {
-                            tracing::trace!(
-                                "h2 stream {} blocked: conn_window={} stream_window={} remaining={}",
-                                stream_id, self.conn_send_window, s.send_window, remaining
-                            );
-                            continue 'outer; // blocked; wait for WINDOW_UPDATE
-                        }
-                        let window = (self.conn_send_window.min(s.send_window) as usize).min(max);
-                        let n = remaining.min(window);
-                        (n, s.resp_sent + n == body.len())
-                    }
-                };
+    /// Free a stream whose own END_STREAM has gone out. It has nothing left to
+    /// send, and its entry counts against the peer's concurrency limit, so the
+    /// slot is not held until the peer ends its request. The peer's end of the
+    /// request may still be open, in which case the stream state is the peer's
+    /// half of the machine and a later DATA from it is answered STREAM_CLOSED.
+    fn reap_ended_streams(&mut self) {
+        while let Some(stream_id) = self
+            .streams
+            .iter()
+            .find(|(_, stream)| stream.end_stream_sent)
+            .map(|(&stream_id, _)| stream_id)
+        {
+            self.close_stream_remembering_window(stream_id);
+        }
+    }
 
-                if to_send == 0 && is_last {
-                    // Empty DATA + END_STREAM to close the stream.
-                    self.push_frame(TYPE_DATA, FLAG_END_STREAM, stream_id, &[]);
-                    self.close_stream_remembering_window(stream_id);
-                    continue 'outer;
+    /// The stream whose frame goes next: the lowest urgency with a response to
+    /// send, taken in stream-id order after the last stream served.
+    /// A non-incremental response already in flight keeps the turn until its
+    /// body ends, because the client cannot use any of it before then. One at
+    /// a lower urgency than the lowest ready stream does not: urgency decides
+    /// first.
+    fn next_sendable_stream(&self) -> Option<u32> {
+        let ready = |urgency: u8, stream: &H2Stream| {
+            stream.priority.urgency == urgency && stream.can_send(self.conn_send_window)
+        };
+        let urgency =
+            (0..=7).find(|&urgency| self.streams.values().any(|stream| ready(urgency, stream)))?;
+        let in_flight = self.streams.get(&self.flush_cursor);
+        if in_flight.is_some_and(|stream| !stream.priority.incremental && ready(urgency, stream)) {
+            return Some(self.flush_cursor);
+        }
+        let next = |(_, stream): &(&u32, &H2Stream)| ready(urgency, stream);
+        self.streams
+            .range((Excluded(self.flush_cursor), Unbounded))
+            .find(next)
+            .or_else(|| self.streams.iter().find(next))
+            .map(|(&stream_id, _)| stream_id)
+    }
+
+    /// Frame one stream's response: one DATA frame per iteration, stopping when
+    /// its window is spent or the queue is full.
+    fn flush_stream(&mut self, stream_id: u32, max: usize) {
+        while self.send_buf.len() < self.send_buf.limit().start()
+            && self
+                .streams
+                .get(&stream_id)
+                .is_some_and(|s| s.can_send(self.conn_send_window))
+        {
+            self.frame_data(stream_id, max);
+        }
+    }
+
+    /// Append one frame for `stream_id`: the empty END_STREAM an empty body
+    /// still owes, or one DATA frame of its body. The last body frame carries
+    /// END_STREAM. The caller's `can_send` check says the stream is owed one.
+    fn frame_data(&mut self, stream_id: u32, max: usize) {
+        let (to_send, is_last) = {
+            let stream = self
+                .streams
+                .get(&stream_id)
+                .expect("the flusher picked a live stream");
+            let body = stream
+                .resp_body
+                .as_ref()
+                .expect("the flusher picked a queued response");
+            let remaining = body.len() - stream.resp_sent;
+            if remaining == 0 {
+                // An empty body: its END_STREAM carries no DATA and needs no
+                // window.
+                (0usize, true)
+            } else {
+                let window = (self.conn_send_window.min(stream.send_window) as usize).min(max);
+                let n = remaining.min(window);
+                (n, stream.resp_sent + n == body.len())
+            }
+        };
+
+        if to_send == 0 {
+            self.push_frame(TYPE_DATA, FLAG_END_STREAM, stream_id, &[]);
+            self.close_stream_remembering_window(stream_id);
+            return;
+        }
+
+        // Send the chunk straight from the buffered body. `append_frame`
+        // borrows only `send_buf`, which is disjoint from the `streams` borrow
+        // holding `body`, so the chunk is not cloned.
+        let flags = if is_last { FLAG_END_STREAM } else { 0 };
+        {
+            let stream = self
+                .streams
+                .get(&stream_id)
+                .expect("the flusher picked a live stream");
+            let body = stream
+                .resp_body
+                .as_ref()
+                .expect("the flusher picked a queued response");
+            append_frame(
+                &mut self.send_buf,
+                TYPE_DATA,
+                flags,
+                stream_id,
+                &body[stream.resp_sent..stream.resp_sent + to_send],
+            );
+        }
+
+        // Debit both windows.
+        self.conn_send_window -= to_send as i32;
+        let s = self
+            .streams
+            .get_mut(&stream_id)
+            .expect("stream still present");
+        s.send_window -= to_send as i32;
+        s.resp_sent += to_send;
+
+        if is_last {
+            // We have sent END_STREAM. RFC 9113 5.1: which state that leaves
+            // the stream in depends on the peer.
+            //
+            // If the client already sent END_STREAM the stream is now fully
+            // closed and can be reaped. If it has NOT, the stream is
+            // half-closed (local): the client may still legally send DATA, and
+            // dropping the stream here would make `stream_state` derive Closed
+            // and reject frames the RFC says must be accepted.
+            let peer_done = self
+                .streams
+                .get(&stream_id)
+                .map(|s| s.state == StreamState::HalfClosedRemote)
+                .unwrap_or(true);
+            if peer_done {
+                self.close_stream_remembering_window(stream_id);
+                // Client-initiated streams only. `last_stream_id` is the
+                // high-water mark of what the PEER has opened: it is what
+                // `stream_state` uses to tell "not yet opened" (idle) from
+                // "opened and finished" (closed), and what GOAWAY reports.
+                // Pushed streams are server-initiated and even-numbered, and
+                // push ids start at 2 and climb, so counting one here would
+                // leave `last_stream_id` at 6 while the client's next legal
+                // HEADERS on stream 3 derived Closed and was answered
+                // STREAM_CLOSED.
+                if stream_id % 2 == 1 {
+                    self.last_stream_id = self.last_stream_id.max(stream_id);
                 }
-
-                // Clone the chunk to satisfy the borrow checker.
-                let chunk: Vec<u8> = {
-                    let s = &self.streams[&stream_id];
-                    let body = s.resp_body.as_ref().unwrap();
-                    body[s.resp_sent..s.resp_sent + to_send].to_vec()
-                };
-
-                let flags = if is_last { FLAG_END_STREAM } else { 0 };
-                self.push_frame(TYPE_DATA, flags, stream_id, &chunk);
-
-                // Debit both windows.
-                self.conn_send_window -= to_send as i32;
-                let s = self.streams.get_mut(&stream_id).unwrap();
-                s.send_window -= to_send as i32;
-                s.resp_sent += to_send;
-
-                if is_last {
-                    // We have sent END_STREAM. RFC 9113 5.1: which state that
-                    // leaves the stream in depends on the peer.
-                    //
-                    // If the client already sent END_STREAM the stream is now
-                    // fully closed and can be reaped. If it has NOT, the
-                    // stream is half-closed (local): the client may still
-                    // legally send DATA, and dropping the stream here would
-                    // make `stream_state` derive Closed and reject frames the
-                    // RFC says must be accepted.
-                    let peer_done = self
-                        .streams
-                        .get(&stream_id)
-                        .map(|s| s.state == StreamState::HalfClosedRemote)
-                        .unwrap_or(true);
-                    if peer_done {
-                        self.close_stream_remembering_window(stream_id);
-                        // Client-initiated streams only. `last_stream_id` is the
-                        // high-water mark of what the PEER has opened: it is what
-                        // `stream_state` uses to tell "not yet opened" (idle)
-                        // from "opened and finished" (closed), and what GOAWAY
-                        // reports. Pushed streams are server-initiated and
-                        // even-numbered, and push ids start at 2 and climb, so
-                        // counting one here would leave `last_stream_id` at 6
-                        // while the client's next legal HEADERS on stream 3
-                        // derived Closed and was answered STREAM_CLOSED.
-                        if stream_id % 2 == 1 {
-                            self.last_stream_id = self.last_stream_id.max(stream_id);
-                        }
-                    } else if let Some(s) = self.streams.get_mut(&stream_id) {
-                        s.state = StreamState::HalfClosedLocal;
-                    }
-                    continue 'outer;
-                }
-                // More data remains but the window may now be exhausted.
-                if self.conn_send_window <= 0 {
-                    break;
-                }
-                let sw = self
-                    .streams
-                    .get(&stream_id)
-                    .map(|s| s.send_window)
-                    .unwrap_or(0);
-                if sw <= 0 {
-                    break;
-                }
+            } else if let Some(s) = self.streams.get_mut(&stream_id) {
+                s.state = StreamState::HalfClosedLocal;
+                s.end_stream_sent = true;
             }
         }
     }
 
     // ── Frame encoding helpers ────────────────────────────────────────────────
 
-    fn encode_response_headers(
+    /// Encode a response header list as one HEADERS frame in `send_buf`.
+    ///
+    /// Every field's name is lowercased into `hdr_scratch` and borrowed back
+    /// from it, so a response allocates no `String` per header and no `Vec` of
+    /// pairs. `hpack_enc.encode_into` writes straight into the connection's
+    /// send buffer, so the encoded block is not a second allocation either.
+    ///
+    /// HTTP/2 requires lowercase field names on the wire (RFC 9113 8.2.1).
+    /// The bytes written are the same as when the name was lowercased into an
+    /// owned `String`: only the copy is gone.
+    fn push_response_headers(
         &mut self,
+        stream_id: u32,
         status: u16,
         headers: &[(String, String)],
         body_len: usize,
-    ) -> Vec<u8> {
-        let status_str = status.to_string();
-        let bodylen_str = body_len.to_string();
+        genid: Option<u64>,
+    ) {
+        let mut scratch = std::mem::take(&mut self.hdr_scratch);
+        scratch.clear();
+        let mut plan = empty_plan();
+        let mut n = 0usize;
 
-        let mut pairs: Vec<(&[u8], &[u8])> = vec![(b":status", status_str.as_bytes())];
+        let mut status_buf = itoa::Buffer::new();
+        push_field(
+            &mut plan,
+            &mut n,
+            FieldPart::Bytes(b":status"),
+            FieldPart::Bytes(status_buf.format(status).as_bytes()),
+        );
         // RFC 9110 8.6: a 1xx/204 must not carry Content-Length, and a 304 must
         // not unless it equals the 200's. m6 sent `content-length: 0` on every
         // 304 -- the one value that actively misinforms, since it claims the
         // representation is empty when it is not.
+        let mut body_buf = itoa::Buffer::new();
         if crate::http11::status_may_have_content_length(status) {
-            pairs.push((b"content-length", bodylen_str.as_bytes()));
+            push_field(
+                &mut plan,
+                &mut n,
+                FieldPart::Bytes(b"content-length"),
+                FieldPart::Bytes(body_buf.format(body_len).as_bytes()),
+            );
         }
-        let filtered: Vec<(String, String)> = headers
-            .iter()
-            .filter(|(k, _)| {
-                let kl = k.to_lowercase();
-                !matches!(
-                    kl.as_str(),
-                    "connection" | "transfer-encoding" | "keep-alive" | "content-length"
-                )
-            })
-            .map(|(k, v)| (k.to_lowercase(), v.clone()))
-            .collect();
-        for (k, v) in &filtered {
-            pairs.push((k.as_bytes(), v.as_bytes()));
+        for (k, v) in headers {
+            if is_hop_by_hop_or_length(k) {
+                continue;
+            }
+            let name = lower_part(&mut scratch, k.as_bytes());
+            push_field(&mut plan, &mut n, name, FieldPart::Bytes(v.as_bytes()));
+        }
+        let mut genid_buf = itoa::Buffer::new();
+        if let Some(genid) = genid {
+            // Lower case: RFC 9113 8.2.1 allows no other spelling, and a client
+            // that enforces it rejects the whole header block. `GENID_HEADER_LOWER`
+            // is already lowercase, so `lower_part` borrows it with no copy.
+            push_field(
+                &mut plan,
+                &mut n,
+                lower_part(&mut scratch, crate::genid::GENID_HEADER_LOWER.as_bytes()),
+                FieldPart::Bytes(genid_buf.format(genid).as_bytes()),
+            );
         }
         // Applied at serialisation so every response carries them regardless
         // of which path produced it (cache hit, backend, error page). The
@@ -1976,23 +2663,206 @@ impl Http2Conn {
         // borrowed rather than copied.
         let security = crate::security::read();
         if let Some(ref guard) = security {
-            for (k, v) in guard.absent_from(&filtered) {
-                pairs.push((k.as_bytes(), v.as_bytes()));
+            for (k, v) in guard.absent_from(headers) {
+                let name = lower_part(&mut scratch, k.as_bytes());
+                push_field(&mut plan, &mut n, name, FieldPart::Bytes(v.as_bytes()));
             }
         }
-        self.hpack_enc.encode(pairs)
+        self.write_headers_frame(stream_id, &plan[..n], &scratch);
+        self.hdr_scratch = scratch;
+    }
+
+    /// Complete a cache hit straight from the entry's own bytes.
+    ///
+    /// The header strings and the body are borrowed, not cloned. The fields a
+    /// hit adds (`Alt-Svc`, merged `Vary`, `Age`, the described-by `Link`,
+    /// `Set-Cookie`) are written here from their start-time or per-hit values,
+    /// in the same order the owned path produced them, so the wire bytes do
+    /// not change.
+    fn dispatch_cached_h2_response(
+        &mut self,
+        stream_id: u32,
+        entry: &CachedResponse,
+        age: std::time::Duration,
+        set_cookie: Option<&str>,
+        hit: &HitHeaders,
+        is_head: bool,
+    ) {
+        self.push_cached_headers(stream_id, entry, age, set_cookie, hit);
+        let body = if is_head {
+            bytes::Bytes::new()
+        } else {
+            entry.body.clone()
+        };
+        if let Some(s) = self.streams.get_mut(&stream_id) {
+            s.resp_body = Some(body);
+            s.resp_sent = 0;
+        }
+        self.flush_pending_streams();
+    }
+
+    fn push_cached_headers(
+        &mut self,
+        stream_id: u32,
+        entry: &CachedResponse,
+        age: std::time::Duration,
+        set_cookie: Option<&str>,
+        hit: &HitHeaders,
+    ) {
+        let is_html = crate::analytics::is_html_response(&entry.headers);
+        let write_describedby = hit.describedby.is_some() && is_html;
+
+        // Vary is merged (or left alone on `Vary: *`) exactly as
+        // `set_vary_accept_encoding(.., true)` does, so the paths agree.
+        let vary = crate::http11::VaryMerge::new(&entry.headers);
+        let vary_star = vary.is_star();
+
+        let mut scratch = std::mem::take(&mut self.hdr_scratch);
+        scratch.clear();
+        let vary_value = if vary_star {
+            None
+        } else {
+            let start = scratch.len() as u32;
+            let mut first = true;
+            for field in vary {
+                if !first {
+                    scratch.extend_from_slice(b", ");
+                }
+                first = false;
+                scratch.extend_from_slice(field.as_bytes());
+            }
+            Some(FieldPart::Scratch(start, scratch.len() as u32 - start))
+        };
+
+        let mut plan = empty_plan();
+        let mut n = 0usize;
+        let mut status_buf = itoa::Buffer::new();
+        push_field(
+            &mut plan,
+            &mut n,
+            FieldPart::Bytes(b":status"),
+            FieldPart::Bytes(status_buf.format(entry.status).as_bytes()),
+        );
+        let mut body_buf = itoa::Buffer::new();
+        if crate::http11::status_may_have_content_length(entry.status) {
+            push_field(
+                &mut plan,
+                &mut n,
+                FieldPart::Bytes(b"content-length"),
+                FieldPart::Bytes(body_buf.format(entry.body.len()).as_bytes()),
+            );
+        }
+        for (k, v) in entry.headers.iter() {
+            if is_hop_by_hop_or_length(k)
+                || k.eq_ignore_ascii_case("alt-svc")
+                || k.eq_ignore_ascii_case("age")
+            {
+                continue;
+            }
+            if !vary_star && k.eq_ignore_ascii_case("vary") {
+                continue;
+            }
+            if write_describedby && k.eq_ignore_ascii_case("link") && link_is_describedby(v) {
+                continue;
+            }
+            let name = lower_part(&mut scratch, k.as_bytes());
+            push_field(&mut plan, &mut n, name, FieldPart::Bytes(v.as_bytes()));
+        }
+        // The order the owned path appended them: alt-svc, vary, age, link,
+        // set-cookie, then the generation and the security headers.
+        let (alt_name, alt_value) = split_header_line(&hit.alt_svc);
+        push_field(
+            &mut plan,
+            &mut n,
+            lower_part(&mut scratch, alt_name),
+            FieldPart::Bytes(alt_value),
+        );
+        if let Some(vary_value) = vary_value {
+            push_field(&mut plan, &mut n, FieldPart::Bytes(b"vary"), vary_value);
+        }
+        let mut age_buf = itoa::Buffer::new();
+        push_field(
+            &mut plan,
+            &mut n,
+            FieldPart::Bytes(b"age"),
+            FieldPart::Bytes(age_buf.format(age.as_secs()).as_bytes()),
+        );
+        if write_describedby {
+            if let Some(line) = hit.describedby.as_deref() {
+                let (name, value) = split_header_line(line);
+                push_field(
+                    &mut plan,
+                    &mut n,
+                    lower_part(&mut scratch, name),
+                    FieldPart::Bytes(value),
+                );
+            }
+        }
+        if let Some(cookie) = set_cookie {
+            push_field(
+                &mut plan,
+                &mut n,
+                FieldPart::Bytes(b"set-cookie"),
+                FieldPart::Bytes(cookie.as_bytes()),
+            );
+        }
+        let mut genid_buf = itoa::Buffer::new();
+        push_field(
+            &mut plan,
+            &mut n,
+            lower_part(&mut scratch, crate::genid::GENID_HEADER.as_bytes()),
+            FieldPart::Bytes(genid_buf.format(entry.genid).as_bytes()),
+        );
+        let security = crate::security::read();
+        if let Some(ref guard) = security {
+            for (k, v) in guard.absent_from(&entry.headers) {
+                let name = lower_part(&mut scratch, k.as_bytes());
+                push_field(&mut plan, &mut n, name, FieldPart::Bytes(v.as_bytes()));
+            }
+        }
+        self.write_headers_frame(stream_id, &plan[..n], &scratch);
+        self.hdr_scratch = scratch;
+    }
+
+    /// Write `plan` as one HEADERS frame at the end of `send_buf`.
+    fn write_headers_frame(
+        &mut self,
+        stream_id: u32,
+        plan: &[(FieldPart<'_>, FieldPart<'_>)],
+        scratch: &[u8],
+    ) {
+        let start = self.send_buf.len();
+        // HEADERS are not paced, so the area can be full. A refusal is
+        // recorded in `send_buf` and closes the connection at its next flush
+        // (`flush_io`), so the frame is left unfinished here.
+        if !self.send_buf.extend_from_slice(&[0u8; FRAME_HDR]) {
+            return;
+        }
+        {
+            let Http2Conn {
+                hpack_enc,
+                send_buf,
+                ..
+            } = self;
+            let block = plan
+                .iter()
+                .map(|(name, value)| (name.resolve(scratch), value.resolve(scratch)));
+            if hpack_enc.encode_into(block, send_buf).is_err() {
+                return;
+            }
+        }
+        let payload_len = self.send_buf.len() - start - FRAME_HDR;
+        self.send_buf[start] = (payload_len >> 16) as u8;
+        self.send_buf[start + 1] = (payload_len >> 8) as u8;
+        self.send_buf[start + 2] = payload_len as u8;
+        self.send_buf[start + 3] = TYPE_HEADERS;
+        self.send_buf[start + 4] = FLAG_END_HEADERS;
+        self.send_buf[start + 5..start + 9]
+            .copy_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
     }
 
     fn push_frame(&mut self, ftype: u8, flags: u8, stream_id: u32, payload: &[u8]) {
-        let len = payload.len();
-        self.send_buf.push((len >> 16) as u8);
-        self.send_buf.push((len >> 8) as u8);
-        self.send_buf.push(len as u8);
-        self.send_buf.push(ftype);
-        self.send_buf.push(flags);
-        self.send_buf
-            .extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
-        self.send_buf.extend_from_slice(payload);
+        append_frame(&mut self.send_buf, ftype, flags, stream_id, payload);
     }
 
     fn push_window_update(&mut self, stream_id: u32, inc: u32) {
@@ -2004,26 +2874,55 @@ impl Http2Conn {
         );
     }
 
-    /// Answer a request whose decoded header list is over `MAX_HEADER_LIST_SIZE`.
+    /// The method of a request being refused, from the block that carried it or
+    /// from the fields already stored for its stream (a trailer section).
+    fn refusal_method(&self, stream_id: u32, block: &[H2Field]) -> String {
+        block
+            .iter()
+            .chain(
+                self.streams
+                    .get(&stream_id)
+                    .map(|s| s.headers.as_slice())
+                    .unwrap_or(&[]),
+            )
+            .find(|f| field_name(&self.decode_buf, f) == ":method")
+            .map(|f| field_value(&self.decode_buf, f).to_string())
+            .unwrap_or_default()
+    }
+
+    /// Answer a request whose decoded head is over one of the two limits.
     ///
-    /// A bodiless 431 on the stream, then RST_STREAM(NO_ERROR) so the peer
-    /// stops sending the rest of the request (RFC 9113 8.1). The block has
-    /// already been decoded, so the connection's HPACK table is unaffected.
-    fn refuse_oversize_header_list(&mut self, stream_id: u32) {
-        tracing::debug!(
+    /// The block has already been decoded, so the connection's HPACK table is
+    /// unaffected. The response is the service's usual error page, titled as
+    /// nginx titles these refusals. RFC 9113 8.1 allows a server that has sent
+    /// a complete response to ask the peer to stop sending a request body with
+    /// RST_STREAM(NO_ERROR), so that follows when the page is fully buffered.
+    fn refuse_head(&mut self, stream_id: u32, status: u16, method: &str) {
+        m6_core::log::debug!(stream_id, status, "h2: request head over a limit");
+        let headers = vec![(
+            "Content-Type".to_string(),
+            "text/html; charset=utf-8".to_string(),
+        )];
+        let body = crate::error::refusal_body(status);
+        self.dispatch_h2_response(
             stream_id,
-            "h2: decoded header list exceeds MAX_HEADER_LIST_SIZE"
+            H2Response {
+                status,
+                headers,
+                body,
+                genid: None,
+            },
+            method.eq_ignore_ascii_case("HEAD"),
         );
-        let block = self.encode_response_headers(431, &[], 0);
-        self.push_frame(
-            TYPE_HEADERS,
-            FLAG_END_HEADERS | FLAG_END_STREAM,
-            stream_id,
-            &block,
-        );
-        self.push_frame(TYPE_RST_STREAM, 0, stream_id, &ERR_NO_ERROR.to_be_bytes());
-        self.streams.remove(&stream_id);
-        self.note_reset(stream_id);
+        let complete = self
+            .streams
+            .get(&stream_id)
+            .is_some_and(|s| s.resp_body.as_ref().is_some_and(|b| s.resp_sent >= b.len()));
+        if complete {
+            self.push_frame(TYPE_RST_STREAM, 0, stream_id, &ERR_NO_ERROR.to_be_bytes());
+            self.retire_stream(stream_id);
+            self.note_reset(stream_id);
+        }
     }
 
     fn send_server_settings(&mut self) {
@@ -2036,7 +2935,7 @@ impl Http2Conn {
         setting_bytes(
             &mut p,
             SETTING_MAX_HEADER_LIST_SIZE,
-            MAX_HEADER_LIST_SIZE as u32,
+            MAX_REQUEST_HEAD as u32,
         );
         self.push_frame(TYPE_SETTINGS, 0, 0, &p);
     }
@@ -2049,7 +2948,7 @@ impl Http2Conn {
     /// stream from it.
     fn check_hpack_block(&mut self, block: &[u8]) -> Result<(), &'static str> {
         if let Err(why) = validate_hpack_block(block, HPACK_MAX_TABLE_SIZE) {
-            tracing::debug!(reason = why, "h2: HPACK block rejected");
+            m6_core::log::debug!(reason = why, "h2: HPACK block rejected");
             self.send_goaway(ERR_COMPRESSION);
             self.phase = Phase::GoingAway;
             return Err(why);
@@ -2070,6 +2969,55 @@ impl Http2Conn {
 
 fn u24_be(b: &[u8]) -> u32 {
     (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32
+}
+
+/// The bytes a frame is appended to: the server's `h2_send` area or a
+/// client's plain `Vec`.
+pub(crate) trait FrameBytes {
+    fn put(&mut self, bytes: &[u8]) -> bool;
+}
+
+impl FrameBytes for Vec<u8> {
+    fn put(&mut self, bytes: &[u8]) -> bool {
+        self.extend_from_slice(bytes);
+        true
+    }
+}
+
+impl FrameBytes for m6_core::limits::Bounded<u8> {
+    fn put(&mut self, bytes: &[u8]) -> bool {
+        self.extend_from_slice(bytes)
+    }
+}
+
+/// Append a well-formed H2 frame to `send_buf`.
+///
+/// A free function so a caller can write a frame from a slice borrowed out of
+/// `self.streams` while `send_buf` is borrowed mutably, without the borrow
+/// checker forcing a clone of the payload.
+pub(crate) fn append_frame(
+    send_buf: &mut impl FrameBytes,
+    ftype: u8,
+    flags: u8,
+    stream_id: u32,
+    payload: &[u8],
+) {
+    let len = payload.len();
+    let mut head = [0u8; FRAME_HDR];
+    head[0] = (len >> 16) as u8;
+    head[1] = (len >> 8) as u8;
+    head[2] = len as u8;
+    head[3] = ftype;
+    head[4] = flags;
+    head[5..9].copy_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
+    // The pacing mark keeps DATA below the `h2_send` start, but HEADERS and
+    // control frames are not paced, so a peer that never reads can fill the
+    // area to its maximum. A refused write is recorded in the area itself
+    // (`Bounded::overflow`) and the connection's next flush closes it, see
+    // `Http2Conn::flush_io`. The payload is not written after a refused head.
+    if send_buf.put(&head) {
+        send_buf.put(payload);
+    }
 }
 
 fn setting_bytes(buf: &mut Vec<u8>, id: u16, val: u32) {
@@ -2171,10 +3119,98 @@ fn validate_hpack_block(block: &[u8], max_table_size: usize) -> Result<(), &'sta
     Ok(())
 }
 
+/// The largest response header list the encoder will plan in one frame.
+///
+/// A backend reply is parsed into a fixed 64-header array (`forward.rs`), and
+/// a response adds at most a handful of fields of its own, so this is above
+/// any list a response can carry.
+const MAX_RESPONSE_FIELDS: usize = 128;
+
+/// One field in a response header block, before it is serialised.
+///
+/// `Bytes` is a slice that already lives long enough (a cached value, a
+/// static name, an `itoa` buffer). `Scratch` is a range in the connection's
+/// `hdr_scratch`, where a lowercased name or a merged `Vary` value was
+/// written. Either way the encoder borrows the bytes: no `String` per field.
+#[derive(Clone, Copy)]
+enum FieldPart<'a> {
+    Bytes(&'a [u8]),
+    Scratch(u32, u32),
+}
+
+impl<'a> FieldPart<'a> {
+    fn resolve<'s>(&self, scratch: &'s [u8]) -> &'s [u8]
+    where
+        'a: 's,
+    {
+        match self {
+            FieldPart::Bytes(bytes) => bytes,
+            FieldPart::Scratch(start, len) => &scratch[*start as usize..(*start + *len) as usize],
+        }
+    }
+}
+
+fn empty_plan<'a>() -> [(FieldPart<'a>, FieldPart<'a>); MAX_RESPONSE_FIELDS] {
+    [(FieldPart::Bytes(&[]), FieldPart::Bytes(&[])); MAX_RESPONSE_FIELDS]
+}
+
+fn push_field<'a>(
+    plan: &mut [(FieldPart<'a>, FieldPart<'a>); MAX_RESPONSE_FIELDS],
+    len: &mut usize,
+    name: FieldPart<'a>,
+    value: FieldPart<'a>,
+) {
+    debug_assert!(*len < MAX_RESPONSE_FIELDS, "response header plan overflow");
+    if *len < MAX_RESPONSE_FIELDS {
+        plan[*len] = (name, value);
+        *len += 1;
+    }
+}
+
+/// Lowercase a field name into `scratch`, or borrow it when it is already
+/// lowercase. HTTP/2 requires lowercase on the wire; this keeps the wire bytes
+/// identical to a lowercased copy without making one.
+fn lower_part<'a>(scratch: &mut Vec<u8>, name: &'a [u8]) -> FieldPart<'a> {
+    if !name.iter().any(|b| b.is_ascii_uppercase()) {
+        FieldPart::Bytes(name)
+    } else {
+        let start = scratch.len() as u32;
+        scratch.extend(name.iter().map(|b| b.to_ascii_lowercase()));
+        FieldPart::Scratch(start, scratch.len() as u32 - start)
+    }
+}
+
+/// Split a start-time header line (`alt-svc: ...`) into name and value.
+fn split_header_line(line: &[u8]) -> (&[u8], &[u8]) {
+    let Some(colon) = line.iter().position(|&b| b == b':') else {
+        return (line, &[]);
+    };
+    let value = &line[colon + 1..];
+    (line[..colon].trim_ascii_start(), value.trim_ascii_start())
+}
+
+/// Whether a response field is one the framing layer owns and must not carry.
+///
+/// The connection-specific set comes from `fields::is_connection_specific` so
+/// h2 and h3 cannot drift apart on RFC 9113 8.2.2 / RFC 9114 4.2; h2 adds
+/// `content-length` because its serialiser writes the length it computed.
+fn is_hop_by_hop_or_length(name: &str) -> bool {
+    crate::fields::is_connection_specific(name) || name.eq_ignore_ascii_case("content-length")
+}
+
+/// Whether a cached `Link` already advertises the site description.
+fn link_is_describedby(value: &str) -> bool {
+    value
+        .as_bytes()
+        .windows(b"rel=\"describedby\"".len())
+        .any(|w| w.eq_ignore_ascii_case(b"rel=\"describedby\""))
+}
+
 fn decode_hpack(
     dec: &mut hpack::Decoder<'_>,
     block: &[u8],
-    out: &mut Vec<(String, String)>,
+    buf: &mut Vec<u8>,
+    out: &mut Vec<H2Field>,
 ) -> Result<usize, &'static str> {
     // Counted as each field is decoded, and a field is kept only while the
     // list is within the limit. A small block of one-byte references to a
@@ -2184,109 +3220,101 @@ fn decode_hpack(
     // in step with the peer.
     let mut list_size = 0usize;
     dec.decode_with_cb(block, |k, v| {
-        list_size = list_size.saturating_add(k.len() + v.len() + HEADER_FIELD_OVERHEAD);
-        if list_size <= MAX_HEADER_LIST_SIZE {
-            out.push((
-                String::from_utf8_lossy(&k).into_owned(),
-                String::from_utf8_lossy(&v).into_owned(),
-            ));
+        list_size = list_size.saturating_add(k.len() + v.len() + FIELD_OVERHEAD);
+        if list_size <= MAX_REQUEST_HEAD {
+            let name = push_field_bytes(buf, &k);
+            let value = push_field_bytes(buf, &v);
+            out.push(H2Field { name, value });
         }
     })
     .map_err(|_| "HPACK decode error")?;
     Ok(list_size)
 }
 
-fn is_headersonly(headers: &[(String, String)]) -> bool {
-    for (k, v) in headers {
+/// Append one field part to the decode buffer and return its range.
+///
+/// Invalid UTF-8 is replaced exactly as `String::from_utf8_lossy` replaced it
+/// before, so a later `&str` view of the bytes says the same thing the old
+/// owned `String` said. A valid part, which is every part a conforming peer
+/// sends, is a plain copy.
+fn push_field_bytes(buf: &mut Vec<u8>, bytes: &[u8]) -> Range<u32> {
+    let start = buf.len() as u32;
+    match std::str::from_utf8(bytes) {
+        Ok(_) => buf.extend_from_slice(bytes),
+        Err(_) => buf.extend_from_slice(String::from_utf8_lossy(bytes).as_bytes()),
+    }
+    start..buf.len() as u32
+}
+
+/// The bytes of one field part, re-borrowed from the connection's buffer.
+fn field_bytes<'a>(buf: &'a [u8], range: &Range<u32>) -> &'a [u8] {
+    buf.get(range.start as usize..range.end as usize)
+        .unwrap_or(&[])
+}
+
+fn field_name<'a>(buf: &'a [u8], field: &H2Field) -> &'a str {
+    std::str::from_utf8(field_bytes(buf, &field.name)).unwrap_or("")
+}
+
+fn field_value<'a>(buf: &'a [u8], field: &H2Field) -> &'a str {
+    std::str::from_utf8(field_bytes(buf, &field.value)).unwrap_or("")
+}
+
+/// Every field in `list` as a borrowed name and value.
+fn fields<'a>(list: &'a [H2Field], buf: &'a [u8]) -> impl Iterator<Item = (&'a str, &'a str)> + 'a {
+    list.iter()
+        .map(move |f| (field_name(buf, f), field_value(buf, f)))
+}
+
+/// Every field in `list` as raw bytes, for the validators that work on bytes.
+fn field_byte_pairs<'a>(
+    list: &'a [H2Field],
+    buf: &'a [u8],
+) -> impl Iterator<Item = (&'a [u8], &'a [u8])> + 'a {
+    list.iter()
+        .map(move |f| (field_bytes(buf, &f.name), field_bytes(buf, &f.value)))
+}
+
+fn is_headersonly(headers: &[H2Field], buf: &[u8]) -> bool {
+    for (k, v) in fields(headers, buf) {
         if k == ":method" {
-            return matches!(
-                v.as_str(),
-                "GET" | "HEAD" | "DELETE" | "OPTIONS" | "CONNECT"
-            );
+            return matches!(v, "GET" | "HEAD" | "DELETE" | "OPTIONS" | "CONNECT");
         }
     }
     false
 }
 
-/// Build the request, and hand back the `x-forwarded-for` it was carrying.
+/// The declared `content-length`, or the fact that the field is malformed.
 ///
-/// The header is stripped either way -- it never reaches a handler, a backend
-/// or a cache key. Returning the value separately is what lets the *caller*
-/// decide whether the peer was entitled to assert it, without the header
-/// itself surviving that decision.
-fn build_request(headers: &[(String, String)], body: Vec<u8>) -> (HttpRequest, Option<String>) {
-    let mut method = String::new();
-    let mut path = String::new();
-    let mut query = None;
-    let mut fwd = Vec::new();
-    let mut authority: Option<String> = None;
-    let mut forwarded_for: Option<String> = None;
-
-    for (k, v) in headers {
-        match k.as_str() {
-            ":method" => method = v.clone(),
-            ":path" => {
-                if let Some(q) = v.find('?') {
-                    path = v[..q].to_string();
-                    query = Some(v[q + 1..].to_string());
-                } else {
-                    path = v.clone();
-                }
-            }
-            ":authority" => authority = Some(v.clone()),
-            k if k.starts_with(':') => {}
-            // Strip proxy-owned headers on ingress — see
-            // `forward::UNTRUSTED_INBOUND`.
-            k if crate::forward::is_untrusted_inbound(k) => {
-                if k.eq_ignore_ascii_case("x-forwarded-for") {
-                    forwarded_for = Some(v.clone());
-                }
-            }
-            _ => fwd.push((k.clone(), v.clone())),
-        }
-    }
-
-    // RFC 9113 8.3.1: :authority is HTTP/2's Host, and an intermediary
-    // translating to HTTP/1.1 must carry it across. Dropping it with the other
-    // pseudo-headers left every h2 request (which is most of them -- curl and
-    // every browser send :authority and no Host) looking hostless to
-    // everything downstream: host-dependent logic silently never fired, and
-    // requests forwarded to a backend carried no Host at all.
-    //
-    // A client that sent both wins with its own Host, which is only reachable
-    // from a non-conforming client; :authority fills in otherwise.
-    if let Some(authority) = authority {
-        if !m6_core::headers::contains(&fwd[..], "host") {
-            fwd.push(("Host".to_string(), authority));
-        }
-    }
-
-    let req = HttpRequest {
-        method,
-        path,
-        query,
-        version: "HTTP/2".to_string(),
-        headers: fwd,
-        body,
+/// RFC 9110 8.6: `Content-Length = 1*DIGIT`, with optional SP and HTAB around
+/// the value (5.6.3). HTTP/2 previously used `v.trim().parse::<usize>()`, which
+/// read `+5` as 5 and silently ignored a value that failed to parse, serving a
+/// request whose framing the peer never declared.
+fn declared_content_length(headers: &[H2Field], buf: &[u8]) -> Result<Option<usize>, ()> {
+    let Some((_, value)) = fields(headers, buf).find(|(k, _)| *k == "content-length") else {
+        return Ok(None);
     };
-    (req, forwarded_for)
+    let value = value.trim_matches([' ', '\t']);
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(());
+    }
+    value.parse().map(Some).map_err(|_| ())
 }
 
 #[cfg(test)]
 mod authority_tests {
-    use super::build_request;
 
-    /// `build_request` hands back the request and the `x-forwarded-for` it
-    /// stripped; these tests are about the request half.
-    fn req_of(pair: (crate::forward::HttpRequest, Option<String>)) -> crate::forward::HttpRequest {
-        pair.0
-    }
-
-    fn h(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
+    /// Materialize the borrowed request exactly as the miss path does, so these
+    /// tests cover the one conversion a request makes on its way to a backend.
+    fn build(pairs: &[(&str, &str)]) -> crate::forward::HttpRequest {
+        let mut buf = Vec::new();
+        let mut fields = Vec::new();
+        for (k, v) in pairs {
+            let name = super::push_field_bytes(&mut buf, k.as_bytes());
+            let value = super::push_field_bytes(&mut buf, v.as_bytes());
+            fields.push(super::H2Field { name, value });
+        }
+        super::H2Request::new(&fields, &buf, Vec::new()).into_owned()
     }
     fn host_of(req: &crate::forward::HttpRequest) -> Option<&str> {
         req.headers
@@ -2298,14 +3326,11 @@ mod authority_tests {
     /// The case every browser and curl actually sends: :authority, no Host.
     #[test]
     fn authority_becomes_host() {
-        let req = req_of(build_request(
-            &h(&[
-                (":method", "GET"),
-                (":path", "/x"),
-                (":authority", "www.example.com"),
-            ]),
-            vec![],
-        ));
+        let req = build(&[
+            (":method", "GET"),
+            (":path", "/x"),
+            (":authority", "www.example.com"),
+        ]);
         assert_eq!(host_of(&req), Some("www.example.com"));
     }
 
@@ -2313,15 +3338,12 @@ mod authority_tests {
     /// and must not be duplicated.
     #[test]
     fn explicit_host_wins_and_is_not_duplicated() {
-        let req = req_of(build_request(
-            &h(&[
-                (":method", "GET"),
-                (":path", "/x"),
-                (":authority", "authority.example"),
-                ("host", "host.example"),
-            ]),
-            vec![],
-        ));
+        let req = build(&[
+            (":method", "GET"),
+            (":path", "/x"),
+            (":authority", "authority.example"),
+            ("host", "host.example"),
+        ]);
         assert_eq!(host_of(&req), Some("host.example"));
         assert_eq!(
             req.headers
@@ -2334,25 +3356,19 @@ mod authority_tests {
 
     #[test]
     fn no_authority_means_no_synthesized_host() {
-        let req = req_of(build_request(
-            &h(&[(":method", "GET"), (":path", "/x")]),
-            vec![],
-        ));
+        let req = build(&[(":method", "GET"), (":path", "/x")]);
         assert_eq!(host_of(&req), None);
     }
 
     /// Other pseudo-headers stay stripped -- they must never reach a backend.
     #[test]
     fn other_pseudo_headers_are_still_dropped() {
-        let req = req_of(build_request(
-            &h(&[
-                (":method", "GET"),
-                (":path", "/x?a=1"),
-                (":scheme", "https"),
-                (":authority", "e.example"),
-            ]),
-            vec![],
-        ));
+        let req = build(&[
+            (":method", "GET"),
+            (":path", "/x?a=1"),
+            (":scheme", "https"),
+            (":authority", "e.example"),
+        ]);
         assert!(
             !req.headers.iter().any(|(k, _)| k.starts_with(':')),
             "{:?}",
@@ -2376,11 +3392,11 @@ mod frame_validation_tests {
         let mut c = Http2Conn::new();
         c.phase = Phase::Active;
         c.recv_buf.extend_from_slice(frames);
-        let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string())
+        let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(), None)
         };
         loop {
-            match c.process_frame(&mut on_request, "127.0.0.1") {
+            match c.process_frame(&mut (), &mut on_request, "127.0.0.1", None) {
                 Ok(true) => continue,
                 Ok(false) => return Ok(()),
                 Err(e) => return Err(e),
@@ -2412,7 +3428,22 @@ mod frame_validation_tests {
     /// A HEADERS frame opening `stream_id` and carrying one extra header,
     /// HPACK-encoded as a literal-without-indexing with a new name.
     pub(super) fn open_stream_with_header(stream_id: u32, name: &str, value: &str) -> Vec<u8> {
-        let mut block = vec![0x82, 0x87, 0x84]; // :method GET, :scheme https, :path /
+        open_stream_with_method_and_header(stream_id, 0x82, name, value)
+    }
+
+    /// The same, with `:method` chosen from the HPACK static table: `0x82` is
+    /// GET and `0x83` is POST.
+    ///
+    /// A body-bearing method matters to the content-length tests: GET is
+    /// dispatched on the header block alone, so its body is always empty and a
+    /// content-length check would measure that dispatch rather than the field.
+    fn open_stream_with_method_and_header(
+        stream_id: u32,
+        method: u8,
+        name: &str,
+        value: &str,
+    ) -> Vec<u8> {
+        let mut block = vec![method, 0x87, 0x84]; // :scheme https, :path /
         block.extend_from_slice(&[0x01, 0x0b]); // :authority, literal
         block.extend_from_slice(b"example.com");
         block.push(0x00); // literal, new name, no indexing
@@ -2434,6 +3465,77 @@ mod frame_validation_tests {
         block.extend_from_slice(&[0x01, 0x0b]);
         block.extend_from_slice(b"example.com");
         frame(TYPE_HEADERS, FLAG_END_HEADERS, stream_id, &block)
+    }
+
+    /// Drive a request whose `content-length` is `value` and whose DATA is
+    /// `body`, returning the connection so its output frames can be read.
+    fn request_with_content_length(
+        value: &str,
+        body: &[u8],
+    ) -> (Http2Conn, Result<(), &'static str>) {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+        let mut frames = open_stream_with_method_and_header(1, 0x83, "content-length", value);
+        frames.extend(frame(TYPE_DATA, FLAG_END_STREAM, 1, body));
+        c.recv_buf.extend_from_slice(&frames);
+        let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(), None)
+        };
+        let result = loop {
+            match c.process_frame(&mut (), &mut on_request, "127.0.0.1", None) {
+                Ok(true) => continue,
+                Ok(false) => break Ok(()),
+                Err(e) => break Err(e),
+            }
+        };
+        (c, result)
+    }
+
+    /// RFC 9110 8.6: `Content-Length` is `1*DIGIT`. The old parser read `+5` as
+    /// 5 and silently ignored a non-numeric value, so both were served as
+    /// though the field were valid or absent. Each is a malformed request
+    /// (RFC 9113 8.1.2.6) and gets RST_STREAM(PROTOCOL_ERROR) on its stream.
+    #[test]
+    fn content_length_that_is_not_1_digit_is_a_malformed_request() {
+        for value in ["+5", "5x", "-5", "abc"] {
+            let (c, result) = request_with_content_length(value, b"hello");
+            assert!(
+                result.is_ok(),
+                "content-length {value:?}: a malformed request is a stream error, not a connection error"
+            );
+            let resets = super::stream_state_tests::sent_frames(&c.send_buf, TYPE_RST_STREAM);
+            assert_eq!(
+                resets.len(),
+                1,
+                "content-length {value:?} must be refused once"
+            );
+            assert_eq!(
+                resets[0].0, 1,
+                "the RST_STREAM must name the request's stream"
+            );
+            assert_eq!(
+                u32::from_be_bytes(resets[0].1[..4].try_into().unwrap()),
+                ERR_PROTOCOL_ERROR,
+                "content-length {value:?} must be PROTOCOL_ERROR"
+            );
+        }
+    }
+
+    /// SP and HTAB around a digits-only value are legal and must be trimmed
+    /// rather than turned into part of the number or refused.
+    #[test]
+    fn content_length_with_ows_is_served() {
+        let (c, result) = request_with_content_length(" 5 ", b"hello");
+        assert!(result.is_ok(), "a valid request is not a connection error");
+        let resets = super::stream_state_tests::sent_frames(&c.send_buf, TYPE_RST_STREAM);
+        assert!(
+            resets.is_empty(),
+            "OWS around 1*DIGIT is legal, got RST_STREAM frames: {resets:?}"
+        );
+        assert!(
+            !super::stream_state_tests::sent_frames(&c.send_buf, TYPE_HEADERS).is_empty(),
+            "the request must be dispatched, not refused"
+        );
     }
 
     /// A HEADERS frame declaring PRIORITY but carrying fewer than the five
@@ -2499,10 +3601,10 @@ mod frame_validation_tests {
         let mut c = Http2Conn::new();
         c.phase = Phase::Active;
         c.recv_buf.extend_from_slice(&frame(TYPE_DATA, 0, 1, &[]));
-        let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], vec![], "t".to_string())
+        let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
+            RequestOutcome::Ready(200, vec![], vec![], "t".to_string(), None)
         };
-        let _ = c.process_frame(&mut on_request, "127.0.0.1");
+        let _ = c.process_frame(&mut (), &mut on_request, "127.0.0.1", None);
 
         // Walk the outgoing buffer for WINDOW_UPDATE frames and check each
         // increment. A zero increment would be a protocol error we caused.
@@ -2687,11 +3789,11 @@ mod stream_state_tests {
     /// Drive a connection over `bytes`, returning the driver's verdict.
     fn run(c: &mut Http2Conn, bytes: &[u8]) -> Result<(), &'static str> {
         c.recv_buf.extend_from_slice(bytes);
-        let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string())
+        let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(), None)
         };
         loop {
-            match c.process_frame(&mut on_request, "127.0.0.1") {
+            match c.process_frame(&mut (), &mut on_request, "127.0.0.1", None) {
                 Ok(true) => continue,
                 Ok(false) => return Ok(()),
                 Err(e) => return Err(e),
@@ -2748,7 +3850,7 @@ mod stream_state_tests {
 
         assert_eq!(c.streams.len(), 0, "every stream really was cancelled");
         assert_eq!(
-            c.active_streams(Instant::now()),
+            c.active_streams(m6_core::platform::now()),
             MAX_CONCURRENT as usize,
             "cancelled streams must still hold their slots"
         );
@@ -2840,7 +3942,7 @@ mod stream_state_tests {
             run(&mut c, &open_and_reset(1 + n * 2)).unwrap();
         }
 
-        let now = Instant::now();
+        let now = m6_core::platform::now();
         assert_eq!(c.active_streams(now), MAX_CONCURRENT as usize);
         assert_eq!(
             c.active_streams(now + RESET_DECAY * 2),
@@ -2893,14 +3995,14 @@ mod stream_state_tests {
             c.note_reset(push_id);
         }
         assert_eq!(
-            c.active_streams(Instant::now()),
+            c.active_streams(m6_core::platform::now()),
             0,
             "declined pushes are not the peer's doing"
         );
 
         // A client-initiated cancellation on the same connection still counts.
         c.note_reset(1);
-        assert_eq!(c.active_streams(Instant::now()), 1);
+        assert_eq!(c.active_streams(m6_core::platform::now()), 1);
     }
 
     /// The budget must not punish a normal client. A page whose requests all
@@ -2924,7 +4026,7 @@ mod stream_state_tests {
             "streams that completed normally must not occupy reset slots"
         );
         assert!(
-            c.active_streams(Instant::now()) < MAX_CONCURRENT as usize,
+            c.active_streams(m6_core::platform::now()) < MAX_CONCURRENT as usize,
             "200 completed requests must not approach the cap"
         );
 
@@ -2978,14 +4080,62 @@ mod stream_state_tests {
         let mut c = Http2Conn::new();
         c.phase = Phase::Active;
         c.recv_buf.extend_from_slice(&f);
-        let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string())
+        let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string(), None)
         };
-        while let Ok(true) = c.process_frame(&mut on_request, "127.0.0.1") {}
+        while let Ok(true) = c.process_frame(&mut (), &mut on_request, "127.0.0.1", None) {}
         assert_eq!(
             c.phase,
             Phase::GoingAway,
             "a backwards stream id must GOAWAY"
+        );
+    }
+
+    /// A frame whose bytes arrive across two reads is reassembled: the parser
+    /// waits for the whole frame rather than reading a partial one, and the
+    /// payload is delivered byte-exact.
+    #[test]
+    fn a_frame_larger_than_one_read_is_reassembled() {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+        let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string(), None)
+        };
+
+        // Open the stream first, then deliver a 16 KiB DATA frame in two reads.
+        c.recv_buf.extend_from_slice(&open_stream(1));
+        assert!(
+            matches!(
+                c.process_frame(&mut (), &mut on_request, "127.0.0.1", None),
+                Ok(true)
+            ),
+            "the HEADERS frame opens the stream"
+        );
+
+        let body: Vec<u8> = (0..MAX_FRAME_SIZE).map(|i| (i % 251) as u8).collect();
+        let data = frame(TYPE_DATA, 0, 1, &body);
+        let split = data.len() / 2;
+
+        c.recv_buf.extend_from_slice(&data[..split]);
+        assert!(
+            !matches!(
+                c.process_frame(&mut (), &mut on_request, "127.0.0.1", None),
+                Ok(true)
+            ),
+            "a partial frame must wait for the rest"
+        );
+
+        c.recv_buf.extend_from_slice(&data[split..]);
+        assert!(
+            matches!(
+                c.process_frame(&mut (), &mut on_request, "127.0.0.1", None),
+                Ok(true)
+            ),
+            "the completed frame must be processed"
+        );
+        assert_eq!(
+            c.streams[&1].body, body,
+            "reassembled DATA must be byte-exact"
         );
     }
 }
@@ -3038,11 +4188,11 @@ mod f005_regression {
     use super::*;
 
     fn drain_buf(c: &mut Http2Conn) -> Result<(), &'static str> {
-        let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string())
+        let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string(), None)
         };
         loop {
-            match c.process_frame(&mut on_request, "127.0.0.1") {
+            match c.process_frame(&mut (), &mut on_request, "127.0.0.1", None) {
                 Ok(true) => continue,
                 Ok(false) => return Ok(()),
                 Err(e) => return Err(e),
@@ -3128,7 +4278,7 @@ mod f005_regression {
         }
         assert!(drain_buf(&mut c).is_err(), "the flood must be refused");
         assert!(
-            c.header_block_buf.len() <= MAX_HEADER_BLOCK,
+            c.header_block_buf.len() <= crate::limits::edge().h2_header_block.max(),
             "buffer must never exceed the cap, reached {}",
             c.header_block_buf.len()
         );
@@ -3451,11 +4601,11 @@ mod hpack_table_size_setting_tests {
         c.phase = Phase::Active;
         c.recv_buf
             .extend_from_slice(&settings(SETTING_HEADER_TABLE_SIZE, u32::MAX));
-        let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string())
+        let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string(), None)
         };
         loop {
-            match c.process_frame(&mut on_request, "127.0.0.1") {
+            match c.process_frame(&mut (), &mut on_request, "127.0.0.1", None) {
                 Ok(true) => continue,
                 Ok(false) => break,
                 Err(e) => panic!("must be accepted, not an error: {e}"),
@@ -3496,6 +4646,7 @@ mod hpack_table_size_setting_tests {
 mod forwarded_client_ip_tests {
     use super::frame_validation_tests::{frame, open_stream_with_header};
     use super::*;
+    use m6_core::http::HeaderSource;
 
     /// Drive one request through a connection and report the address the
     /// request handler was given, plus whether the header survived into the
@@ -3516,15 +4667,15 @@ mod forwarded_client_ip_tests {
 
         let seen = std::cell::RefCell::new((String::new(), false));
         {
-            let mut on_request = |req: &HttpRequest, ip: &str| -> RequestOutcome {
-                let survived = req
-                    .headers
-                    .iter()
-                    .any(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-for"));
+            let mut on_request = |_: &mut (), req: RequestRef<'_>, ip: &str| -> RequestOutcome {
+                let survived = match req {
+                    RequestRef::H2(req) => req.headers().find("x-forwarded-for").is_some(),
+                    RequestRef::Owned(_) => unreachable!("this connection decodes h2"),
+                };
                 *seen.borrow_mut() = (ip.to_string(), survived);
-                RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string())
+                RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(), None)
             };
-            while let Ok(true) = c.process_frame(&mut on_request, peer_ip) {}
+            while let Ok(true) = c.process_frame(&mut (), &mut on_request, peer_ip, None) {}
         }
         seen.into_inner()
     }
@@ -3638,8 +4789,9 @@ mod hpack_robustness {
             // through, not to make it safe.
             let panicked = std::panic::catch_unwind(|| {
                 let mut dec = hpack::Decoder::new();
+                let mut buf = Vec::new();
                 let mut out = Vec::new();
-                let _ = decode_hpack(&mut dec, &block, &mut out);
+                let _ = decode_hpack(&mut dec, &block, &mut buf, &mut out);
             })
             .is_err();
             if panicked {
@@ -3666,8 +4818,9 @@ mod hpack_robustness {
             let block = part.to_vec();
             let ok = std::panic::catch_unwind(|| {
                 let mut dec = hpack::Decoder::new();
+                let mut buf = Vec::new();
                 let mut out = Vec::new();
-                let _ = decode_hpack(&mut dec, &block, &mut out);
+                let _ = decode_hpack(&mut dec, &block, &mut buf, &mut out);
             })
             .is_ok();
             assert!(
@@ -3715,9 +4868,10 @@ mod issue_7_intermittent_conformance {
         c.recv_buf
             .extend_from_slice(&frame(TYPE_GOAWAY, 0, 0, &payload));
 
-        let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome { unreachable!() };
+        let mut on_request =
+            |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome { unreachable!() };
         assert!(matches!(
-            c.process_frame(&mut on_request, "127.0.0.1"),
+            c.process_frame(&mut (), &mut on_request, "127.0.0.1", None),
             Ok(true)
         ));
 
@@ -3759,8 +4913,9 @@ mod issue_7_intermittent_conformance {
         c.recv_buf
             .extend_from_slice(&frame(TYPE_PING, 0, 0, b"h2spec  "));
 
-        let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome { unreachable!() };
-        while let Ok(true) = c.process_frame(&mut on_request, "127.0.0.1") {}
+        let mut on_request =
+            |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome { unreachable!() };
+        while let Ok(true) = c.process_frame(&mut (), &mut on_request, "127.0.0.1", None) {}
 
         let acks: Vec<_> = sent_frames(&c.send_buf, TYPE_PING)
             .into_iter()
@@ -3887,7 +5042,11 @@ mod server_push_tests {
             c.peer_initial_window = w;
         }
         let w = c.peer_initial_window;
-        c.streams.insert(1, H2Stream::new(w));
+        let mut stream = H2Stream::new(w);
+        // A response is dispatched after the peer has ended its request, so by
+        // the time these frames go out the stream is half-closed (remote).
+        stream.state = StreamState::HalfClosedRemote;
+        c.streams.insert(1, stream);
         c.last_stream_id = 1;
         c
     }
@@ -3907,8 +5066,9 @@ mod server_push_tests {
                 status: 200,
                 headers: vec![],
                 body: vec![b'x'; ASSET],
+                genid: None,
             },
-            "GET",
+            false,
         );
     }
 
@@ -3925,7 +5085,9 @@ mod server_push_tests {
         let mut c = conn_with_open_stream();
         serve_a_large_response(&mut c);
 
-        let pushed: Vec<_> = sent_frames(&c.send_buf, TYPE_DATA)
+        // The bounded send queue frames one queue's worth per writable event,
+        // so the rest of the body is driven the way the event loop drives it.
+        let pushed: Vec<_> = super::tests::data_frames_across_flushes(&mut c)
             .into_iter()
             .filter(|(sid, _)| *sid == 1)
             .collect();
@@ -3969,16 +5131,17 @@ mod server_push_tests {
     }
 }
 
-/// RFC 9113 6.5.2. The decoded header list is bounded, the bound is advertised,
-/// and a block over it is answered 431 on its own stream.
+/// RFC 9113 6.5.2. The decoded head is bounded, the bound is advertised, and a
+/// head over a limit is answered on its own stream.
 #[cfg(test)]
 mod header_list_size_tests {
     use super::frame_validation_tests::frame;
     use super::*;
 
     /// Request headers whose list size (name + value + 32 per field, counted
-    /// as RFC 9113 6.5.2 defines it) is exactly `target`, padded by one custom
-    /// field.
+    /// as RFC 9113 6.5.2 defines it) is exactly `target`. Padding is split
+    /// over as many fields as the target needs, because one field has its own
+    /// limit.
     fn request_fields(target: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut f: Vec<(Vec<u8>, Vec<u8>)> = vec![
             (b":method".to_vec(), b"GET".to_vec()),
@@ -3986,21 +5149,49 @@ mod header_list_size_tests {
             (b":path".to_vec(), b"/".to_vec()),
             (b":authority".to_vec(), b"example.com".to_vec()),
         ];
-        let used: usize = f
-            .iter()
-            .map(|(k, v)| k.len() + v.len() + HEADER_FIELD_OVERHEAD)
-            .sum();
-        let name = b"x-padding".to_vec();
-        let value_len = target - used - name.len() - HEADER_FIELD_OVERHEAD;
-        f.push((name, vec![b'a'; value_len]));
-        f
+        let mut n = 0usize;
+        loop {
+            let used: usize = f
+                .iter()
+                .map(|(k, v)| k.len() + v.len() + FIELD_OVERHEAD)
+                .sum();
+            if used == target {
+                return f;
+            }
+            assert!(used < target, "the base fields are over {target}");
+            let name = format!("x-padding{n}").into_bytes();
+            let remaining = target - used;
+            assert!(
+                remaining >= name.len() + FIELD_OVERHEAD,
+                "cannot pad to {target} exactly"
+            );
+            let value_len = (remaining - name.len() - FIELD_OVERHEAD).min(8_000);
+            f.push((name, vec![b'a'; value_len]));
+            n += 1;
+        }
+    }
+
+    /// A minimal valid GET, so a test can add the one field it is about.
+    fn base_fields() -> Vec<(Vec<u8>, Vec<u8>)> {
+        vec![
+            (b":method".to_vec(), b"GET".to_vec()),
+            (b":scheme".to_vec(), b"https".to_vec()),
+            (b":path".to_vec(), b"/".to_vec()),
+            (b":authority".to_vec(), b"example.com".to_vec()),
+        ]
     }
 
     /// Feed a GET whose decoded list size is `size`, split over HEADERS and
     /// CONTINUATION frames, and return the connection plus whether the request
     /// reached the handler.
     fn send(size: usize) -> (Http2Conn, bool) {
-        let fields = request_fields(size);
+        feed_fields(&request_fields(size))
+    }
+
+    /// Feed one field list for stream 1, split over HEADERS and CONTINUATION
+    /// frames, and return the connection plus whether the request reached the
+    /// handler.
+    fn feed_fields(fields: &[(Vec<u8>, Vec<u8>)]) -> (Http2Conn, bool) {
         let pairs: Vec<(&[u8], &[u8])> = fields
             .iter()
             .map(|(k, v)| (k.as_slice(), v.as_slice()))
@@ -4032,12 +5223,12 @@ mod header_list_size_tests {
         c.phase = Phase::Active;
         c.recv_buf.extend_from_slice(&wire);
         let mut reached = false;
-        let mut on_request = |_: &HttpRequest, _: &str| -> RequestOutcome {
+        let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
             reached = true;
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string())
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(), None)
         };
         loop {
-            match c.process_frame(&mut on_request, "127.0.0.1") {
+            match c.process_frame(&mut (), &mut on_request, "127.0.0.1", None) {
                 Ok(true) => continue,
                 Ok(false) => break,
                 Err(e) => panic!("a header list size must not be a connection error: {e}"),
@@ -4076,34 +5267,65 @@ mod header_list_size_tests {
     fn an_amplified_block_never_holds_more_than_the_limit_in_memory() {
         let block = amplified_block(2_000);
         let mut dec = hpack::Decoder::new();
+        let mut buf = Vec::new();
         let mut out = Vec::new();
-        let size = decode_hpack(&mut dec, &block, &mut out).expect("a valid block");
+        let size = decode_hpack(&mut dec, &block, &mut buf, &mut out).expect("a valid block");
         assert!(
             size > 2_000 * 4_000,
             "the true size is still counted: {size}"
         );
         let held: usize = out
             .iter()
-            .map(|(k, v)| k.len() + v.len() + HEADER_FIELD_OVERHEAD)
+            .map(|f| {
+                field_bytes(&buf, &f.name).len()
+                    + field_bytes(&buf, &f.value).len()
+                    + FIELD_OVERHEAD
+            })
             .sum();
         assert!(
-            held <= MAX_HEADER_LIST_SIZE,
+            held <= MAX_REQUEST_HEAD,
             "decoding kept {held} bytes of fields for a {}-byte block",
             block.len()
         );
     }
 
     #[test]
-    fn an_amplified_block_is_answered_431_and_the_connection_survives() {
+    fn an_amplified_block_is_answered_400_and_the_connection_survives() {
         let (c, reached) = feed_block(&amplified_block(2_000));
         assert!(!reached, "an oversize list must not reach the handler");
-        assert_eq!(status_of_stream_1(&c), "431");
+        assert_eq!(status_of_stream_1(&c), "400");
+        assert_eq!(c.phase, Phase::Active, "the connection must survive");
+    }
+
+    /// One field over `MAX_HEADER_LINE`, with the section well inside
+    /// `MAX_REQUEST_HEAD`, is the case the total alone cannot catch.
+    #[test]
+    fn a_field_over_the_line_limit_is_answered_400() {
+        let mut fields = base_fields();
+        fields.push((b"x-pad".to_vec(), vec![b'a'; 8 * 1024 - 5 + 1]));
+        let (c, reached) = feed_fields(&fields);
+        assert!(!reached, "an oversize field must not reach the handler");
+        assert_eq!(status_of_stream_1(&c), "400");
+        assert_eq!(c.phase, Phase::Active, "the connection must survive");
+    }
+
+    /// `:method` plus `:path` is the HTTP/2 request line, and its limit is 414.
+    #[test]
+    fn a_request_line_over_the_limit_is_answered_414() {
+        let mut fields = base_fields();
+        fields[2].1 = format!("/{}", "a".repeat(8 * 1024 + 1 - 4 - 1)).into_bytes();
+        let (c, reached) = feed_fields(&fields);
+        assert!(
+            !reached,
+            "an oversize request line must not reach the handler"
+        );
+        assert_eq!(status_of_stream_1(&c), "414");
         assert_eq!(c.phase, Phase::Active, "the connection must survive");
     }
 
     #[test]
     fn a_header_list_at_the_limit_is_served() {
-        let (c, reached) = send(MAX_HEADER_LIST_SIZE);
+        let (c, reached) = send(MAX_REQUEST_HEAD);
         assert!(
             reached,
             "a list exactly at the limit must reach the handler"
@@ -4112,12 +5334,15 @@ mod header_list_size_tests {
     }
 
     #[test]
-    fn a_header_list_over_the_limit_is_answered_431_on_its_stream() {
-        let (c, reached) = send(MAX_HEADER_LIST_SIZE + 1);
+    fn a_header_list_over_the_limit_is_answered_400_on_its_stream() {
+        let (c, reached) = send(MAX_REQUEST_HEAD + 1);
         assert!(!reached, "an oversize list must not reach the handler");
-        assert_eq!(status_of_stream_1(&c), "431");
+        assert_eq!(status_of_stream_1(&c), "400");
         assert_eq!(c.phase, Phase::Active, "the connection must survive");
-        assert!(c.was_reset(1), "the stream is closed with RST_STREAM");
+        assert!(
+            super::stream_state_tests::sent_frames(&c.send_buf, TYPE_RST_STREAM).is_empty(),
+            "a complete response needs no RST_STREAM"
+        );
     }
 
     #[test]
@@ -4130,6 +5355,476 @@ mod header_list_size_tests {
             (u16::from_be_bytes([s[0], s[1]]) == SETTING_MAX_HEADER_LIST_SIZE)
                 .then(|| u32::from_be_bytes([s[2], s[3], s[4], s[5]]))
         });
-        assert_eq!(advertised, Some(MAX_HEADER_LIST_SIZE as u32));
+        assert_eq!(advertised, Some(MAX_REQUEST_HEAD as u32));
+    }
+}
+
+#[cfg(test)]
+mod header_encoding_tests {
+    use super::*;
+
+    /// Decode the first HEADERS frame's block out of a connection's send
+    /// buffer, as a client would read it off the wire.
+    fn headers_block(c: &Http2Conn) -> Vec<(String, String)> {
+        assert_eq!(c.send_buf[3], TYPE_HEADERS, "the first frame is HEADERS");
+        let len = u24_be(&c.send_buf[0..3]) as usize;
+        let mut dec = hpack::Decoder::new();
+        let mut out = Vec::new();
+        dec.decode_with_cb(&c.send_buf[FRAME_HDR..FRAME_HDR + len], |k, v| {
+            out.push((
+                String::from_utf8_lossy(&k).into_owned(),
+                String::from_utf8_lossy(&v).into_owned(),
+            ));
+        })
+        .expect("a server-produced block decodes");
+        out
+    }
+
+    fn value<'a>(fields: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        fields
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn count(fields: &[(String, String)], name: &str) -> usize {
+        fields
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+            .count()
+    }
+
+    fn conn() -> Http2Conn {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+        c.streams.insert(1, H2Stream::new(c.peer_initial_window));
+        c.last_stream_id = 1;
+        c
+    }
+
+    /// RFC 9113 8.2.1: field names on the wire are lowercase. The encoder
+    /// lowercases into its scratch buffer instead of into a `String`; the
+    /// bytes a client receives are the ones a lowercased copy produced.
+    #[test]
+    fn owned_response_field_names_are_lowercase_and_hop_by_hop_fields_are_dropped() {
+        let mut c = conn();
+        c.push_response_headers(
+            1,
+            200,
+            &[
+                ("Content-Type".to_string(), "text/plain".to_string()),
+                ("X-MiXeD".to_string(), "kept".to_string()),
+                ("Connection".to_string(), "close".to_string()),
+                ("Transfer-Encoding".to_string(), "chunked".to_string()),
+                ("Keep-Alive".to_string(), "timeout=5".to_string()),
+            ],
+            2,
+            None,
+        );
+        let fields = headers_block(&c);
+        assert!(
+            fields
+                .iter()
+                .all(|(k, _)| !k.bytes().any(|b| b.is_ascii_uppercase())),
+            "a field name reached the wire with case: {fields:?}"
+        );
+        assert_eq!(value(&fields, "content-type"), Some("text/plain"));
+        assert_eq!(value(&fields, "x-mixed"), Some("kept"));
+        assert_eq!(value(&fields, "content-length"), Some("2"));
+        for dropped in ["connection", "transfer-encoding", "keep-alive"] {
+            assert_eq!(count(&fields, dropped), 0, "{dropped} was not dropped");
+        }
+    }
+
+    /// A borrowed cache hit writes the same fields, values and order the owned
+    /// path wrote: names lowercase, `Age`/`Vary` replaced rather than
+    /// duplicated, and the start-time `Alt-Svc` line used.
+    #[test]
+    fn borrowed_cache_hit_writes_lowercase_fields_and_replaces_age_vary_and_alt_svc() {
+        let entry = CachedResponse {
+            status: 200,
+            headers: crate::cache::HeaderBlock::from_pairs(vec![
+                ("Content-Type".to_string(), "text/plain".to_string()),
+                (
+                    "Cache-Control".to_string(),
+                    "public, max-age=60".to_string(),
+                ),
+                ("Content-Length".to_string(), "9".to_string()),
+                ("Connection".to_string(), "close".to_string()),
+                ("Age".to_string(), "41".to_string()),
+                ("Vary".to_string(), "Cookie".to_string()),
+                ("Alt-Svc".to_string(), "h3=\":1\"; ma=1".to_string()),
+            ]),
+            body: bytes::Bytes::from_static(b"cacheable"),
+            genid: 7,
+        };
+        let hit = HitHeaders {
+            alt_svc: std::sync::Arc::from(&b"alt-svc: h3=\":8443\"; ma=86400"[..]),
+            describedby: None,
+        };
+        let mut c = conn();
+        c.dispatch_cached_h2_response(
+            1,
+            &entry,
+            std::time::Duration::from_secs(3),
+            Some("sid=abc"),
+            &hit,
+            false,
+        );
+        let fields = headers_block(&c);
+        assert!(
+            fields
+                .iter()
+                .all(|(k, _)| !k.bytes().any(|b| b.is_ascii_uppercase())),
+            "a field name reached the wire with case: {fields:?}"
+        );
+        assert_eq!(value(&fields, "content-type"), Some("text/plain"));
+        assert_eq!(value(&fields, "cache-control"), Some("public, max-age=60"));
+        assert_eq!(value(&fields, "content-length"), Some("9"));
+        assert_eq!(value(&fields, "age"), Some("3"));
+        assert_eq!(value(&fields, "vary"), Some("Cookie, Accept-Encoding"));
+        assert_eq!(value(&fields, "alt-svc"), Some("h3=\":8443\"; ma=86400"));
+        assert_eq!(value(&fields, "set-cookie"), Some("sid=abc"));
+        assert_eq!(value(&fields, "m6-genid"), Some("7"));
+        for once in ["content-length", "age", "vary", "alt-svc", "m6-genid"] {
+            assert_eq!(count(&fields, once), 1, "{once} appears more than once");
+        }
+        assert_eq!(count(&fields, "connection"), 0);
+    }
+}
+
+/// The bounded send queue and RFC 9218 send order.
+#[cfg(test)]
+mod tests {
+    use super::frame_validation_tests::{frame, open_stream, open_stream_with_header};
+    use super::stream_state_tests::sent_frames;
+    use super::*;
+
+    /// Every DATA frame the connection emits, across as many flushes as the
+    /// bounded send queue needs: `send_buf` is emptied between them the way
+    /// `flush_io` empties it into the socket. Returns once the connection has
+    /// nothing left to frame.
+    pub(super) fn data_frames_across_flushes(c: &mut Http2Conn) -> Vec<(u32, Vec<u8>)> {
+        let mut frames = Vec::new();
+        loop {
+            frames.extend(sent_frames(&c.send_buf, TYPE_DATA));
+            c.send_buf.clear();
+            let before = frames.len();
+            c.flush_pending_streams();
+            frames.extend(sent_frames(&c.send_buf, TYPE_DATA));
+            c.send_buf.clear();
+            if frames.len() == before {
+                return frames;
+            }
+        }
+    }
+
+    /// One connection with `streams` request streams open, each carrying the
+    /// given `priority` header and answered with a body of `len` bytes. The
+    /// connection's send window starts spent, so no DATA is framed until the
+    /// test opens it; each stream's own window fits its whole body.
+    fn conn_with_streams(streams: &[(u32, &str, usize)]) -> Http2Conn {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+        c.peer_initial_window = 1 << 20;
+        c.conn_send_window = 0;
+        for &(stream_id, priority, len) in streams {
+            let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
+                RequestOutcome::Ready(200, vec![], vec![0x5a; len], "test".to_string(), None)
+            };
+            c.recv_buf
+                .extend_from_slice(&open_stream_with_header(stream_id, "priority", priority));
+            c.process_frame(&mut (), &mut on_request, "127.0.0.1", None)
+                .expect("a valid request");
+        }
+        c.send_buf.clear();
+        c
+    }
+
+    /// The order in which the responses started leaving: the stream id of each
+    /// DATA frame, with consecutive repeats collapsed.
+    fn responses_started_in_order(c: &mut Http2Conn) -> Vec<u32> {
+        let mut order: Vec<u32> = Vec::new();
+        for (stream_id, _) in data_frames_across_flushes(c) {
+            if order.last() != Some(&stream_id) {
+                order.push(stream_id);
+            }
+        }
+        order
+    }
+
+    /// The DATA frames in `send_buf`, as (stream id, flags, payload length).
+    fn data_frame_header(buf: &[u8]) -> Vec<(u32, u8, usize)> {
+        let mut frames = Vec::new();
+        let mut at = 0usize;
+        while at + FRAME_HDR <= buf.len() {
+            let len = u24_be(&buf[at..at + 3]) as usize;
+            let ftype = buf[at + 3];
+            let flags = buf[at + 4];
+            let stream_id =
+                u32::from_be_bytes(buf[at + 5..at + 9].try_into().unwrap()) & 0x7fff_ffff;
+            if ftype == TYPE_DATA {
+                frames.push((stream_id, flags, len));
+            }
+            at += FRAME_HDR + len;
+        }
+        frames
+    }
+
+    /// One request whose handler answers `len` bytes on `stream_id`.
+    fn request_with_body(stream_id: u32, len: usize) -> Http2Conn {
+        let mut c = Http2Conn::new();
+        c.phase = Phase::Active;
+        let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
+            RequestOutcome::Ready(200, vec![], vec![0x5a; len], "test".to_string(), None)
+        };
+        c.recv_buf.extend_from_slice(&open_stream(stream_id));
+        c.process_frame(&mut (), &mut on_request, "127.0.0.1", None)
+            .expect("a valid request");
+        c
+    }
+
+    /// One flush must not leave more than a queue's worth of DATA waiting,
+    /// however much the peer's windows allow. Unbounded, a cache hit's whole
+    /// body reached the socket at once and the kernel, not m6, decided what
+    /// left first.
+    /// An input buffer past the `h2_recv` maximum refuses the connection with
+    /// an error that names the key, and one at the maximum does not.
+    #[test]
+    fn an_input_buffer_past_its_limit_is_refused() {
+        let mut c = Http2Conn::new();
+        let max = crate::limits::edge().h2_recv.max();
+        c.recv_buf = vec![0; max];
+        assert!(c.check_recv_room().is_ok());
+        c.recv_buf.push(0);
+        let err = c.check_recv_room().unwrap_err().to_string();
+        assert!(err.contains("over [limits.h2_recv] max = 4 MiB"), "{err}");
+    }
+
+    #[test]
+    fn send_queue_stays_bounded() {
+        let mut c = request_with_body(1, 1 << 20);
+        // A peer that has granted room for the whole body: the bound, not the
+        // window, has to stop the flush.
+        c.conn_send_window = 1 << 20;
+        c.streams.get_mut(&1).unwrap().send_window = 1 << 20;
+        c.send_buf.clear();
+        c.flush_pending_streams();
+        let mark = c.send_buf.limit().start();
+        assert!(
+            c.send_buf.len() < mark + DEFAULT_MAX_FRAME as usize,
+            "one flush queued {} unsent bytes",
+            c.send_buf.len()
+        );
+        assert!(
+            !sent_frames(&c.send_buf, TYPE_DATA).is_empty(),
+            "the flush must still frame the next DATA"
+        );
+    }
+
+    /// `h2_send`'s configured start and max bound a real response send: the
+    /// flusher stops at the start, a frame may grow the area by doubling, and
+    /// the maximum is never reached.
+    #[test]
+    fn the_h2_send_limit_bounds_a_real_send() {
+        use m6_core::limits::{Bounded, Limit, H2_SEND};
+
+        let mut c = request_with_body(1, 1 << 20);
+        c.send_buf = Bounded::new(&Limit::custom(&H2_SEND, 4 * 1024, 64 * 1024));
+        c.send_buf.set_what("an HTTP/2 response");
+        // A peer that has granted room for the whole body: the bound, not the
+        // window, has to stop the flush.
+        c.conn_send_window = 1 << 20;
+        c.streams.get_mut(&1).unwrap().send_window = 1 << 20;
+        c.flush_pending_streams();
+
+        assert!(
+            c.send_buf.len() < 4 * 1024 + DEFAULT_MAX_FRAME as usize + FRAME_HDR,
+            "the configured start did not stop the flush: {} unsent bytes",
+            c.send_buf.len()
+        );
+        assert!(
+            c.send_buf.capacity() <= 64 * 1024,
+            "the configured max did not bound the area: {}",
+            c.send_buf.capacity()
+        );
+        assert!(
+            c.send_buf.capacity() >= 4 * 1024,
+            "the area is below its configured start: {}",
+            c.send_buf.capacity()
+        );
+        let frames = sent_frames(&c.send_buf, TYPE_DATA);
+        assert!(!frames.is_empty(), "the real body was not framed at all");
+        assert_eq!(
+            frames.iter().map(|(_, body)| body.len()).sum::<usize>(),
+            DEFAULT_MAX_FRAME as usize,
+            "one pass frames one frame"
+        );
+    }
+
+    /// `append_frame` writes the frame in every build profile. It once wrote
+    /// both halves inside a debug assertion, which a release build compiles
+    /// out, so the shipped binary sent no HTTP/2 frame at all. Run under
+    /// `cargo test --release` this is the test that catches it.
+    #[test]
+    fn append_frame_writes_the_frame_in_every_profile() {
+        use m6_core::limits::{Bounded, Limit, H2_SEND};
+
+        let mut buf: Bounded<u8> = Bounded::new(&Limit::custom(&H2_SEND, 64, 1024));
+        append_frame(&mut buf, TYPE_PING, 0, 0, &[7; 8]);
+        assert_eq!(buf.len(), FRAME_HDR + 8, "the frame was not written");
+        assert_eq!(u24_be(&buf[0..3]), 8);
+        assert_eq!(buf[3], TYPE_PING);
+        assert_eq!(&buf[FRAME_HDR..], &[7; 8]);
+    }
+
+    /// HEADERS and control frames are not paced, so a peer that opens streams
+    /// and never reads can fill `h2_send` to its maximum. That closes the one
+    /// connection with an error naming the key. It used to panic on the HPACK
+    /// encode, which aborts the whole process.
+    #[test]
+    fn a_full_send_area_closes_the_connection_without_a_panic() {
+        use m6_core::limits::{Bounded, Limit, H2_SEND};
+
+        let mut c = Http2Conn::new();
+        c.send_buf = Bounded::new(&Limit::custom(&H2_SEND, 64, 128));
+        let value = vec![b'x'; 512];
+        let plan = [(FieldPart::Bytes(b"x-big"), FieldPart::Bytes(&value))];
+        c.write_headers_frame(1, &plan, &[]);
+        assert!(c.send_buf.overflow().is_some(), "the refusal is recorded");
+        // A control frame after the refusal is refused too: the area stays
+        // under its maximum.
+        c.push_frame(TYPE_PING, 0, 0, &[0; 200]);
+        assert!(c.send_buf.len() <= 128, "{} bytes queued", c.send_buf.len());
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (_peer, _) = m6_core::platform::net::connect_tcp(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        server.set_nonblocking(true).expect("nonblocking");
+        let err = c
+            .send_until_blocked(&mut H2Io::Plain { stream: &server })
+            .expect_err("a full send area closes the connection");
+        assert!(err.to_string().contains("[limits.h2_send]"), "{err}");
+    }
+
+    /// The bound frames one queue per pass, so a connection whose socket takes
+    /// everything has to go on framing in the same turn: no writable edge comes
+    /// for a socket that never stopped being writable. A 40 KiB body is the
+    /// smallest that needs a third pass, and fits any socket buffer.
+    #[test]
+    fn send_until_blocked_goes_past_one_queue_when_the_socket_takes_it() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (_peer, _) = m6_core::platform::net::connect_tcp(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        server.set_nonblocking(true).expect("nonblocking");
+        let mut c = request_with_body(1, 40 * 1024);
+        c.conn_send_window = 1 << 20;
+        c.streams.get_mut(&1).unwrap().send_window = 1 << 20;
+        c.send_until_blocked(&mut H2Io::Plain { stream: &server })
+            .expect("the write");
+        assert!(
+            c.send_buf.is_empty() && !c.more_to_flush(),
+            "the socket took it all, so nothing may be left: {} bytes queued, {:?}",
+            c.send_buf.len(),
+            c.streams.get(&1).map(|s| (s.resp_sent, s.end_stream_sent))
+        );
+    }
+
+    /// RFC 9218 10: responses leave in urgency order. Within one urgency a
+    /// non-incremental response is finished before the next one at that
+    /// urgency starts, in stream-id order, because the client cannot use it
+    /// until it is complete.
+    #[test]
+    fn urgent_stream_leaves_first() {
+        // Urgencies 5, 5, 1 and 3 in stream-id order, each body several frames.
+        let mut c = conn_with_streams(&[
+            (1, "u=5", 64 * 1024),
+            (3, "u=5", 64 * 1024),
+            (5, "u=1", 64 * 1024),
+            (7, "u=3", 64 * 1024),
+        ]);
+        // One WINDOW_UPDATE opens the connection for all of the bodies.
+        c.recv_buf.extend_from_slice(&frame(
+            TYPE_WINDOW_UPDATE,
+            0,
+            0,
+            &(1u32 << 20).to_be_bytes(),
+        ));
+        let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| {
+            RequestOutcome::Ready(200, vec![], vec![], String::new(), None)
+        };
+        c.process_frame(&mut (), &mut on_request, "127.0.0.1", None)
+            .expect("a window update is legal");
+
+        assert_eq!(
+            responses_started_in_order(&mut c),
+            vec![5, 7, 1, 3],
+            "the most urgent response must start first, then urgency 3, then \
+             the two at urgency 5 in stream-id order"
+        );
+    }
+
+    /// RFC 9218 10: incremental responses of the same urgency share the
+    /// connection, one frame each in turn, because the client can use the
+    /// beginning of each as it arrives.
+    #[test]
+    fn incremental_streams_interleave() {
+        let mut c = conn_with_streams(&[(1, "u=0, i", 64 * 1024), (3, "u=0, i", 64 * 1024)]);
+        c.conn_send_window = 1 << 20;
+
+        let frames: Vec<u32> = data_frames_across_flushes(&mut c)
+            .into_iter()
+            .map(|(stream_id, _)| stream_id)
+            .collect();
+        assert_eq!(
+            frames.len(),
+            8,
+            "two 64 KiB bodies, four frames each, and no second END_STREAM"
+        );
+        assert_eq!(
+            frames,
+            vec![1, 3, 1, 3, 1, 3, 1, 3],
+            "incremental responses must take one frame each in turn"
+        );
+    }
+
+    /// A response dispatched before the peer ends its request has already put
+    /// END_STREAM on its last DATA frame. The peer's own END_STREAM, an empty
+    /// DATA or a trailer section, must not make the flusher send a second one:
+    /// RFC 9113 5.1 makes a frame the peer receives after END_STREAM a
+    /// connection error.
+    #[test]
+    fn one_end_stream_when_the_peer_ends_after_ours() {
+        for terminator in [
+            frame(TYPE_DATA, FLAG_END_STREAM, 1, &[]),
+            frame(TYPE_HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 1, &[]),
+        ] {
+            let mut c = request_with_body(1, 16);
+            assert_eq!(
+                data_frame_header(&c.send_buf),
+                vec![(1, FLAG_END_STREAM, 16)],
+                "the response goes out as one DATA frame with END_STREAM"
+            );
+
+            c.recv_buf.extend_from_slice(&terminator);
+            let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| {
+                RequestOutcome::Ready(200, vec![], vec![], String::new(), None)
+            };
+            c.process_frame(&mut (), &mut on_request, "127.0.0.1", None)
+                .expect("the peer's end is a legal frame");
+            c.flush_pending_streams();
+
+            assert_eq!(
+                data_frame_header(&c.send_buf),
+                vec![(1, FLAG_END_STREAM, 16)],
+                "the peer's END_STREAM must not produce a second one"
+            );
+            assert!(
+                c.streams.is_empty(),
+                "a stream both ends have finished is reaped"
+            );
+        }
     }
 }

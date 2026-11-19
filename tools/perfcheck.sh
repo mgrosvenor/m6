@@ -1,302 +1,409 @@
 #!/usr/bin/env bash
-# perfcheck.sh — measure the hot paths and refuse a merge that made them slower.
+# perfcheck.sh: an interleaved, pinned A/B of a candidate build against a base build.
 #
-# The same shape as tools/conformance.sh: a recorded number per target in
-# tools/perf-baseline.txt, and a run that comes in worse than its number by
-# more than the allowed margin fails. A run that comes in better prints the new
-# number and asks you to record it deliberately, in the commit that earned it.
+# A recorded number in a file stopped meaning anything on 2026-09-27: the
+# content it was measured against changed, and the machine it was measured on
+# moved. This script therefore builds and compares two binaries, the candidate
+# and a base, so both arms render the same bytes on the same machine in the
+# same minute. The verdict is made by the tested Rust module behind the
+# m6-perf-ab binary, never by this script.
 #
-# Usage:
-#   tools/perfcheck.sh            # measure and compare
-#   tools/perfcheck.sh --update   # record the measured numbers as the new ones
-#   tools/perfcheck.sh --margin 15
-#   tools/perfcheck.sh --runs 9   # rounds per target, default 5, minimum wins
+# WHY INTERLEAVED. The two arms alternate each round, base then candidate on odd
+# rounds and candidate then base on even rounds, so drift that grows through the
+# run lands on both arms equally and cancels in the paired difference.
+#
+# WHY PINNED. The server runs on one CPU and the C client on another, so the
+# client's own work never competes with the server for a CPU, and every thread
+# of the server shares one CPU and its cache, the layout a single-threaded
+# event-loop server will run under.
+#
+# WHY A C CLIENT. The previous client was Python, and its own interpreter time
+# sat inside every reading. It also never checked the status line, so a 404 or a
+# 500 was timed as a fast render. The C client checks every status line and
+# times only the socket work.
 #
 # EVERY RUN APPENDS ONE LINE TO tools/perf-history.jsonl, in git. A number
 # without the conditions it was taken under cannot be compared with anything
 # later, so the record carries the commit, the toolchain, the CPU model and core
 # count, the OS, total memory, and the load average BEFORE and AFTER the run. It
-# keeps every raw reading, not only the minimum, so the spread is visible.
+# keeps every raw reading, not only the medians, so the spread is visible.
 #
 # It carries no hostname, address or domain. What class of machine, and how busy,
 # is the question. Which machine is not.
 #
-# WHY A MARGIN. These are wall-clock numbers on a shared machine, so they move
-# a few percent between runs for reasons that have nothing to do with the code.
-# The default margin is 20%, which is wide enough that an idle laptop does not
-# fail a correct change and narrow enough to catch the kind of regression that
-# matters: this file exists because `App` spent 0.63 ms per page copying its own
-# config for months and nothing noticed.
-#
-# WHY MEDIAN OF SEVERAL ROUNDS, INTERLEAVED WHERE THERE ARE TWO SIDES. One
-# reading of one process is a reading of the afternoon. See
-# docs/PERFORMANCE.md.
-#
-# This paragraph said median while the code took the MINIMUM, from the day it was
-# written until 2026-09-27. Owner's decision that day settled it in favour of what
-# the comment already said: work with medians. A minimum is the best reading the
-# machine ever managed, which is not what anyone's request costs. The median is
-# the typical cost, and typical is what a latency number is for.
-#
-# WHERE IT RUNS. The build host, and not the
-# laptop's pre-push hook. A wall-clock measurement needs a quiet machine: this
-# laptop sits at load 20-30 with the owner's own dev servers and preview
-# instances running, and readings there moved by half between consecutive runs.
-# The recorded numbers in perf-baseline.txt are therefore build-host numbers
-# and mean nothing anywhere else. Same reasoning as the conformance check,
-# which also only became real once it ran on the box that gates a deploy.
-#
-# WHAT IT DOES NOT DO. It does not compare against another commit. Doing that
-# honestly means building both, and a pre-push check that builds twice is a
-# check people learn to skip. The recorded numbers are the previous side of the
-# comparison, which is what makes this cheap enough to actually run.
+# WHERE IT RUNS. The build host, and not the laptop's pre-push hook. A wall-clock
+# measurement needs a quiet machine. This laptop sits at load 20-30 with dev
+# servers and preview instances running, and readings there moved by half
+# between consecutive runs. Same reasoning as the conformance check, which also
+# only became real once it ran on the box that gates a deploy.
 
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-BASELINE="$HERE/perf-baseline.txt"
-# Per-account. See the same change in tools/conformance.sh: a bare
-# /tmp/m6-perfcheck is one directory shared by every account, and a root-owned
-# one is unwritable to the account that runs the gate on a hardened build host.
+# Per-account. A bare /tmp/m6-perfcheck is one directory shared by every
+# account, and a root-owned one is unwritable to the account that runs the gate
+# on a hardened build host.
 WORK="${PERFCHECK_WORK:-/tmp/m6-perfcheck-$(id -un)}"
 
-# ── What is measured, and where it comes from ─────────────────────────────────
-#
-# The examples repository, checked out beside this one. It used to be a
-# deployment's `deploy/rendered/prod/configs/m6-html.conf`, which meant m6 could
-# not measure itself: a bare checkout with no site beside it failed the check
-# rather than running it, and the recorded number belonged to one particular
-# site's content.
-#
-# The examples are m6's own, they are version-controlled with it in mind, and
-# their content is committed, so the same bytes are rendered on every machine
-# and the number means the same thing twice. PERFCHECK_EXAMPLES overrides the
-# location; PERFCHECK_SITE still points the whole check at a deployment instead,
-# for a deployment that wants to measure its own content.
-EXAMPLES="${PERFCHECK_EXAMPLES:-$(cd "$ROOT/.." 2>/dev/null && pwd)/m6-examples}"
+# The examples directory of this repository holds the committed bytes both arms
+# render. PERFCHECK_EXAMPLES overrides its location.
+# PERFCHECK_SITE still points the whole check at a deployment instead, for a
+# deployment that wants to measure its own content.
+EXAMPLES="${PERFCHECK_EXAMPLES:-$ROOT/examples}"
 SITE="${PERFCHECK_SITE:-}"
-UPDATE=false
-MARGIN=20
-RUNS=5
-HISTORY="$HERE/perf-history.jsonl"
+HISTORY="${PERFCHECK_HISTORY:-$HERE/perf-history.jsonl}"
+
+BASE_BIN=""
+CAND_BIN="$ROOT/target/release/m6-html"
+BASE_EXAMPLES=""
+# 100 rounds, not 30: each round starts a fresh m6-html and each settles at its
+# own speed, so the round medians span a wide range and more requests per round
+# cannot narrow it. More rounds average that out; 100 rounds of 500 requests
+# keeps every CI99 width inside the 10% cap on an A/A.
+ROUNDS=100
+REQUESTS=500
+THRESHOLD=3
+MAX_CI_WIDTH=10
+
+# shellcheck source=tools/perfcheck-stray.sh
+. "$HERE/perfcheck-stray.sh"
+
+usage() {
+  cat <<'EOF'
+usage: tools/perfcheck.sh --base-bin PATH [options]
+
+  --base-bin PATH       the base m6-html (required)
+  --cand-bin PATH       the candidate m6-html (default target/release/m6-html)
+  --base-examples DIR   the examples the base arm renders (default: the candidate's)
+  --rounds N            rounds per target (default 100)
+  --requests N          requests per round (default 500)
+  --threshold PCT       slower verdict threshold, percent (default 3)
+  --max-ci-width PCT    interval width that marks a run not measured (default 10)
+
+Environment:
+  PERFCHECK_EXAMPLES      examples directory (default: examples/ in this repository)
+  PERFCHECK_SITE          measure a deployment's render:capabilities instead
+  PERFCHECK_WORK          work directory
+  PERFCHECK_HISTORY       history file (default tools/perf-history.jsonl)
+  PERFCHECK_CPUS          client,server CPUs to pin
+  PERFCHECK_UNPINNED      set to run without taskset; the result is not measured
+  PERFCHECK_ACCEPT_SLOWER a reason that accepts a deliberate regression
+EOF
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --update) UPDATE=true; shift ;;
-    --margin) MARGIN="$2"; shift 2 ;;
-    --runs)   RUNS="$2"; shift 2 ;;
-    *) echo "usage: $0 [--update] [--margin PERCENT] [--runs N]"; exit 2 ;;
+    --base-bin) BASE_BIN="$2"; shift 2 ;;
+    --cand-bin) CAND_BIN="$2"; shift 2 ;;
+    --base-examples) BASE_EXAMPLES="$2"; shift 2 ;;
+    --rounds) ROUNDS="$2"; shift 2 ;;
+    --requests) REQUESTS="$2"; shift 2 ;;
+    --threshold) THRESHOLD="$2"; shift 2 ;;
+    --max-ci-width) MAX_CI_WIDTH="$2"; shift 2 ;;
+    *) usage; exit 2 ;;
   esac
 done
 
-if ! [[ "$RUNS" =~ ^[0-9]+$ ]] || (( RUNS < 1 )); then
-  echo "--runs takes a positive integer, got '$RUNS'" >&2
+if [[ -z "$BASE_BIN" ]]; then
+  echo "perfcheck: --base-bin is required" >&2
+  usage
+  exit 2
+fi
+if [[ ! -x "$BASE_BIN" ]]; then
+  echo "perfcheck: $BASE_BIN is not executable" >&2
+  usage
   exit 2
 fi
 
-GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; RESET='\033[0m'
-pass() { echo -e "${GREEN}PASS${RESET} $*"; }
-fail() { echo -e "${RED}FAIL${RESET} $*"; }
-info() { echo -e "${YELLOW}----${RESET} $*"; }
+# Both binaries are resolved to absolute paths and used as-is everywhere, so the
+# leftover-server check after the loop matches exactly the processes this run
+# started, not another checkout's servers that share a relative path.
+BASE_BIN="$(resolve_abs "$BASE_BIN")"
+CAND_BIN="$(resolve_abs "$CAND_BIN")"
+
+if ! [[ "$ROUNDS" =~ ^[0-9]+$ ]] || (( ROUNDS < 1 )); then
+  echo "perfcheck: --rounds takes a positive integer, got '$ROUNDS'" >&2
+  usage; exit 2
+fi
+if ! [[ "$REQUESTS" =~ ^[0-9]+$ ]] || (( REQUESTS < 1 )); then
+  echo "perfcheck: --requests takes a positive integer, got '$REQUESTS'" >&2
+  usage; exit 2
+fi
+if ! [[ "$THRESHOLD" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+  echo "perfcheck: --threshold takes a non-negative number, got '$THRESHOLD'" >&2
+  usage; exit 2
+fi
+if ! [[ "$MAX_CI_WIDTH" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+  echo "perfcheck: --max-ci-width takes a non-negative number, got '$MAX_CI_WIDTH'" >&2
+  usage; exit 2
+fi
+
+# A wall-clock number is only worth anything on an idle host, so this takes the
+# build host to itself through tools/host-lock.sh, or reports NOT MEASURED and
+# fails. A caller already holding the host (build-host-tests.sh) has exported
+# M6_HOST_LOCK_HELD=exclusive, and the call returns at once.
+# shellcheck source=tools/host-lock.sh
+. "$HERE/host-lock.sh"
+host_alone || exit 2
 
 mkdir -p "$WORK"
-MEASURED="$WORK/measured.txt"
-RAW="$WORK/raw.txt"
-: > "$MEASURED"
-: > "$RAW"
-RESULT=0
+CLIENT="$WORK/perf_client"
+ROUNDS_FILE="$WORK/rounds.txt"
+: > "$ROUNDS_FILE"
 
-# The load average BEFORE anything starts, because the measurement raises it
-# itself. A reader needs what the box was already doing, not what this script
-# did to it.
-load_now() { uptime | sed 's/.*load average[s]*: *//; s/,.*//' | tr -d ' '; }
+# The C client, standard library and POSIX only, built with the same flags CI
+# uses so a warning here is a warning there.
+if ! cc -O2 -std=c11 -Wall -Wextra -Werror -o "$CLIENT" "$HERE/perf_client.c" \
+    2> "$WORK/cc.log"; then
+  echo "perfcheck: building the C client failed" >&2
+  cat "$WORK/cc.log" >&2
+  exit 2
+fi
+
+# The verdict binary. If it is missing, build it; a failure to build it is a
+# check that cannot measure, and fails.
+AB_BIN="$ROOT/target/release/m6-perf-ab"
+if [[ ! -x "$AB_BIN" ]]; then
+  if ! (cd "$ROOT" && cargo build --release -p m6-http --bin m6-perf-ab) \
+      > "$WORK/build-ab.log" 2>&1; then
+    echo "perfcheck: building m6-perf-ab failed" >&2
+    cat "$WORK/build-ab.log" >&2
+    exit 2
+  fi
+fi
+
+# ── The machine facts the record needs ────────────────────────────────────────
+#
+# Each is empty when its command fails, so a fact this machine cannot report is
+# a null in the record rather than a number it did not take.
+machine_cpu() {
+  if [[ -r /proc/cpuinfo ]]; then
+    awk -F: '/^model name/ { sub(/^[ \t]+/, "", $2); print $2; exit }' /proc/cpuinfo 2>/dev/null
+  else
+    sysctl -n machdep.cpu.brand_string 2>/dev/null
+  fi
+}
+
+machine_cores() {
+  if command -v lscpu >/dev/null 2>&1; then
+    local n
+    n="$(lscpu -p=Core,Socket 2>/dev/null | grep -v '^#' | sort -u | grep -c .)"
+    if [[ "$n" =~ ^[0-9]+$ ]] && (( n > 0 )); then echo "$n"; return; fi
+  fi
+  sysctl -n hw.physicalcpu 2>/dev/null
+}
+
+machine_mem_kb() {
+  if [[ -r /proc/meminfo ]]; then
+    awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo 2>/dev/null
+  else
+    local b
+    b="$(sysctl -n hw.memsize 2>/dev/null)"
+    [[ "$b" =~ ^[0-9]+$ ]] && echo $(( b / 1024 ))
+  fi
+}
+
+M6_PERF_CPU="$(machine_cpu)"
+M6_PERF_CORES="$(machine_cores)"
+M6_PERF_MEM_KB="$(machine_mem_kb)"
+M6_PERF_OS="$(uname -sr 2>/dev/null)"
+M6_PERF_ARCH="$(uname -m 2>/dev/null)"
+M6_PERF_TOOLCHAIN="$(rustc --version 2>/dev/null)"
+M6_PERF_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+export M6_PERF_CPU M6_PERF_CORES M6_PERF_MEM_KB M6_PERF_OS M6_PERF_ARCH M6_PERF_TOOLCHAIN M6_PERF_TS
+# The commit and dirtiness come from the checkout. build-host-tests.sh sets them
+# first, because the tree it synced to the host has no .git to ask.
+if [[ -z "${M6_PERF_COMMIT:-}" ]]; then
+  M6_PERF_COMMIT="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null)"
+  export M6_PERF_COMMIT
+fi
+if [[ -z "${M6_PERF_DIRTY:-}" ]]; then
+  if [[ -z "$(git -C "$ROOT" status --porcelain 2>/dev/null)" ]]; then
+    M6_PERF_DIRTY=0
+  else
+    M6_PERF_DIRTY=1
+  fi
+  export M6_PERF_DIRTY
+fi
+
+# ── The CPUs ──────────────────────────────────────────────────────────────────
+#
+# The client CPU is the lowest CPU on the lowest core, the server CPU the lowest
+# CPU on the highest core. Two cores, so the client's own work never competes
+# with the server, and every thread of the server shares one CPU and its cache.
+# PERFCHECK_CPUS replaces the choice, and PERFCHECK_UNPINNED runs without
+# taskset, which makes the result always not measured.
+PINNED=1
+CLIENT_CPU=""
+SERVER_CPU=""
+if [[ "${PERFCHECK_UNPINNED:-0}" == "1" ]]; then
+  PINNED=0
+elif [[ -n "${PERFCHECK_CPUS:-}" ]]; then
+  CLIENT_CPU="${PERFCHECK_CPUS%%,*}"
+  SERVER_CPU="${PERFCHECK_CPUS##*,}"
+else
+  if ! command -v taskset >/dev/null 2>&1 || ! command -v lscpu >/dev/null 2>&1; then
+    echo "NOT MEASURED: taskset/lscpu missing" >&2
+    exit 2
+  fi
+  map="$(lscpu -p=CPU,CORE 2>/dev/null \
+    | awk -F, '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {print $1","$2}')"
+  [[ -n "$map" ]] || { echo "NOT MEASURED: lscpu gave no CPU map" >&2; exit 2; }
+  low_core="$(printf '%s\n' "$map" | awk -F, '{print $2}' | sort -n | head -1)"
+  high_core="$(printf '%s\n' "$map" | awk -F, '{print $2}' | sort -n | tail -1)"
+  CLIENT_CPU="$(printf '%s\n' "$map" | awk -F, -v c="$low_core" '$2==c {print $1}' | sort -n | head -1)"
+  SERVER_CPU="$(printf '%s\n' "$map" | awk -F, -v c="$high_core" '$2==c {print $1}' | sort -n | head -1)"
+  if [[ "$low_core" == "$high_core" ]]; then
+    echo "NOT MEASURED: one core, the client and server would share it" >&2
+    exit 2
+  fi
+fi
+
+# Run a command pinned to one CPU, or unpinned when the run asked for that.
+# `exec` replaces the subshell that `&` and `$()` fork, so `$!` is the command
+# itself and `kill` stops it rather than a now-empty wrapper shell.
+run_pinned() {
+  local cpu="$1"; shift
+  if (( PINNED == 1 )); then
+    exec taskset -c "$cpu" "$@"
+  else
+    exec "$@"
+  fi
+}
+
+load_now() {
+  if [[ -r /proc/loadavg ]]; then
+    cut -d' ' -f1 /proc/loadavg
+  else
+    uptime | sed -E 's/.*load averages?: *//; s/[ ,].*//'
+  fi
+}
 LOAD_BEFORE="$(load_now)"
 
-PIDS=()
-cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done; }
+SERVER_PID=""
+cleanup() { [[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" 2>/dev/null; }
 trap cleanup EXIT INT TERM
 
-baseline_for() { awk -v k="$1" '$1==k {print $2}' "$BASELINE" 2>/dev/null; }
-
-# Compare a measurement against its recorded number.
+# ── Targets ───────────────────────────────────────────────────────────────────
 #
-# Lower is better for every target here; they are all nanoseconds. If that ever
-# stops being true the unit column in the baseline file has to say so.
-compare() {  # compare <key> <measured-ns>
-  local key="$1" got="$2"
-  local base; base="$(baseline_for "$key")"
-  printf '%s %s\n' "$key" "$got" >> "$MEASURED"
+# A rendered HTML page, end to end over the socket: routing, the request
+# dictionary, the template engine, compression and the response writer. Three
+# of them, because a page has more than one cost and one target cannot separate
+# them.
+#
+#   render:minimal     example 01, `/`. Almost no content, so what is left is the
+#                      FIXED per-request cost, undiluted.
+#   render:blog-index  example 05, `/blog`. The post index rendered from the
+#                      committed posts.json, the per-item cost.
+#   render:no-store    example 05, `/login`. A cache = "no-store" route, the page
+#                      every visitor pays for because no cache keeps it.
+#
+# The base arm can render another examples checkout (--base-examples), which is
+# what P2 uses to pair an old build with old content.
+BASE_EXAMPLES_DIR="${BASE_EXAMPLES:-$EXAMPLES}"
 
-  if [[ -z "$base" ]]; then
-    info "$key: ${got}ns (no number recorded yet — record it with --update)"
-    return
-  fi
-
-  local ceiling=$(( base + base * MARGIN / 100 ))
-  if (( got > ceiling )); then
-    fail "$key: ${got}ns against ${base}ns, which is over the ${MARGIN}% margin (ceiling ${ceiling}ns)."
-    info "  this change made it slower, OR the machine was busy while measuring."
-    info "  This check is meant to run on the build host, which is quiet. On a"
-    info "  loaded laptop it will fail on correct code: measured readings there"
-    info "  moved 50% between runs while a release build was going."
-    RESULT=1
-  elif (( got * 100 < base * 90 )); then
-    pass "$key: ${got}ns against ${base}ns — faster. Record it with --update, in the commit that earned it."
+target_rows() {
+  if [[ -n "$SITE" ]]; then
+    printf '%s\n' "render:capabilities /capabilities __site__"
   else
-    pass "$key: ${got}ns against ${base}ns"
+    printf '%s\n' "render:minimal / 01-static"
+    printf '%s\n' "render:blog-index /blog 05-cms"
+    printf '%s\n' "render:no-store /login 05-cms"
   fi
 }
 
-have() { command -v "$1" >/dev/null 2>&1; }
+arm_site() {
+  local arm="$1" subdir="$2" ex
+  if [[ "$arm" == "base" ]]; then ex="$BASE_EXAMPLES_DIR"; else ex="$EXAMPLES"; fi
+  echo "$ex/$subdir"
+}
 
-# ── Targets: a rendered HTML page, end to end over the socket ─────────────────
-#
-# The one kind of number that covers the most code: routing, the request
-# dictionary, the template engine, compression and the response writer. It is
-# also where the copy work landed, so it is the number that would have caught it.
-#
-# Two of them, because a page has two costs and one target cannot separate them:
-#
-#   render:minimal     example 01, `/`. A 10-line template over 185 bytes of
-#                      params. Almost no content, which is the point: what is
-#                      left is the FIXED per-request cost, undiluted. The defect
-#                      this file exists for was exactly that shape -- `App` spent
-#                      0.63 ms per page copying its own config, regardless of how
-#                      big the page was -- and it shows up most clearly here.
-#
-#   render:blog-index  example 05, `/blog`. The post index rendered from 113 KB
-#                      of committed posts.json, iterating every post. This is the
-#                      per-item cost, which a minimal page cannot see at all.
-#
-# A regression in one and not the other says where to look, which one number
-# never did.
-measure_one() {
-  local key="$1" site="$2" conf="$3" path="$4"
-
-  if [[ ! -f "$conf" ]]; then
-    fail "$key — no config at $conf, so nothing was measured."
-    info "  The examples are expected beside this checkout:"
-    info "    git clone https://github.com/mgrosvenor/m6-examples"
-    info "  Or set PERFCHECK_EXAMPLES, or PERFCHECK_SITE for a deployment."
-    RESULT=1
-    return 1
-  fi
-  local bin="$ROOT/target/release/m6-html"
-  if [[ ! -x "$bin" ]]; then
-    fail "$key — $bin is missing. Build release first."
-    RESULT=1
-    return 1
-  fi
-
-  local sock="$WORK/render.sock"
-  local -a readings=()
-  # $RUNS rounds, take the MEDIAN. Owner's decision, 2026-09-27.
-  #
-  # A minimum is the best reading the machine ever managed and no request costs
-  # that. A maximum is whatever else the box was doing. The median is the typical
-  # cost, which is the number a latency floor should be made of.
-  #
-  # Every reading is kept, not only the median. A single figure cannot separate a
-  # run that read 157us, 158us, 159us from one that read 157us, 340us, 890us, and
-  # those two say very different things about the machine.
-  for _ in $(seq 1 "$RUNS"); do
-    rm -f "$sock"
-    M6_SOCKET_OVERRIDE="$sock" "$bin" "$site" "$conf" --log-level error \
-      > "$WORK/render.log" 2>&1 &
-    local pid=$!
-    PIDS+=("$pid")
-    for _ in $(seq 1 100); do [[ -S "$sock" ]] && break; sleep 0.05; done
-    if [[ ! -S "$sock" ]]; then
-      fail "$key — m6-html never bound $sock. See $WORK/render.log"
-      RESULT=1
-      kill "$pid" 2>/dev/null
-      return 1
-    fi
-    local got
-    got="$(python3 "$HERE/perfcheck_client.py" "$sock" "$path" 200 2>/dev/null)"
-    kill "$pid" 2>/dev/null
-    wait "$pid" 2>/dev/null
-    if [[ -n "$got" ]]; then
-      readings+=("$got")
-    fi
+run_round() {
+  local key="$1" r="$2" arm="$3" site="$4" conf="$5" path="$6" bin="$7"
+  local sock="$WORK/render.sock" log="$WORK/render-$key-$arm.log"
+  rm -f "$sock"
+  # A fresh socket per round, and the closed descriptors keep the server from
+  # inheriting the host lock.
+  M6_SOCKET_OVERRIDE="$sock" \
+    run_pinned "$SERVER_CPU" "$bin" "$site" "$conf" --log-level error \
+    > "$log" 2>&1 6<&- 8<&- &
+  local pid=$! i
+  SERVER_PID="$pid"
+  for ((i = 0; i < 100; i++)); do
+    [[ -S "$sock" ]] && break
+    sleep 0.05
   done
-
-  local all="${readings[*]:-}"
-  printf '%s %s\n' "$key" "$all" >> "$RAW"
-  info "$key: $RUNS rounds, ns: $all"
-
-  # The median. For an even count, the mean of the two middle readings, which is
-  # why this is integer arithmetic on nanoseconds rather than picking a side.
-  local best=""
-  if (( ${#readings[@]} > 0 )); then
-    best="$(printf '%s\n' "${readings[@]}" | sort -n | awk '
-      { a[NR] = $1 }
-      END {
-        if (NR % 2) { print a[(NR + 1) / 2] }
-        else        { print int((a[NR / 2] + a[NR / 2 + 1]) / 2) }
-      }')"
-  fi
-
-  if [[ -z "$best" ]]; then
-    fail "$key — measured nothing. A check that cannot measure must fail."
-    RESULT=1
+  if [[ ! -S "$sock" ]]; then
+    echo "perfcheck: $key ($arm) never bound $sock; see $log" >&2
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    SERVER_PID=""
     return 1
   fi
-  compare "$key" "$best"
+  local out rc
+  out="$(run_pinned "$CLIENT_CPU" "$CLIENT" "$sock" "$path" "$REQUESTS")"
+  rc=$?
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  SERVER_PID=""
+  if (( rc != 0 )); then
+    echo "perfcheck: $key ($arm) client failed (exit $rc); see $log" >&2
+    return 1
+  fi
+  printf '%s %s %s %s\n' "$key" "$r" "$arm" "$out" >> "$ROUNDS_FILE"
 }
 
-info "Performance check (margin ${MARGIN}%)"
-
-if [[ -n "$SITE" ]]; then
-  # A deployment measuring its own content. Its layout, its target name.
-  measure_one "render:capabilities" "$SITE" \
-    "$SITE/deploy/rendered/prod/configs/m6-html.conf" /capabilities
-else
-  measure_one "render:minimal" "$EXAMPLES/examples/01-static" \
-    "$EXAMPLES/examples/01-static/configs/m6-html.conf" /
-  measure_one "render:blog-index" "$EXAMPLES/examples/05-cms" \
-    "$EXAMPLES/examples/05-cms/configs/m6-html.conf" /blog
-fi
-
-# ── The history record ────────────────────────────────────────────────────────
-#
-# Written on every run, pass or fail, before the verdict is printed. A run that
-# failed is exactly the run a later reader wants the conditions for.
-#
-# It never blocks the check. A gate that fails because its bookkeeping failed is
-# a gate that gets skipped, so a problem here is reported and the exit code is
-# still the measurement's.
-LOAD_AFTER="$(load_now)"
-if have python3; then
-  if python3 "$HERE/perf_history.py" "$HISTORY" "$RAW" "$BASELINE" \
-       "$MARGIN" "$RUNS" "$LOAD_BEFORE" "$LOAD_AFTER"; then
-    info "recorded in $(basename "$HISTORY"), load ${LOAD_BEFORE} before, ${LOAD_AFTER} after"
+# ── The run ───────────────────────────────────────────────────────────────────
+for ((r = 1; r <= ROUNDS; r++)); do
+  if (( r % 2 == 1 )); then
+    arms=(base cand)
   else
-    info "the history record failed to write. The measurement above still stands."
+    arms=(cand base)
   fi
-fi
+  while read -r key path subdir; do
+    for arm in "${arms[@]}"; do
+      bin="$BASE_BIN"; site=""; conf=""
+      if [[ "$arm" == "base" ]]; then bin="$BASE_BIN"; else bin="$CAND_BIN"; fi
+      if [[ "$subdir" == "__site__" ]]; then
+        site="$SITE"
+        conf="$SITE/deploy/rendered/prod/configs/m6-html.conf"
+      else
+        site="$(arm_site "$arm" "$subdir")"
+        conf="$site/configs/m6-html.conf"
+      fi
+      run_round "$key" "$r" "$arm" "$site" "$conf" "$path" "$bin"
+    done
+  done < <(target_rows)
+done
 
-if [[ "$UPDATE" == "true" ]]; then
-  cp "$BASELINE" "$BASELINE.new" 2>/dev/null || : > "$BASELINE.new"
-  while read -r k v; do
-    [[ -z "$k" ]] && continue
-    if grep -qE "^${k}[[:space:]]" "$BASELINE.new"; then
-      awk -v key="$k" -v val="$v" '$1 == key { printf "%-26s %s\n", key, val; next } { print }' \
-        "$BASELINE.new" > "$BASELINE.tmp" && mv "$BASELINE.tmp" "$BASELINE.new"
-    else
-      printf '%-26s %s\n' "$k" "$v" >> "$BASELINE.new"
-    fi
-  done < "$MEASURED"
-  mv "$BASELINE.new" "$BASELINE"
-  info "numbers recorded in $BASELINE — commit this with the change that earned it"
-  exit 0
-fi
+# ── No strays ─────────────────────────────────────────────────────────────────
+#
+# Each round kills its server and waits for it, so no m6-html from this run
+# should still be alive when the loop finishes. A stray server pins the measured
+# CPU and corrupts every reading, so a run that leaves one behind fails rather
+# than reporting a number. Both the base and candidate binaries are checked, at
+# the absolute paths the run started, so a stray in either arm is caught.
+deadline=$(( SECONDS + 5 ))
+while stray_alive "$BASE_BIN" "$CAND_BIN"; do
+  if (( SECONDS >= deadline )); then
+    echo "NOT MEASURED: m6-html from this run is still alive after the run" >&2
+    exit 2
+  fi
+  sleep 0.2
+done
 
-echo
-if (( RESULT == 0 )); then
-  pass "performance: nothing got slower"
-else
-  fail "performance: see above"
+# ── The verdict ───────────────────────────────────────────────────────────────
+#
+# m6-perf-ab pairs the arms, decides, prints the table and appends the history
+# record, then this script exits with its status. M6_PERF_COMMIT, M6_PERF_DIRTY
+# and M6_PERF_BASE_COMMIT pass through unchanged. A check that measured nothing
+# fails here rather than reporting a pass: an empty rounds file means every
+# round failed, and m6-perf-ab must not read that as "no slowdown".
+if [[ ! -s "$ROUNDS_FILE" ]]; then
+  echo "NOT MEASURED: no rounds were measured, the rounds file is empty" >&2
+  exit 2
 fi
-exit $RESULT
+LOAD_AFTER="$(load_now)"
+"$AB_BIN" "$ROUNDS_FILE" "$HISTORY" "$THRESHOLD" "$MAX_CI_WIDTH" "$ROUNDS" "$REQUESTS" \
+  "$LOAD_BEFORE" "$LOAD_AFTER" "$PINNED" "$CLIENT_CPU" "$SERVER_CPU"
+rc=$?
+exit $rc

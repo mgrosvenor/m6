@@ -1,0 +1,15 @@
+# deploy.toml — node addresses for deploy.sh and invalidate-cache.sh.
+# Copy to deploy.toml and fill in your actual SSH targets.
+# deploy.toml is listed in site-gitignore so it stays off version control.
+
+[deploy]
+origin   = "root@example.com"   # SSH target for the origin
+site_dir = "/var/www/my-blog"       # path on every node
+ssh_opts = "-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15"
+
+[cache_nodes]
+edge-a = "root@edge-a.example.com"
+edge-b = "root@edge-b.example.com"
+edge-c = "root@edge-c.example.com"
+edge-d = "root@edge-d.example.com"
+edge-e = "root@edge-e.example.com"

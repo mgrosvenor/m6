@@ -1,0 +1,13 @@
+{% extends "templates/base.html" %}
+{% block title %}Home — {{ site_name }}{% endblock %}
+{% block content %}
+<h1>Log Viewer Demo</h1>
+<p>This example adds a real-time log viewer to the m6 stack.</p>
+<p>
+  All processes write structured JSON logs to stdout. In development,
+  <code>dev.sh</code> redirects each process's stdout to a file in
+  <code>logs/</code>. The log viewer tails those files via m6-file's
+  tail mode and displays new entries as they arrive.
+</p>
+<p><a href="/logs">Open Log Viewer →</a></p>
+{% endblock %}
