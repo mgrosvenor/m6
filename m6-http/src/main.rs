@@ -14,6 +14,7 @@ use std::time::Instant;
 use anyhow::Context;
 use bytes::Bytes;
 use m6_core::log::{debug, error, info, warn};
+use m6_core::platform::net::{RecvMeta, UdpBatch, MAX_BATCH};
 use quiche::h3::NameValue;
 use rand::RngCore;
 
@@ -105,6 +106,8 @@ struct CompletionCtx<'a> {
     registry: &'a m6_core::platform::Registry,
     quic_port: u16,
     udp: &'a UdpSocket,
+    batch: UdpBatch,
+    out: &'a mut [u8],
     connections: &'a mut HashMap<Vec<u8>, QuicConn>,
     now: Instant,
 }
@@ -121,6 +124,8 @@ impl<'a> CompletionCtx<'a> {
         registry: &'a m6_core::platform::Registry,
         quic_port: u16,
         udp: &'a UdpSocket,
+        batch: UdpBatch,
+        out: &'a mut [u8],
         connections: &'a mut HashMap<Vec<u8>, QuicConn>,
         now: Instant,
     ) -> Self {
@@ -131,6 +136,8 @@ impl<'a> CompletionCtx<'a> {
             registry,
             quic_port,
             udp,
+            batch,
+            out,
             connections,
             now,
         }
@@ -169,6 +176,14 @@ const TOKEN_LOG: Token = Token(usize::MAX - 4);
 /// The per-process status listener, `[server] status_bind`.
 const TOKEN_STATUS_LISTENER: Token = Token(usize::MAX - 5);
 const MAX_DATAGRAM_SIZE: usize = 1350;
+
+/// The largest payload one UDP GSO `sendmsg` carries. A segmented send is one
+/// UDP payload however many datagrams the kernel cuts it into, so this bounds
+/// a flush's batch.
+const QUIC_BATCH_BYTES: usize = 65_507;
+
+/// The most segments Linux cuts one UDP GSO `sendmsg` into.
+const QUIC_BATCH_SEGMENTS: usize = 64;
 
 /// Who owns a per-descriptor token: the owner and the owner's own slot index.
 #[derive(Clone, Copy)]
@@ -799,6 +814,8 @@ struct EventLoopIo {
     /// The QUIC socket's local address, read once when the socket was created.
     /// Every `RecvInfo` uses it; `getsockname` is not called per datagram.
     udp_local: SocketAddr,
+    /// Whether the QUIC socket segments a batch, probed once at the socket.
+    udp_batch: UdpBatch,
     tcp: Option<Http11Listener>,
     h2c: Option<H2cListener>,
     signals: Signals,
@@ -1651,7 +1668,7 @@ fn write_waiter(
                     method.eq_ignore_ascii_case("HEAD"),
                     genid,
                 );
-                flush_conn(cx.udp, qconn);
+                flush_conn(cx.udp, cx.batch, &mut cx.out[..], qconn);
             }
         }
         Waiter::Background => {
@@ -2068,6 +2085,8 @@ fn complete_h2_streams(
     registry: &m6_core::platform::Registry,
     quic_port: u16,
     udp: &UdpSocket,
+    batch: UdpBatch,
+    out: &mut [u8],
     connections: &mut HashMap<Vec<u8>, QuicConn>,
 ) {
     for c in completions {
@@ -2079,6 +2098,8 @@ fn complete_h2_streams(
                 registry,
                 quic_port,
                 udp,
+                batch,
+                out,
                 connections,
                 m6_core::platform::now(),
             );
@@ -2899,6 +2920,7 @@ fn event_loop(
     let EventLoopIo {
         udp,
         udp_local,
+        udp_batch,
         mut tcp,
         mut h2c,
         mut signals,
@@ -2949,6 +2971,10 @@ fn event_loop(
     let mut connections: HashMap<Vec<u8>, QuicConn> = HashMap::new();
     let mut conn_id_map: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
     let mut recv_buf = vec![0u8; 65536];
+    // One batch buffer for every flush in the loop. A flush packs into this
+    // and sends it once; reusing it keeps a flush free of allocation and of a
+    // 64 KB clear.
+    let mut flush_buf = vec![0u8; QUIC_BATCH_BYTES];
     let mut events = Events::with_capacity(256);
     // Wait time against work time, per kind of event that woke the loop. An
     // iteration with events of several kinds is counted under its first event.
@@ -3075,8 +3101,10 @@ fn event_loop(
                         BoundUdp {
                             socket: &udp,
                             local: udp_local,
+                            batch: udp_batch,
+                            recv_buf: &mut recv_buf,
+                            flush_buf: &mut flush_buf,
                         },
-                        &mut recv_buf,
                         &mut connections,
                         &mut conn_id_map,
                         quiche_config,
@@ -3142,6 +3170,8 @@ fn event_loop(
                             poll.registry(),
                             quic_port,
                             &udp,
+                            udp_batch,
+                            &mut flush_buf,
                             &mut connections,
                         );
                     }
@@ -3160,6 +3190,8 @@ fn event_loop(
                             poll.registry(),
                             quic_port,
                             &udp,
+                            udp_batch,
+                            &mut flush_buf,
                             &mut connections,
                         );
                     }
@@ -3174,6 +3206,8 @@ fn event_loop(
                                 poll.registry(),
                                 quic_port,
                                 &udp,
+                                udp_batch,
+                                &mut flush_buf,
                                 &mut connections,
                                 now,
                             );
@@ -3207,6 +3241,8 @@ fn event_loop(
                 poll.registry(),
                 quic_port,
                 &udp,
+                udp_batch,
+                &mut flush_buf,
                 &mut connections,
                 now,
             );
@@ -3220,6 +3256,8 @@ fn event_loop(
                 poll.registry(),
                 quic_port,
                 &udp,
+                udp_batch,
+                &mut flush_buf,
                 &mut connections,
                 now,
             );
@@ -3240,6 +3278,8 @@ fn event_loop(
             poll.registry(),
             quic_port,
             &udp,
+            udp_batch,
+            &mut flush_buf,
             &mut connections,
         );
         let (dead, completions) = state.h2s_pool.expire(now2, poll.registry());
@@ -3256,6 +3296,8 @@ fn event_loop(
             poll.registry(),
             quic_port,
             &udp,
+            udp_batch,
+            &mut flush_buf,
             &mut connections,
         );
 
@@ -3270,6 +3312,8 @@ fn event_loop(
                 poll.registry(),
                 quic_port,
                 &udp,
+                udp_batch,
+                &mut flush_buf,
                 &mut connections,
                 now,
             );
@@ -3285,7 +3329,7 @@ fn event_loop(
 
         // Drive the QUIC connections whose timer is due. The ones that received
         // a packet this turn were flushed in drain_udp; an idle one needs nothing.
-        flush_due(&udp, &mut connections, now2);
+        flush_due(&udp, udp_batch, &mut flush_buf, &mut connections, now2);
 
         // Remove closed/timed-out connections.
         connections.retain(|_, c| !c.conn.is_closed());
@@ -3412,38 +3456,68 @@ struct H3Loop<'a> {
     quic_port: u16,
 }
 
-/// The QUIC socket and the local address it was bound to.
+/// The QUIC socket, the local address it was bound to, its batch sender and
+/// the loop's two QUIC buffers.
 ///
 /// The address is read once when the socket is created. It is the `to` of every
 /// `RecvInfo`; asking the kernel for it per datagram was one `getsockname` per
-/// received packet.
+/// received packet. The batch is probed once for the same reason: whether the
+/// kernel segments a batch is a property of the socket. Both buffers are the
+/// loop's, reused across turns, so a receive and a flush allocate nothing and
+/// clear nothing.
 struct BoundUdp<'a> {
     socket: &'a UdpSocket,
     local: SocketAddr,
+    batch: UdpBatch,
+    /// Receive slots, one datagram each. A slice, not `&mut Vec<u8>`: it never
+    /// grows or shrinks.
+    recv_buf: &'a mut [u8],
+    /// The batch a flush packs before one send.
+    flush_buf: &'a mut [u8],
 }
 
 fn drain_udp(
     udp: BoundUdp<'_>,
-    // A slice, not `&mut Vec<u8>`: this never grows or shrinks the buffer, it
-    // fills it and reslices it to the datagram length.
-    recv_buf: &mut [u8],
     connections: &mut HashMap<Vec<u8>, QuicConn>,
     conn_id_map: &mut HashMap<Vec<u8>, Vec<u8>>,
     quiche_config: &mut quiche::Config,
     state: &mut ServerState,
     h3: &H3Loop,
 ) {
+    // One readiness event drains the socket. Each receive takes in up to
+    // MAX_BATCH datagrams, one per slot, and `next` walks them before the next
+    // call.
+    let slot = udp.recv_buf.len() / MAX_BATCH;
+    let mut metas = [RecvMeta::default(); MAX_BATCH];
+    let mut received = 0;
+    let mut next = 0;
     loop {
-        let (len, from) = match udp.socket.recv_from(recv_buf) {
-            Ok(v) => v,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) => {
-                warn!(error = %e, "udp recv error");
+        if next == received {
+            received = match udp
+                .batch
+                .recv(udp.socket, &mut *udp.recv_buf, slot, &mut metas)
+            {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    warn!(error = %e, "udp recv error");
+                    break;
+                }
+            };
+            if received == 0 {
                 break;
             }
+            next = 0;
+        }
+        let index = next;
+        next += 1;
+        let len = metas[index].len;
+        let from = match metas[index].from {
+            Some(from) => from,
+            None => continue,
         };
-
-        let pkt = &mut recv_buf[..len];
+        let start = index * slot;
+        let pkt = &mut udp.recv_buf[start..start + len];
 
         // Parse QUIC header to get connection ID
         let hdr = match quiche::Header::from_slice(pkt, quiche::MAX_CONN_ID_LEN) {
@@ -3525,7 +3599,7 @@ fn drain_udp(
             // It does not move h3 conformance. The twelve h3spec failures are
             // quiche's and are documented in tools/conformance-scores.txt.
             warn!("conn.recv error: {}", e);
-            flush_conn(udp.socket, qconn);
+            flush_conn(udp.socket, udp.batch, &mut *udp.flush_buf, qconn);
             continue;
         }
 
@@ -3570,7 +3644,7 @@ fn drain_udp(
                 Ok(c) => c,
                 Err(e) => {
                     warn!("h3 Config::new error: {}", e);
-                    flush_conn(udp.socket, qconn);
+                    flush_conn(udp.socket, udp.batch, &mut *udp.flush_buf, qconn);
                     continue;
                 }
             };
@@ -3584,7 +3658,7 @@ fn drain_udp(
                 }
                 Err(e) => {
                     warn!("h3 init error: {}", e);
-                    flush_conn(udp.socket, qconn);
+                    flush_conn(udp.socket, udp.batch, &mut *udp.flush_buf, qconn);
                     continue;
                 }
             }
@@ -3602,7 +3676,7 @@ fn drain_udp(
         }
 
         // Send any pending QUIC packets
-        flush_conn(udp.socket, qconn);
+        flush_conn(udp.socket, udp.batch, &mut *udp.flush_buf, qconn);
     }
 }
 
@@ -6793,10 +6867,52 @@ fn finalize_url_response_inner(
 
 // ── QUIC packet flush helpers ─────────────────────────────────────────────────
 
-fn flush_conn(udp: &UdpSocket, qconn: &mut QuicConn) {
-    let mut out = [0u8; MAX_DATAGRAM_SIZE];
+/// Send everything `qconn` has queued.
+///
+/// The packets are packed into one buffer while they have one destination and
+/// one size, then sent as one batch: one `sendmsg` carrying `UDP_SEGMENT` on a
+/// Linux socket that has it, and one datagram per call where it does not. The
+/// batch stops at [`QUIC_BATCH_BYTES`] and [`QUIC_BATCH_SEGMENTS`], which is
+/// what one UDP GSO send takes.
+///
+/// `out` is the loop's own buffer, reused across flushes: a batch is packed
+/// once into the bytes that go on the wire, with no copy between `send` and the
+/// system call.
+fn flush_conn(udp: &UdpSocket, batch: UdpBatch, out: &mut [u8], qconn: &mut QuicConn) {
+    let capacity = out.len().min(QUIC_BATCH_BYTES);
+    debug_assert!(
+        capacity >= MAX_DATAGRAM_SIZE,
+        "a flush buffer holds one packet"
+    );
+    let out = &mut out[..capacity];
+    let mut filled = 0;
+    // Every datagram before the last in a batch is this size; the last is at
+    // most this size. That is the shape UDP_SEGMENT requires.
+    let mut segment_size = 0;
+    let mut segments = 0;
+    let mut dest: Option<SocketAddr> = None;
+    // The congestion controller's burst for one turn. A batch stops here too,
+    // so one send never puts more datagrams on the wire than the controller
+    // allows at once. It is zero before a path is active, and then the buffer
+    // is the only cap.
+    let burst = qconn.conn.send_quantum().min(capacity);
+
     loop {
-        let (written, send_info) = match qconn.conn.send(&mut out) {
+        // Leave room for the largest datagram quiche can write into this batch.
+        if filled + MAX_DATAGRAM_SIZE > capacity
+            || (burst > 0 && filled + MAX_DATAGRAM_SIZE > burst)
+            || segments == QUIC_BATCH_SEGMENTS
+        {
+            if !flush_batch(udp, batch, &out[..filled], segment_size, dest) {
+                return;
+            }
+            filled = 0;
+            segment_size = 0;
+            segments = 0;
+            dest = None;
+        }
+
+        let (written, send_info) = match qconn.conn.send(&mut out[filled..]) {
             Ok(v) => v,
             Err(quiche::Error::Done) => break,
             Err(e) => {
@@ -6804,11 +6920,65 @@ fn flush_conn(udp: &UdpSocket, qconn: &mut QuicConn) {
                 break;
             }
         };
-        if let Err(e) = udp.send_to(&out[..written], send_info.to) {
-            if e.kind() == std::io::ErrorKind::WouldBlock {
-                break;
+
+        if segments == 0 {
+            dest = Some(send_info.to);
+            segment_size = written;
+            filled = written;
+            segments = 1;
+        } else if Some(send_info.to) == dest && written == segment_size {
+            filled += written;
+            segments += 1;
+        } else if Some(send_info.to) == dest && written < segment_size {
+            // The packet after a short one cannot be part of the same batch,
+            // and this one is its last segment.
+            filled += written;
+            if !flush_batch(udp, batch, &out[..filled], segment_size, dest) {
+                return;
             }
-            warn!("udp send error: {}", e);
+            filled = 0;
+            segment_size = 0;
+            segments = 0;
+            dest = None;
+        } else {
+            // Another destination, or a packet larger than the batch's
+            // segment: send what is packed and start the batch with this one.
+            if !flush_batch(udp, batch, &out[..filled], segment_size, dest) {
+                return;
+            }
+            out.copy_within(filled..filled + written, 0);
+            filled = written;
+            segment_size = written;
+            segments = 1;
+            dest = Some(send_info.to);
+        }
+    }
+
+    if filled > 0 {
+        let _ = flush_batch(udp, batch, &out[..filled], segment_size, dest);
+    }
+}
+
+/// Send one packed batch, or one datagram per segment where the socket does not
+/// segment. Returns false when the socket would block, which ends the flush as
+/// a single send that would block did.
+fn flush_batch(
+    udp: &UdpSocket,
+    batch: UdpBatch,
+    buf: &[u8],
+    segment_size: usize,
+    dest: Option<SocketAddr>,
+) -> bool {
+    let dest = match dest {
+        Some(dest) => dest,
+        None => return true,
+    };
+    match batch.send(udp, buf, segment_size, dest) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+        Err(e) => {
+            warn!("udp batch send error: {}", e);
+            true
         }
     }
 }
@@ -6906,12 +7076,18 @@ fn drain_writable(qconn: &mut QuicConn) {
 /// microsecond per idle connection per turn, and a QUIC connection idles for
 /// 30 s after its client went away: with a thousand of them each loop turn
 /// spent longer sweeping than serving.
-fn flush_due(udp: &UdpSocket, connections: &mut HashMap<Vec<u8>, QuicConn>, now: Instant) {
+fn flush_due(
+    udp: &UdpSocket,
+    batch: UdpBatch,
+    out: &mut [u8],
+    connections: &mut HashMap<Vec<u8>, QuicConn>,
+    now: Instant,
+) {
     for qconn in connections.values_mut() {
         if qconn.conn.timeout_instant().is_some_and(|at| at <= now) {
             qconn.conn.on_timeout();
             drain_writable(qconn);
-            flush_conn(udp, qconn);
+            flush_conn(udp, batch, out, qconn);
         }
     }
 }
@@ -7551,6 +7727,11 @@ fn run(args: Vec<String>) -> i32 {
             return 2;
         }
     };
+    // Whether this socket sends a batch as one segmented `sendmsg` is a
+    // property of the socket, asked once here with the other socket facts. The
+    // probe leaves the kernel option off, so a single datagram is still one
+    // send and only a flush asks for segmentation.
+    let udp_batch = UdpBatch::for_socket(&udp);
 
     let mut lifecycle = m6_core::signal::Lifecycle::new("m6-http", None);
     lifecycle.started();
@@ -7846,6 +8027,7 @@ fn run(args: Vec<String>) -> i32 {
         EventLoopIo {
             udp,
             udp_local: udp_local.get(),
+            udp_batch,
             tcp: tcp_listener,
             h2c: h2c_listener,
             signals,
@@ -8776,6 +8958,8 @@ mod flush_due_tests {
     #[test]
     fn a_connection_whose_timer_is_due_is_driven() {
         let server_udp = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let batch = UdpBatch::for_socket(&server_udp);
+        let mut out = vec![0u8; QUIC_BATCH_BYTES];
         let (qconn, _pair) = established(100, &server_udp);
         let mut connections = HashMap::from([(vec![1u8], qconn)]);
         let at = connections[&vec![1u8]]
@@ -8787,7 +8971,13 @@ mod flush_due_tests {
             std::hint::spin_loop();
         }
         assert!(!connections[&vec![1u8]].conn.is_closed());
-        flush_due(&server_udp, &mut connections, m6_core::platform::now());
+        flush_due(
+            &server_udp,
+            batch,
+            &mut out,
+            &mut connections,
+            m6_core::platform::now(),
+        );
         assert!(
             connections[&vec![1u8]].conn.is_closed(),
             "a connection past its idle timeout was not driven"
@@ -8800,6 +8990,8 @@ mod flush_due_tests {
     #[test]
     fn idle_connections_whose_timer_is_not_due_are_not_touched() {
         let server_udp = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let batch = UdpBatch::for_socket(&server_udp);
+        let mut out = vec![0u8; QUIC_BATCH_BYTES];
         let (mut idle, idle_pair) = established(30_000, &server_udp);
         let (due, _due_pair) = established(100, &server_udp);
         queue_data(&mut idle);
@@ -8811,7 +9003,13 @@ mod flush_due_tests {
         while m6_core::platform::now() < due_at {
             std::hint::spin_loop();
         }
-        flush_due(&server_udp, &mut connections, m6_core::platform::now());
+        flush_due(
+            &server_udp,
+            batch,
+            &mut out,
+            &mut connections,
+            m6_core::platform::now(),
+        );
 
         assert!(
             connections[&vec![2u8]].conn.is_closed(),
