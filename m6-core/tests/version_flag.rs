@@ -35,10 +35,43 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// The host triple `cargo metadata` filters the dependency graph by.
+///
+/// It comes from `rustc -vV`'s `host:` line, the same answer cargo gives for
+/// the machine the test is running on. A triple written into this test would be
+/// wrong on the other supported target, and it would be a machine name in a
+/// public repository.
+fn host_triple() -> String {
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let out = Command::new(rustc)
+        .arg("-vV")
+        .output()
+        .expect("run rustc -vV");
+    assert!(
+        out.status.success(),
+        "rustc -vV failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let reported = String::from_utf8_lossy(&out.stdout);
+    reported
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .expect("rustc -vV reports a host triple")
+        .to_string()
+}
+
 /// `cargo metadata` for the workspace, with the resolved dependency graph.
 ///
 /// `--offline --locked` keeps the test out of the network and fails if the
 /// lockfile disagrees with a manifest, which is the same check a release makes.
+///
+/// `--filter-platform` is what keeps `--offline` working on a machine that
+/// fetched crates for this target only, which is what a CI runner is. Without
+/// it, `cargo metadata` resolves every target's dependencies and refuses an
+/// offline run whose cache has no Android-only crate in it. The graph the test
+/// reads is this machine's, which is the one whose binaries it runs.
 fn metadata() -> Value {
     let root = workspace_root();
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
@@ -48,6 +81,8 @@ fn metadata() -> Value {
         .arg("1")
         .arg("--offline")
         .arg("--locked")
+        .arg("--filter-platform")
+        .arg(host_triple())
         .arg("--manifest-path")
         .arg(root.join("Cargo.toml"))
         .output()
