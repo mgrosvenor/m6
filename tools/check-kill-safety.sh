@@ -14,8 +14,8 @@
 # `lsof -ti :8443 | xargs kill -9`, three `dev.sh` scripts with
 # `pkill -x m6-http`, and 08's `kill_own` with `pgrep -f "$SITE"`. Each reaches
 # a process by name, port or command-line text, so each kills another session's
-# stack on a machine where two sessions run the same example. bf5e737 and
-# 0f1f2ee removed them and gave the examples `examples/own.sh`: record a pid
+# stack on a machine where two sessions run the same example. The examples
+# now use `examples/own.sh`: record a pid
 # when the process starts, store its start time beside it, and compare the
 # start time before signalling, so a reused pid is left alone.
 #
