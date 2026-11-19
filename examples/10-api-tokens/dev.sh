@@ -9,6 +9,7 @@ export PATH="$M6/target/release:$PATH"
 # Development keys and state: a private per-user directory, see dev-home.sh.
 . "$SITE/../dev-home.sh"
 "$SITE/../dev-keys.sh"
+. "$SITE/../own.sh"
 
 # ── Auth database ─────────────────────────────────────────────────────────────
 # Always recreate to start with clean state (removes any API tokens from prior runs).
@@ -18,28 +19,32 @@ m6-auth-cli "$(m6_conf "$SITE/configs/m6-auth.conf")" user add api --role api --
 
 # ── Clean up stale state ──────────────────────────────────────────────────────
 mkdir -p /tmp/m6
-lsof -ti :8443 2>/dev/null | xargs kill -9 2>/dev/null || true
-sleep 0.3
+own_init "$SITE" stack
+own_reap
+own_refuse_busy 8443 "example 10" || exit 1
 rm -f /tmp/m6/m6-html-api*.sock /tmp/m6/m6-file-api*.sock /tmp/m6/m6-auth-api*.sock /tmp/m6/check-m6-auth-api*.sock
 
 # ── Start services ────────────────────────────────────────────────────────────
 M6_SOCKET_OVERRIDE=/tmp/m6/m6-html-api.sock \
     m6-html "$SITE" "$SITE/configs/m6-html.conf" &
 HTML_PID=$!
+own_track "$HTML_PID"
 
 M6_SOCKET_OVERRIDE=/tmp/m6/m6-file-api.sock \
     m6-file "$SITE" "$SITE/configs/m6-file.conf" &
 FILE_PID=$!
+own_track "$FILE_PID"
 
 M6_SOCKET_OVERRIDE=/tmp/m6/m6-auth-api.sock \
     m6-auth-server "$SITE" "$(m6_conf "$SITE/configs/m6-auth.conf")" &
 AUTH_PID=$!
+own_track "$AUTH_PID"
 
 # m6-auth-server also binds the check socket beside this one (check-<name>),
 # which answers POST /check for m6-http: every `require` and the source
 # node's /genid ask it who the caller is.
 
-trap 'kill $HTML_PID $FILE_PID $AUTH_PID $HTTP_PID 2>/dev/null; wait 2>/dev/null' EXIT
+trap 'own_stop_records; own_forget; wait 2>/dev/null' EXIT
 
 # Wait for backend sockets
 for _ in $(seq 1 30); do
@@ -51,6 +56,7 @@ done
 
 m6-http "$SITE" "$(m6_conf "$SITE/configs/system-dev.toml")" &
 HTTP_PID=$!
+own_track "$HTTP_PID"
 
 echo "Running at https://localhost:8443"
 echo ""

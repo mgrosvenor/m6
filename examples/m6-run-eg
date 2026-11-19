@@ -14,14 +14,18 @@
 #   --no-browser                        don't open the browser after start
 #
 # Examples live in <NN>-<name>/dev.sh
-# Each dev stack owns a pgid stored in /tmp/m6-eg/<NN>.pgid
+# Each dev stack owns a pgid stored in /tmp/m6-eg/<checkout-id>/<NN>.pgid.
+# The checkout id is part of the path: /tmp is shared by every checkout and
+# session on the machine, so a global /tmp/m6-eg/05.pgid let one session's
+# stop signal the process another session had recorded for example 05.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 EXAMPLES_DIR="$SCRIPT_DIR"
 M6_DIR="${M6:-$(cd "$SCRIPT_DIR/.." && pwd)}"
-PGID_DIR="/tmp/m6-eg"
+PGID_DIR="/tmp/m6-eg/$(printf '%s' "$SCRIPT_DIR" | cksum | cut -d' ' -f1)"
+. "$SCRIPT_DIR/own.sh"
 OPEN_BROWSER=1
 
 # Ensure m6 binaries are on PATH for dev.sh scripts that don't set it themselves.
@@ -137,29 +141,41 @@ running_pgid() {
     fi
 }
 
-# Kill a process group by pgid and wait for it to exit.
+# Stop a stack by pgid and wait for it to exit.
 kill_eg() {
-    local num
+    local num dir pg port
     num=$(printf "%02d" "$((10#$1))")
-    local pg
     pg=$(running_pgid "$num")
-    if [ -n "$pg" ]; then
-        echo "stopping example $num (pid $pg)..."
-        kill "$pg" 2>/dev/null || true          # SIGTERM → triggers dev.sh EXIT trap
-        local i=0
-        while kill -0 "$pg" 2>/dev/null && [ $i -lt 30 ]; do
-            sleep 0.1; i=$((i+1))
-        done
-        kill -9 "$pg" 2>/dev/null || true       # force-kill if still alive
-        # Also clean up anything still on the port.
-        local port
-        port=$(example_port "$num" 2>/dev/null || echo "8443")
-        lsof -ti ":$port" 2>/dev/null | xargs kill -9 2>/dev/null || true
-        rm -f "$PGID_DIR/${num}.pgid"
-        echo "stopped."
-    else
+    if [ -z "$pg" ]; then
         echo "example $num is not running."
+        return
     fi
+    dir=$(find_eg_dir "$1" 2>/dev/null || true)
+    echo "stopping example $num (pid $pg)..."
+    kill "$pg" 2>/dev/null || true          # SIGTERM → triggers dev.sh EXIT trap
+    local i=0
+    while kill -0 "$pg" 2>/dev/null && [ $i -lt 30 ]; do
+        sleep 0.1; i=$((i+1))
+    done
+    if kill -0 "$pg" 2>/dev/null; then
+        # dev.sh ignored SIGTERM. Stop the children it recorded in its own pid
+        # file before force-killing the shell; otherwise they are orphaned on
+        # the port. This is still only what this example wrote down.
+        if [ -n "$dir" ]; then
+            own_init "$dir" stack
+            own_stop_records
+            own_forget
+        fi
+        kill -9 "$pg" 2>/dev/null || true
+    fi
+    port=$(example_port "$num" 2>/dev/null || echo "8443")
+    if ! own_wait_port_free "$port" 30; then
+        local holder
+        holder=$(own_port_holder "$port")
+        echo "warning: port $port is still held by pid ${holder:-unknown}, which example $num did not record; leaving it alone." >&2
+    fi
+    rm -f "$PGID_DIR/${num}.pgid"
+    echo "stopped."
 }
 
 # Start an example in a new process group.
@@ -186,11 +202,20 @@ start_eg() {
         [ -n "$pg" ] && kill_eg "$other_n"
     done
 
-    # Clear port (dev.sh does this too, but ensure a clean start).
+    # Stop what a previous run of THIS example recorded (its own pid file).
+    # A listener this checkout did not start belongs to another session; it is
+    # reported and left alone, and this start fails rather than killing it.
     local port
     port=$(example_port "$1")
-    lsof -ti ":$port" 2>/dev/null | xargs kill -9 2>/dev/null || true
-    sleep 0.3
+    own_init "$dir" stack
+    own_reap
+    if ! own_wait_port_free "$port" 30; then
+        local holder
+        holder=$(own_port_holder "$port")
+        echo "error: port $port is held by pid ${holder:-unknown}, which example $num did not start." >&2
+        echo "       Refusing to kill it. Stop that process yourself, or run the example on another port." >&2
+        exit 1
+    fi
 
     # Run setup.sh if present and not yet completed (detected by absence of keys/ or data/).
     if [ -f "$dir/setup.sh" ]; then
@@ -309,8 +334,6 @@ rebuild_eg() {
 
     # 2. Any Cargo.toml sub-packages under the example directory.
     while IFS= read -r cargo_toml; do
-        local pkg_dir
-        pkg_dir=$(dirname "$cargo_toml")
         local pkg_name
         pkg_name=$(grep '^name' "$cargo_toml" | head -1 | sed 's/.*= *"\(.*\)"/\1/')
         if [ -n "$pkg_name" ]; then

@@ -11,6 +11,7 @@ export PATH="$M6/target/release:$EXAMPLES/target/release:$PATH"
 # Development keys and state: a private per-user directory, see dev-home.sh.
 . "$SITE/../dev-home.sh"
 "$SITE/../dev-keys.sh"
+. "$SITE/../own.sh"
 
 # ── Setup check ───────────────────────────────────────────────────────────────
 if [ ! -f $M6_DEV_HOME/11-admin-dashboard/auth.db ]; then
@@ -24,8 +25,9 @@ fi
 
 # ── Clean up stale state ──────────────────────────────────────────────────────
 mkdir -p /tmp/m6
-lsof -ti :8444 2>/dev/null | xargs kill -9 2>/dev/null || true
-sleep 0.3
+own_init "$SITE" stack
+own_reap
+own_refuse_busy 8444 "example 11" || exit 1
 rm -f /tmp/m6/m6-auth-admin.sock /tmp/m6/check-m6-auth-admin.sock \
       /tmp/m6/render-admin.sock \
       /tmp/m6/m6-file-admin.sock
@@ -36,6 +38,7 @@ echo "=== 11-admin-dashboard ==="
 M6_SOCKET_OVERRIDE=/tmp/m6/m6-auth-admin.sock \
     m6-auth-server "$SITE" "$(m6_conf "$SITE/configs/m6-auth.conf")" &
 AUTH_PID=$!
+own_track "$AUTH_PID"
 
 # m6-auth-server also binds the check socket beside this one (check-<name>),
 # which answers POST /check for m6-http: every `require` and the source
@@ -45,13 +48,15 @@ AUTH_PID=$!
 M6_SOCKET_OVERRIDE=/tmp/m6/render-admin.sock \
     render-admin "$SITE" "$(m6_conf "$SITE/configs/render-admin.conf")" &
 ADMIN_PID=$!
+own_track "$ADMIN_PID"
 
 # ── m6-file (static dashboard) ────────────────────────────────────────────────
 M6_SOCKET_OVERRIDE=/tmp/m6/m6-file-admin.sock \
     m6-file "$SITE" "$SITE/configs/m6-file.conf" &
 FILE_PID=$!
+own_track "$FILE_PID"
 
-trap 'kill $AUTH_PID $ADMIN_PID $FILE_PID $HTTP_PID 2>/dev/null; wait 2>/dev/null' EXIT
+trap 'own_stop_records; own_forget; wait 2>/dev/null' EXIT
 
 # ── Wait for backend sockets ──────────────────────────────────────────────────
 printf "waiting for backends"
@@ -70,6 +75,7 @@ mkdir -p $M6_DEV_HOME/11-admin-dashboard/state
 STATE_DIRECTORY=$M6_DEV_HOME/11-admin-dashboard/state \
     m6-http "$SITE" "$(m6_conf "$SITE/configs/system-dev.toml")" >> $M6_DEV_HOME/11-admin-dashboard/m6-http-admin.log 2>&1 &
 HTTP_PID=$!
+own_track "$HTTP_PID"
 
 echo ""
 echo "Admin dashboard: https://localhost:8444/"

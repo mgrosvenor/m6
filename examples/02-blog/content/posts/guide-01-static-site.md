@@ -214,23 +214,32 @@ export PATH="$M6/target/release:$PATH"
 # Development keys and state: a private per-user directory, see dev-home.sh.
 . "$SITE/../dev-home.sh"
 "$SITE/../dev-keys.sh"
+. "$SITE/../own.sh"
 
 # ── Clean up stale state ──────────────────────────────────────────────────────
 mkdir -p /tmp/m6
-lsof -ti :8443 2>/dev/null | xargs kill -9 2>/dev/null || true
-sleep 0.3
+
+# Stop only what a previous run of THIS example recorded, by pid, in
+# logs/.own-stack.pids. A process this script did not start is reported with
+# its pid and left alone: a port scan or a name match would stop another
+# session's stack just as readily as this one's.
+own_init "$SITE" stack
+own_reap
+own_refuse_busy 8443 "example 01" || exit 1
 rm -f /tmp/m6/m6-html.sock /tmp/m6/m6-file.sock
 
 # ── Start services ────────────────────────────────────────────────────────────
 M6_SOCKET_OVERRIDE=/tmp/m6/m6-html.sock \
     m6-html "$SITE" "$SITE/configs/m6-html.conf" &
 HTML_PID=$!
+own_track "$HTML_PID"
 
 M6_SOCKET_OVERRIDE=/tmp/m6/m6-file.sock \
     m6-file "$SITE" "$SITE/configs/m6-file.conf" &
 FILE_PID=$!
+own_track "$FILE_PID"
 
-trap 'kill $HTML_PID $FILE_PID $HTTP_PID 2>/dev/null; wait 2>/dev/null' EXIT
+trap 'own_stop_records; own_forget; wait 2>/dev/null' EXIT
 
 # Wait for backend sockets
 for i in $(seq 1 20); do
@@ -240,12 +249,15 @@ done
 
 m6-http "$SITE" "$(m6_conf "$SITE/configs/system-dev.toml")" &
 HTTP_PID=$!
+own_track "$HTTP_PID"
 
 echo "Running at https://localhost:8443"
 wait
 ```
 
-The first lines load `examples/dev-home.sh`, which creates the private per-user directory (`m6_conf` writes a config copy with the real path into it), and run `examples/dev-keys.sh`, which writes the certificate named in `configs/system-dev.toml` into that directory if it does not exist yet. It uses `mkcert` when installed and falls back to a self-signed `openssl` certificate. The script then starts three background processes. `trap` kills them all on `Ctrl-C`. `set -e` aborts if any step fails.
+The first lines load `examples/dev-home.sh`, which creates the private per-user directory (`m6_conf` writes a config copy with the real path into it), and run `examples/dev-keys.sh`, which writes the certificate named in `configs/system-dev.toml` into that directory if it does not exist yet. It uses `mkcert` when installed and falls back to a self-signed `openssl` certificate. The script then starts three background processes. `set -e` aborts if any step fails.
+
+The cleanup is the part worth copying. The script records every pid it starts in `logs/.own-stack.pids` and stops exactly those on `Ctrl-C`. If port 8443 is already held when it starts, it prints the holder's pid and exits. It does not kill it, because a listener it did not start is someone else's. A port scan with its pids piped to `kill -9`, or a process-name match, stops another session's stack just as readily as this one's, so this file does neither. `examples/own.sh` is the shared helper that records, reaps and refuses.
 
 ## Seeing a change
 

@@ -16,6 +16,7 @@ export PATH="$M6/target/release:$PATH"
 # Development keys and state: a private per-user directory, see dev-home.sh.
 . "$SITE/../dev-home.sh"
 "$SITE/../dev-keys.sh"
+. "$SITE/../own.sh"
 
 # Run again after editing a post, then restart m6-html so it reads the new file.
 # ── Generate posts.json from Markdown (initial pass) ──────────────────────────
@@ -28,19 +29,9 @@ fi
 mkdir -p "$SITE/logs"
 mkdir -p /tmp/m6
 
-lsof -ti :8443 2>/dev/null | xargs kill -9 2>/dev/null || true
-# Kill only this example's own processes: matching the site directory in the
-# command line cannot reach another m6 on the machine. The port holder is killed
-# above, to clear a stale run of this example.
-kill_own() {
-    local pid
-    for pid in $(pgrep -f "$SITE" 2>/dev/null || true); do
-        [ "$pid" = "$$" ] && continue
-        kill "$pid" 2>/dev/null || true
-    done
-}
-kill_own
-sleep 0.3
+own_init "$SITE" stack
+own_reap
+own_refuse_busy 8443 "example 02" || exit 1
 
 rm -f /tmp/m6/m6-html*.sock /tmp/m6/m6-file*.sock
 
@@ -49,13 +40,15 @@ info "Starting m6-html..."
 M6_SOCKET_OVERRIDE=/tmp/m6/m6-html.sock \
     m6-html "$SITE" "$SITE/configs/m6-html.conf" >> "$SITE/logs/m6-html.log" 2>&1 &
 HTML_PID=$!
+own_track "$HTML_PID"
 
 info "Starting m6-file..."
 M6_SOCKET_OVERRIDE=/tmp/m6/m6-file.sock \
     m6-file "$SITE" "$SITE/configs/m6-file.conf" >> "$SITE/logs/m6-file.log" 2>&1 &
 FILE_PID=$!
+own_track "$FILE_PID"
 
-trap 'echo ""; info "Stopping..."; kill $HTML_PID $FILE_PID $HTTP_PID 2>/dev/null; wait 2>/dev/null' EXIT
+trap 'echo ""; info "Stopping..."; own_stop_records; own_forget; wait 2>/dev/null' EXIT
 
 # Wait for backend sockets
 echo -n "Waiting for backend sockets"
@@ -71,6 +64,7 @@ done
 info "Starting m6-http..."
 m6-http "$SITE" "$(m6_conf "$SITE/configs/system-dev.toml")" >> "$SITE/logs/m6-http.log" 2>&1 &
 HTTP_PID=$!
+own_track "$HTTP_PID"
 
 # Wait for server readiness
 CURL="$(command -v /opt/homebrew/opt/curl/bin/curl 2>/dev/null || echo curl)"

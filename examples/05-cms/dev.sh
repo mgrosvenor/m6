@@ -27,6 +27,7 @@ info "Building render-cms..."
 # Development keys and state: a private per-user directory, see dev-home.sh.
 . "$SITE/../dev-home.sh"
 "$SITE/../dev-keys.sh"
+. "$SITE/../own.sh"
 
 # ── Auth database ─────────────────────────────────────────────────────────────
 if [ ! -f $M6_DEV_HOME/05-cms/auth.db ]; then
@@ -51,19 +52,9 @@ fi
 mkdir -p "$SITE/logs"
 mkdir -p /tmp/m6
 
-lsof -ti :8443 2>/dev/null | xargs kill -9 2>/dev/null || true
-# Kill only this example's own processes: matching the site directory in the
-# command line cannot reach another m6 on the machine. The port holder is killed
-# above, to clear a stale run of this example.
-kill_own() {
-    local pid
-    for pid in $(pgrep -f "$SITE" 2>/dev/null || true); do
-        [ "$pid" = "$$" ] && continue
-        kill "$pid" 2>/dev/null || true
-    done
-}
-kill_own
-sleep 0.3
+own_init "$SITE" stack
+own_reap
+own_refuse_busy 8443 "example 05" || exit 1
 
 rm -f /tmp/m6/m6-html*.sock /tmp/m6/m6-file*.sock /tmp/m6/m6-auth*.sock /tmp/m6/check-m6-auth*.sock /tmp/m6/render-cms*.sock
 
@@ -72,16 +63,19 @@ info "Starting m6-html..."
 M6_SOCKET_OVERRIDE=/tmp/m6/m6-html.sock \
     m6-html "$SITE" "$SITE/configs/m6-html.conf" >> "$SITE/logs/m6-html.log" 2>&1 &
 HTML_PID=$!
+own_track "$HTML_PID"
 
 info "Starting m6-file..."
 M6_SOCKET_OVERRIDE=/tmp/m6/m6-file.sock \
     m6-file "$SITE" "$SITE/configs/m6-file.conf" >> "$SITE/logs/m6-file.log" 2>&1 &
 FILE_PID=$!
+own_track "$FILE_PID"
 
 info "Starting m6-auth-server..."
 M6_SOCKET_OVERRIDE=/tmp/m6/m6-auth.sock \
     m6-auth-server "$SITE" "$(m6_conf "$SITE/configs/m6-auth.conf")" >> "$SITE/logs/m6-auth.log" 2>&1 &
 AUTH_PID=$!
+own_track "$AUTH_PID"
 
 # m6-auth-server also binds the check socket beside this one (check-<name>),
 # which answers POST /check for m6-http: every `require` and the source
@@ -91,8 +85,9 @@ info "Starting render-cms..."
 M6_SOCKET_OVERRIDE=/tmp/m6/render-cms.sock \
     "$EXAMPLES/target/release/render-cms" "$SITE" "$(m6_conf "$SITE/configs/render-cms.conf")" >> "$SITE/logs/render-cms.log" 2>&1 &
 CMS_PID=$!
+own_track "$CMS_PID"
 
-trap 'echo ""; info "Stopping..."; kill $HTML_PID $FILE_PID $AUTH_PID $CMS_PID $HTTP_PID 2>/dev/null; wait 2>/dev/null' EXIT
+trap 'echo ""; info "Stopping..."; own_stop_records; own_forget; wait 2>/dev/null' EXIT
 
 # Wait for backend sockets
 echo -n "Waiting for backend sockets"
@@ -110,6 +105,7 @@ mkdir -p $M6_DEV_HOME/05-cms/state
 STATE_DIRECTORY=$M6_DEV_HOME/05-cms/state \
     m6-http "$SITE" "$(m6_conf "$SITE/configs/system-dev.toml")" >> "$SITE/logs/m6-http.log" 2>&1 &
 HTTP_PID=$!
+own_track "$HTTP_PID"
 
 # Wait for server readiness
 CURL="$(command -v /opt/homebrew/opt/curl/bin/curl 2>/dev/null || echo curl)"

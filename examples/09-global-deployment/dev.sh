@@ -24,6 +24,7 @@ export PATH="$M6/target/release:$PATH"
 # Development keys and state: a private per-user directory, see dev-home.sh.
 . "$SITE09/../dev-home.sh"
 "$SITE09/../dev-keys.sh"
+. "$SITE09/../own.sh"
 
 # ── Require 07 to have been set up first ─────────────────────────────────────
 if [ ! -f $M6_DEV_HOME/07-dev-to-production/auth.db ]; then
@@ -49,11 +50,12 @@ sed -e 's#https://localhost:8443/genid#https://localhost:9001/genid#' \
 # ── Generate posts.json ────────────────────────────────────────────────────────
 m6-md "$SITE07/content/posts/" --output "$SITE07/data/posts.json"
 
-# ── Clean up stale processes ──────────────────────────────────────────────────
+# ── Stop this example's previous run; refuse a foreign port holder ────────────
+own_init "$SITE09" stack
+own_reap
 for port in 9000 9001 9002 9003 9004 9005 9006; do
-    lsof -ti :"$port" 2>/dev/null | xargs kill -9 2>/dev/null || true
+    own_refuse_busy "$port" "example 09" || exit 1
 done
-sleep 0.3
 rm -f /tmp/m6/m6-html*.sock /tmp/m6/m6-file*.sock /tmp/m6/m6-auth*.sock \
        /tmp/m6/check-m6-auth*.sock /tmp/m6/render-cms*.sock
 mkdir -p /tmp/m6
@@ -62,20 +64,22 @@ mkdir -p /tmp/m6
 M6_SOCKET_OVERRIDE=/tmp/m6/m6-html.sock \
     m6-html "$SITE07" "$SITE07/configs/m6-html.conf" &
 HTML_PID=$!
+own_track "$HTML_PID"
 
 M6_SOCKET_OVERRIDE=/tmp/m6/m6-file.sock \
     m6-file "$SITE07" "$SITE07/configs/m6-file.conf" &
 FILE_PID=$!
+own_track "$FILE_PID"
 
 M6_SOCKET_OVERRIDE=/tmp/m6/m6-auth.sock \
     m6-auth-server "$SITE07" "$(m6_conf "$SITE07/configs/m6-auth.conf")" &
 AUTH_PID=$!
+own_track "$AUTH_PID"
 
 M6_SOCKET_OVERRIDE=/tmp/m6/render-cms.sock \
     "$EXAMPLES/target/release/render-cms" "$SITE07" "$STATE/render-cms.conf" &
 RENDER_PID=$!
-
-ALL_PIDS="$HTML_PID $FILE_PID $AUTH_PID $RENDER_PID"
+own_track "$RENDER_PID"
 
 # Wait for backend sockets
 echo "Waiting for backend services..."
@@ -93,25 +97,25 @@ done
 STATE_DIRECTORY="$STATE/state" \
     m6-http "$SITE09/site-origin" "$(m6_conf "$SITE09/configs/local/origin.toml")" &
 ORIGIN_PID=$!
-ALL_PIDS="$ALL_PIDS $ORIGIN_PID"
+own_track "$ORIGIN_PID"
 
 # ── Cache nodes (ports 9002–9006, all proxy to origin H2C on 9000) ────────────
 m6-http "$SITE09/site-cache" "$(m6_conf "$SITE09/configs/local/cache-edge-a.toml")" &
-ALL_PIDS="$ALL_PIDS $!"
+own_track "$!"
 
 m6-http "$SITE09/site-cache" "$(m6_conf "$SITE09/configs/local/cache-edge-b.toml")" &
-ALL_PIDS="$ALL_PIDS $!"
+own_track "$!"
 
 m6-http "$SITE09/site-cache" "$(m6_conf "$SITE09/configs/local/cache-edge-c.toml")" &
-ALL_PIDS="$ALL_PIDS $!"
+own_track "$!"
 
 m6-http "$SITE09/site-cache" "$(m6_conf "$SITE09/configs/local/cache-edge-d.toml")" &
-ALL_PIDS="$ALL_PIDS $!"
+own_track "$!"
 
 m6-http "$SITE09/site-cache" "$(m6_conf "$SITE09/configs/local/cache-edge-e.toml")" &
-ALL_PIDS="$ALL_PIDS $!"
+own_track "$!"
 
-trap 'kill $ALL_PIDS 2>/dev/null; wait 2>/dev/null' EXIT
+trap 'own_stop_records; own_forget; wait 2>/dev/null' EXIT
 
 echo ""
 echo "┌─────────────────────────────────────────────────────────────┐"
