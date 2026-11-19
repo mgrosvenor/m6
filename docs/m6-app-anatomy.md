@@ -463,7 +463,7 @@ A key under `[limits]` that is not in the table stops the process at start with 
 | `h2_recv` | bytes | 16 KiB | 4 MiB | m6-http | one HTTP/2 connection's read buffer | the connection closes |
 | `h2_header_block` | bytes | 16 KiB | 256 KiB | m6-http | one HTTP/2 header block before decoding | GOAWAY, ENHANCE_YOUR_CALM |
 | `h2_stream_body` | bytes | 4 KiB | 32 MiB | m6-http | one HTTP/2 request body | the stream is reset |
-| `h2_send` | bytes | 16 KiB | 1 MiB | m6-http | one HTTP/2 connection's unsent response bytes, where `start` is the pacing mark | never reached: the flusher stops at `start` |
+| `h2_send` | bytes | 64 KiB | 1 MiB | m6-http | one HTTP/2 connection's unsent response bytes, where `start` is the pacing mark | never reached: the flusher stops at `start` |
 | `request_dict` | entries | 32 | 4096 | services | the fields of one request: query, form, path parameters, cookies and built-ins | the request is refused with a 400 |
 | `refresh_queue` | entries | 16 | 4096 | m6-http | stale cache entries waiting for a background fetch | the refresh is refused |
 | `rate_limit_addresses` | entries | 1024 | 50000 | m6-http | client addresses the request counter tracks | a new address is answered 429 |

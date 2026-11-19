@@ -1250,9 +1250,9 @@ fn h3_serves_a_body_of(len: usize) {
     );
 }
 
-/// RFC 9113 6.9 and 5.1: a response longer than the 16 KiB send queue completes.
+/// RFC 9113 6.9 and 5.1: a response longer than the send queue completes.
 ///
-/// m6-http frames response DATA only while fewer than 16 KiB sit unsent, and
+/// m6-http frames response DATA only while fewer bytes than the `h2_send` start sit unsent, and
 /// the next writable event is meant to frame the next piece. A page load takes
 /// bodies of tens of KiB to a few MiB over h2, and a connection that stops after
 /// the first two frames serves a status and a content-length and then 32,768

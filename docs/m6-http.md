@@ -836,7 +836,7 @@ One thread, one edge-triggered `m6_core::platform::Poll` loop, no async runtime.
 The H2C and H2S client pools run in the loop beside the TLS and QUIC listeners.
 
 An HTTP/2 connection sends in the same way: `send_until_blocked` frames and writes until the socket would block or no stream has credit left, and the writable edge the loop then waits for runs it again.
-The send queue starts at 16 KiB (`[limits.h2_send] start`), so a body of any size is sent in many passes, and a socket that took every byte never reports a new edge.
+The send queue starts at 64 KiB (`[limits.h2_send] start`; the same value is the kernel's unsent-bytes mark on Linux), so a body of any size is sent in many passes, and a socket that took every byte never reports a new edge.
 `rfc9113_6_9_h2_serves_a_37_kib_body`, `_300_kib_body` and `_2_mib_body` in `m6-http/tests/rfc_conformance.rs` fetch each size with a client that announces a browser's windows.
 
 The fixed tokens are `TOKEN_TLS_LISTENER`, `TOKEN_STATUS_LISTENER`, `TOKEN_H2C_LISTENER`, `TOKEN_UDP`, `TOKEN_SIGNAL` and `TOKEN_LOG`.

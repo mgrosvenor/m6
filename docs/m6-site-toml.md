@@ -700,6 +700,7 @@ m6-http sizes its buffers and queues from named limits, each with a `start` and 
 The table lives in the system config, because memory is a property of the node.
 A `[limits]` table in `site.toml` stops the start with exit 2 in a two-file config, and the message names the system config.
 The keys m6-http reads are `edge_request`, `edge_response`, `h2_recv`, `h2_header_block`, `h2_stream_body`, `h2_send`, `refresh_queue`, `rate_limit_addresses`, `cache_bytes`, `connections`, `log_buffer`, `log_field` and `heap_reserve`.
+`h2_send` starts at 64 KiB. That value is how many unsent response bytes an HTTP/2 connection holds before it waits for the socket, and on Linux it is also the kernel's unsent-bytes mark for the connection. A smaller value lets a more urgent stream on the same connection overtake a large body sooner. A larger one sends large bodies in fewer writes.
 `heap_reserve` is the heap m6-http reserves from the OS at start, on huge pages where the kernel has them. Its default is `cache_bytes` max plus 64 MiB, rounded up to 2 MiB, and the cache is carved from it. A `[limits.heap_reserve] start` below `cache_bytes` max is warned at start, naming both keys.
 [`m6-app-anatomy.md`](m6-app-anatomy.md) §4.2 gives every limit with its defaults in Table 6, the growth rule, the rounding to the page size and the error a value past its maximum gets.
 

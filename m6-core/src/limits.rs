@@ -136,7 +136,7 @@ pub const H2_STREAM_BODY: LimitSpec = bytes("h2_stream_body", 4 * KIB, 32 * MIB)
 /// One HTTP/2 connection's unsent response bytes. The flusher stops framing at
 /// `start` and `max` is the hard ceiling that pacing keeps it below, so a
 /// response is never cut.
-pub const H2_SEND: LimitSpec = bytes("h2_send", 16 * KIB, MIB);
+pub const H2_SEND: LimitSpec = bytes("h2_send", 64 * KIB, MIB);
 /// Entries in one request's dictionary overlay: the query, form fields,
 /// path parameters, cookies and built-ins. A request that needs more is
 /// refused with a 400.
