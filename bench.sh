@@ -499,7 +499,7 @@ run_handshake_suites() {
 
 run_mixed_suite() {
     echo ""
-    echo "Mixed hot hits + new full TLS handshakes: rates=${MIXED_RATES}/s  seconds=${MIXED_SECONDS}  key=${BENCH_KEY:-ec}  features=${BENCH_FEATURES:-none (ring)}  profile=$PROFILE"
+    echo "Mixed hot hits + new full TLS handshakes: rates=${MIXED_RATES}/s  seconds=${MIXED_SECONDS}  key=${BENCH_KEY:-ec}  features=${BENCH_FEATURES:-none}  profile=$PROFILE"
     stop_all
     start_backends
     start_http
