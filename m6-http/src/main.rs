@@ -249,8 +249,9 @@ struct QuicConn {
     /// Set once the handshake has been recorded, so a connection that stays up
     /// for an hour contributes one sample rather than one per packet.
     handshake_recorded: bool,
-    /// The batch a flush packed and the socket refused, kept until it will take
-    /// it. `None` when nothing is waiting. See [`Flush`].
+    /// The batches a flush packed and the socket refused, in order, kept until
+    /// the socket will take them. `None` when nothing is waiting. See
+    /// [`PendingBatch`].
     blocked: Option<PendingBatch>,
 }
 
@@ -7007,14 +7008,8 @@ enum Flush {
     Blocked,
 }
 
-/// A packed batch the socket refused, kept in order until it will take it.
-///
-/// `quiche::Connection::send` hands the caller the bytes of a packet and drops
-/// its own copy of them. A refused send therefore puts nothing on the wire, and
-/// those frames are retransmitted only when quiche's loss timer fires. Keeping
-/// the batch is what lets the writable event send the very datagrams the socket
-/// refused, instead of the response waiting out a PTO.
-struct PendingBatch {
+/// One packed batch the socket refused, kept until the socket will take it.
+struct PendingChunk {
     /// The packed datagrams, back to back, packed at `segment_size`.
     bytes: Vec<u8>,
     /// Every datagram before the last is this size, which is what
@@ -7022,6 +7017,64 @@ struct PendingBatch {
     segment_size: usize,
     /// Where the batch is for.
     dest: SocketAddr,
+}
+
+/// The batches a flush packed and the socket refused, in the order quiche made
+/// them.
+///
+/// `quiche::Connection::send` hands the caller the bytes of a packet and drops
+/// its own copy of them. A refused send therefore puts nothing on the wire, and
+/// those frames are retransmitted only when quiche's loss timer fires. Keeping
+/// the batch is what lets the writable event send the very datagrams the socket
+/// refused, instead of the response waiting out a PTO.
+///
+/// A flush usually has one batch outside quiche's send queue when a send is
+/// refused: the one it packed. The `_` arm of [`flush_conn`]'s match is the
+/// exception. `conn.send` has already handed over the packet that could not
+/// join the pack, so that packet is a second batch and sits in the flush buffer
+/// after the first. Both are kept here and sent in order, so a refused send
+/// never strands a packet quiche has already given up.
+#[derive(Default)]
+struct PendingBatch {
+    /// The refused batches, oldest first.
+    chunks: Vec<PendingChunk>,
+}
+
+impl PendingBatch {
+    /// Keep `bytes` as the next batch to send.
+    fn keep(&mut self, bytes: &[u8], segment_size: usize, dest: SocketAddr) {
+        self.chunks.push(PendingChunk {
+            bytes: bytes.to_vec(),
+            segment_size,
+            dest,
+        });
+    }
+
+    /// Send the batches in order, dropping each one the socket takes. A batch
+    /// the socket refuses stays, and so does every batch behind it, so the
+    /// retry sends them in the order quiche made them.
+    fn flush(&mut self, udp: &UdpSocket, batch: UdpBatch) -> Flush {
+        let mut sent = 0;
+        for chunk in &self.chunks {
+            if flush_batch(
+                udp,
+                batch,
+                &chunk.bytes,
+                chunk.segment_size,
+                Some(chunk.dest),
+            ) == Flush::Blocked
+            {
+                break;
+            }
+            sent += 1;
+        }
+        self.chunks.drain(..sent);
+        if self.chunks.is_empty() {
+            Flush::Sent
+        } else {
+            Flush::Blocked
+        }
+    }
 }
 
 /// The connections whose last batch the socket refused, and whether the QUIC
@@ -7090,20 +7143,14 @@ impl BlockedSends {
 ///
 /// `out` is the loop's own buffer, reused across flushes: a batch is packed
 /// once into the bytes that go on the wire, with no copy between `send` and the
-/// system call. The one copy it does make is of a batch the socket refused,
-/// which the connection keeps for the writable event.
+/// system call. The copies it does make are of the batches the socket refused,
+/// which the connection keeps for the writable event: the batch it packed, and
+/// in the `_` arm also the packet quiche handed over after it.
 fn flush_conn(udp: &UdpSocket, batch: UdpBatch, out: &mut [u8], qconn: &mut QuicConn) -> Flush {
     // A batch refused last time goes first, so the packets leave in the order
     // quiche made them.
-    if let Some(pending) = qconn.blocked.take() {
-        if flush_batch(
-            udp,
-            batch,
-            &pending.bytes,
-            pending.segment_size,
-            Some(pending.dest),
-        ) == Flush::Blocked
-        {
+    if let Some(mut pending) = qconn.blocked.take() {
+        if pending.flush(udp, batch) == Flush::Blocked {
             qconn.blocked = Some(pending);
             return Flush::Blocked;
         }
@@ -7168,9 +7215,17 @@ fn flush_conn(udp: &UdpSocket, batch: UdpBatch, out: &mut [u8], qconn: &mut Quic
                 // Another destination, or a packet larger than the batch's
                 // segment: send what is packed and start the batch with this
                 // one. The copy is needed because the send leaves `out` alone
-                // and the new packet sits after the bytes just sent.
+                // and the new packet sits after the bytes just sent. A refused
+                // send keeps the packed batch, and this packet too: it is
+                // outside the batch, so nothing else would send it.
                 let packed = pack.len;
                 if send_pack(udp, batch, out, &mut pack, qconn) == Flush::Blocked {
+                    keep_batch(
+                        qconn,
+                        &out[packed..packed + written],
+                        written,
+                        Some(send_info.to),
+                    );
                     return Flush::Blocked;
                 }
                 out.copy_within(packed..packed + written, 0);
@@ -7242,11 +7297,10 @@ fn keep_batch(qconn: &mut QuicConn, bytes: &[u8], segment_size: usize, dest: Opt
     let Some(dest) = dest else {
         return;
     };
-    qconn.blocked = Some(PendingBatch {
-        bytes: bytes.to_vec(),
-        segment_size,
-        dest,
-    });
+    qconn
+        .blocked
+        .get_or_insert_with(PendingBatch::default)
+        .keep(bytes, segment_size, dest);
 }
 
 /// Flush the connections whose batch the socket refused, on the writable
@@ -9640,6 +9694,132 @@ mod quic_flush_tests {
         assert!(
             events.iter().next().is_none(),
             "an empty set still watches writability"
+        );
+    }
+
+    /// A packet that could not join a refused batch goes out on the writable
+    /// event too, ahead of everything behind it.
+    ///
+    /// A 60-byte response on stream 3 and a 12 KB one on stream 7 make quiche
+    /// write a small packet and then a full one. The full one cannot join the
+    /// batch, so `flush_conn` sends the small one and hands the full one over
+    /// as a second batch. When the socket refuses the small one, the full one
+    /// is outside the batch and quiche has already forgotten it: keeping the
+    /// pack alone strands it until the loss timer, and stream 7 then stops at
+    /// the gap.
+    ///
+    /// The bound is the PTO, as in the refused-batch test: a test that only
+    /// checked the bytes arrive would pass once the retransmission landed.
+    ///
+    /// Break: the second batch is dropped, the retry sends it out of order, or
+    /// the connection is not remembered.
+    #[test]
+    fn a_packet_after_a_refused_batch_goes_out_on_the_writable_event() {
+        const PATH_RTT: Duration = Duration::from_millis(100);
+        let server_udp = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let batch = UdpBatch::for_socket(&server_udp);
+        let mut out = vec![0u8; QUIC_BATCH_BYTES];
+        let (mut qconn, mut pair) = established_over(30_000, PATH_RTT, &server_udp);
+        // quiche writes the flushable streams in the order they became
+        // flushable, so the small packet comes first and the packet after it
+        // is full.
+        qconn
+            .conn
+            .stream_send(3, &[9u8; 60], true)
+            .expect("small stream");
+        qconn
+            .conn
+            .stream_send(7, &vec![7u8; 12_000], false)
+            .expect("large stream");
+
+        let key = vec![1u8];
+        let mut connections = HashMap::from([(key.clone(), qconn)]);
+        let mut blocked = BlockedSends::default();
+
+        test_send_seam::refuse_next_batches(1);
+        let flush = flush_conn(
+            &server_udp,
+            batch,
+            &mut out,
+            connections.get_mut(&key).expect("connection"),
+        );
+        assert_eq!(flush, Flush::Blocked, "the refused batch was not reported");
+        blocked.record(&key);
+        let qconn = connections.get_mut(&key).expect("connection");
+        let pto = qconn
+            .conn
+            .timeout_instant()
+            .expect("the loss timer is armed")
+            .saturating_duration_since(m6_core::platform::now());
+        assert!(pto >= PATH_RTT, "the frames would wait {pto:?}, not a PTO");
+        assert!(
+            datagram_within(&pair.client_udp, Duration::ZERO).is_none(),
+            "a refused flush put a datagram on the wire"
+        );
+
+        // The poller reports the socket writable, and that event's flush sends
+        // both held batches before packing anything new.
+        let mut poll = Poll::new().expect("poll");
+        poll.registry()
+            .register_fd(server_udp.as_raw_fd(), TOKEN_UDP, Interest::READABLE)
+            .expect("register");
+        blocked
+            .sync(&server_udp, poll.registry())
+            .expect("watch writable");
+        let mut events = Events::with_capacity(8);
+        poll.poll(&mut events, Some(Duration::from_secs(5)))
+            .expect("poll");
+        let ready = events.iter().next().expect("no writable event");
+        assert!(
+            ready.is_writable(),
+            "the writable interest was not registered"
+        );
+
+        let started = m6_core::platform::now();
+        flush_blocked(&server_udp, batch, &mut out, &mut connections, &mut blocked);
+        assert!(
+            blocked.is_empty(),
+            "the connection is still waiting for the socket"
+        );
+
+        // Everything that flush sent goes into the client, and then the long
+        // response is read in order. Its first packet was the one outside the
+        // refused batch, so without it stream 7 stops at the gap.
+        let from = server_udp.local_addr().expect("server address");
+        let to = pair.client_udp.local_addr().expect("client address");
+        let mut buf = [0u8; 2048];
+        let mut datagrams = 0;
+        loop {
+            match pair.client_udp.recv_from(&mut buf) {
+                Ok((n, _)) => {
+                    datagrams += 1;
+                    pair.client
+                        .recv(&mut buf[..n], quiche::RecvInfo { from, to })
+                        .expect("client receive");
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) => panic!("client socket: {e}"),
+            }
+        }
+        let mut body = Vec::new();
+        let mut chunk = [0u8; 2048];
+        while let Ok((n, _fin)) = pair.client.stream_recv(7, &mut chunk) {
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..n]);
+        }
+        assert!(
+            started.elapsed() < pto / 2,
+            "the retry took {:?}, half the PTO was {:?}",
+            started.elapsed(),
+            pto / 2
+        );
+        assert_eq!(
+            body.len(),
+            12_000,
+            "{datagrams} datagrams arrived and stream 7 got {} bytes: the packet outside the refused batch is missing",
+            body.len()
         );
     }
 
