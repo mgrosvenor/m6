@@ -3003,7 +3003,7 @@ fn event_loop(
     let mut blocked = BlockedSends::default();
     // The connections one `recvmmsg` batch fed. It is cleared when each batch
     // is flushed, so its capacity survives the whole run.
-    let mut touched: Vec<Vec<u8>> = Vec::new();
+    let mut touched = Touched::default();
 
     // Count this thread's allocations from the first iteration. The
     // counter is read once at stop, after the loop, where ordinary logging may
@@ -3537,8 +3537,8 @@ struct BoundUdp<'a> {
     /// The connections the receive batch being consumed has fed, in first-seen
     /// order. Each is flushed once after the batch, not once per datagram.
     /// Reused across batches, so steady state allocates nothing for the common
-    /// case of one connection.
-    touched: &'a mut Vec<Vec<u8>>,
+    /// case of one connection. See [`Touched`].
+    touched: &'a mut Touched,
 }
 
 fn drain_udp(
@@ -3662,7 +3662,7 @@ fn drain_udp(
         // This connection is flushed once, after the whole batch. Marking it
         // after the lookup means a datagram that found no connection never
         // becomes a flush of one.
-        note_touched(udp.touched, &key);
+        udp.touched.note(&key);
 
         let recv_info = quiche::RecvInfo {
             from,
@@ -3771,14 +3771,48 @@ fn drain_udp(
     }
 }
 
-/// Remember that `key` took a datagram in this receive batch.
+/// The connections one receive batch fed, in first-seen order.
 ///
-/// The list is small (one connection is the steady state), so it is checked
-/// linearly. A connection that appears in a batch sixteen times still appears
-/// once here.
-fn note_touched(touched: &mut Vec<Vec<u8>>, key: &[u8]) {
-    if !touched.iter().any(|seen| seen == key) {
-        touched.push(key.to_vec());
+/// The steady state is one connection, which can appear sixteen times in a
+/// batch of sixteen datagrams. The list is small, so it is checked linearly,
+/// and a connection that appears sixteen times is one entry here.
+///
+/// The entry buffers are kept across batches and only the live prefix is read:
+/// the first batch that feeds a connection copies its key into a buffer, and
+/// every batch after that copies into the same buffer. That is what the comment
+/// on [`BoundUdp::touched`] means by reusing the list: a batch allocates only
+/// when it feeds more distinct connections than any batch before it.
+#[derive(Default)]
+struct Touched {
+    /// Every entry the list has needed. Only the first `len` are live.
+    entries: Vec<Vec<u8>>,
+    /// How many entries the batch being consumed has fed.
+    len: usize,
+}
+
+impl Touched {
+    /// Start a new receive batch.
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// The connections this batch has fed, in first-seen order.
+    fn keys(&self) -> &[Vec<u8>] {
+        &self.entries[..self.len]
+    }
+
+    /// Remember that `key` took a datagram in this batch.
+    fn note(&mut self, key: &[u8]) {
+        if self.keys().iter().any(|seen| seen.as_slice() == key) {
+            return;
+        }
+        if self.len == self.entries.len() {
+            self.entries.push(Vec::new());
+        }
+        let entry = &mut self.entries[self.len];
+        entry.clear();
+        entry.extend_from_slice(key);
+        self.len += 1;
     }
 }
 
@@ -3800,9 +3834,9 @@ fn flush_received(
     out: &mut [u8],
     connections: &mut HashMap<Vec<u8>, QuicConn>,
     blocked: &mut BlockedSends,
-    touched: &[Vec<u8>],
+    touched: &Touched,
 ) {
-    for key in touched {
+    for key in touched.keys() {
         if let Some(qconn) = connections.get_mut(key) {
             if flush_conn(udp, batch, out, qconn) == Flush::Blocked {
                 blocked.record(key);
@@ -9988,6 +10022,48 @@ mod quic_flush_tests {
         (datagrams, body)
     }
 
+    /// The touched list keeps the entry buffers it has used, so a batch after
+    /// the first copies into the same memory instead of allocating.
+    ///
+    /// The pointer is the measurement `Vec` gives: `clear` keeps the buffer,
+    /// and a `note` that fits in it leaves the pointer alone. A list that
+    /// pushed a fresh `Vec` per batch would move it.
+    ///
+    /// Break: `note` pushing a new entry for a key the live list does not
+    /// hold, or `clear` dropping the entries instead of their length.
+    #[test]
+    fn a_touched_list_reuses_the_entries_it_has_used() {
+        let mut touched = Touched::default();
+        touched.note(&[1u8; 20]);
+        assert_eq!(touched.keys().len(), 1);
+        let buffer = touched.entries[0].as_ptr();
+
+        touched.clear();
+        touched.note(&[2u8; 20]);
+        assert_eq!(touched.keys().len(), 1, "the new batch is a new list");
+        assert_eq!(touched.keys()[0], vec![2u8; 20], "the batch's own key");
+        assert_eq!(
+            touched.entries.len(),
+            1,
+            "the second batch added an entry rather than reusing one"
+        );
+        assert_eq!(
+            touched.entries[0].as_ptr(),
+            buffer,
+            "the second batch allocated a new entry buffer"
+        );
+
+        // A batch with more connections than any before it grows the list and
+        // still reads only the live prefix.
+        touched.clear();
+        touched.note(&[3u8; 20]);
+        touched.note(&[4u8; 20]);
+        assert_eq!(touched.keys(), &[vec![3u8; 20], vec![4u8; 20]]);
+        touched.clear();
+        touched.note(&[5u8; 20]);
+        assert_eq!(touched.keys(), &[vec![5u8; 20]], "a stale entry is live");
+    }
+
     /// One receive batch flushes each connection it fed once, not once per
     /// datagram, and every byte still arrives in order.
     ///
@@ -10028,9 +10104,16 @@ mod quic_flush_tests {
         let mut connections =
             HashMap::from([(first_key.clone(), first), (second_key.clone(), second)]);
         // Sixteen datagrams for the first connection and three for the second,
-        // which is what one full batch of ACKs and a short one look like.
-        let mut touched = vec![first_key; 16];
-        touched.extend(std::iter::repeat_n(second_key, 3));
+        // which is what one full batch of ACKs and a short one look like. Each
+        // connection is noted once however many datagrams it took.
+        let mut touched = Touched::default();
+        for _ in 0..16 {
+            touched.note(&first_key);
+        }
+        for _ in 0..3 {
+            touched.note(&second_key);
+        }
+        assert_eq!(touched.keys().len(), 2, "one entry per connection");
         let mut blocked = BlockedSends::default();
 
         test_send_stats::reset();
