@@ -1089,7 +1089,25 @@ Verified with `a_symlinked_directory_inside_the_site_is_refused`, which returns 
 
 - **Linux on the development host.** Every platform and cgroup run above is macOS arm64. On that host the Linux arms of `host_facts()`, the cgroup walk and every `/proc` parse are formatted and parsed but not type-checked, because it has only the `aarch64-apple-darwin` standard library and no rustup. The first Linux CI job that runs `cargo check --workspace --all-targets`, `platform_gate` and `platform_contract` is the proof.
 - **The deploy-side writer of `[monitor] expected_deploy_file`.** The monitor reads the file and reports it as waiting. m6 ships no writer of the file, so until a deployment writes one no version or config sha256 is compared.
-- **A physically mixed-commit binary.** The mechanism and the metadata test are the evidence, and a source tarball's `+unknown` is unit-tested.
+### Known issues
+
+**HTTP/3 costs more than HTTP/2 on a loopback benchmark, and this release does not close that.** On a cached 52 KB page at four connections it uses about 2.6 times the server CPU per response, 215 us against 82 us, and its latency is about 2.2 times. HTTP/3 is still faster than 1.15.0 on every row measured, so the gap against HTTP/2 is older than this release rather than introduced by it.
+
+Where the CPU goes, from a symbolised profile of the server at four connections:
+
+| cause | share |
+|---|---|
+| the kernel's per-datagram UDP path | 31% |
+| the QUIC library's per-packet packetisation and recovery | 26% |
+| per-packet AEAD at a 1,350-byte datagram | 15% |
+| copies and allocation | 13% |
+| m6's own code | 5% |
+
+The kernel's share is measured on loopback, where the sender also pays for segmenting a batch and delivering it to the receiver's socket. A network card and the remote host take on that work in production, so the share above is an upper bound on that row rather than a prediction.
+
+**No ACK-frequency control in this release.** The pinned QUIC library implements neither the ack-frequency frame nor its transport parameter, so an endpoint cannot ask its peer to acknowledge less often, and no figure is claimed for the share that would remove.
+
+**Five things are planned and none is in this release.** Zero-copy response bodies, the per-datagram allocations and clock reads in the receive loop, three small per-packet savings in the QUIC library, a measurement of HTTP/3 against HTTP/2 over a real network rather than loopback, and an evaluation of the BBRv2 congestion controller under real round-trip time and loss.
 
 ---
 
