@@ -439,7 +439,12 @@ fn no_service_manager_variable_outside_the_layer() {
     let root = root();
     let mut found = Vec::new();
     for rel in rust_files(&root) {
-        if in_layer(&rel) {
+        // An example's integration test starts m6-http the way a service manager
+        // does, by handing it the state directory in its environment. That is
+        // setting the variable for the layer to read, not reading it.
+        let example_test =
+            rel.starts_with("examples") && rel.components().any(|c| c.as_os_str() == "tests");
+        if in_layer(&rel) || example_test {
             continue;
         }
         found.extend(offending_lines(&root, &rel, &|line| {
