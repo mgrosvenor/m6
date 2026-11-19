@@ -7965,9 +7965,10 @@ fn run(args: Vec<String>) -> i32 {
         eprintln!("set_nonblocking error: {e}");
         return 2;
     }
-    // A bound socket's local address cannot change, and the QUIC receive path
-    // needs it for every `RecvInfo`. Read it once here, not once per datagram.
-    let udp_local = match m6_http_lib::h3::LocalAddr::read(&udp) {
+    // A bound socket's local address cannot change, and every `RecvInfo` needs
+    // it. Read it once here, which is one `getsockname` for the socket rather
+    // than one per received datagram.
+    let udp_local = match udp.local_addr() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("local_addr error: {e}");
@@ -8273,7 +8274,7 @@ fn run(args: Vec<String>) -> i32 {
     let code = event_loop(
         EventLoopIo {
             udp,
-            udp_local: udp_local.get(),
+            udp_local,
             udp_batch,
             tcp: tcp_listener,
             h2c: h2c_listener,
