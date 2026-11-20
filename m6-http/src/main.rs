@@ -444,6 +444,9 @@ struct ServerState {
     /// tick neither formats nor allocates. Empty when this node has no
     /// heartbeat.
     heartbeat_request: Vec<u8>,
+    /// The same `GET /genid` as a request, for a backend reached over h2c or
+    /// h2s, built once at start. `None` when this node has no heartbeat.
+    heartbeat_h2_request: Option<forward::HttpRequest>,
 }
 
 /// One cache entry to fetch in the background.
@@ -2404,7 +2407,22 @@ fn encode_heartbeat_request(host: &str, token: &str, out: &mut Vec<u8>) {
     out.extend_from_slice(b"\r\n\r\n");
 }
 
-/// Start one heartbeat on the upstream slot, from the bytes fixed at start.
+/// Encode the heartbeat's `GET /genid` once, at start, for an h2 backend. The
+/// authority is the backend's URL host, which the h2 client sets itself.
+fn heartbeat_h2_request(token: &str) -> forward::HttpRequest {
+    forward::HttpRequest {
+        method: "GET".to_string(),
+        path: m6_core::site::GENID_PATH.to_string(),
+        query: None,
+        version: "HTTP/2".to_string(),
+        headers: vec![("authorization".to_string(), format!("Bearer {token}"))],
+        body: Vec::new(),
+    }
+}
+
+/// Start one heartbeat on the transport the backend's scheme names, from the
+/// request fixed at start: an h2 stream for h2c and h2s, an upstream slot for
+/// http and https. The same split `dispatch_url_backend` makes.
 ///
 /// `NoSlot` is the node being busy, not the upstream being down, so the caller
 /// leaves the heartbeat due and tries on the next turn.
@@ -2415,20 +2433,40 @@ fn launch_heartbeat(
     let Some(backend_idx) = state.heartbeat_backend else {
         return Err(UrlDispatchError::NoSlot);
     };
-    let (key, token, watched) = take_url_slot(state, backend_idx)?;
-    {
-        // Disjoint fields: the bytes copied from are fixed at start and this
-        // never allocates the slot's buffer beyond its first use.
-        let entry = state.upstreams.get_mut(key);
-        entry
-            .upstream
-            .request_buf()
-            .extend_from_slice(&state.heartbeat_request);
-    }
-    begin_url_slot(state, registry, backend_idx, key, token, watched, false)?;
-    let entry = state.upstreams.get_mut(key);
-    entry.waiter = Some(Waiter::Heartbeat);
-    entry.ctx = Some(forward::PendingUrlContext::for_heartbeat());
+    let id = match state.pool_manager.url_backend(backend_idx).scheme {
+        pool::UrlScheme::H2c | pool::UrlScheme::H2s => {
+            // Taken out for the dispatch, which needs `state` whole, and put
+            // back whatever happens: nothing is built per beat.
+            let Some(req) = state.heartbeat_h2_request.take() else {
+                return Err(UrlDispatchError::NoSlot);
+            };
+            let host = state.pool_manager.url_backend(backend_idx).host.clone();
+            let id = dispatch_h2(state, registry, backend_idx, &req, "", &host);
+            state.heartbeat_h2_request = Some(req);
+            id?
+        }
+        pool::UrlScheme::Http | pool::UrlScheme::Https => {
+            let (key, token, watched) = take_url_slot(state, backend_idx)?;
+            {
+                // Disjoint fields: the bytes copied from are fixed at start
+                // and this never allocates the slot's buffer beyond its first
+                // use.
+                let entry = state.upstreams.get_mut(key);
+                entry
+                    .upstream
+                    .request_buf()
+                    .extend_from_slice(&state.heartbeat_request);
+            }
+            begin_url_slot(state, registry, backend_idx, key, token, watched, false)?;
+            UpstreamId::Slot(key)
+        }
+    };
+    park(
+        state,
+        id,
+        forward::PendingUrlContext::for_heartbeat(),
+        Waiter::Heartbeat,
+    );
     Ok(())
 }
 
@@ -4837,29 +4875,42 @@ fn dispatch_url_backend(
         "url backend dispatch"
     );
     match state.pool_manager.url_backend(backend_idx).scheme {
-        pool::UrlScheme::H2c => {
-            ensure_h2c_conn(state, backend_idx, registry)?;
+        pool::UrlScheme::H2c | pool::UrlScheme::H2s => {
             let original_host = origin_host(req, &state.config).to_string();
-            let backend = state.pool_manager.url_backend(backend_idx);
-            let (conn, stream) = state
-                .h2c_pool
-                .dispatch(&backend.url, req, client_ip, &original_host, registry)
-                .map_err(UrlDispatchError::Failed)?;
-            Ok(UpstreamId::H2c { conn, stream })
-        }
-        pool::UrlScheme::H2s => {
-            ensure_h2s_conn(state, backend_idx, registry)?;
-            let original_host = origin_host(req, &state.config).to_string();
-            let backend = state.pool_manager.url_backend(backend_idx);
-            let (conn, stream) = state
-                .h2s_pool
-                .dispatch(&backend.url, req, client_ip, &original_host, registry)
-                .map_err(UrlDispatchError::Failed)?;
-            Ok(UpstreamId::H2s { conn, stream })
+            dispatch_h2(state, registry, backend_idx, req, client_ip, &original_host)
         }
         pool::UrlScheme::Http | pool::UrlScheme::Https => {
             launch_url_upstream(state, registry, req, client_ip, backend_idx).map(UpstreamId::Slot)
         }
+    }
+}
+
+/// Start one request to an h2c or h2s URL backend on its connection pool,
+/// opening the connection first when the pool has none.
+fn dispatch_h2(
+    state: &mut ServerState,
+    registry: &m6_core::platform::Registry,
+    backend_idx: usize,
+    req: &forward::HttpRequest,
+    client_ip: &str,
+    original_host: &str,
+) -> Result<UpstreamId, UrlDispatchError> {
+    if let pool::UrlScheme::H2c = state.pool_manager.url_backend(backend_idx).scheme {
+        ensure_h2c_conn(state, backend_idx, registry)?;
+        let backend = state.pool_manager.url_backend(backend_idx);
+        let (conn, stream) = state
+            .h2c_pool
+            .dispatch(&backend.url, req, client_ip, original_host, registry)
+            .map_err(UrlDispatchError::Failed)?;
+        Ok(UpstreamId::H2c { conn, stream })
+    } else {
+        ensure_h2s_conn(state, backend_idx, registry)?;
+        let backend = state.pool_manager.url_backend(backend_idx);
+        let (conn, stream) = state
+            .h2s_pool
+            .dispatch(&backend.url, req, client_ip, original_host, registry)
+            .map_err(UrlDispatchError::Failed)?;
+        Ok(UpstreamId::H2s { conn, stream })
     }
 }
 
@@ -8116,20 +8167,18 @@ fn run(args: Vec<String>) -> i32 {
         .as_ref()
         .and_then(|genid| genid.upstream.as_deref())
         .and_then(|name| pool_manager.find_url(name));
-    let heartbeat_request = match (
-        heartbeat_backend,
-        config
-            .genid
-            .as_ref()
-            .and_then(|genid| genid.token.as_ref())
-            .map(|token| token.expose().as_str()),
-    ) {
+    let heartbeat_token = config
+        .genid
+        .as_ref()
+        .and_then(|genid| genid.token.as_ref())
+        .map(|token| token.expose().as_str());
+    let (heartbeat_request, heartbeat_h2) = match (heartbeat_backend, heartbeat_token) {
         (Some(idx), Some(token)) => {
             let mut buf = Vec::with_capacity(256);
             encode_heartbeat_request(pool_manager.url_backend(idx).host.as_str(), token, &mut buf);
-            buf
+            (buf, Some(heartbeat_h2_request(token)))
         }
-        _ => Vec::new(),
+        _ => (Vec::new(), None),
     };
 
     // Compute error mode
@@ -8458,6 +8507,7 @@ fn run(args: Vec<String>) -> i32 {
         genid,
         heartbeat_backend,
         heartbeat_request,
+        heartbeat_h2_request: heartbeat_h2,
     };
 
     if state.config.server.warm_on_start {
