@@ -59,10 +59,10 @@ One child carries all four types.
 N is the larger of 200 and 14 for each `[[monitor.nodes]]` entry.
 A node writes about 7 matching lines a minute, 6 metrics documents at 10 seconds and 1 traffic document at 60, so 14 lines for each node cover at least two minutes of the whole fleet, which is more than two poll intervals at the default 30 seconds.
 Start-up lines share the window and shorten it a little, and the floor of 200 keeps a small fleet's window large enough to hold a start-up record.
-The count is not a time and the monitor's clock is not read, but the newest entries are chosen by the senders' clocks.
+The count reads no clock of the monitor's, and the newest entries are chosen by the senders' clocks.
 The reads overlap, and each entry is taken once.
 A read that failed or was killed changes nothing for the next one.
-Known limits, for this release: the window is the newest N entries of every node merged, ordered by each sender's own clock, so it is not a window of time and not a share for each node.
+Known limits, for this release: the window is the newest N entries of every node merged and ordered by each sender's own clock, so it spans a period of each sender's time and holds no guaranteed share for each node.
 A node whose clock lags by more than the window's span is not read, and a node whose clock runs ahead, or that writes much faster than the others, fills the window and hides the rest.
 A poll interval over about two minutes on a fleet of more than 14 nodes is not covered, because the window holds about two minutes of the fleet.
 A start-up record older than the window is not read, and its absence is not a finding, so `--check` then skips that node's version, config-sha256, decided and completeness checks.

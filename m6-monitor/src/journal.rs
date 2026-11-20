@@ -21,15 +21,15 @@
 //! traffic document at 60, so 14 lines for each node cover at least two minutes
 //! of the whole fleet, which is more than two poll intervals at the default 30
 //! seconds. Start-up lines share the window and shorten it a little, and 200 is
-//! the floor so a small fleet still holds a node's start-up record. The monitor's
-//! clock is not read: the reads overlap, and [`Latest`] and [`Startup`] take each
-//! entry once.
+//! the floor so a small fleet still holds a node's start-up record. The count
+//! reads no clock of the monitor's, and [`Latest`] and [`Startup`] take each entry
+//! once because the reads overlap.
 //!
 //! **Known limits, for this release.** The window is the newest N entries of
-//! every node merged and ordered by each sender's own clock. It is neither a
-//! time nor a share for each node. A node whose clock lags by more than the
-//! window's span is not read. A node whose clock runs ahead, or that writes much
-//! faster than the others, fills the window and hides the rest. A poll interval
+//! every node merged and ordered by each sender's own clock, so it spans a period
+//! of each sender's time and holds no guaranteed share for each node. A node whose
+//! clock lags by more than the window's span is not read. A node whose clock runs
+//! ahead, or that writes much faster than the others, is read and hides the rest. A poll interval
 //! over about two minutes on a fleet of more than 14 nodes is not covered. A
 //! start-up record older than the window is not read, and its absence is not a
 //! finding. A read per node is the planned fix.
@@ -1384,6 +1384,37 @@ mod tests {
             1,
             "one --all, so long fields are not nulled"
         );
+    }
+
+    /// The window is the floor or fourteen lines a node, whichever is larger: three
+    /// nodes ask for the floor, forty ask for 560, and 560 is two minutes of seven
+    /// lines a minute for every node, which is the requirement the docs state.
+    #[test]
+    fn the_window_is_the_larger_of_the_floor_and_fourteen_lines_a_node() {
+        let limit = Limit::builtin(&m6_core::limits::JOURNAL_LINE);
+        let args = |nodes| {
+            let reader = Reader::new(
+                Some(PathBuf::from("/var/empty")),
+                nodes,
+                Duration::ZERO,
+                &limit,
+                None,
+            );
+            reader
+                .command()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert!(args(3).contains(&"--lines=200".to_string()), "the floor");
+        assert!(
+            args(14).contains(&"--lines=200".to_string()),
+            "14 x 14 is under it"
+        );
+        assert!(args(40).contains(&"--lines=560".to_string()), "14 x 40");
+        // Two minutes of 7 lines a minute for each node, past two 30 s polls.
+        let lines = |nodes: usize| MIN_LINES.max(LINES_PER_NODE * nodes);
+        assert!(lines(40) >= 40 * 7 * 2);
     }
 
     /// A read killed at its deadline does not poison the next one: its child

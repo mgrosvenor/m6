@@ -707,8 +707,8 @@ Over a remote journal that several hosts upload into, a follower returns the doc
 The same read without `--follow` returns every host's documents.
 The service now starts one `journalctl --all --output=json --lines=<N> --directory <dir>` read with the four `M6_TYPE` matches at start and then once each poll interval, with no `--follow`, which is the read `--check` makes.
 N is the larger of 200 and 14 for each `[[monitor.nodes]]` entry, so the read covers at least two minutes of the whole fleet at about 7 matching lines a minute for each node.
-The monitor's own clock is not read, but the newest entries are chosen by each sender's clock.
-Known limits: the window is the newest N entries of every node merged, so a node whose clock lags by more than the window, a node whose clock runs ahead or that writes much faster than the others, a poll interval over about two minutes on a fleet of more than 14 nodes, and a start-up record older than the window are each not read, and a missing start-up record is not a finding.
+The count reads no clock of the monitor's, and the newest entries are chosen by each sender's clock.
+Known limits: the window is the newest N entries of every node merged and ordered by each sender's clock, so a node whose clock lags by more than the window's span is not read, a node whose clock runs ahead or that writes much faster than the others is read and hides the rest, a poll interval over about two minutes on a fleet of more than 14 nodes is not covered, and a start-up record older than the window is not read, its absence not a finding.
 A read per node is planned to remove these limits.
 `Latest` keeps the newest document under each node name by the journal's time for the entry and counts an entry without one as malformed, and a start-up line that two overlapping reads both carry is counted once.
 At most one read starts each poll interval, a read still running one interval after it started is killed and reported, the loop never waits for the child, and a journal directory that is missing starts no `journalctl` at all.
