@@ -78,6 +78,7 @@ Take from it that the user and group commands need `[storage]` and `[tokens] iss
 
 **Table 2: the config keys m6-auth-cli reads.**
 Without `[keys]`, `token create` exits 1 with `config missing [keys] section`.
+A config whose `[keys]` table names only `public_key`, as a check-only process's config does, is read. `token create` then exits 1 because it has no private key to sign with, and every other command runs.
 
 Every path in the file is absolute, and a relative one exits 2 naming the setting.
 m6-auth-cli creates the directory that holds the database when it is missing.

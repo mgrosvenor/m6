@@ -345,6 +345,7 @@ It asks that upstream for the ID and follows it.
 
 1. **Heartbeat.**
    At start, and then once `heartbeat_secs` (default 10) have passed since the last one finished, the node sends `GET /genid` to the upstream with `Authorization: Bearer <token from token_file>`.
+   The heartbeat takes the transport the upstream's URL scheme names: an h2 stream for `h2c://` and `h2s://`, and an HTTP/1.1 upstream slot for `http://` and `https://`.
    One heartbeat is in flight at most, on the accounting tick, under the backend's `backend_timeout_secs` deadline.
    The address is the one resolved at start, so an address change needs a restart.
 2. **A new ID is a full flush.**
