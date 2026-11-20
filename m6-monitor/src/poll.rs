@@ -288,9 +288,9 @@ pub struct Poller {
     header_checks: Vec<HeaderCheck>,
     /// The newest metrics and traffic document the journal carried, by node.
     latest: crate::journal::Latest,
-    /// The one journal reader. The service starts a read on each poll tick,
+    /// The one journal reader. The service starts a read each poll interval,
     /// and a check starts one and drains it; a read is never a follower. Its
-    /// `stopped` is the one record of why it is not running.
+    /// `stopped` is the one record of why the last read failed.
     pub journal: crate::journal::Reader,
     cache: VerdictCache,
     nameserver: SocketAddr,
@@ -360,9 +360,8 @@ impl Poller {
         dir: Result<std::path::PathBuf, String>,
         limit: &m6_core::limits::Limit,
     ) {
-        let nodes = self.nodes.len();
         self.journal = match dir {
-            Ok(dir) => crate::journal::Reader::once(&dir, nodes, limit),
+            Ok(dir) => crate::journal::Reader::once(&dir, limit),
             Err(reason) => crate::journal::Reader::unavailable(reason, limit),
         };
         let Poller {
@@ -431,10 +430,9 @@ impl Poller {
             timeout,
             header_checks,
             latest: crate::journal::Latest::new(),
-            journal: crate::journal::Reader::idle(
-                n,
-                &m6_core::limits::Limit::builtin(&m6_core::limits::JOURNAL_LINE),
-            ),
+            journal: crate::journal::Reader::idle(&m6_core::limits::Limit::builtin(
+                &m6_core::limits::JOURNAL_LINE,
+            )),
             cache: VerdictCache::with_cap(lookup_cap),
             nameserver,
             wg_file,
@@ -1653,6 +1651,7 @@ mod tests {
             "MESSAGE": document.to_string(),
             "M6_TYPE": document["type"],
             "_HOSTNAME": "build",
+            "__REALTIME_TIMESTAMP": crate::journal::next_realtime().to_string(),
         }))
         .unwrap()
     }

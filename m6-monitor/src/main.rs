@@ -214,9 +214,6 @@ fn run_service() -> Result<()> {
     let nodes = fleet
         .resolve(&tls)
         .unwrap_or_else(|e| fail("resolving the fleet", format!("{e:#}")));
-    // The journal read's `--lines` window is the fleet count times its two
-    // document types, so it is taken before the fleet moves into the poller.
-    let node_count = nodes.len();
     m6_core::ndjson::set_page_limit(site.limits().get(&m6_core::limits::NDJSON_PAGE));
     let nameserver = m6_core::dns::nameserver()
         .unwrap_or_else(|e| fail("reading the resolver configuration", e));
@@ -253,7 +250,7 @@ fn run_service() -> Result<()> {
     // never a refusal to start: the monitor's own page and check still run.
     let journal_limit = site.limits().get(&m6_core::limits::JOURNAL_LINE).clone();
     poller.journal = match fleet.journal_path(site.site_dir()) {
-        Ok(dir) => journal::Reader::open(&dir, node_count, &journal_limit),
+        Ok(dir) => journal::Reader::open(&dir, interval, &journal_limit),
         Err(e) => {
             m6_core::log::error!(error = %format!("{e:#}"), "the journal cannot be read");
             journal::Reader::unavailable(format!("{e:#}"), &journal_limit)
@@ -514,10 +511,23 @@ fn run_service() -> Result<()> {
             publish(progress, &mut snapshot, &thresholds, &mut history);
         }
 
-        // The journal read shares that tick. A read still in flight is not
-        // doubled: its descriptor is already in the loop and the next tick
-        // tries again. A read that starts gets its pipe registered here.
-        if due && poller.journal.start_if_idle() {
+        // The journal read has the poll's interval and the loop's own tick, and
+        // no timer of its own. A read in flight past one interval is killed and
+        // reported. At most one read starts per interval, so a poll that
+        // overruns does not turn this into a read on every pass, and a read
+        // still in flight is not doubled. A read that starts gets its pipe
+        // registered here.
+        if poller.journal.expire(now) {
+            if let Some(fd) = journal_fd.take() {
+                let _ = poll.registry().deregister_fd(fd);
+            }
+            poller.journal.retire();
+            m6_core::log::error!(
+                error = poller.journal.stopped.as_deref().unwrap_or_default(),
+                "the journal read overran"
+            );
+        }
+        if poller.journal.start_if_idle(now) {
             if let Some(fd) = poller.journal.fd() {
                 poll.registry()
                     .register_fd(fd, JOURNAL, Interest::READABLE)?;
