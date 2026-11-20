@@ -10182,11 +10182,26 @@ mod quic_flush_tests {
             "the loopback socket refused a batch"
         );
 
-        let (first_datagrams, first_got) = drain_pair(&mut first_pair, &server_udp);
-        let (second_datagrams, second_got) = drain_pair(&mut second_pair, &server_udp);
+        // Loopback delivery is not synchronous with the send (macOS can hand
+        // the datagrams over a moment later), so read until every datagram
+        // the sends carried has arrived, or the deadline passes.
+        let (mut read, mut first_got, mut second_got) = (0, Vec::new(), Vec::new());
+        let deadline = m6_core::platform::now() + Duration::from_secs(5);
+        while read < datagrams && m6_core::platform::now() <= deadline {
+            let (n1, got1) = drain_pair(&mut first_pair, &server_udp);
+            let (n2, got2) = drain_pair(&mut second_pair, &server_udp);
+            read += n1 + n2;
+            first_got.extend_from_slice(&got1);
+            second_got.extend_from_slice(&got2);
+            if read < datagrams {
+                let _ = m6_core::platform::wait_readable(
+                    std::os::fd::AsFd::as_fd(&first_pair.client_udp),
+                    Duration::from_millis(20),
+                );
+            }
+        }
         assert_eq!(
-            first_datagrams + second_datagrams,
-            datagrams,
+            read, datagrams,
             "the client read a different number of datagrams than the sends carried"
         );
         assert_eq!(first_got, first_body, "the first body is byte for byte");
