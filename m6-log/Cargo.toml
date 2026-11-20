@@ -35,6 +35,13 @@ libtest-mimic = "0.8"
 name    = "no_allocation"
 harness = false
 
+# Its own harness: the first check points the process's stdout at the file it
+# counts, and the default harness writes each test's result to that same
+# stdout. The file's header gives the rest.
+[[test]]
+name    = "flush_points"
+harness = false
+
 [[bench]]
 name    = "line"
 harness = false
