@@ -707,10 +707,13 @@ Over a remote journal that several hosts upload into, a follower returns the doc
 The same read without `--follow` returns every host's documents.
 The service now starts one `journalctl --all --output=json --lines=<N> --directory <dir>` read with the four `M6_TYPE` matches at start and then once each poll interval, with no `--follow`, which is the read `--check` makes.
 N is the larger of 200 and 14 for each `[[monitor.nodes]]` entry, so the read covers at least two minutes of the whole fleet at about 7 matching lines a minute for each node.
-The count reads no clock, so a node whose clock is wrong is still read.
-`Latest` keeps each node's newest document by that node's own journal time and counts an entry without one as malformed, and a start-up line that two overlapping reads both carry is counted once.
+The monitor's own clock is not read, but the newest entries are chosen by each sender's clock.
+Known limits: the window is the newest N entries of every node merged, so a node whose clock lags by more than the window, a node whose clock runs ahead or that writes much faster than the others, a poll interval over about two minutes on a fleet of more than 14 nodes, and a start-up record older than the window are each not read, and a missing start-up record is not a finding.
+A read per node is planned to remove these limits.
+`Latest` keeps the newest document under each node name by the journal's time for the entry and counts an entry without one as malformed, and a start-up line that two overlapping reads both carry is counted once.
 At most one read starts each poll interval, a read still running one interval after it started is killed and reported, the loop never waits for the child, and a journal directory that is missing starts no `journalctl` at all.
-Verified with the monitor's unit tests, each of which fails when its behaviour is taken out: two nodes' interleaved, out-of-order entries both reach `Latest`, an older entry read later does not replace a newer one, a start-up record split across two reads counts each line once, the command carries `--lines` with that count and no `--follow` or `--since`, the missing-directory reader runs nothing, a stuck read is killed at its deadline and the read after it starts normally.
+Verified with the monitor's unit tests, which cover two nodes' interleaved, out-of-order entries, an older entry read later, a start-up record split across two reads, the command's arguments, the missing-directory reader, and a stuck read killed at its deadline.
+The tests do not cover the limits above.
 A live multi-host journal is not measured here.
 
 **The monitor reads whole journal fields, so a metrics document is no longer null.** Its one `journalctl` command asked for JSON output without `--all`, and JSON output prints a field null when its name and value reach 4096 bytes together, which for `MESSAGE` is 4088 bytes of value. A metrics document is about 6.4 KB, so every one of them reached the monitor with no message, was counted as malformed and dropped, and the digest reported that no metrics line existed for any node. The command now passes `--all`.

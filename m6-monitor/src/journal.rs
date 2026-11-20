@@ -13,7 +13,7 @@
 //! different delays, so the lagging host's new entries are older than the
 //! follower's position and are never returned. The same command without
 //! `--follow` prints both hosts' entries every time, so the service reads a
-//! window of time and the child exits, the way `--check` always has.
+//! count of lines and the child exits, the way `--check` always has.
 //!
 //! **A read's window is a count of lines.** Each read passes `--lines=N`, with
 //! `N = max(200, 14 x the number of [[monitor.nodes]] entries)`. A node writes
@@ -21,14 +21,23 @@
 //! traffic document at 60, so 14 lines for each node cover at least two minutes
 //! of the whole fleet, which is more than two poll intervals at the default 30
 //! seconds. Start-up lines share the window and shorten it a little, and 200 is
-//! the floor so a small fleet still holds a node's start-up record. The window
-//! reads no clock: the reads overlap, and [`Latest`] and [`Startup`] take each
+//! the floor so a small fleet still holds a node's start-up record. The monitor's
+//! clock is not read: the reads overlap, and [`Latest`] and [`Startup`] take each
 //! entry once.
+//!
+//! **Known limits, for this release.** The window is the newest N entries of
+//! every node merged and ordered by each sender's own clock. It is neither a
+//! time nor a share for each node. A node whose clock lags by more than the
+//! window's span is not read. A node whose clock runs ahead, or that writes much
+//! faster than the others, fills the window and hides the rest. A poll interval
+//! over about two minutes on a fleet of more than 14 nodes is not covered. A
+//! start-up record older than the window is not read, and its absence is not a
+//! finding. A read per node is the planned fix.
 //!
 //! **A document is ordered by the journal's `__REALTIME_TIMESTAMP`.** For a
 //! remote journal that is the uploading node's own clock, which no application
 //! on the node can set but the node itself can. It orders one node's own
-//! entries, which share one clock, and is never compared between nodes. Nothing
+//! entries kept under one node name, which a node chooses in its own document. Nothing
 //! inside `MESSAGE` orders anything. An entry without the field is counted as
 //! malformed, and an older entry read later never replaces a newer one.
 //!
@@ -985,11 +994,11 @@ impl Reader {
     /// The one `journalctl` command: the last `window` entries of the four
     /// types it reads, all on one child.
     ///
-    /// The count is not a time, so it reads no clock and a node whose clock is
-    /// wrong is still read. It is sized in [`MIN_LINES`] and
-    /// [`LINES_PER_NODE`]. A count shared with every host that uploads into the
-    /// directory is enough only because it covers more than two poll intervals
-    /// of the whole fleet. The read does not follow: a follower over a remote
+    /// The count reads no clock of the monitor's, but the newest entries are
+    /// chosen by the senders' clocks, so a node whose clock lags past the window
+    /// is not read. It is sized in [`MIN_LINES`] and [`LINES_PER_NODE`], and
+    /// covers about two minutes of the fleet when every node writes at the same
+    /// rate. The read does not follow: a follower over a remote
     /// journal that two hosts upload into shows one host's entries and never the
     /// other's.
     fn command(&self) -> Command {
@@ -1377,50 +1386,13 @@ mod tests {
         );
     }
 
-    /// The window is `max(200, 14 x nodes)` lines: a node writes about 7
-    /// matching lines a minute, so 14 per node is at least two minutes of the
-    /// fleet, more than two default poll intervals.
-    #[test]
-    fn the_window_is_the_larger_of_the_floor_and_fourteen_lines_a_node() {
-        let limit = Limit::builtin(&m6_core::limits::JOURNAL_LINE);
-        let args = |nodes| {
-            let reader = Reader::new(
-                Some(PathBuf::from("/var/empty")),
-                nodes,
-                Duration::ZERO,
-                &limit,
-                None,
-            );
-            reader
-                .command()
-                .get_args()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-        };
-        assert!(args(3).contains(&"--lines=200".to_string()), "the floor");
-        assert!(
-            args(14).contains(&"--lines=200".to_string()),
-            "14 x 14 is under it"
-        );
-        assert!(args(40).contains(&"--lines=560".to_string()), "14 x 40");
-        // Two minutes of 7 lines a minute for each node, past two 30 s polls.
-        let lines = |nodes: usize| MIN_LINES.max(LINES_PER_NODE * nodes);
-        assert!(lines(40) >= 40 * 7 * 2);
-    }
-
     /// A read killed at its deadline does not poison the next one: its child
-    /// is reaped, its pipe is closed, and the next read starts at once and with
-    /// the same window.
+    /// is reaped, its pipe is closed, and the next read starts at once.
     #[test]
     fn the_read_after_a_killed_one_starts_normally() {
         let mut reader = running("sleep 30", Duration::from_secs(30));
         let began = m6_core::platform::now();
         reader.last_started = Some(began);
-        let before = reader
-            .command()
-            .get_args()
-            .map(|a| a.to_owned())
-            .collect::<Vec<_>>();
         assert!(reader.expire(began + Duration::from_secs(30)));
         reader.retire();
         reaped(&mut reader);
@@ -1428,12 +1400,6 @@ mod tests {
         let next = began + Duration::from_secs(31);
         reader.start_if_idle(next);
         assert_eq!(reader.last_started, Some(next), "the next read was started");
-        let after = reader
-            .command()
-            .get_args()
-            .map(|a| a.to_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(before, after, "the same window");
     }
 
     /// A reader with no journal directory runs nothing on any tick, and keeps

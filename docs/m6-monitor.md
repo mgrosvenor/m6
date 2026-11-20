@@ -59,9 +59,14 @@ One child carries all four types.
 N is the larger of 200 and 14 for each `[[monitor.nodes]]` entry.
 A node writes about 7 matching lines a minute, 6 metrics documents at 10 seconds and 1 traffic document at 60, so 14 lines for each node cover at least two minutes of the whole fleet, which is more than two poll intervals at the default 30 seconds.
 Start-up lines share the window and shorten it a little, and the floor of 200 keeps a small fleet's window large enough to hold a start-up record.
-The count is not a time, so no read depends on the monitor's clock or a node's.
+The count is not a time and the monitor's clock is not read, but the newest entries are chosen by the senders' clocks.
 The reads overlap, and each entry is taken once.
 A read that failed or was killed changes nothing for the next one.
+Known limits, for this release: the window is the newest N entries of every node merged, ordered by each sender's own clock, so it is not a window of time and not a share for each node.
+A node whose clock lags by more than the window's span is not read, and a node whose clock runs ahead, or that writes much faster than the others, fills the window and hides the rest.
+A poll interval over about two minutes on a fleet of more than 14 nodes is not covered, because the window holds about two minutes of the fleet.
+A start-up record older than the window is not read, and its absence is not a finding, so `--check` then skips that node's version, config-sha256, decided and completeness checks.
+A read per node is the planned fix.
 
 A read does not follow.
 `journalctl --follow` over a remote journal that two hosts upload into returns only one host's entries, whichever it started behind, and never the other's.
@@ -75,7 +80,7 @@ A read still in flight is not started again.
 A read still in flight one interval after it started is killed, reported in `Reader::stopped`, and the next read starts normally.
 The loop never waits for the child: `Reader::retire` reaps it only when it has exited, and a later pass reaps it otherwise.
 `journal::Latest` keeps the newest metrics document and the newest traffic document for each node name, and `Poller::record_journal` reads those two maps when a poll reaches its `Perf` and `Traffic` steps.
-It orders each node's documents by the entry's `__REALTIME_TIMESTAMP`, which a remote journal stores as the uploading node's own clock, so it orders one node's own entries and is never compared between nodes.
+It orders each node's documents by the entry's `__REALTIME_TIMESTAMP`, which a remote journal stores as the uploading node's own clock, so it orders the entries kept under one node name, which a node chooses in its own document.
 Nothing inside `MESSAGE` orders anything, because the node writes all of it.
 An entry without the field is counted as malformed, and an older entry read later does not replace a newer one.
 The reads overlap, so a start-up line that arrives again is counted once, by its recorded time and `seq`.
