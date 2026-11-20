@@ -288,9 +288,9 @@ pub struct Poller {
     header_checks: Vec<HeaderCheck>,
     /// The newest metrics and traffic document the journal carried, by node.
     latest: crate::journal::Latest,
-    /// The one journal reader: the service's `--follow` child, or a check's
-    /// one-shot read. Its `stopped` is the one record of why it is not
-    /// running.
+    /// The one journal reader. The service starts a read on each poll tick,
+    /// and a check starts one and drains it; a read is never a follower. Its
+    /// `stopped` is the one record of why it is not running.
     pub journal: crate::journal::Reader,
     cache: VerdictCache,
     nameserver: SocketAddr,
@@ -338,11 +338,11 @@ fn journal_document<T: serde::de::DeserializeOwned>(
 
 impl Poller {
     /// Read what the journal pipe holds and keep every line it carried.
-    pub fn read_journal(&mut self, now: Instant) -> crate::journal::Event {
+    pub fn read_journal(&mut self) -> crate::journal::Event {
         let Poller {
             journal, latest, ..
         } = self;
-        journal.read(now, |line| latest.ingest(line))
+        journal.read(|line| latest.ingest(line))
     }
 
     /// Point the poller at the deploy's expectation file.
@@ -360,8 +360,9 @@ impl Poller {
         dir: Result<std::path::PathBuf, String>,
         limit: &m6_core::limits::Limit,
     ) {
+        let nodes = self.nodes.len();
         self.journal = match dir {
-            Ok(dir) => crate::journal::Reader::once(&dir, limit),
+            Ok(dir) => crate::journal::Reader::once(&dir, nodes, limit),
             Err(reason) => crate::journal::Reader::unavailable(reason, limit),
         };
         let Poller {
@@ -430,9 +431,10 @@ impl Poller {
             timeout,
             header_checks,
             latest: crate::journal::Latest::new(),
-            journal: crate::journal::Reader::idle(&m6_core::limits::Limit::builtin(
-                &m6_core::limits::JOURNAL_LINE,
-            )),
+            journal: crate::journal::Reader::idle(
+                n,
+                &m6_core::limits::Limit::builtin(&m6_core::limits::JOURNAL_LINE),
+            ),
             cache: VerdictCache::with_cap(lookup_cap),
             nameserver,
             wg_file,

@@ -21,9 +21,9 @@
 //! connection table, and `m6_core::platform` the reactor. The fleet poll is not a thread.
 //! It is a table of steps in this loop (`poll.rs`): each node's `/health`
 //! request, each tunnel connect and each crawler lookup is a descriptor the
-//! loop waits on, and so is the one `journalctl --follow` pipe `journal.rs`
-//! reads the two documents from, so a node that hangs holds only its own step
-//! and never the monitor.
+//! loop waits on, and so is the `journalctl` pipe `journal.rs` reads the two
+//! documents from, so a node that hangs holds only its own step and never the
+//! monitor.
 //!
 //! Nothing blocks while serving. The fleet, every node's host name, the
 //! history file and the host's certificate store are read at start, and a
@@ -81,7 +81,7 @@ const SIGNALS: Token = Token(usize::MAX - 1);
 /// The operational log's stdout, registered while it holds bytes a full
 /// destination would not take.
 const LOG: Token = Token(usize::MAX - 2);
-/// The journal reader's pipe: the one long-lived `journalctl --follow` child.
+/// The journal reader's pipe: the `journalctl` child of the read in flight.
 const JOURNAL: Token = Token(usize::MAX - 3);
 /// The accounting tick, and the longest the loop waits when nothing happens.
 const TICK: Duration = Duration::from_secs(1);
@@ -214,6 +214,9 @@ fn run_service() -> Result<()> {
     let nodes = fleet
         .resolve(&tls)
         .unwrap_or_else(|e| fail("resolving the fleet", format!("{e:#}")));
+    // The journal read's `--lines` window is the fleet count times its two
+    // document types, so it is taken before the fleet moves into the poller.
+    let node_count = nodes.len();
     m6_core::ndjson::set_page_limit(site.limits().get(&m6_core::limits::NDJSON_PAGE));
     let nameserver = m6_core::dns::nameserver()
         .unwrap_or_else(|e| fail("reading the resolver configuration", e));
@@ -250,7 +253,7 @@ fn run_service() -> Result<()> {
     // never a refusal to start: the monitor's own page and check still run.
     let journal_limit = site.limits().get(&m6_core::limits::JOURNAL_LINE).clone();
     poller.journal = match fleet.journal_path(site.site_dir()) {
-        Ok(dir) => journal::Reader::open(&dir, &journal_limit, m6_core::platform::now()),
+        Ok(dir) => journal::Reader::open(&dir, node_count, &journal_limit),
         Err(e) => {
             m6_core::log::error!(error = %format!("{e:#}"), "the journal cannot be read");
             journal::Reader::unavailable(format!("{e:#}"), &journal_limit)
@@ -424,8 +427,7 @@ fn run_service() -> Result<()> {
                 }
                 LOG => m6_core::log::flush(),
                 JOURNAL => {
-                    let now = m6_core::platform::now();
-                    if poller.read_journal(now) == journal::Event::Exited {
+                    if poller.read_journal() == journal::Event::Exited {
                         if let Some(fd) = journal_fd.take() {
                             let _ = poll.registry().deregister_fd(fd);
                         }
@@ -472,17 +474,6 @@ fn run_service() -> Result<()> {
             }
         }
 
-        // The journal's child is started again on its backoff, and its pipe
-        // joins the loop again when it does.
-        poller.journal.restart_if_due(m6_core::platform::now());
-        if journal_fd.is_none() {
-            if let Some(fd) = poller.journal.fd() {
-                poll.registry()
-                    .register_fd(fd, JOURNAL, Interest::READABLE)?;
-                journal_fd = Some(fd);
-            }
-        }
-
         // A full stdout holds its bytes in the Sink. Watch it for writability
         // only while it does, so the loop never waits on the log.
         if let Err(e) = m6_core::log::watch(poll.registry(), LOG) {
@@ -523,6 +514,17 @@ fn run_service() -> Result<()> {
             publish(progress, &mut snapshot, &thresholds, &mut history);
         }
 
+        // The journal read shares that tick. A read still in flight is not
+        // doubled: its descriptor is already in the loop and the next tick
+        // tries again. A read that starts gets its pipe registered here.
+        if due && poller.journal.start_if_idle() {
+            if let Some(fd) = poller.journal.fd() {
+                poll.registry()
+                    .register_fd(fd, JOURNAL, Interest::READABLE)?;
+                journal_fd = Some(fd);
+            }
+        }
+
         // The accounting tick: report and clear the loop's wait and work per
         // trigger. The monitor serves no metrics page, so the report is the
         // tick's own accounting rather than a served number.
@@ -543,8 +545,8 @@ fn run_service() -> Result<()> {
     history.flush();
     #[cfg(feature = "count-allocations")]
     eprintln!("{client_allocs} allocation(s) in the client arm outside table growth");
-    // The journal's child is killed here, so no `journalctl --follow`
-    // outlives the monitor.
+    // The journal's child is killed here, so no `journalctl` outlives the
+    // monitor.
     poller.journal.retire();
     // Connections still open are dropped: a SIGTERM does not wait for a
     // request in flight. `complete` removes the socket and logs the line.

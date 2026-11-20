@@ -182,7 +182,8 @@ Run it on a host whose journal received an m6 service.
 journalctl M6_TYPE=perf -o json --all
 ```
 
-`m6-monitor`'s journal reader in `m6-monitor/src/journal.rs` starts `journalctl` with `--lines=200`, `--all`, `--output=json` and `--directory <dir>`, and adds `--follow` in the running monitor.
+`m6-monitor`'s journal reader in `m6-monitor/src/journal.rs` starts `journalctl` with `--lines=<fleet entries × 2>`, `--all`, `--output=json` and `--directory <dir>`.
+It does not follow: a read prints the recent tail and exits, once at start and once on each poll tick.
 It filters on `M6_TYPE=perf`, `M6_TYPE=traffic`, `M6_TYPE=startup` and `M6_TYPE=shutdown`, so one child carries the four types.
 
 `journal_stream()` in `m6-platform/src/lib.rs` reads `JOURNAL_STREAM` and compares its device and inode with the ones `fstat` reports for descriptor 1.
@@ -371,7 +372,7 @@ Table 9 names the documents that own what this page leaves out.
 | document | owns |
 |---|---|
 | [`m6-http.md`](m6-http.md) §11 | the metrics and traffic documents inside the `perf` and `traffic` lines |
-| [`m6-monitor.md`](m6-monitor.md) §2 and §7.1 | the reader that follows the journal, and the checks it makes on each start-up record |
+| [`m6-monitor.md`](m6-monitor.md) §2 and §7.1 | the reader that takes one journal tail per poll, and the checks it makes on each start-up record |
 | [`m6-app-anatomy.md`](m6-app-anatomy.md) §4.2 | every `[limits]` entry, `log_buffer`, `log_field` and `journal_line` among them |
 | [`m6-core-reference.md`](m6-core-reference.md) §4.9 | the `m6_core::startup` interface an application calls |
 

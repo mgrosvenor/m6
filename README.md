@@ -422,7 +422,7 @@ An operator reads a running node through four things, and each has one owning do
 - **The start-up record** is written once at every start: the build, the invocation, the sha256 of every config file, every setting with its source, the host facts and the effective `[limits]`, then one `shutdown` line on a clean exit. [`docs/m6-log.md`](docs/m6-log.md) §9 gives its parts.
 - **The version flags.** Every binary answers `--version` with the tag form, such as `v1.16.0-rc.1`, and `--version-full` with one line per m6 crate it links, commit and dirty flag included. [`CONTRIBUTING.md`](CONTRIBUTING.md) §4.2 gives both forms.
 
-m6-monitor reads all four across a fleet: it polls `/health` and follows the journal, and it checks each start-up record against the environment and the deploy's record ([`docs/m6-monitor.md`](docs/m6-monitor.md) §7.1).
+m6-monitor reads all four across a fleet: it polls `/health` and reads the journal on each poll, and it checks each start-up record against the environment and the deploy's record ([`docs/m6-monitor.md`](docs/m6-monitor.md) §7.1).
 
 ### 6.2 Publishing a generation
 

@@ -1,7 +1,7 @@
 # m6-monitor: the fleet's figures from its journal
 
 m6-monitor reports how a fleet of m6 nodes is doing.
-It reads the monitor host's copy of every node's journal through one long-lived `journalctl --follow` child, and asks each node for `GET /health` on every poll.
+It reads the monitor host's copy of every node's journal with one `journalctl` read at start and one on each poll tick, and asks each node for `GET /health` on every poll.
 From those two inputs it builds one digest, serves it as a page, as *JSON* and as text, and records every poll in a history file when the config names one.
 All five routes answer on a unix socket, and the monitor has no listener of its own.
 
@@ -45,20 +45,29 @@ The record arrives as several lines with `type` `startup` and one with `type` `s
 `GET /health` is the request every node sees on every poll.
 A fleet can also declare header checks, and every configured tunnel is probed, so section 4 places both beside the two inputs.
 
-Section 2 follows the child that reads the journal, and section 3 the one input that is a request.
+Section 2 follows one read of the journal, and section 3 the one input that is a request.
 
 ## 2. The journal reader
 
-The journal is read by one child process for the life of the service, and its output is one more descriptor in the monitor's event loop.
+The journal is read once at start and once on each poll tick. Each read starts a `journalctl` child that prints the recent tail and exits, and its stdout is one more descriptor in the monitor's event loop.
 
-`journal::Reader::open` starts `journalctl` with `--follow`, `--lines=200`, `--all`, `--output=json`, `--directory <journal_dir>`, and four matches: `M6_TYPE=perf`, `M6_TYPE=traffic`, `M6_TYPE=startup` and `M6_TYPE=shutdown`. `--all` is there because JSON output nulls a field whose name and value reach 4096 bytes together, and a metrics document is about 6.4 KB.: `M6_TYPE=perf`, `M6_TYPE=traffic`, `M6_TYPE=startup` and `M6_TYPE=shutdown`.
+`journal::Reader::open` starts `journalctl` with `--lines=<fleet entries × 2>`, `--all`, `--output=json`, `--directory <journal_dir>`, and four matches: `M6_TYPE=perf`, `M6_TYPE=traffic`, `M6_TYPE=startup` and `M6_TYPE=shutdown`.
 One child carries all four types.
 `M6_TYPE` is the journal field `m6-log` writes for every line under systemd, set from the line's own `type` (`m6-log/src/journal.rs`), so the child selects the types before any JSON is parsed.
-`--lines=200` starts the follow with the last 200 matching lines, so a monitor that has just restarted reports figures before any node writes again.
+`--all` is there because JSON output nulls a field whose name and value reach 4096 bytes together, and a metrics document is about 6.4 KB.
+`--lines` is one metrics document and one traffic document for every configured `[[monitor.nodes]]` entry, so one read carries each node's latest document of both kinds.
+Table 3 sets no upper bound on the fleet, so the window tracks the configured count rather than a constant.
+
+A read does not follow.
+`journalctl --follow` over a remote journal that two hosts upload into returns only one host's entries, whichever it started behind, and never the other's.
+The uploaders deliver their batches with different delays, so the lagging host's new entries are older than the follower's position and are never returned.
+The same command without `--follow` prints both hosts' recent entries every time, so the service reads the recent tail and exits, the way `--check` always has.
 
 The pipe is made non-blocking and registered under the `JOURNAL` token in `m6-monitor/src/main.rs`.
-The loop reads whole lines from it and hands each to `Poller::ingest_journal`, so no poll runs `journalctl` and the loop never waits on the child.
+The loop reads whole lines from it and hands each to `Poller::read_journal`, so the loop never waits on the child.
+A read still in flight when the next tick is due is not started again: its descriptor is already in the loop, and the next tick tries again.
 `journal::Latest` keeps the newest metrics document and the newest traffic document for each node name, and `Poller::record_journal` reads those two maps when a poll reaches its `Perf` and `Traffic` steps.
+It keeps a document only when the document's own timestamp is newer, so a read that carries an older document later cannot replace a newer one.
 The same `ingest` call hands a `startup` or `shutdown` line to `journal::Startup`, which groups the several lines of one record by their shared `run_id`.
 
 A start-up record's node is the record's own `node` field.
@@ -70,7 +79,7 @@ The key the report shows is the node and the app, and the deploy's expectation f
 A record that reports no hostname is attributed to its app alone, and the check warns that a second host running the same app would be merged with it.
 
 A record is judged only when the monitor saw it from its first line.
-The `--lines=200` tail can start in the middle of a record, so a record whose first line seen is not `seq` 1 is counted in `Startup::cut` and neither shown nor judged.
+The read's `--lines` tail can start in the middle of a record, so a record whose first line seen is not `seq` 1 is counted in `Startup::cut` and neither shown nor judged.
 A record that started before the monitor did is shown as the current run and is not judged for its completeness or its restarts, because the tail can cut its last lines as easily as its first.
 A record still arriving after `journal::INCOMPLETE_AFTER`, 120 seconds, is moved to the report's unfinished list, which is how a start that never finishes becomes a finding.
 
@@ -84,15 +93,15 @@ A fleet entry that names a node differently gets no figures for it, and the dige
 
 A line longer than `[limits] journal_line` is counted in `Reader::oversized` and dropped, and the reader discards bytes to the next newline so the following line starts clean.
 When the child exits, the loop deregisters the pipe and `Reader::retire` reaps the process.
-`Reader::restart_if_due` starts it again on a backoff that begins at one second and doubles to thirty (`Reader::stop` and `MAX_BACKOFF`).
-`Reader::stopped` keeps the reason, and `Poller::set_journal_state` hands it to the poller, which appends it to a node's missing-document error.
-At stop, `Reader`'s `Drop` kills and waits, so no `journalctl --follow` outlives the monitor.
+`Reader::start_if_idle` starts the next read on the next tick, and leaves a read that is still in flight alone.
+`Reader::stopped` keeps the reason a read could not start or did not exit cleanly, and the poller appends it to a node's missing-document error.
+At stop, `Reader`'s `Drop` kills and waits, so no `journalctl` outlives the monitor.
 
 `record_journal` reports a node with no document: it sets `no metrics line in the journal for this node`, and `no traffic line in the journal for this node` for the traffic document.
 The digest turns the missing metrics document into a Warn finding, `metrics unavailable: ... Health is known, everything else is not.`, which on its own leaves `/check` at exit 0 and the page at 200.
 A node that cannot be reached finishes its poll at the `Health` step, so it carries no document error and its `status` is `unreachable`.
 
-The same reader serves the one-shot check: `Reader::once` runs without `--follow`, `Reader::drain` reads the pipe to its end, and `m6-monitor --check` reads with the built-in `journal_line` limit.
+The same reader serves the one-shot check: `Reader::once` starts one read, `Reader::drain` reads the pipe to its end, and `m6-monitor --check` reads with the built-in `journal_line` limit.
 A relative `journal_dir` resolves against the config file's directory under `--check`, and against the site directory in the service.
 
 Section 3 turns to the one input that is a request.
@@ -164,7 +173,7 @@ Table 3 lists the `[monitor]` keys, their defaults, and what each one decides.
 |---|---|---|
 | `nodes` | required, at least one | the fleet, as `[[monitor.nodes]]` entries |
 | `timeout_ms` | 5000 | the deadline for each step of a node's poll |
-| `journal_dir` | `/var/log/journal/remote` | the directory the reader follows, resolved against the site directory |
+| `journal_dir` | `/var/log/journal/remote` | the directory each read opens, resolved against the site directory |
 | `history_file` | absent | the *SQLite* file that keeps the polls |
 | `history_max_mb` | 256, from 1 to 1048576 | the file's cap |
 | `one_certificate` | `false` | whether every node is expected to serve one certificate |

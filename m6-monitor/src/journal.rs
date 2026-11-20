@@ -3,9 +3,17 @@
 //! Every node streams its journal to mon with `systemd-journal-upload`, and mon
 //! keeps it with `systemd-journal-remote` under a directory of per-peer files.
 //! The metrics and traffic lines are in it, so the monitor reads them from
-//! there instead of polling an endpoint: one `journalctl --follow` child at
-//! start, its stdout one more descriptor in the existing loop, and never one
-//! `journalctl` per poll.
+//! there instead of polling an endpoint: one `journalctl` read at start and one
+//! on each existing poll tick, its stdout one more descriptor in the existing
+//! loop, and no new timer or thread.
+//!
+//! **A read does not follow.** `journalctl --follow` over a remote journal that
+//! two hosts upload into returns only one host's entries, whichever it started
+//! behind, and never the other's. The uploaders deliver their batches with
+//! different delays, so the lagging host's new entries are older than the
+//! follower's position and are never returned. The same command without
+//! `--follow` prints both hosts' recent entries every time, so the service
+//! reads the recent tail and exits, the way `--check` always has.
 //!
 //! **A line is attributed by the `node` field inside `MESSAGE`.** That is the
 //! name the node's own `site.toml` gives it, and every m6-http line carries it.
@@ -17,22 +25,24 @@
 //!
 //! # The start-up record
 //!
-//! `M6_TYPE=startup` and `M6_TYPE=shutdown` are read on the same child as the
-//! two documents, so the monitor follows four types with one `journalctl`
-//! process. A start-up record is several lines sharing one `run_id`, so this
+//! `M6_TYPE=startup` and `M6_TYPE=shutdown` are read by the same child as the
+//! two documents, so one `journalctl` process reads four types. A start-up
+//! record is several lines sharing one `run_id`, so this
 //! module groups them and [`Startup`] holds the newest record of each node and
 //! app. The node is the record's own `node` field when it carries one, and the
 //! machine's hostname from its platform line otherwise. The app is the record's
 //! own `app` field. `_HOSTNAME` is never read for either.
 //!
-//! A record whose first line the `--lines=200` tail cut cannot be judged, so it
-//! is counted in [`Startup::cut`] and not shown. A record that started before
-//! the monitor did is shown as the current run and is not judged for its
-//! completeness or its restarts, because the tail can cut its last lines as
-//! easily as its first.
+//! A record whose first line the read's `--lines` tail cut cannot be judged, so
+//! it is counted in [`Startup::cut`] and not shown. A record that started
+//! before the monitor did is shown as the current run and is not judged for
+//! its completeness or its restarts, because the tail can cut its last lines
+//! as easily as its first.
 //!
-//! The child is restarted on a backoff when it stops, and it is killed at
-//! stop, so no `journalctl --follow` outlives the monitor.
+//! The read's `--lines` window follows the configured fleet: one metrics
+//! document and one traffic document for each `[[monitor.nodes]]` entry. A
+//! read still in flight when the next tick is due is not started again. The
+//! child is killed at stop, so no `journalctl` outlives the monitor.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -44,9 +54,6 @@ use m6_core::platform::process::{Child, Io, Streams};
 use std::time::{Duration, Instant};
 
 use m6_core::limits::{Bounded, Limit};
-
-/// The longest the monitor waits before starting the reader again.
-const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 /// How long a start-up record may take from its first line to its `complete`
 /// line before the monitor reports it unfinished.
@@ -532,16 +539,25 @@ fn unix_ms(time: std::time::SystemTime) -> u64 {
         .as_millis() as u64
 }
 
+/// One document and the time of the line that carried it.
+#[derive(Debug)]
+struct Document {
+    /// The line's own RFC 3339 timestamp, which `m6-log` writes as
+    /// `YYYY-MM-DDTHH:MM:SS.ffffffZ`. Its fixed width and UTC zone make the
+    /// string order the clock order.
+    at: String,
+    value: serde_json::Value,
+}
+
 /// The newest document of each kind the journal has carried, by node name, and
 /// the start-up records it carried.
 ///
-/// The four types share one `journalctl --follow` child. The two documents are
-/// found on `MESSAGE`'s `type`, and the two record types are handed to
-/// [`Startup`].
+/// The four types share one `journalctl` read. The two documents are found on
+/// `MESSAGE`'s `type`, and the two record types are handed to [`Startup`].
 #[derive(Debug, Default)]
 pub struct Latest {
-    perf: BTreeMap<String, serde_json::Value>,
-    traffic: BTreeMap<String, serde_json::Value>,
+    perf: BTreeMap<String, Document>,
+    traffic: BTreeMap<String, Document>,
     /// The start-up and shutdown records, by run id and then by node and app.
     pub startup: Startup,
     /// Lines whose `MESSAGE` had no node name, or was not one of the two
@@ -582,13 +598,13 @@ impl Latest {
             self.unattributed += 1;
             return;
         };
+        // The document's own timestamp, not the order this read delivered it
+        // in. A later read can carry an older document, and it must not replace
+        // the newer one already kept.
+        let at = line["timestamp"].as_str().unwrap_or_default();
         match line["type"].as_str() {
-            Some("perf") => {
-                self.perf.insert(node.to_string(), document.clone());
-            }
-            Some("traffic") => {
-                self.traffic.insert(node.to_string(), document.clone());
-            }
+            Some("perf") => keep_newest(&mut self.perf, node, at, document),
+            Some("traffic") => keep_newest(&mut self.traffic, node, at, document),
             _ => {}
         }
     }
@@ -599,12 +615,12 @@ impl Latest {
     /// poller, which is where an unreadable document is reported against the
     /// node it names.
     pub fn perf(&self, node: &str) -> Option<&serde_json::Value> {
-        self.perf.get(node)
+        self.perf.get(node).map(|document| &document.value)
     }
 
     /// The newest traffic summary a node wrote, if the journal carried one.
     pub fn traffic(&self, node: &str) -> Option<&serde_json::Value> {
-        self.traffic.get(node)
+        self.traffic.get(node).map(|document| &document.value)
     }
 
     /// Nodes the journal has a metrics document for, in a test.
@@ -620,6 +636,34 @@ impl Latest {
     }
 }
 
+/// Keep `value` for `node` only when its own timestamp is newer than the kept
+/// document's.
+///
+/// The timestamps are the fixed-width RFC 3339 strings `m6-log` writes, so
+/// comparing them as text compares the clock. An older document read later
+/// leaves the newer one in place, which is what makes reading the journal tail
+/// on every poll safe: the same documents arrive again in every read. A
+/// document with no timestamp can replace nothing after its own first read.
+fn keep_newest(
+    documents: &mut BTreeMap<String, Document>,
+    node: &str,
+    at: &str,
+    value: &serde_json::Value,
+) {
+    let newer = documents
+        .get(node)
+        .is_none_or(|current| at > current.at.as_str());
+    if newer {
+        documents.insert(
+            node.to_string(),
+            Document {
+                at: at.to_string(),
+                value: value.clone(),
+            },
+        );
+    }
+}
+
 /// What one read pass found.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Event {
@@ -631,11 +675,16 @@ pub enum Event {
     Exited,
 }
 
-/// The `journalctl --follow` child and the line being assembled.
+/// The one-shot `journalctl` child and the line being assembled.
+///
+/// A read starts a child that prints the recent tail and exits, and its stdout
+/// is one more non-blocking descriptor in the loop. A read still in flight is
+/// not started again: [`Reader::start_if_idle`] is called on the poll tick and
+/// does nothing while a child or its pipe is still there.
 pub struct Reader {
     dir: PathBuf,
-    /// `--follow` for the service, off for `--check`, which reads once.
-    follow: bool,
+    /// The fleet's configured entries, which set the `--lines` window.
+    nodes: usize,
     child: Option<Child>,
     stdout: Option<File>,
     /// The one line being assembled, bounded by a named limit.
@@ -643,70 +692,90 @@ pub struct Reader {
     /// A line past the limit is dropped, and its bytes are ignored until its
     /// newline arrives, so the next line starts clean.
     dropping: bool,
-    /// When to start the child again, after it stopped.
-    restart_at: Option<Instant>,
-    backoff: Duration,
     /// Lines delivered, and lines dropped for their size.
     pub lines: u64,
     pub oversized: u64,
-    /// How many times the child has been started, after the first.
-    pub restarts: u64,
     /// Why the child is not running, when it is not.
     pub stopped: Option<String>,
 }
 
+/// The document types one read has to hold for every node: a metrics document
+/// and a traffic summary. `--lines` is the fleet count times this, so one read
+/// carries each node's latest document of both kinds.
+const DOCUMENT_TYPES_PER_NODE: usize = 2;
+
 impl Reader {
     /// A reader with nothing started, the one place its fields are set.
-    fn new(dir: PathBuf, follow: bool, limit: &Limit, stopped: Option<String>) -> Reader {
+    fn new(dir: PathBuf, nodes: usize, limit: &Limit, stopped: Option<String>) -> Reader {
         Reader {
             dir,
-            follow,
+            nodes,
             child: None,
             stdout: None,
             line: Bounded::<u8>::new(limit),
             dropping: false,
-            restart_at: None,
-            backoff: Duration::from_secs(1),
             lines: 0,
             oversized: 0,
-            restarts: 0,
             stopped,
         }
     }
 
     /// A reader with no child and no fault, before the service or the check
     /// opens the journal.
-    pub fn idle(limit: &Limit) -> Reader {
-        Reader::new(PathBuf::new(), false, limit, None)
+    pub fn idle(nodes: usize, limit: &Limit) -> Reader {
+        Reader::new(PathBuf::new(), nodes, limit, None)
     }
 
     /// A reader for a journal directory that could not be opened: it starts
     /// nothing, and `stopped` says why.
     pub fn unavailable(reason: String, limit: &Limit) -> Reader {
-        Reader::new(PathBuf::new(), true, limit, Some(reason))
+        Reader::new(PathBuf::new(), 0, limit, Some(reason))
     }
 
-    /// Start following `dir`. A child that cannot start is not fatal: the
-    /// reason is kept in `stopped`, and a backoff tries again.
-    pub fn open(dir: &Path, limit: &Limit, now: Instant) -> Reader {
-        let mut reader = Reader::new(dir.to_path_buf(), true, limit, None);
-        reader.start(now);
+    /// Start one read of `dir`. A child that cannot start is not fatal: the
+    /// reason is kept in `stopped`, and the next tick tries again.
+    ///
+    /// `nodes` is the configured fleet size, which sets the `--lines` window.
+    pub fn open(dir: &Path, nodes: usize, limit: &Limit) -> Reader {
+        let mut reader = Reader::new(dir.to_path_buf(), nodes, limit, None);
+        reader.start();
         reader
     }
 
-    /// One run with no `--follow`, for `--check`: journalctl prints the recent
-    /// tail and exits, and the pipe is read to its end, so a one-shot tool does
-    /// not wait on a timer.
-    pub fn once(dir: &Path, limit: &Limit) -> Reader {
-        let mut reader = Reader::new(dir.to_path_buf(), false, limit, None);
-        reader.start(m6_core::platform::now());
-        reader
+    /// One run for `--check`: journalctl prints the recent tail and exits, and
+    /// [`Reader::drain`] reads the pipe to its end.
+    pub fn once(dir: &Path, nodes: usize, limit: &Limit) -> Reader {
+        Reader::open(dir, nodes, limit)
+    }
+
+    /// Start a read when none is in flight, and say whether it started.
+    ///
+    /// The poll tick calls this. A read still in flight is not doubled: its
+    /// child or its pipe is still here, and the next tick tries again. A
+    /// child that cannot start is reported by `stopped` and tried again then.
+    pub fn start_if_idle(&mut self) -> bool {
+        if self.child.is_some() || self.stdout.is_some() {
+            return false;
+        }
+        self.start();
+        self.stdout.is_some()
     }
 
     /// Read a one-shot run to its end, handing every line to `each`.
     pub fn drain(&mut self, mut each: impl FnMut(&[u8])) {
+        // A one-shot tool may wait, so its pipe is blocking here. The service
+        // leaves the pipe non-blocking for its loop.
+        let set = self
+            .stdout
+            .as_ref()
+            .map(|stdout| m6_core::platform::fd::set_nonblocking(stdout, false));
+        if let Some(Err(e)) = set {
+            self.stopped = Some(format!("the pipe could not be made blocking: {e}"));
+            self.retire();
+            return;
+        }
         while self.stdout.is_some() {
-            if self.read(m6_core::platform::now(), &mut each) == Event::Exited {
+            if self.read(&mut each) == Event::Exited {
                 self.retire();
             }
         }
@@ -718,23 +787,13 @@ impl Reader {
         self.stdout.as_ref().map(AsRawFd::as_raw_fd)
     }
 
-    /// Start the child again when its backoff has passed.
-    pub fn restart_if_due(&mut self, now: Instant) {
-        if self.child.is_none()
-            && self.stdout.is_none()
-            && self.restart_at.is_some_and(|at| now >= at)
-        {
-            self.start(now);
-        }
-    }
-
     /// Read what the pipe holds, handing every complete line to `each`.
     ///
     /// [`Event::Exited`] means the child is gone and its descriptor must be
     /// removed from the reactor before [`Reader::retire`] closes it: a closed
     /// descriptor number can be given to the next socket, and deregistering it
     /// then would remove that socket instead.
-    pub fn read(&mut self, now: Instant, mut each: impl FnMut(&[u8])) -> Event {
+    pub fn read(&mut self, mut each: impl FnMut(&[u8])) -> Event {
         let mut chunk = [0u8; 8 * 1024];
         loop {
             let Some(stdout) = self.stdout.as_mut() else {
@@ -742,19 +801,15 @@ impl Reader {
             };
             let read = m6_core::platform::fd::read(stdout, &mut chunk);
             let count = match read {
-                Ok(0) if !self.follow => {
-                    self.finish_once();
-                    return Event::Exited;
-                }
                 Ok(0) => {
-                    self.stop("journalctl exited", now);
+                    self.finish_once();
                     return Event::Exited;
                 }
                 Ok(count) => count,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Event::Idle,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => {
-                    self.stop(&format!("read error: {e}"), now);
+                    self.stop(&format!("read error: {e}"));
                     return Event::Exited;
                 }
             };
@@ -800,19 +855,19 @@ impl Reader {
         }
     }
 
-    /// The one `journalctl` command, with every type it follows on it.
+    /// The one `journalctl` command, with every type it reads on it.
     ///
-    /// One child carries all four types. Two followers would mean two
-    /// descriptors, two backoffs and two `--lines=200` tails to reconcile, so
-    /// the two record types are two more matches on this command and nothing
-    /// else.
+    /// One child carries all four types. `--lines` is the fleet count times
+    /// the two document types, so one read carries every node's latest
+    /// metrics and traffic documents. The count is the configured
+    /// `[[monitor.nodes]]` entries: `docs/m6-monitor.md` sets no upper bound
+    /// on them, so a fixed window would miss documents on a larger fleet and
+    /// read far more than a small one needs. Reading the tail and exiting is
+    /// what makes both hosts of a shared remote journal visible to one read.
     fn command(&self) -> Command {
         let mut command = Command::new("journalctl");
-        if self.follow {
-            command.arg("--follow");
-        }
         command
-            .arg("--lines=200")
+            .arg(format!("--lines={}", self.nodes * DOCUMENT_TYPES_PER_NODE))
             // JSON output prints a field null when its name and value reach 4096 bytes
             // together, which for MESSAGE is a value of 4088. A metrics document is about
             // 6.4 KB, so every one of them would arrive null. A null is no MESSAGE, which this
@@ -829,8 +884,8 @@ impl Reader {
         command
     }
 
-    /// Start the child, and put it back on a longer backoff when it fails.
-    fn start(&mut self, now: Instant) {
+    /// Start the read's child.
+    fn start(&mut self) {
         let mut command = self.command();
         // Only stdout is read. Stderr goes nowhere, as a reader that stops
         // draining it would otherwise stall journalctl.
@@ -844,32 +899,21 @@ impl Reader {
                 let Some(stdout) = child.stdout.take() else {
                     let _ = child.kill();
                     let _ = child.wait();
-                    self.stop("journalctl has no stdout", now);
+                    self.stop("journalctl has no stdout");
                     return;
                 };
-                // The loop must never wait on the pipe, the same rule stdout
-                // follows. A one-shot read wants the opposite: it reads to the
-                // end and returns.
-                let set = if self.follow {
-                    m6_core::platform::fd::set_nonblocking(&stdout, true)
-                } else {
-                    Ok(false)
-                };
-                if let Err(e) = set {
+                // The loop must never wait on the pipe.
+                if let Err(e) = m6_core::platform::fd::set_nonblocking(&stdout, true) {
                     let _ = child.kill();
                     let _ = child.wait();
-                    self.stop(
-                        &format!("the pipe could not be made non-blocking: {e}"),
-                        now,
-                    );
+                    self.stop(&format!("the pipe could not be made non-blocking: {e}"));
                     return;
                 }
                 self.stdout = Some(stdout);
                 self.child = Some(child);
-                self.restart_at = None;
                 self.stopped = None;
             }
-            Err(e) => self.stop(&format!("journalctl could not start: {e}"), now),
+            Err(e) => self.stop(&format!("journalctl could not start: {e}")),
         }
     }
 
@@ -887,21 +931,17 @@ impl Reader {
         };
     }
 
-    /// Record why the reader stopped, kill what is left of the child, and
-    /// schedule the next start on a doubling backoff.
+    /// Record why the read stopped and kill what is left of the child.
     ///
     /// The pipe stays open: the loop deregisters its descriptor first and
     /// [`Reader::retire`] closes it, so the number cannot be reused by a
     /// socket that the deregistration would then remove.
-    fn stop(&mut self, reason: &str, now: Instant) {
+    fn stop(&mut self, reason: &str) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
         self.stopped = Some(reason.to_string());
-        self.restart_at = Some(now + self.backoff);
-        self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
-        self.restarts += 1;
     }
 }
 
@@ -928,17 +968,23 @@ mod tests {
         .unwrap()
     }
 
-    fn document(kind: &str, node: &str) -> serde_json::Value {
+    fn document_at(kind: &str, node: &str, at: &str) -> serde_json::Value {
         match kind {
             "perf" => serde_json::json!({
+                "timestamp": at,
                 "type": "perf",
                 "fields": {"perf": {"node": node, "uptime_s": 5}},
             }),
             _ => serde_json::json!({
+                "timestamp": at,
                 "type": "traffic",
                 "fields": {"traffic": {"node": node, "window_minutes": 60}},
             }),
         }
+    }
+
+    fn document(kind: &str, node: &str) -> serde_json::Value {
+        document_at(kind, node, "2026-11-20T00:00:00.000000Z")
     }
 
     /// Three nodes on one host are three nodes, because the document names
@@ -959,14 +1005,54 @@ mod tests {
     #[test]
     fn the_newest_document_wins() {
         let mut latest = Latest::new();
-        let mut first = document("perf", "origin");
+        let mut first = document_at("perf", "origin", "2026-11-20T00:00:01.000000Z");
         first["fields"]["perf"]["uptime_s"] = serde_json::json!(5);
-        let mut second = document("perf", "origin");
+        let mut second = document_at("perf", "origin", "2026-11-20T00:00:02.000000Z");
         second["fields"]["perf"]["uptime_s"] = serde_json::json!(9);
         latest.ingest(&line(first));
         latest.ingest(&line(second));
         assert_eq!(latest.perf("origin").expect("a document")["uptime_s"], 9);
         assert_eq!(latest.nodes_with_perf(), 1);
+    }
+
+    /// A later read can carry an older document: the uploader delivered it
+    /// out of order. The newer document already kept must stay.
+    #[test]
+    fn an_older_document_read_later_does_not_replace_a_newer_one() {
+        let mut latest = Latest::new();
+        let mut newer = document_at("perf", "origin", "2026-11-20T00:00:09.000000Z");
+        newer["fields"]["perf"]["uptime_s"] = serde_json::json!(9);
+        latest.ingest(&line(newer));
+        let mut older = document_at("perf", "origin", "2026-11-20T00:00:05.000000Z");
+        older["fields"]["perf"]["uptime_s"] = serde_json::json!(1);
+        latest.ingest(&line(older));
+        assert_eq!(
+            latest.perf("origin").expect("a document")["uptime_s"],
+            9,
+            "the older document read later replaced the newer one"
+        );
+    }
+
+    /// One read carries both nodes: their documents interleave, one node's is
+    /// newer than the other's, and each node keeps its own.
+    #[test]
+    fn two_nodes_documents_in_one_read_both_reach_latest() {
+        let mut latest = Latest::new();
+        let at_a = "2026-11-20T00:00:01.000000Z";
+        let at_b = "2026-11-20T00:00:02.000000Z";
+        let mut a = document_at("perf", "edge-a", at_a);
+        a["fields"]["perf"]["uptime_s"] = serde_json::json!(11);
+        let mut b = document_at("perf", "edge-b", at_b);
+        b["fields"]["perf"]["uptime_s"] = serde_json::json!(22);
+        latest.ingest(&line(a));
+        latest.ingest(&line(b));
+        latest.ingest(&line(document_at("traffic", "edge-a", at_a)));
+        latest.ingest(&line(document_at("traffic", "edge-b", at_b)));
+
+        assert_eq!(latest.nodes_with_perf(), 2, "both nodes' metrics");
+        assert_eq!(latest.nodes_with_traffic(), 2, "both nodes' traffic");
+        assert_eq!(latest.perf("edge-a").expect("a document")["uptime_s"], 11);
+        assert_eq!(latest.perf("edge-b").expect("a document")["uptime_s"], 22);
     }
 
     #[test]
@@ -991,20 +1077,13 @@ mod tests {
         assert_eq!(latest.unattributed, 0);
     }
 
-    /// The two record types are two more matches on the one child the two
-    /// documents already use. A second follower would be a second process, a
-    /// second tail and a second backoff, and this is the test that refuses it.
-    /// A child that exits leaves its pipe open until `retire`, so the loop
-    /// can deregister the descriptor before the number is free for reuse.
-    /// The reader once closed it inside `read`, before the loop deregistered.
+    /// A read that exits leaves its pipe open until `retire`, so the loop can
+    /// deregister the descriptor before the number is free for reuse.
     #[test]
-    fn an_exited_child_keeps_its_descriptor_until_retire() {
-        let mut reader = Reader::unavailable(
-            "a test reader".into(),
-            &Limit::builtin(&m6_core::limits::JOURNAL_LINE),
-        );
+    fn a_finished_read_keeps_its_descriptor_until_retire() {
+        let mut reader = Reader::idle(1, &Limit::builtin(&m6_core::limits::JOURNAL_LINE));
         let mut child = m6_core::platform::process::spawn(
-            Command::new("sh").args(["-c", "printf 'one\\n'"]),
+            Command::new("sh").args(["-c", "printf 'one\\n'; exit 3"]),
             Streams {
                 stdin: Io::Null,
                 stdout: Io::Piped,
@@ -1016,25 +1095,17 @@ mod tests {
         reader.child = Some(child);
         let fd = reader.fd().expect("the pipe");
         let mut lines = 0;
-        let now = m6_core::platform::now();
-        while reader.read(now, |_| lines += 1) != Event::Exited {}
+        while reader.read(|_| lines += 1) != Event::Exited {}
         assert_eq!(lines, 1);
         assert_eq!(reader.fd(), Some(fd), "the descriptor is still open");
         assert!(reader.stopped.is_some(), "the reason is recorded");
-        reader.restart_if_due(now + MAX_BACKOFF * 2);
-        assert_eq!(reader.fd(), Some(fd), "no restart before retire");
         reader.retire();
         assert_eq!(reader.fd(), None, "retire closes it");
     }
 
     /// A one-shot reader whose child runs `script` in place of journalctl.
     fn once_running(script: &str) -> Reader {
-        let mut reader = Reader::unavailable(
-            "a test reader".into(),
-            &Limit::builtin(&m6_core::limits::JOURNAL_LINE),
-        );
-        reader.follow = false;
-        reader.stopped = None;
+        let mut reader = Reader::idle(1, &Limit::builtin(&m6_core::limits::JOURNAL_LINE));
         let mut child = m6_core::platform::process::spawn(
             Command::new("sh").args(["-c", script]),
             Streams {
@@ -1049,6 +1120,17 @@ mod tests {
         reader
     }
 
+    /// A read already in flight at the next tick is not started again.
+    #[test]
+    fn a_read_in_flight_is_not_started_again() {
+        let mut reader = once_running("printf 'one\\n'");
+        let fd = reader.fd().expect("the pipe");
+        assert!(!reader.start_if_idle(), "a child in flight is not doubled");
+        assert_eq!(reader.fd(), Some(fd), "the same pipe");
+        assert_eq!(reader.stopped, None);
+        reader.retire();
+    }
+
     /// `--check` reads the journal once. The child printing its tail and
     /// exiting is the normal end, and once read as "not running", so every
     /// `--check` reported the reader unavailable.
@@ -1059,7 +1141,6 @@ mod tests {
         reader.drain(|_| lines += 1);
         assert_eq!(lines, 2);
         assert_eq!(reader.stopped, None);
-        assert_eq!(reader.restarts, 0, "a one-shot run schedules no restart");
 
         let mut failed = once_running("exit 3");
         failed.drain(|_| {});
@@ -1067,12 +1148,11 @@ mod tests {
         assert!(reason.contains('3'), "{reason}");
     }
 
+    /// The read does not follow, and its `--lines` window is the fleet count
+    /// times the two document types.
     #[test]
-    fn the_one_follower_reads_all_four_line_types() {
-        let reader = Reader::unavailable(
-            "a test reader".into(),
-            &Limit::builtin(&m6_core::limits::JOURNAL_LINE),
-        );
+    fn the_one_read_has_all_four_types_and_does_not_follow() {
+        let reader = Reader::idle(3, &Limit::builtin(&m6_core::limits::JOURNAL_LINE));
         let command = reader.command();
         let args: Vec<std::ffi::OsString> = command.get_args().map(|a| a.to_os_string()).collect();
         let types: Vec<String> = args
@@ -1090,10 +1170,16 @@ mod tests {
             ],
             "four types on one child"
         );
+        assert!(
+            args.iter().all(|a| a != "--follow"),
+            "a read prints its tail and exits"
+        );
         assert_eq!(
-            args.iter().filter(|a| *a == "--follow").count(),
+            args.iter()
+                .filter(|a| a.to_string_lossy() == "--lines=6")
+                .count(),
             1,
-            "one follower"
+            "one metrics and one traffic document for each of three nodes"
         );
         assert_eq!(
             args.iter().filter(|a| *a == "--directory").count(),
@@ -1119,7 +1205,7 @@ mod tests {
 
     /// The reader side of the null: a metrics document of the size a real one is must
     /// arrive whole and be retained, and a null MESSAGE must be counted rather than read.
-    /// The argument itself is covered by `the_one_follower_reads_all_four_line_types`,
+    /// The argument itself is covered by `the_one_read_has_all_four_types_and_does_not_follow`,
     /// which fails if `--all` is removed; this test does not construct the command.
     #[test]
     fn a_metrics_document_over_4096_bytes_is_read_whole() {
