@@ -121,6 +121,16 @@ impl Stack {
     /// `html_cache` is the `Cache-Control` the source's backend stamps on `/`
     /// and `/other`. `heartbeat_secs` is the cache node's interval.
     fn new(html_cache: &str, heartbeat_secs: u64, warm_on_start: bool) -> Stack {
+        Stack::build(html_cache, heartbeat_secs, warm_on_start, false)
+    }
+
+    /// As `new`, but the cache node reaches the source over its internal h2c
+    /// listener, as a cache forwards to its origin on a private backbone.
+    fn new_h2c(html_cache: &str, heartbeat_secs: u64) -> Stack {
+        Stack::build(html_cache, heartbeat_secs, false, true)
+    }
+
+    fn build(html_cache: &str, heartbeat_secs: u64, warm_on_start: bool, h2c: bool) -> Stack {
         rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .ok();
@@ -156,6 +166,21 @@ impl Stack {
 
         let source_port = claim_port();
         let cache_port = claim_port();
+        let h2c_port = claim_port();
+        let (source_h2c, upstream_url) = if h2c {
+            (
+                format!(
+                    "h2c_bind = \"{0}\"\ninternal_binds = [\"{0}\"]\ninternal_peers = [\"127.0.0.1\"]\n",
+                    h2c_port.addr()
+                ),
+                format!("h2c://{}\"\n", h2c_port.addr()),
+            )
+        } else {
+            (
+                String::new(),
+                format!("https://{}\"\ntls_skip_verify = true\n", source_port.addr()),
+            )
+        };
 
         // ── The source's site and backend ────────────────────────────────
         let source_site = d.join("source-site");
@@ -206,7 +231,7 @@ impl Stack {
         std::fs::write(
             &source_system,
             format!(
-                "[server]\nbind = \"{}\"\ntls_cert = \"{}/cert.pem\"\ntls_key = \"{}/key.pem\"\n\n\
+                "[server]\nbind = \"{}\"\ntls_cert = \"{}/cert.pem\"\ntls_key = \"{}/key.pem\"\n{source_h2c}\n\
                  [node]\nname = \"genid-source\"\n\n\
                  [auth]\nbackend = \"auth-check\"\n\n\
                  [genid]\nread_require = \"role:reader\"\nwrite_require = \"role:writer\"\n",
@@ -233,11 +258,10 @@ impl Stack {
                  [rate_limit]\nenabled = false\n\n\
                  [server]\nbackend_timeout_secs = 5\n\n\
                  [stats]\ninterval_s = 1\n\n\
-                 [[backend]]\nname = \"origin\"\nurl = \"https://{}\"\ntls_skip_verify = true\n\n\
+                 [[backend]]\nname = \"origin\"\nurl = \"{upstream_url}\n\
                  [[backend]]\nname = \"auth-check\"\nsockets = \"{}/check.sock\"\n\n\
                  [[route]]\npath = \"/\"\nbackend = \"origin\"\n\n\
                  [[route]]\npath = \"/{{*path}}\"\nbackend = \"origin\"\n",
-                source_port.addr(),
                 d.display()
             ),
         )
@@ -617,6 +641,29 @@ fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
+
+/// The heartbeat speaks the transport of the backend's URL scheme. A cache node
+/// whose `[genid] upstream` is an `h2c://` backend asks over h2c, so it learns
+/// the ID and reports its upstream up, as it does for an `https://` backend.
+///
+/// Break: send the heartbeat as HTTP/1.1 whatever the scheme, and the source
+/// logs a bad connection preface once a heartbeat, the node never learns an ID
+/// and reports its upstream down.
+#[test]
+fn the_cache_learns_the_id_over_an_h2c_upstream() {
+    let mut stack = Stack::new_h2c("public, max-age=60", 1);
+    stack.start_html();
+    stack.start_source();
+    stack.start_cache();
+
+    assert!(
+        stack.wait_perf_ready("0", m6_core::testkit::RESPONSE_BOUND),
+        "the metrics line never reported the source's ID with its upstream up:\n--- m6-http-cache ---\n{}\n--- m6-http-source ---\n{}",
+        stack.cache_output(),
+        stack.source_output()
+    );
+    assert_eq!(stack.genid_bool("upstream_down"), Some(false));
+}
 
 /// The cache node learns the source's ID without being asked by a client, and
 /// the metrics line reports it, the upstream, the round trip and that it is up.

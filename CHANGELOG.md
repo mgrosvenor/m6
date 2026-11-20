@@ -700,6 +700,10 @@ The sync used to delete the file the build host wrote, so the history never ente
 
 ### Fixed
 
+**A cache node whose `[genid] upstream` is an `h2c://` or `h2s://` backend asked it over HTTP/1.1.** The heartbeat was one raw `GET /genid` sent on an HTTP/1.1 upstream slot whatever the backend's URL scheme, so an h2c-only listener logged "http2 error: bad connection preface" once a heartbeat, the node never learned an ID, and it reported `id` null, `upstream_down` true and a degraded `/health` for ever, while client requests forwarded to the same backend worked.
+The heartbeat now takes the transport the URL scheme names, the same split every other request to that backend makes: an h2 stream for h2c and h2s, an upstream slot for http and https.
+Verified by a test that starts a source with an internal h2c listener and a cache node whose genid upstream is `h2c://127.0.0.1:<port>`, and waits for the cache's metrics line to report the source's ID with its upstream up. It fails on the old code with the preface error in the source's log and passes with the fix.
+
 **m6-core's TLS client reads a response of any size.** It read every waiting TLS record before draining any plaintext, so a response larger than rustls's plaintext buffer failed with "received plaintext buffer full" instead of growing the read buffer. m6-monitor could not fetch a page over about 20 KB. The reader now drains after each record, and when the slot's buffer is full it returns so the caller grows the buffer, within its limit. Test: `a_tls_response_larger_than_the_read_buffer_grows_it_and_arrives_whole` (256 KiB body, 4 KiB start), which fails with the old reader.
 
 **m6-auth-cli reads a check-only config.** A config whose `[keys]` table names only `public_key`, as a check-only process's does, was refused while parsing with "error: parsing config file", although user and group commands never read the keys. `[keys] private_key` is now optional, and a config without it gives a tool that can manage users but cannot mint tokens. Test: `a_user_command_reads_a_config_whose_keys_name_only_the_public_key` in `m6-auth-cli/tests/integration.rs`, which fails without the fix.
