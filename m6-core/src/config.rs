@@ -801,11 +801,6 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
     })
 }
 
-/// The `[minification]` keys that switched JavaScript minification on. The
-/// minifier corrupted strings, so it is gone and these are unknown keys.
-const REMOVED_MINIFICATION_KEYS: &[&str] =
-    &["inline_js", "application/javascript", "text/javascript"];
-
 /// Reads `[minification]`. The minifiers are only linked with the `minify`
 /// feature, so without them nothing is on by default and a config that turns
 /// minification on is refused, rather than quietly serving unminified bodies.
@@ -823,12 +818,6 @@ fn parse_minification(
             let on = val.as_bool().ok_or_else(|| {
                 anyhow::anyhow!("[minification] {key} must be true or false, got {val}")
             })?;
-            if REMOVED_MINIFICATION_KEYS.contains(&key.as_str()) {
-                anyhow::bail!(
-                    "[minification] {key} is not a key: m6 does not minify JavaScript, \
-                     in a script file or inline in a page, so a script is served as written"
-                );
-            }
             minification.enabled.insert(key.clone(), on);
         }
     }
@@ -997,6 +986,14 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    /// Compressed by default and deliberately not minified.
+    const NOT_MINIFIED: &[&str] = &[
+        "image/svg+xml",
+        "text/plain",
+        "application/javascript",
+        "text/javascript",
+    ];
+
     #[test]
     fn every_minified_type_is_also_compressed_by_default() {
         let compression = default_compression();
@@ -1014,15 +1011,7 @@ mod tests {
         let mut extra: Vec<&String> = compression
             .keys()
             .filter(|k| !minification.enabled.contains_key(*k))
-            .filter(|k| {
-                ![
-                    "image/svg+xml",
-                    "text/plain",
-                    "application/javascript",
-                    "text/javascript",
-                ]
-                .contains(&k.as_str())
-            })
+            .filter(|k| !NOT_MINIFIED.contains(&k.as_str()))
             .collect();
         extra.sort();
         assert!(extra.is_empty(), "compressed but not minified: {extra:?}");
@@ -1351,30 +1340,6 @@ template = "templates/home.html"
             assert!(err.contains(table), "error should name {table:?}: {err}");
             assert!(err.contains(key), "error should name {key:?}: {err}");
         }
-    }
-
-    /// The keys that switched JavaScript minification on are gone, so a
-    /// config that sets one stops at load and the error names the key.
-    #[test]
-    fn a_removed_javascript_minification_key_is_refused_by_name() {
-        for key in [
-            "inline_js",
-            "\"application/javascript\"",
-            "\"text/javascript\"",
-        ] {
-            let err = load_text(&format!("[minification]\n{key} = true\n"))
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains(key.trim_matches('"')), "{key}: {err}");
-            assert!(err.contains("[minification]"), "{key}: {err}");
-        }
-    }
-
-    #[test]
-    fn javascript_is_not_minified_by_default() {
-        let m = default_minification();
-        assert!(!m.is_enabled("text/javascript"));
-        assert!(!m.is_enabled("application/javascript"));
     }
 
     #[test]

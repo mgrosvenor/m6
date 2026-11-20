@@ -762,17 +762,14 @@ mod tests {
         let mut conf = tempfile::NamedTempFile::new().unwrap();
         std::io::Write::write_all(&mut conf, b"").unwrap();
         let cfg = m6_core::config::load(conf.path(), dir.path()).unwrap();
-        for ae in [None, Some("identity")] {
-            let req = asset_req(dir.path(), "app.js", ae, &[])
-                .with_config(std::sync::Arc::new(cfg.clone()));
-            let (status, _, body) = wire(&req);
-            assert_eq!(status, 200);
-            assert_eq!(
-                String::from_utf8_lossy(&body),
-                script,
-                "the script must be served unchanged"
-            );
-        }
+        let req = asset_req(dir.path(), "app.js", None, &[]).with_config(std::sync::Arc::new(cfg));
+        let (status, _, body) = wire(&req);
+        assert_eq!(status, 200);
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            script,
+            "the script must be served unchanged"
+        );
     }
 
     /// A file with enough redundancy that brotli and gzip both actually

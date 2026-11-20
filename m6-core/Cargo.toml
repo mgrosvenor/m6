@@ -42,7 +42,7 @@ multipart = ["dep:multer", "dep:bytes", "dep:futures-util", "dep:futures-executo
 # `NoTemplates`, and a route that names a template is a configuration error.
 templates = ["dep:tera", "dep:comrak"]
 
-# The minifiers for HTML, CSS, JavaScript and JSON, run on the response path
+# The minifiers for HTML, CSS and JSON, run on the response path
 # when the config enables them. minify-html brings a full CSS engine, which a
 # service that never minifies should not link. Without the feature, a config
 # that enables minification fails to load and names it.

@@ -18,6 +18,7 @@
 pub fn minify_html(data: &[u8]) -> Vec<u8> {
     let mut cfg = minify_html::Cfg::new();
     cfg.minify_css = true;
+    // Explicit, so a change of the crate's default cannot switch it on.
     cfg.minify_js = false;
     cfg.keep_comments = false;
     cfg.keep_closing_tags = true;

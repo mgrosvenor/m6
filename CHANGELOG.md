@@ -706,10 +706,10 @@ The minifier re-emitted a string that held an apostrophe as a template literal, 
 `"That didn't verify \u2014 please try again."` was served as `` `That didn't verify \\u2014 please try again.` ``, so the page showed the six characters `\u2014` where it should show one dash.
 `"tab\there"` was served as `` `tab\\there` ``.
 Its newest release decodes the escape and then inserts a NUL byte after it, so upgrading did not help, and an inline `<script>` switched on with `inline_js` produced the same bytes.
-`minify_js`, the `minify-js` dependency, the JavaScript arm of the minification step in core and in `m6-file`, and the `inline_js` option are removed.
-A config that sets `inline_js`, `application/javascript` or `text/javascript` under `[minification]` stops at load with an error that names the key.
+`minify_js`, m6's own dependency on `minify-js`, the JavaScript arm of the minification step in core and in `m6-file`, and the `inline_js` option are removed.
+`minify-html` still links `minify-js` for its own use, and m6 never turns it on, so an inline `<script>` is left as written.
 HTML, CSS and JSON minification are unchanged, and the default compression types still include JavaScript.
-Verified by a request-level test in `m6-file` that serves a script holding `\u2014`, `\t` and an apostrophe in one string under the default config and expects the bytes on disk, which failed on the old code with `var a=`That didn't verify \\u2014 tab\\there.``, by a test that `minify_html` leaves the same inline script unchanged, and by a test that each removed key is refused by name.
+Verified by a request-level test in `m6-file` that serves a script holding `\u2014`, `\t` and an apostrophe in one string under the default config and expects the bytes on disk, which failed on the old code with `var a=`That didn't verify \\u2014 tab\\there.``, and by a test that `minify_html` leaves the same inline script unchanged.
 
 **The monitor's service read one host's documents from a remote journal and reported every other node's metrics unavailable.**
 Its one `journalctl` child used `--follow`.

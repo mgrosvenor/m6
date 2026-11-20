@@ -367,7 +367,7 @@ Table 5 is the reserved set, and a key in it never reaches a template.
 | `[params_cache]` | core | `size`, default 256 entries |
 | `[server]` | core | `read_timeout_s`, default 30, `0` disables. `socket_mode`, an octal string as systemd writes it, default `"0660"` |
 | `[compression]` | core | brotli and gzip levels per MIME type |
-| `[minification]` | core | on or off per MIME type. JavaScript is never minified, so `inline_js`, `application/javascript` and `text/javascript` are refused at load. A build without the `minify` feature refuses a config that turns it on. The `no-store` exception is in Table 9 of `m6-architecture.md` |
+| `[minification]` | core | on or off per MIME type. JavaScript is never minified. A build without the `minify` feature refuses a config that turns it on. The `no-store` exception is in Table 9 of `m6-architecture.md` |
 | `[log]` | core | `level`, default `info` |
 | `[limits.<name>]` | core | `start` and `max` of a named buffer or queue, §4.2 and Table 6 |
 | `[[route]]` | core | the configuration route table, §5 |

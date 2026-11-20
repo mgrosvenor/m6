@@ -1459,7 +1459,6 @@ dependencies = [
  "m6-platform",
  "mimalloc",
  "minify-html",
- "minify-js",
  "rand 0.8.5",
  "resolv-conf",
  "rustls",
