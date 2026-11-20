@@ -30,6 +30,9 @@ struct TokensConfig {
 #[derive(Deserialize, Default)]
 struct KeysConfig {
     /// A path, typed as one, because the key's bytes are never in the config.
+    /// Optional: a check-only config names only `public_key`, and a user or group
+    /// command reads such a config without needing to sign anything.
+    #[serde(default)]
     private_key: PathBuf,
     public_key: String,
 }
