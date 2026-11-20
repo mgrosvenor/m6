@@ -50,16 +50,11 @@ own_track "$FILE_PID"
 
 trap 'echo ""; info "Stopping..."; own_stop_records; own_forget; wait 2>/dev/null' EXIT
 
-# Wait for backend sockets
-echo -n "Waiting for backend sockets"
-for _ in $(seq 1 20); do
-    if [[ -S /tmp/m6/m6-html.sock && -S /tmp/m6/m6-file.sock ]]; then
-        echo " ready."
-        break
-    fi
-    echo -n "."
-    sleep 0.25
-done
+# Wait for backend sockets. A backend that exits stops the stack here, before
+# m6-http starts on a half-built one.
+echo "Waiting for backend sockets..."
+own_wait_sockets "example 02" /tmp/m6/m6-html.sock /tmp/m6/m6-file.sock || exit 1
+info "Backend sockets ready."
 
 info "Starting m6-http..."
 m6-http "$SITE" "$(m6_conf "$SITE/configs/system-dev.toml")" >> "$SITE/logs/m6-http.log" 2>&1 &

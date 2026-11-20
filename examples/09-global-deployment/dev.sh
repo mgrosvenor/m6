@@ -81,16 +81,18 @@ M6_SOCKET_OVERRIDE=/tmp/m6/render-cms.sock \
 RENDER_PID=$!
 own_track "$RENDER_PID"
 
-# Wait for backend sockets
+# Stop what this run started, including when the wait below fails. The origin
+# and the cache nodes are tracked after the wait, and this same trap covers them.
+trap 'own_stop_records; own_forget; wait 2>/dev/null' EXIT
+
+# Wait for backend sockets. A backend that exits stops the stack here, before
+# the origin starts on a half-built one.
 echo "Waiting for backend services..."
-for _ in $(seq 1 50); do
-    [ -S /tmp/m6/m6-html.sock ] && \
-    [ -S /tmp/m6/m6-file.sock ] && \
-    [ -S /tmp/m6/m6-auth.sock ] && \
-    [ -S /tmp/m6/check-m6-auth.sock ] && \
-    [ -S /tmp/m6/render-cms.sock ] && break
-    sleep 0.2
-done
+own_wait_sockets "example 09" \
+    /tmp/m6/m6-html.sock /tmp/m6/m6-file.sock \
+    /tmp/m6/m6-auth.sock /tmp/m6/check-m6-auth.sock \
+    /tmp/m6/render-cms.sock || exit 1
+echo "Backend services ready."
 
 # ── Origin — TLS (port 9001) + H2C backbone (port 9000) ──────────────────────
 # Single m6-http instance: bind = TLS for users, h2c_bind = cleartext for cache nodes
@@ -114,8 +116,6 @@ own_track "$!"
 
 m6-http "$SITE09/site-cache" "$(m6_conf "$SITE09/configs/local/cache-edge-e.toml")" &
 own_track "$!"
-
-trap 'own_stop_records; own_forget; wait 2>/dev/null' EXIT
 
 echo ""
 echo "┌─────────────────────────────────────────────────────────────┐"
