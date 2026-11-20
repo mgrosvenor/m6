@@ -344,8 +344,8 @@ fn a_real_journald_carries_the_fields() {
     std::env::remove_var(TEST_SOCKET);
 
     let out = std::process::Command::new("journalctl")
-        // JSON output nulls a field over 4096 bytes without --all, and the
-        // probe below reads MESSAGE back out of it.
+        // The probe is short, so --all changes nothing here today. It matches the
+        // monitor's read, so a probe that grows past 4096 bytes is read whole.
         .args([
             "--all",
             "--output=json",

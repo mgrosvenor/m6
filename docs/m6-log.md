@@ -179,10 +179,10 @@ This command selects the metrics datagrams on the native field and prints them a
 Run it on a host whose journal received an m6 service.
 
 ```sh
-journalctl M6_TYPE=perf -o json
+journalctl M6_TYPE=perf -o json --all
 ```
 
-`m6-monitor`'s journal reader in `m6-monitor/src/journal.rs` starts `journalctl` with `--lines=200`, `--output=json` and `--directory <dir>`, and adds `--follow` in the running monitor.
+`m6-monitor`'s journal reader in `m6-monitor/src/journal.rs` starts `journalctl` with `--lines=200`, `--all`, `--output=json` and `--directory <dir>`, and adds `--follow` in the running monitor.
 It filters on `M6_TYPE=perf`, `M6_TYPE=traffic`, `M6_TYPE=startup` and `M6_TYPE=shutdown`, so one child carries the four types.
 
 `journal_stream()` in `m6-platform/src/lib.rs` reads `JOURNAL_STREAM` and compares its device and inode with the ones `fstat` reports for descriptor 1.

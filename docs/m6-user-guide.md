@@ -1475,7 +1475,7 @@ Under systemd each line is one datagram on journald's native socket, and its `M6
 ```bash
 journalctl -u m6-http M6_TYPE=perf
 journalctl -u m6-http M6_TYPE=access --since -1h
-journalctl -u m6-http -o json M6_TYPE=perf | jq -r .MESSAGE | jq .
+journalctl -u m6-http -o json --all M6_TYPE=perf | jq -r .MESSAGE | jq .
 journalctl -u m6-http M6_TYPE=startup -o cat
 ```
 
