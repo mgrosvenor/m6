@@ -700,6 +700,8 @@ The sync used to delete the file the build host wrote, so the history never ente
 
 ### Fixed
 
+**m6-auth-cli reads a check-only config.** A config whose `[keys]` table names only `public_key`, as a check-only process's does, was refused while parsing with "error: parsing config file", although user and group commands never read the keys. `[keys] private_key` is now optional, and a config without it gives a tool that can manage users but cannot mint tokens. Test: `a_user_command_reads_a_config_whose_keys_name_only_the_public_key` in `m6-auth-cli/tests/integration.rs`, which fails without the fix.
+
 **The examples job's teardown stops the `dev.sh` it started, by pid and start time, in place of `pgrep -f` on the directory.**
 The run step writes the pid and its `ps` start time to `.ci-dev.pid`, and the `Stop the stack` step compares the start time before signalling, so a pid that now belongs to another process is left alone.
 The build host's example 05 cleanup does the same: it stops the recorded `dev.sh`, reaps the service pids `dev.sh` wrote to `logs/.own-stack.pids` when `examples/own.sh` is present, and waits for the shell in place of killing everything whose command line mentions the directory.

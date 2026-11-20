@@ -743,3 +743,29 @@ fn a_config_without_an_issuer_exits_2_naming_the_key() {
         stderr(&out)
     );
 }
+
+// ── A check-only config ───────────────────────────────────────────────────────
+
+/// A check-only process's config names `[keys] public_key` and no private key.
+/// The CLI's user commands read only `[storage]` and must accept that config,
+/// not refuse it while parsing a table they never use.
+#[test]
+fn a_user_command_reads_a_config_whose_keys_name_only_the_public_key() {
+    let env = TestEnv::new();
+    let cfg = format!(
+        "[storage]\npath = \"{}\"\n\n[tokens]\nissuer = \"test\"\n\n[keys]\npublic_key = \"{}\"\n",
+        env.db_path().display(),
+        env.dir.path().join("keys/auth.pub").display(),
+    );
+    std::fs::write(env.config(), cfg).expect("write config");
+    let out = env.run(&[
+        "user",
+        "add",
+        "reader",
+        "--role",
+        "genid-read",
+        "--password",
+        "secret",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+}
