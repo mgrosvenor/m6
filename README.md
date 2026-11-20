@@ -214,7 +214,7 @@ Tera template renderer for HTML routes.
 - Static params are stored as `Arc<Map>`, so a request clones a pointer and copies no Map
 - Dynamic `{stem}`-keyed params resolved and LRU-cached
 - `Accept-Encoding` negotiated by `m6_core::negotiate`, which parses the q-values, refuses `q=0` and allocates nothing
-- Minification pipeline (applied before compression): HTML (`minify-html`), CSS (in-house), JSON (`serde_json`), JS (`minify-js` / parse-js engine, falls back to original bytes on parse failure)
+- Minification pipeline (applied before compression): HTML (`minify-html`), CSS (in-house), JSON (`serde_json`). JavaScript is not minified, in a script file or inline in a page
 - Brotli and gzip compression with configurable levels per MIME type
 
 **Performance design:**

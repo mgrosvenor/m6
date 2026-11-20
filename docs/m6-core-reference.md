@@ -66,7 +66,7 @@ Table 1 gives the eleven features.
 | feature | default | what it adds |
 |---|---|---|
 | `templates` | **on** | `template` module, `TeraFactory`, `TeraRenderer`. Pulls tera and comrak. Without it a service passes `NoTemplates`. |
-| `minify` | **on** | `minify` module, and the minification step in `site`. Pulls minify-html, which brings a CSS engine, and minify-js. Without it a config that turns minification on fails to load and names this feature. |
+| `minify` | **on** | `minify` module, and the minification step in `site`. Pulls minify-html, which brings a CSS engine. Without it a config that turns minification on fails to load and names this feature. |
 | `testkit` | off | The `testkit` module, and `alloc-count`. Enable from `[dev-dependencies]` only. |
 | `alloc-count` | off | The counting allocator on its own, so a service binary can count its loop's allocations. |
 | `alloc-trace` | off | A backtrace per allocation, for the `alloc_sites` diagnostic target. |
@@ -190,7 +190,7 @@ pub struct RendererConfig {
     pub params_cache:  ParamsCacheConfig,    // size
     pub server:        ServerConfig,         // read_timeout, socket_mode
     pub compression:   HashMap<String, CompressionLevel>,  // per-mime brotli/gzip
-    pub minification:  MinificationConfig,   // per-mime enabled, inline_js
+    pub minification:  MinificationConfig,   // per-mime enabled
     pub log:           LogConfig,            // level
     pub limits:        Limits,               // [limits.<name>], start and max per buffer
     pub site_toml:     Option<PathBuf>,      // the reserved key site_toml
@@ -697,7 +697,8 @@ The four small modules come first, and SQLite has the rest of the section.
 
 `compress` provides `brotli_compress(data, quality)`, `brotli_decompress(data)`, `gzip_compress(data, level)` and `gzip_decompress(data)`.
 
-`minify` (feature `minify`) provides `minify_html(data, minify_inline_js)`, `minify_js(data)`, `minify_css(data)` and `minify_json(data)`.
+`minify` (feature `minify`) provides `minify_html(data)`, `minify_css(data)` and `minify_json(data)`.
+There is no JavaScript minifier, and `minify_html` leaves an inline `<script>` as written.
 
 `util` provides `slugify`, `today_iso8601`, `now_iso8601`, `iso8601_minutes_ago` and `html_escape`.
 

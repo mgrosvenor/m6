@@ -3007,10 +3007,9 @@ fn minified(
         return None;
     }
     match mime {
-        "text/html" => Some(crate::minify::minify_html(bytes, config.inline_js)),
+        "text/html" => Some(crate::minify::minify_html(bytes)),
         "text/css" => Some(crate::minify::minify_css(bytes)),
         "application/json" => Some(crate::minify::minify_json(bytes)),
-        "application/javascript" | "text/javascript" => Some(crate::minify::minify_js(bytes)),
         _ => None,
     }
 }
@@ -3864,10 +3863,8 @@ mod tests {
                 m.insert("text/html".to_string(), true);
                 m.insert("text/css".to_string(), true);
                 m.insert("application/json".to_string(), true);
-                m.insert("application/javascript".to_string(), false);
                 m
             },
-            inline_js: false,
         };
         assert!(cfg.is_enabled("text/html"));
         assert!(cfg.is_enabled("text/css"));

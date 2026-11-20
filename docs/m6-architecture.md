@@ -511,7 +511,7 @@ Table 8 gives the sorts of component core holds.
 | Service scaffolding | the reactor, the signal descriptor, the deadlines, the connection table, routing, the socket helper and the shutdown sequence |
 | Configuration | parsing and validation, and secrets merging |
 | Request and response | what a handler receives and returns, the layered request dictionary, cookie construction, multipart bodies |
-| Content | gzip and brotli, HTML, CSS, JSON and JavaScript minification, and the renderer seam with its template implementation behind it |
+| Content | gzip and brotli, HTML, CSS and JSON minification, and the renderer seam with its template implementation behind it |
 | Safety | path parameter validation and traversal refusal, request size caps, cryptographic token generation |
 | Observability | logging setup, the analytics record format, the health and performance endpoints, host load, memory, disk and temperature, firewall counters, newline-delimited JSON |
 | Test kit | standing a service up, claiming a socket without a race, driving it and tearing it down |
@@ -690,7 +690,7 @@ Table 9 gives them by area.
 | processes | an accepted connection has a read deadline, 30 seconds by default (`DEFAULT_READ_TIMEOUT_SECS`) | a peer that connects and says nothing otherwise holds its slot until it disconnects, and enough of those fill the table while the service looks healthy |
 | processes | exit 0 clean, 1 runtime error including a configured TLS or h2c bind failure, 2 configuration or usage error including a QUIC or shared-port bind failure | a supervisor can tell a refused config from a runtime failure, which lets a deploy validate a new binary with `--dump-config` before installing it |
 | content | minification runs before compression, a `no-store` response is not minified, and each minifier returns its input unchanged when it cannot parse | ratios are better in that order, a response no cache keeps would pay the cost on every request, and a minifier that does not understand a file passes it through |
-| content | inline script minification is off by default | the engine parses scripts as modules, which have different scoping, and it can silently rewrite a valid classic script into a broken one |
+| content | JavaScript is never minified, in a script file or inline in a page | the only engine re-emitted a string holding an apostrophe as a template literal with its escapes doubled, and a script is served as written |
 | content | text types declare a charset and JSON does not | without a charset clients fall back to a legacy encoding and render UTF-8 as mojibake, and the parameter is undefined for JSON |
 | auth | access tokens are short-lived (`access_ttl` 900 seconds) with a longer refresh (`refresh_ttl` 30 days) on its own path | a stolen access token expires on its own, and the refresh path is the one thing that needs to be revocable |
 | auth | login is throttled per address | it is the one endpoint where guessing is the attack |
