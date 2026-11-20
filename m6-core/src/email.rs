@@ -532,25 +532,35 @@ impl Smtp {
 
     /// Read what the socket has, until WouldBlock or EOF.
     fn read_in(&mut self) -> Result<(), SmtpError> {
+        if self.tls.is_some() {
+            // The TLS reader returns when the buffer is full with plaintext
+            // still inside rustls, and the socket has no new readiness for it,
+            // so grow and read again until it stops making progress.
+            loop {
+                self.make_room()?;
+                let (Some(tls), Some(stream)) = (self.tls.as_mut(), self.stream.as_mut()) else {
+                    return Ok(());
+                };
+                let before = self.in_len;
+                let read =
+                    crate::client::read_tls_into(tls, stream, &mut self.in_buf, &mut self.in_len);
+                match read {
+                    Ok(true) => {
+                        self.eof = true;
+                        return Ok(());
+                    }
+                    Ok(false) => {}
+                    Err(e) => return Err(self.error(&e.to_string())),
+                }
+                if self.in_len < self.in_buf.len() || self.in_len == before {
+                    return Ok(());
+                }
+            }
+        }
         self.make_room()?;
         let Some(stream) = self.stream.as_mut() else {
             return Ok(());
         };
-        if let Some(tls) = self.tls.as_mut() {
-            return match crate::client::read_tls_into(
-                tls,
-                stream,
-                &mut self.in_buf,
-                &mut self.in_len,
-            ) {
-                Ok(true) => {
-                    self.eof = true;
-                    Ok(())
-                }
-                Ok(false) => Ok(()),
-                Err(e) => Err(self.error(&e.to_string())),
-            };
-        }
         loop {
             if self.in_len == self.in_buf.len() {
                 // `stream` borrows `self`, so the growth is repeated here
@@ -1254,8 +1264,17 @@ mod tests {
             seen.lock()
                 .unwrap()
                 .push(format!("tls:{}", String::from_utf8_lossy(&ehlo).trim_end()));
-            tls.write_all(b"250-test\r\n250-AUTH PLAIN LOGIN\r\n250 8BITMIME\r\n")
-                .expect("second ehlo reply");
+            // A long reply, many times the 512-byte starting buffer, so the TLS
+            // reader fills the buffer with plaintext still inside rustls and
+            // the client must grow and read again without a new readiness.
+            let mut reply = Vec::new();
+            for i in 0..200 {
+                reply.extend_from_slice(
+                    format!("250-X-EXTENSION-{i:04} padding-to-make-the-reply-long\r\n").as_bytes(),
+                );
+            }
+            reply.extend_from_slice(b"250-test\r\n250-AUTH PLAIN LOGIN\r\n250 8BITMIME\r\n");
+            tls.write_all(&reply).expect("second ehlo reply");
             let auth = read_until(&mut tls, b"\r\n");
             seen.lock().unwrap().push(format!(
                 "auth:{}",

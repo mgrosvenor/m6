@@ -700,6 +700,8 @@ The sync used to delete the file the build host wrote, so the history never ente
 
 ### Fixed
 
+**m6-core's TLS client reads a response of any size.** It read every waiting TLS record before draining any plaintext, so a response larger than rustls's plaintext buffer failed with "received plaintext buffer full" instead of growing the read buffer. m6-monitor could not fetch a page over about 20 KB. The reader now drains after each record, and when the slot's buffer is full it returns so the caller grows the buffer, within its limit. Test: `a_tls_response_larger_than_the_read_buffer_grows_it_and_arrives_whole` (256 KiB body, 4 KiB start), which fails with the old reader.
+
 **m6-auth-cli reads a check-only config.** A config whose `[keys]` table names only `public_key`, as a check-only process's does, was refused while parsing with "error: parsing config file", although user and group commands never read the keys. `[keys] private_key` is now optional, and a config without it gives a tool that can manage users but cannot mint tokens. Test: `a_user_command_reads_a_config_whose_keys_name_only_the_public_key` in `m6-auth-cli/tests/integration.rs`, which fails without the fix.
 
 **The examples job's teardown stops the `dev.sh` it started, by pid and start time, in place of `pgrep -f` on the directory.**
