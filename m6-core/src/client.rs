@@ -1113,7 +1113,8 @@ pub(crate) fn flush_tls_to(
 ///
 /// The plaintext is drained after every record, so rustls's own plaintext
 /// buffer never fills, whatever the response's size. When `buf` is full this
-/// returns with the socket unread, and the caller grows `buf` and calls again:
+/// returns with the socket unread, and the caller grows `buf` and calls again
+/// (both callers loop on a full buffer):
 /// a large body grows the buffer and never fails while under its limit.
 ///
 /// Returns whether the peer closed. The one reader shared by [`Upstream`] and
@@ -1150,8 +1151,8 @@ pub(crate) fn read_tls_into(
             return Err(io::Error::new(io::ErrorKind::InvalidData, e));
         }
     }
-    // The peer closed: hand over what is left, then report the close.
-    drain_plaintext(tls, buf, len)?;
+    // The peer closed. The loop's drain has already handed over every byte
+    // rustls decrypted, so there is nothing left to drain.
     Ok(true)
 }
 
