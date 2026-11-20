@@ -445,8 +445,8 @@ struct ServerState {
     /// heartbeat.
     heartbeat_request: Vec<u8>,
     /// The same `GET /genid` as a request, for a backend reached over h2c or
-    /// h2s, built once at start. Empty path when no heartbeat is configured.
-    heartbeat_h2_request: forward::HttpRequest,
+    /// h2s, built once at start. `None` when this node has no heartbeat.
+    heartbeat_h2_request: Option<forward::HttpRequest>,
 }
 
 /// One cache entry to fetch in the background.
@@ -2434,35 +2434,16 @@ fn launch_heartbeat(
         return Err(UrlDispatchError::NoSlot);
     };
     let id = match state.pool_manager.url_backend(backend_idx).scheme {
-        pool::UrlScheme::H2c => {
-            ensure_h2c_conn(state, backend_idx, registry)?;
-            let backend = state.pool_manager.url_backend(backend_idx);
-            let (conn, stream) = state
-                .h2c_pool
-                .dispatch(
-                    &backend.url,
-                    &state.heartbeat_h2_request,
-                    "",
-                    &backend.host,
-                    registry,
-                )
-                .map_err(UrlDispatchError::Failed)?;
-            UpstreamId::H2c { conn, stream }
-        }
-        pool::UrlScheme::H2s => {
-            ensure_h2s_conn(state, backend_idx, registry)?;
-            let backend = state.pool_manager.url_backend(backend_idx);
-            let (conn, stream) = state
-                .h2s_pool
-                .dispatch(
-                    &backend.url,
-                    &state.heartbeat_h2_request,
-                    "",
-                    &backend.host,
-                    registry,
-                )
-                .map_err(UrlDispatchError::Failed)?;
-            UpstreamId::H2s { conn, stream }
+        pool::UrlScheme::H2c | pool::UrlScheme::H2s => {
+            // Taken out for the dispatch, which needs `state` whole, and put
+            // back whatever happens: nothing is built per beat.
+            let Some(req) = state.heartbeat_h2_request.take() else {
+                return Err(UrlDispatchError::NoSlot);
+            };
+            let host = state.pool_manager.url_backend(backend_idx).host.clone();
+            let id = dispatch_h2(state, registry, backend_idx, &req, "", &host);
+            state.heartbeat_h2_request = Some(req);
+            id?
         }
         pool::UrlScheme::Http | pool::UrlScheme::Https => {
             let (key, token, watched) = take_url_slot(state, backend_idx)?;
@@ -4894,29 +4875,42 @@ fn dispatch_url_backend(
         "url backend dispatch"
     );
     match state.pool_manager.url_backend(backend_idx).scheme {
-        pool::UrlScheme::H2c => {
-            ensure_h2c_conn(state, backend_idx, registry)?;
+        pool::UrlScheme::H2c | pool::UrlScheme::H2s => {
             let original_host = origin_host(req, &state.config).to_string();
-            let backend = state.pool_manager.url_backend(backend_idx);
-            let (conn, stream) = state
-                .h2c_pool
-                .dispatch(&backend.url, req, client_ip, &original_host, registry)
-                .map_err(UrlDispatchError::Failed)?;
-            Ok(UpstreamId::H2c { conn, stream })
-        }
-        pool::UrlScheme::H2s => {
-            ensure_h2s_conn(state, backend_idx, registry)?;
-            let original_host = origin_host(req, &state.config).to_string();
-            let backend = state.pool_manager.url_backend(backend_idx);
-            let (conn, stream) = state
-                .h2s_pool
-                .dispatch(&backend.url, req, client_ip, &original_host, registry)
-                .map_err(UrlDispatchError::Failed)?;
-            Ok(UpstreamId::H2s { conn, stream })
+            dispatch_h2(state, registry, backend_idx, req, client_ip, &original_host)
         }
         pool::UrlScheme::Http | pool::UrlScheme::Https => {
             launch_url_upstream(state, registry, req, client_ip, backend_idx).map(UpstreamId::Slot)
         }
+    }
+}
+
+/// Start one request to an h2c or h2s URL backend on its connection pool,
+/// opening the connection first when the pool has none.
+fn dispatch_h2(
+    state: &mut ServerState,
+    registry: &m6_core::platform::Registry,
+    backend_idx: usize,
+    req: &forward::HttpRequest,
+    client_ip: &str,
+    original_host: &str,
+) -> Result<UpstreamId, UrlDispatchError> {
+    if let pool::UrlScheme::H2c = state.pool_manager.url_backend(backend_idx).scheme {
+        ensure_h2c_conn(state, backend_idx, registry)?;
+        let backend = state.pool_manager.url_backend(backend_idx);
+        let (conn, stream) = state
+            .h2c_pool
+            .dispatch(&backend.url, req, client_ip, original_host, registry)
+            .map_err(UrlDispatchError::Failed)?;
+        Ok(UpstreamId::H2c { conn, stream })
+    } else {
+        ensure_h2s_conn(state, backend_idx, registry)?;
+        let backend = state.pool_manager.url_backend(backend_idx);
+        let (conn, stream) = state
+            .h2s_pool
+            .dispatch(&backend.url, req, client_ip, original_host, registry)
+            .map_err(UrlDispatchError::Failed)?;
+        Ok(UpstreamId::H2s { conn, stream })
     }
 }
 
@@ -8178,21 +8172,13 @@ fn run(args: Vec<String>) -> i32 {
         .as_ref()
         .and_then(|genid| genid.token.as_ref())
         .map(|token| token.expose().as_str());
-    let heartbeat_h2 = heartbeat_h2_request(heartbeat_token.unwrap_or_default());
-    let heartbeat_request = match (
-        heartbeat_backend,
-        config
-            .genid
-            .as_ref()
-            .and_then(|genid| genid.token.as_ref())
-            .map(|token| token.expose().as_str()),
-    ) {
+    let (heartbeat_request, heartbeat_h2) = match (heartbeat_backend, heartbeat_token) {
         (Some(idx), Some(token)) => {
             let mut buf = Vec::with_capacity(256);
             encode_heartbeat_request(pool_manager.url_backend(idx).host.as_str(), token, &mut buf);
-            buf
+            (buf, Some(heartbeat_h2_request(token)))
         }
-        _ => Vec::new(),
+        _ => (Vec::new(), None),
     };
 
     // Compute error mode
