@@ -51,7 +51,7 @@ Section 2 follows the child that reads the journal, and section 3 the one input 
 
 The journal is read by one child process for the life of the service, and its output is one more descriptor in the monitor's event loop.
 
-`journal::Reader::open` starts `journalctl` with `--follow`, `--lines=200`, `--output=json`, `--directory <journal_dir>`, and four matches: `M6_TYPE=perf`, `M6_TYPE=traffic`, `M6_TYPE=startup` and `M6_TYPE=shutdown`.
+`journal::Reader::open` starts `journalctl` with `--follow`, `--lines=200`, `--all`, `--output=json`, `--directory <journal_dir>`, and four matches: `M6_TYPE=perf`, `M6_TYPE=traffic`, `M6_TYPE=startup` and `M6_TYPE=shutdown`. `--all` is there because JSON output nulls a field whose name and value reach 4096 bytes together, and a metrics document is about 6.4 KB.: `M6_TYPE=perf`, `M6_TYPE=traffic`, `M6_TYPE=startup` and `M6_TYPE=shutdown`.
 One child carries all four types.
 `M6_TYPE` is the journal field `m6-log` writes for every line under systemd, set from the line's own `type` (`m6-log/src/journal.rs`), so the child selects the types before any JSON is parsed.
 `--lines=200` starts the follow with the last 200 matching lines, so a monitor that has just restarted reports figures before any node writes again.

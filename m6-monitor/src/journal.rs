@@ -813,6 +813,12 @@ impl Reader {
         }
         command
             .arg("--lines=200")
+            // JSON output prints a field null when its name and value reach 4096 bytes
+            // together, which for MESSAGE is a value of 4088. A metrics document is about
+            // 6.4 KB, so every one of them would arrive null. A null is no MESSAGE, which this
+            // reader counts as malformed and drops, so the digest then reports
+            // that the node has no metrics line at all.
+            .arg("--all")
             .arg("--output=json")
             .arg("--directory")
             .arg(&self.dir)
@@ -1094,6 +1100,14 @@ mod tests {
             1,
             "one journal directory"
         );
+        // JSON output nulls a field whose name and value reach 4096 bytes together
+        // without this, which for MESSAGE is 4088 bytes of value, and a metrics
+        // document is about 6.4 KB.
+        assert_eq!(
+            args.iter().filter(|a| *a == "--all").count(),
+            1,
+            "one --all, so long fields are not nulled"
+        );
     }
 
     #[test]
@@ -1101,6 +1115,32 @@ mod tests {
         let mut latest = Latest::new();
         latest.ingest(b"{\"MESSAGE\":\"not json\"}");
         assert_eq!(latest.malformed, 1);
+    }
+
+    /// The reader side of the null: a metrics document of the size a real one is must
+    /// arrive whole and be retained, and a null MESSAGE must be counted rather than read.
+    /// The argument itself is covered by `the_one_follower_reads_all_four_line_types`,
+    /// which fails if `--all` is removed; this test does not construct the command.
+    #[test]
+    fn a_metrics_document_over_4096_bytes_is_read_whole() {
+        let fields = "x".repeat(6_400);
+        let document = format!("{{\"node\":\"edge-a\",\"pad\":\"{fields}\"}}");
+        let metrics = format!("{{\"type\":\"perf\",\"fields\":{{\"perf\":{document}}}}}");
+        let line = format!("{{\"MESSAGE\":{}}}", serde_json::json!(metrics));
+        let mut latest = Latest::new();
+        latest.ingest(line.as_bytes());
+        assert_eq!(latest.malformed, 0, "a 6.4 KB document is not malformed");
+        assert!(
+            latest.perf.contains_key("edge-a"),
+            "the document's node was not retained: {:?}",
+            latest.perf.keys().collect::<Vec<_>>()
+        );
+
+        // The same entry with the field nulled, which is what a missing `--all`
+        // delivers: counted, not silently dropped.
+        let mut nulled = Latest::new();
+        nulled.ingest(b"{\"MESSAGE\":null}");
+        assert_eq!(nulled.malformed, 1);
     }
 
     /// One start-up line as the writer emits it, inside the journal's JSON.

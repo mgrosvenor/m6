@@ -442,6 +442,7 @@ Verified on 2026-11-16 on a macOS sandbox: `tls_reload` and the new unit tests p
 - **`[monitor] environment` and `[monitor] expected_deploy_file`.** The first says whether a dirty build or a pre-release is refused. The second names the deploy's record of the version and config sha256 per node and app, resolved against the site directory. The deploy writes that file and the monitor reads it. A file that does not exist yet is a warning that says it is waiting for the deploy side, never a refusal to start.
 - **`/check` gains a STARTUP section and `/digest` a `startup` object.** Each gives every node's and app's current run: the version, the run id, the start time the record states, and the sha256 of every config file it read, with the shutdown line when there is one.
 
+
 ### Changed
 
 **Every credential gate in m6-http now asks m6-auth-server's `POST /check`, and `[auth] public_key` is removed.**
@@ -699,6 +700,9 @@ The sync used to delete the file the build host wrote, so the history never ente
 - **The metrics turn makes no host read and one write, from 141 system calls.** The host block, a dozen `/proc` and `/sys` files, was read whole inside the turn that writes the metrics line, and every request arriving meanwhile waited for it. `platform::host::HostReader` now reads the facts fixed for the process once at start (CPU count, descriptor limits, the cgroup memory limit, the thermal zone list) and then one source per one-second accounting tick: one file, opened, read and closed in 4 system calls on Linux. The document is serialised straight into the log buffer with no `serde_json::Value` tree, and the percentiles are found by selection instead of a full sort. On a 4-vCPU Linux build host (release), the turn fell from about 850 us to about 165 us and the costliest host step is 101 us. Table 22 of `docs/PERFORMANCE.md` has the M4 figures, and `loop_never_waits.rs` holds the longest turn of an idle node under 2 ms.
 
 ### Fixed
+
+**The monitor reads whole journal fields, so a metrics document is no longer null.** Its one `journalctl` command asked for JSON output without `--all`, and JSON output prints a field null when its name and value reach 4096 bytes together, which for `MESSAGE` is 4088 bytes of value. A metrics document is about 6.4 KB, so every one of them reached the monitor with no message, was counted as malformed and dropped, and the digest reported that no metrics line existed for any node. The command now passes `--all`.
+Verified on a monitor reading its node directory with the command's own options: the metrics document arrived as a null field in 87 of 87 entries, and as a string in 87 of 87 after the change.
 
 **A cache node whose `[genid] upstream` is an `h2c://` or `h2s://` backend asked it over HTTP/1.1.** The heartbeat was one raw `GET /genid` sent on an HTTP/1.1 upstream slot whatever the backend's URL scheme, so an h2c-only listener logged "http2 error: bad connection preface" once a heartbeat, the node never learned an ID, and it reported `id` null, `upstream_down` true and a degraded `/health` for ever, while client requests forwarded to the same backend worked.
 The heartbeat now takes the transport the URL scheme names, the same split every other request to that backend makes: an h2 stream for h2c and h2s, an upstream slot for http and https.
