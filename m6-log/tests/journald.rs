@@ -344,8 +344,8 @@ fn a_real_journald_carries_the_fields() {
     std::env::remove_var(TEST_SOCKET);
 
     let out = std::process::Command::new("journalctl")
-        // The probe is short, so --all changes nothing here today. It matches the
-        // monitor's read, so a probe that grows past 4096 bytes is read whole.
+        // The probe is short, so this flag changes nothing here. It matches the
+        // monitor's read, so a probe that grows past the null threshold arrives whole.
         .args([
             "--all",
             "--output=json",

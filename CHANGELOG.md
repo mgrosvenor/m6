@@ -701,7 +701,7 @@ The sync used to delete the file the build host wrote, so the history never ente
 
 ### Fixed
 
-**The monitor reads whole journal fields, so a metrics document is no longer null.** Its one `journalctl` command asked for JSON output without `--all`, and JSON output prints any field at 4096 bytes or more as null. A metrics document is about 6.4 KB, so every one of them reached the monitor with no message, was counted as malformed and dropped, and the digest reported that no metrics line existed for any node. The command now passes `--all`.
+**The monitor reads whole journal fields, so a metrics document is no longer null.** Its one `journalctl` command asked for JSON output without `--all`, and JSON output prints a field null when its name and value reach 4096 bytes together, which for `MESSAGE` is 4088 bytes of value. A metrics document is about 6.4 KB, so every one of them reached the monitor with no message, was counted as malformed and dropped, and the digest reported that no metrics line existed for any node. The command now passes `--all`.
 Verified on a monitor reading its node directory with the command's own options: the metrics document arrived as a null field in 87 of 87 entries, and as a string in 87 of 87 after the change.
 
 **A cache node whose `[genid] upstream` is an `h2c://` or `h2s://` backend asked it over HTTP/1.1.** The heartbeat was one raw `GET /genid` sent on an HTTP/1.1 upstream slot whatever the backend's URL scheme, so an h2c-only listener logged "http2 error: bad connection preface" once a heartbeat, the node never learned an ID, and it reported `id` null, `upstream_down` true and a degraded `/health` for ever, while client requests forwarded to the same backend worked.

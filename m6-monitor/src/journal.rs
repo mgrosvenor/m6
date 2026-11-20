@@ -813,8 +813,9 @@ impl Reader {
         }
         command
             .arg("--lines=200")
-            // JSON output prints any field at 4096 bytes or more as null, and a
-            // metrics document is about 6.4 KB. A null arrives as no MESSAGE, which this
+            // JSON output prints a field null when its name and value reach 4096 bytes
+            // together, which for MESSAGE is a value of 4088. A metrics document is about
+            // 6.4 KB, so every one of them would arrive null. A null is no MESSAGE, which this
             // reader counts as malformed and drops, so the digest then reports
             // that the node has no metrics line at all.
             .arg("--all")
@@ -1099,9 +1100,9 @@ mod tests {
             1,
             "one journal directory"
         );
-        // JSON output nulls any field at 4096 bytes or more without this, and a
-        // metrics document is about 6.4 KB, so its MESSAGE would arrive null
-        // and the digest would report no metrics for ever.
+        // JSON output nulls a field whose name and value reach 4096 bytes together
+        // without this, which for MESSAGE is 4088 bytes of value, and a metrics
+        // document is about 6.4 KB.
         assert_eq!(
             args.iter().filter(|a| *a == "--all").count(),
             1,
@@ -1116,10 +1117,10 @@ mod tests {
         assert_eq!(latest.malformed, 1);
     }
 
-    /// A metrics document is about 6.4 KB, and journalctl's JSON output prints
-    /// any field at 4096 bytes or more as null unless it is given `--all`. This
-    /// is the reader side of that: a document that size must arrive whole, and a
-    /// null must be counted rather than read as a document.
+    /// The reader side of the null: a metrics document of the size a real one is must
+    /// arrive whole and be retained, and a null MESSAGE must be counted rather than read.
+    /// The argument itself is covered by `the_one_follower_reads_all_four_line_types`,
+    /// which fails if `--all` is removed; this test does not construct the command.
     #[test]
     fn a_metrics_document_over_4096_bytes_is_read_whole() {
         let fields = "x".repeat(6_400);
