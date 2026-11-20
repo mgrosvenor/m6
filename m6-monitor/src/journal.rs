@@ -813,6 +813,9 @@ impl Reader {
         }
         command
             .arg("--lines=200")
+            // JSON output prints any field over 4096 bytes as null without this,
+            // and a metrics document is about 6.4 KB.
+            .arg("--all")
             .arg("--output=json")
             .arg("--directory")
             .arg(&self.dir)
@@ -1093,6 +1096,14 @@ mod tests {
             args.iter().filter(|a| *a == "--directory").count(),
             1,
             "one journal directory"
+        );
+        // JSON output nulls any field over 4096 bytes without this, and a
+        // metrics document is about 6.4 KB, so its MESSAGE would arrive null
+        // and the digest would report no metrics for ever.
+        assert_eq!(
+            args.iter().filter(|a| *a == "--all").count(),
+            1,
+            "one --all, so long fields are not nulled"
         );
     }
 

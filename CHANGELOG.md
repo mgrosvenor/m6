@@ -442,6 +442,12 @@ Verified on 2026-11-16 on a macOS sandbox: `tls_reload` and the new unit tests p
 - **`[monitor] environment` and `[monitor] expected_deploy_file`.** The first says whether a dirty build or a pre-release is refused. The second names the deploy's record of the version and config sha256 per node and app, resolved against the site directory. The deploy writes that file and the monitor reads it. A file that does not exist yet is a warning that says it is waiting for the deploy side, never a refusal to start.
 - **`/check` gains a STARTUP section and `/digest` a `startup` object.** Each gives every node's and app's current run: the version, the run id, the start time the record states, and the sha256 of every config file it read, with the shutdown line when there is one.
 
+**The monitor reads whole journal fields, so a metrics document is no longer null.** Its one `journalctl`
+command asked for JSON output without `--all`, and JSON output prints any field over 4096 bytes as null. A metrics
+document is about 6.4 KB, so every one of them reached the monitor with no message and the digest reported that
+no metrics line existed for any node. The command now passes `--all`, and the same omission is fixed in the one
+test that reads a journal line's message back out of JSON.
+
 ### Changed
 
 **Every credential gate in m6-http now asks m6-auth-server's `POST /check`, and `[auth] public_key` is removed.**

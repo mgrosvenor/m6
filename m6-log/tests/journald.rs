@@ -344,7 +344,15 @@ fn a_real_journald_carries_the_fields() {
     std::env::remove_var(TEST_SOCKET);
 
     let out = std::process::Command::new("journalctl")
-        .args(["--output=json", "--since", "-2 min", "M6_TYPE=event"])
+        // JSON output nulls a field over 4096 bytes without --all, and the
+        // probe below reads MESSAGE back out of it.
+        .args([
+            "--all",
+            "--output=json",
+            "--since",
+            "-2 min",
+            "M6_TYPE=event",
+        ])
         .output()
         .expect("journalctl runs");
     let text = String::from_utf8_lossy(&out.stdout);
