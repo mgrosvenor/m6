@@ -701,6 +701,21 @@ The sync used to delete the file the build host wrote, so the history never ente
 
 ### Fixed
 
+**The monitor's service read one host's documents from a remote journal and reported every other node's metrics unavailable.**
+Its one `journalctl` child used `--follow`.
+Over a remote journal that several hosts upload into, a follower returns the documents of only the host it started behind, because the uploaders deliver their batches with different delays and the lagging host's new entries are older than the follower's position.
+The same read without `--follow` returns every host's documents.
+The service now starts one `journalctl --all --output=json --lines=<N> --directory <dir>` read with the four `M6_TYPE` matches at start and then once each poll interval, with no `--follow`, which is the read `--check` makes.
+N is the larger of 200 and 14 for each `[[monitor.nodes]]` entry, so the read covers at least two minutes of the whole fleet at about 7 matching lines a minute for each node.
+The count reads no clock of the monitor's, and the newest entries are chosen by each sender's clock.
+Known limits: the window is the newest N entries of every node merged and ordered by each sender's clock, so a node whose clock lags by more than the window's span is not read, a node whose clock runs ahead or that writes much faster than the others is read and hides the rest, a poll interval over about two minutes on a fleet of more than 14 nodes is not covered, and a start-up record older than the window is not read, its absence not a finding.
+A read per node is planned to remove these limits.
+`Latest` keeps the newest document under each node name by the journal's time for the entry and counts an entry without one as malformed, and a start-up line that two overlapping reads both carry is counted once.
+At most one read starts each poll interval, a read still running one interval after it started is killed and reported, the loop never waits for the child, and a journal directory that is missing starts no `journalctl` at all.
+Verified with the monitor's unit tests, which cover two nodes' interleaved, out-of-order entries, an older entry read later, a start-up record split across two reads, the command's arguments, the missing-directory reader, and a stuck read killed at its deadline.
+The tests do not cover the limits above.
+A live multi-host journal is not measured here.
+
 **The monitor reads whole journal fields, so a metrics document is no longer null.** Its one `journalctl` command asked for JSON output without `--all`, and JSON output prints a field null when its name and value reach 4096 bytes together, which for `MESSAGE` is 4088 bytes of value. A metrics document is about 6.4 KB, so every one of them reached the monitor with no message, was counted as malformed and dropped, and the digest reported that no metrics line existed for any node. The command now passes `--all`.
 Verified on a monitor reading its node directory with the command's own options: the metrics document arrived as a null field in 87 of 87 entries, and as a string in 87 of 87 after the change.
 

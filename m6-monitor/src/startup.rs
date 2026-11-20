@@ -869,6 +869,7 @@ mod tests {
             "MESSAGE": line.to_string(),
             "M6_TYPE": line["type"],
             "_HOSTNAME": "build",
+            "__REALTIME_TIMESTAMP": crate::journal::next_realtime().to_string(),
         }))
         .unwrap()
     }

@@ -1494,7 +1494,7 @@ Section 7.7 lists the reads.
 m6-monitor polls each node's public `/health` for liveness and reads every node's metrics and traffic documents and start-up records from the monitor host's journal.
 Each node streams its journal to the monitor host with `systemd-journal-upload`, and `systemd-journal-remote` keeps it under `/var/log/journal/remote`, one file per peer address.
 `[monitor] journal_dir` names that directory and defaults to `/var/log/journal/remote`.
-[`m6-monitor.md`](m6-monitor.md) sections 2 and 3 give how the reader follows the journal, attributes each line to a node and restarts after a failure.
+[`m6-monitor.md`](m6-monitor.md) section 2 gives how each read of the journal attributes each line to a node, why it does not follow, and how the next read starts.
 The monitor needs no token.
 
 Two more keys let the monitor judge each start-up record.
