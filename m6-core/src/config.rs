@@ -277,13 +277,9 @@ impl RendererConfig {
         );
 
         // The minification table is flat in the file: `[minification]` holds
-        // `inline_js` and one `<mime> = true` key per type, so the record and
-        // the rebuilt file use the same shape.
+        // one `<mime> = true` key per type, so the record and the rebuilt
+        // file use the same shape.
         let mut minification = Map::new();
-        minification.insert(
-            "inline_js".to_string(),
-            Value::Bool(self.minification.inline_js),
-        );
         for (mime, on) in &self.minification.enabled {
             minification.insert(mime.clone(), Value::Bool(*on));
         }
@@ -395,18 +391,6 @@ fn json_option(value: &Option<String>) -> Value {
 pub struct MinificationConfig {
     /// Which MIME types have minification enabled.
     pub enabled: std::collections::HashMap<String, bool>,
-    /// Whether to minify inline `<script>` blocks inside HTML responses.
-    ///
-    /// Defaults to `false`. The `minify-html` JS engine parses scripts as
-    /// ES modules (`TopLevelMode::Module`), which has different scoping
-    /// semantics from classic scripts and can silently corrupt valid inline
-    /// JS (e.g. rewriting string `'\n'` as template literal `'\\n'`,
-    /// making `var`-declared functions inaccessible from `onclick` attributes,
-    /// etc.). Enable only if all inline scripts in your templates are written
-    /// as self-contained ES modules.
-    ///
-    /// Set in config with `[minification] inline_js = true`.
-    pub inline_js: bool,
 }
 
 impl MinificationConfig {
@@ -421,14 +405,7 @@ fn default_minification() -> MinificationConfig {
     m.insert("text/html".to_string(), true);
     m.insert("text/css".to_string(), true);
     m.insert("application/json".to_string(), true);
-    // JS files: on by default — parse-js engine handles modern ES syntax
-    // and falls back to original bytes on parse failure.
-    m.insert("application/javascript".to_string(), true);
-    m.insert("text/javascript".to_string(), true);
-    MinificationConfig {
-        enabled: m,
-        inline_js: false,
-    }
+    MinificationConfig { enabled: m }
 }
 
 /// Framework-consumed top-level keys that must not appear in the request dict.
@@ -824,6 +801,11 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
     })
 }
 
+/// The `[minification]` keys that switched JavaScript minification on. The
+/// minifier corrupted strings, so it is gone and these are unknown keys.
+const REMOVED_MINIFICATION_KEYS: &[&str] =
+    &["inline_js", "application/javascript", "text/javascript"];
+
 /// Reads `[minification]`. The minifiers are only linked with the `minify`
 /// feature, so without them nothing is on by default and a config that turns
 /// minification on is refused, rather than quietly serving unminified bodies.
@@ -841,14 +823,16 @@ fn parse_minification(
             let on = val.as_bool().ok_or_else(|| {
                 anyhow::anyhow!("[minification] {key} must be true or false, got {val}")
             })?;
-            if key == "inline_js" {
-                minification.inline_js = on;
-            } else {
-                minification.enabled.insert(key.clone(), on);
+            if REMOVED_MINIFICATION_KEYS.contains(&key.as_str()) {
+                anyhow::bail!(
+                    "[minification] {key} is not a key: m6 does not minify JavaScript, \
+                     in a script file or inline in a page, so a script is served as written"
+                );
             }
+            minification.enabled.insert(key.clone(), on);
         }
     }
-    let asked = minification.inline_js || minification.enabled.values().any(|&on| on);
+    let asked = minification.enabled.values().any(|&on| on);
     if asked && !minifiers_linked {
         anyhow::bail!(
             "[minification] turns minification on, but this build of m6-core has no minifiers: \
@@ -1030,7 +1014,15 @@ mod tests {
         let mut extra: Vec<&String> = compression
             .keys()
             .filter(|k| !minification.enabled.contains_key(*k))
-            .filter(|k| !["image/svg+xml", "text/plain"].contains(&k.as_str()))
+            .filter(|k| {
+                ![
+                    "image/svg+xml",
+                    "text/plain",
+                    "application/javascript",
+                    "text/javascript",
+                ]
+                .contains(&k.as_str())
+            })
             .collect();
         extra.sort();
         assert!(extra.is_empty(), "compressed but not minified: {extra:?}");
@@ -1038,7 +1030,7 @@ mod tests {
 
     #[test]
     fn minification_asked_for_without_the_minify_feature_is_refused_by_name() {
-        for body in ["\"text/html\" = true", "inline_js = true"] {
+        for body in ["\"text/html\" = true", "\"text/css\" = true"] {
             let table: toml::Value = toml::from_str(&format!("[minification]\n{body}"))
                 .map(|v: toml::Value| v["minification"].clone())
                 .unwrap();
@@ -1053,7 +1045,7 @@ mod tests {
     fn a_build_without_the_minify_feature_loads_a_config_that_leaves_minification_off() {
         let none = parse_minification(None, false).unwrap();
         assert!(!none.is_enabled("text/html"));
-        let off: toml::Value = toml::from_str("\"text/html\" = false\ninline_js = false").unwrap();
+        let off: toml::Value = toml::from_str("\"text/html\" = false").unwrap();
         assert!(!parse_minification(Some(&off), false)
             .unwrap()
             .is_enabled("text/html"));
@@ -1361,9 +1353,33 @@ template = "templates/home.html"
         }
     }
 
+    /// The keys that switched JavaScript minification on are gone, so a
+    /// config that sets one stops at load and the error names the key.
+    #[test]
+    fn a_removed_javascript_minification_key_is_refused_by_name() {
+        for key in [
+            "inline_js",
+            "\"application/javascript\"",
+            "\"text/javascript\"",
+        ] {
+            let err = load_text(&format!("[minification]\n{key} = true\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(key.trim_matches('"')), "{key}: {err}");
+            assert!(err.contains("[minification]"), "{key}: {err}");
+        }
+    }
+
+    #[test]
+    fn javascript_is_not_minified_by_default() {
+        let m = default_minification();
+        assert!(!m.is_enabled("text/javascript"));
+        assert!(!m.is_enabled("application/javascript"));
+    }
+
     #[test]
     fn a_non_boolean_minification_value_is_refused() {
-        let err = load_text("[minification]\ninline_js = \"yes\"\n")
+        let err = load_text("[minification]\n\"text/html\" = \"yes\"\n")
             .unwrap_err()
             .to_string();
         assert!(err.contains("must be true or false"), "{err}");

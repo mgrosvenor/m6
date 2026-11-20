@@ -26,7 +26,7 @@ fn html_response(html: String) -> Response {
 }
 
 use m6_core::compress::{brotli_compress, gzip_compress};
-use m6_core::minify::{minify_css, minify_html, minify_js, minify_json};
+use m6_core::minify::{minify_css, minify_html, minify_json};
 use m6_core::request::{parse_cookies, parse_query_string};
 use m6_core::response::Response;
 use m6_core::server::write_response;
@@ -133,82 +133,6 @@ const JSON_1KB: &[u8] = b"{
   \"read_time_minutes\": 8,
   \"views\": 12483
 }";
-
-const JS_3KB: &[u8] = b"
-// Navigation dropdown
-(function () {
-  'use strict';
-
-  function initNavDropdowns() {
-    var dropdowns = document.querySelectorAll('.nav-dropdown');
-    dropdowns.forEach(function (dropdown) {
-      var toggle = dropdown.querySelector('.nav-dropdown__toggle');
-      var menu   = dropdown.querySelector('.nav-dropdown__menu');
-      if (!toggle || !menu) { return; }
-
-      toggle.addEventListener('click', function (event) {
-        event.preventDefault();
-        event.stopPropagation();
-        var isOpen = dropdown.classList.contains('is-open');
-        closeAllDropdowns();
-        if (!isOpen) {
-          dropdown.classList.add('is-open');
-          menu.setAttribute('aria-expanded', 'true');
-        }
-      });
-    });
-
-    document.addEventListener('click', closeAllDropdowns);
-    document.addEventListener('keydown', function (event) {
-      if (event.key === 'Escape') { closeAllDropdowns(); }
-    });
-  }
-
-  function closeAllDropdowns() {
-    document.querySelectorAll('.nav-dropdown.is-open').forEach(function (el) {
-      el.classList.remove('is-open');
-      var menu = el.querySelector('.nav-dropdown__menu');
-      if (menu) { menu.setAttribute('aria-expanded', 'false'); }
-    });
-  }
-
-  function initThemeToggle() {
-    var btn = document.querySelector('#theme-toggle');
-    if (!btn) { return; }
-    var stored = localStorage.getItem('theme') || 'light';
-    document.documentElement.setAttribute('data-theme', stored);
-    btn.addEventListener('click', function () {
-      var current = document.documentElement.getAttribute('data-theme');
-      var next    = current === 'dark' ? 'light' : 'dark';
-      document.documentElement.setAttribute('data-theme', next);
-      localStorage.setItem('theme', next);
-    });
-  }
-
-  function initCopyButtons() {
-    document.querySelectorAll('pre').forEach(function (pre) {
-      var btn = document.createElement('button');
-      btn.className = 'copy-btn';
-      btn.textContent = 'Copy';
-      btn.addEventListener('click', function () {
-        var code = pre.querySelector('code');
-        if (!code) { return; }
-        navigator.clipboard.writeText(code.textContent).then(function () {
-          btn.textContent = 'Copied!';
-          setTimeout(function () { btn.textContent = 'Copy'; }, 2000);
-        });
-      });
-      pre.style.position = 'relative';
-      pre.appendChild(btn);
-    });
-  }
-
-  document.addEventListener('DOMContentLoaded', function () {
-    initNavDropdowns();
-    initThemeToggle();
-    initCopyButtons();
-  });
-}());";
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -627,16 +551,13 @@ fn bench_minify(c: &mut Criterion) {
     let mut group = c.benchmark_group("minify");
     group.sample_size(500);
     group.bench_function("minify_html_2kb", |b| {
-        b.iter(|| black_box(minify_html(black_box(HTML_2KB), false)))
+        b.iter(|| black_box(minify_html(black_box(HTML_2KB))))
     });
     group.bench_function("minify_css_8kb", |b| {
         b.iter(|| black_box(minify_css(black_box(CSS_8KB))))
     });
     group.bench_function("minify_json_1kb", |b| {
         b.iter(|| black_box(minify_json(black_box(JSON_1KB))))
-    });
-    group.bench_function("minify_js_3kb", |b| {
-        b.iter(|| black_box(minify_js(black_box(JS_3KB))))
     });
     group.finish();
 }
@@ -648,19 +569,13 @@ fn bench_minify_then_compress(c: &mut Criterion) {
     group.sample_size(200);
     group.bench_function("html_minify_then_brotli6", |b| {
         b.iter(|| {
-            let minified = minify_html(black_box(HTML_2KB), false);
+            let minified = minify_html(black_box(HTML_2KB));
             black_box(brotli_compress(&minified, 6).unwrap())
         })
     });
     group.bench_function("css_minify_then_brotli6", |b| {
         b.iter(|| {
             let minified = minify_css(black_box(CSS_8KB));
-            black_box(brotli_compress(&minified, 6).unwrap())
-        })
-    });
-    group.bench_function("js_minify_then_brotli6", |b| {
-        b.iter(|| {
-            let minified = minify_js(black_box(JS_3KB));
             black_box(brotli_compress(&minified, 6).unwrap())
         })
     });
@@ -930,7 +845,7 @@ size = 64
     const N_MIN: usize = 5_000;
     println!("\n── Minification paths (n={N_MIN}) ───────────────────────────────────────────");
     report_percentiles("minify html 2KB", N_MIN, || {
-        black_box(minify_html(black_box(HTML_2KB), false));
+        black_box(minify_html(black_box(HTML_2KB)));
     });
     report_percentiles("minify css 8KB", N_MIN, || {
         black_box(minify_css(black_box(CSS_8KB)));
@@ -938,23 +853,16 @@ size = 64
     report_percentiles("minify json 1KB", N_MIN, || {
         black_box(minify_json(black_box(JSON_1KB)));
     });
-    report_percentiles("minify js 3KB", N_MIN, || {
-        black_box(minify_js(black_box(JS_3KB)));
-    });
 
     // ── Minify + compress pipeline ────────────────────────────────────────────
     const N_PIPE: usize = 2_000;
     println!("\n── Minify+compress pipeline (n={N_PIPE}) ────────────────────────────────────");
     report_percentiles("html: minify → brotli-6", N_PIPE, || {
-        let m = minify_html(black_box(HTML_2KB), false);
+        let m = minify_html(black_box(HTML_2KB));
         black_box(brotli_compress(&m, 6).unwrap());
     });
     report_percentiles("css:  minify → brotli-6", N_PIPE, || {
         let m = minify_css(black_box(CSS_8KB));
-        black_box(brotli_compress(&m, 6).unwrap());
-    });
-    report_percentiles("js:   minify → brotli-6", N_PIPE, || {
-        let m = minify_js(black_box(JS_3KB));
         black_box(brotli_compress(&m, 6).unwrap());
     });
 

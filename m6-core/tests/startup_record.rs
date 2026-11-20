@@ -362,8 +362,8 @@ fn every_setting_carries_its_source() {
     assert_eq!(setting(&lines, "server", "socket_mode")["source"], "file");
     // default, present rather than omitted
     assert_eq!(
-        setting(&lines, "minification", "inline_js"),
-        &serde_json::json!({"value": false, "source": "default"})
+        setting(&lines, "minification", "text/html"),
+        &serde_json::json!({"value": true, "source": "default"})
     );
     // env
     assert_eq!(

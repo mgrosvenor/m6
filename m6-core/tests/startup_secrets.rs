@@ -35,7 +35,6 @@ read_timeout_s = 44
 socket_mode = "0640"
 
 [minification]
-inline_js = true
 "text/plain" = true
 
 [compression."text/plain"]

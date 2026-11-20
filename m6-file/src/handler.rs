@@ -295,13 +295,9 @@ pub fn serve(req: &Request) -> Result<Response> {
     // treatment here as it would through the render path.
     let data = if minify_this {
         match mime_base.as_str() {
-            "text/html" => m6_core::minify::minify_html(
-                &data,
-                minification.map(|m| m.inline_js).unwrap_or(false),
-            ),
+            "text/html" => m6_core::minify::minify_html(&data),
             "text/css" => m6_core::minify::minify_css(&data),
             "application/json" => m6_core::minify::minify_json(&data),
-            "application/javascript" | "text/javascript" => m6_core::minify::minify_js(&data),
             _ => data,
         }
     } else {
@@ -750,6 +746,33 @@ mod tests {
         );
         req = req.with_config(std::sync::Arc::new(cfg));
         req
+    }
+
+    /// A script is served as the bytes on disk. The JavaScript minifier m6
+    /// used to run re-emitted a string holding an apostrophe as a template
+    /// literal with its escapes doubled, so `"didn't \u2014 tab\there"` went
+    /// out as `` `didn't \\u2014 tab\\there` ``. The config is the default
+    /// one, so this is the path a site with no `[minification]` table takes.
+    #[test]
+    fn a_script_is_served_byte_identical_under_the_default_config() {
+        let script = "var m = \"That didn't verify \u{2014} \\u2014 tab\\there.\";\n";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("assets/app.js"), script).unwrap();
+        let mut conf = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut conf, b"").unwrap();
+        let cfg = m6_core::config::load(conf.path(), dir.path()).unwrap();
+        for ae in [None, Some("identity")] {
+            let req = asset_req(dir.path(), "app.js", ae, &[])
+                .with_config(std::sync::Arc::new(cfg.clone()));
+            let (status, _, body) = wire(&req);
+            assert_eq!(status, 200);
+            assert_eq!(
+                String::from_utf8_lossy(&body),
+                script,
+                "the script must be served unchanged"
+            );
+        }
     }
 
     /// A file with enough redundancy that brotli and gzip both actually

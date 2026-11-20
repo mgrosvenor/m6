@@ -1,49 +1,29 @@
-//! Minification for HTML, CSS, JSON and JavaScript.
+//! Minification for HTML, CSS and JSON.
 //!
 //! Applied before compression, and only for types the config enables. Each
 //! function returns the original bytes unchanged if the input does not parse,
 //! so a minifier that cannot understand a file degrades to passing it through
 //! rather than corrupting it.
 //!
-//! Inline `<script>` minification is **off by default** and should stay that
-//! way unless every inline script is a self-contained ES module: the engine
-//! parses scripts as modules, which has different scoping, and it can silently
-//! rewrite valid classic scripts into broken ones.
+//! JavaScript is never minified, in a script file or inline in a page. The
+//! only engine available re-emits a string holding an apostrophe as a template
+//! literal and doubles its escapes, so `"didn't \u2014"` came out as
+//! `` `didn't \\u2014` ``, and a newer release of it inserts a NUL byte after
+//! a decoded escape. A script is served as written.
 
 /// Minify HTML using the `minify-html` crate.
 ///
-/// `minify_inline_js` controls whether inline `<script>` blocks are
-/// minified. It defaults to `false` because `minify-html` parses scripts as
-/// ES modules (`TopLevelMode::Module`), which has different scoping semantics
-/// from classic scripts and silently corrupts valid inline JS (e.g.
-/// rewriting string `'\n'` as template literal `` `\\n` ``, making
-/// `var`-declared functions inaccessible from `onclick` attributes, etc.).
-/// CSS and whitespace minification are unaffected by this flag.
-pub fn minify_html(data: &[u8], minify_inline_js: bool) -> Vec<u8> {
+/// Inline `<script>` blocks are left as written, for the reason above. CSS and
+/// whitespace minification apply.
+pub fn minify_html(data: &[u8]) -> Vec<u8> {
     let mut cfg = minify_html::Cfg::new();
     cfg.minify_css = true;
-    cfg.minify_js = minify_inline_js;
+    cfg.minify_js = false;
     cfg.keep_comments = false;
     cfg.keep_closing_tags = true;
     cfg.keep_spaces_between_attributes = true;
     cfg.keep_html_and_head_opening_tags = true;
     minify_html::minify(data, &cfg)
-}
-
-/// Minify JavaScript using the `minify-js` crate (parse-js engine).
-///
-/// Parses as a top-level module and emits compact output.
-/// Returns the original bytes unchanged if parsing fails — no corruption risk.
-pub fn minify_js(data: &[u8]) -> Vec<u8> {
-    let session = minify_js::Session::new();
-    let mut out = Vec::new();
-    match minify_js::minify(&session, minify_js::TopLevelMode::Module, data, &mut out) {
-        Ok(()) => out,
-        Err(e) => {
-            crate::log::warn!(error = %e, "minify_js: parse failed, serving unminified source");
-            data.to_vec()
-        }
-    }
 }
 
 /// Minify CSS: strip /* ... */ comments and collapse runs of whitespace.
@@ -291,27 +271,24 @@ mod tests {
         assert_eq!(&out, bad);
     }
 
+    /// An inline script goes through `minify_html` as written. The engine
+    /// that was switched on for it turned this string into a template literal
+    /// with doubled escapes.
     #[test]
-    fn test_minify_js_compacts() {
-        // The minifier may rename identifiers and rewrite syntax, but output must be shorter.
-        let js = b"const x = 1;\nconst y = 2;\nconsole.log(x + y);\n";
-        let out = minify_js(js);
-        assert!(out.len() < js.len(), "minified JS should be shorter");
-        // Output should still be valid UTF-8.
-        assert!(std::str::from_utf8(&out).is_ok());
-    }
-
-    #[test]
-    fn test_minify_js_passthrough_on_invalid() {
-        let bad = b"function { {{ broken";
-        let out = minify_js(bad);
-        assert_eq!(&out, bad, "invalid JS should pass through unchanged");
+    fn test_minify_html_leaves_an_inline_script_as_written() {
+        let html = b"<html><body><script>var m = \"That didn't verify \\u2014 tab\\there.\";</script></body></html>";
+        let out = minify_html(html);
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(
+            s.contains("var m = \"That didn't verify \\u2014 tab\\there.\";"),
+            "inline script changed: {s}"
+        );
     }
 
     #[test]
     fn test_minify_html_removes_comments() {
         let html = b"<html><body><!-- comment --><p>Hello</p></body></html>";
-        let out = minify_html(html, false);
+        let out = minify_html(html);
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("Hello"), "content missing: {}", s);
     }

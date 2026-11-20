@@ -2082,7 +2082,6 @@ dependencies = [
  "m6-platform",
  "mimalloc",
  "minify-html",
- "minify-js",
  "multer",
  "rand 0.8.8",
  "rcgen",
