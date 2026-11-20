@@ -5,10 +5,19 @@
 //! `harness = false`. The harness speaks libtest's protocol through
 //! `libtest-mimic`, forced onto one thread: the check runs in `main` and fails
 //! when anything allocated.
+//!
+//! The check sends the process's stdout to `/dev/null`, and the harness prints
+//! a failed trial's report there. The `tests/common::Stdout` guard puts the
+//! descriptor back when the check ends, on the panic path too, so a failure is
+//! reported instead of swallowed.
+
+mod common;
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use common::Stdout;
 use libtest_mimic::{Arguments, Failed, Trial};
 use m6_log::{with_operational, Level, Line, Type};
 
@@ -53,11 +62,7 @@ fn main() {
 }
 
 fn no_allocation_after_init() -> Result<(), Failed> {
-    let devnull = std::fs::File::options()
-        .write(true)
-        .open("/dev/null")
-        .expect("/dev/null");
-    m6_platform::fd::dup2_stdout(&devnull).expect("stdout is /dev/null");
+    let _stdout = Stdout::to_file(Path::new("/dev/null"));
     m6_log::init(Level::Trace).expect("the logger");
 
     // Built before the measured window: the document allocates, the line that
