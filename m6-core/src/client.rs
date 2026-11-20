@@ -1111,6 +1111,11 @@ pub(crate) fn flush_tls_to(
 
 /// Feed the socket into `tls` and drain its plaintext into `buf[*len..]`.
 ///
+/// The plaintext is drained after every record, so rustls's own plaintext
+/// buffer never fills, whatever the response's size. When `buf` is full this
+/// returns with the socket unread, and the caller grows `buf` and calls again:
+/// a large body grows the buffer and never fails while under its limit.
+///
 /// Returns whether the peer closed. The one reader shared by [`Upstream`] and
 /// [`crate::email::Smtp`].
 pub(crate) fn read_tls_into(
@@ -1119,21 +1124,23 @@ pub(crate) fn read_tls_into(
     buf: &mut [u8],
     len: &mut usize,
 ) -> io::Result<bool> {
-    let mut eof = false;
     loop {
+        if drain_plaintext(tls, buf, len)? {
+            return Ok(true);
+        }
+        if *len == buf.len() {
+            // Full: the caller grows the buffer and reads on.
+            return Ok(false);
+        }
         match tls.read_tls(stream) {
-            Ok(0) => {
-                eof = true;
-                break;
-            }
+            Ok(0) => break,
             Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e)
                 if e.kind() == io::ErrorKind::ConnectionReset
                     || e.kind() == io::ErrorKind::BrokenPipe =>
             {
-                eof = true;
                 break;
             }
             Err(e) => return Err(e),
@@ -1143,22 +1150,28 @@ pub(crate) fn read_tls_into(
             return Err(io::Error::new(io::ErrorKind::InvalidData, e));
         }
     }
-    loop {
-        if *len == buf.len() {
-            break;
-        }
+    // The peer closed: hand over what is left, then report the close.
+    drain_plaintext(tls, buf, len)?;
+    Ok(true)
+}
+
+/// Move `tls`'s decrypted plaintext into `buf[*len..]` until either is empty.
+/// Returns whether the peer's close was reached.
+fn drain_plaintext(
+    tls: &mut ClientConnection,
+    buf: &mut [u8],
+    len: &mut usize,
+) -> io::Result<bool> {
+    while *len < buf.len() {
         match tls.reader().read(&mut buf[*len..]) {
-            Ok(0) => break,
+            Ok(0) => return Ok(true),
             Ok(n) => *len += n,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                eof = true;
-                break;
-            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(true),
             Err(e) => return Err(e),
         }
     }
-    Ok(eof)
+    Ok(false)
 }
 
 /// Drive the TLS handshake until it completes or the socket would block.
@@ -2357,6 +2370,78 @@ mod socket_tests {
         // blocking on a close the client never sends.
         up.close();
 
+        peer.join().expect("peer");
+    }
+
+    /// A TLS response far larger than the read buffer arrives whole: the reader
+    /// drains each record as it comes, so rustls's own plaintext buffer never
+    /// fills, and the slot's buffer grows to the body instead of failing.
+    #[test]
+    fn a_tls_response_larger_than_the_read_buffer_grows_it_and_arrives_whole() {
+        const BODY: usize = 256 * 1024;
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
+        let cert = ck.cert.der().clone();
+        let key =
+            rustls::pki_types::PrivateKeyDer::try_from(ck.key_pair.serialize_der()).expect("key");
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let server = Arc::new(
+            rustls::ServerConfig::builder_with_provider(provider.clone())
+                .with_safe_default_protocol_versions()
+                .expect("versions")
+                .with_no_client_auth()
+                .with_single_cert(vec![cert.clone()], key)
+                .expect("server config"),
+        );
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).expect("trust the run's own cert");
+        let client = Arc::new(
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .expect("versions")
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let peer = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().expect("accept");
+            let conn = rustls::ServerConnection::new(server).expect("server conn");
+            let mut stream = rustls::StreamOwned::new(conn, tcp);
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                }
+            }
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {BODY}\r\n\r\n");
+            let _ = stream.write_all(head.as_bytes());
+            let body: Vec<u8> = (0..BODY).map(|i| b'a' + (i % 26) as u8).collect();
+            let _ = stream.write_all(&body);
+            let _ = stream.flush();
+        });
+
+        let name = rustls::pki_types::ServerName::try_from("localhost".to_string()).expect("name");
+        let tls = TlsClient {
+            config: client,
+            name,
+        };
+        let deadline = crate::platform::now() + Duration::from_secs(10);
+        // A 4 KiB start, so the body must grow the buffer many times.
+        let mut up = Upstream::new(4 * 1024, 4 * 1024);
+        up.request_buf()
+            .extend_from_slice(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        up.start(&Addr::Tcp(addr), Some(&tls), false, deadline)
+            .expect("start");
+        let (status, _, body) = drive_to_completion(&mut up).expect("drive");
+        assert_eq!(status, 200);
+        assert_eq!(body.len(), BODY);
+        assert!(body
+            .iter()
+            .enumerate()
+            .all(|(i, &b)| b == b'a' + (i % 26) as u8));
         peer.join().expect("peer");
     }
 
