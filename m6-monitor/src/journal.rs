@@ -15,26 +15,22 @@
 //! `--follow` prints both hosts' entries every time, so the service reads a
 //! window of time and the child exits, the way `--check` always has.
 //!
-//! **A read's window is a time, never a line count.** Each read passes
-//! `--since`. A later read starts before the last successful read began by
-//! [`MARGIN_INTERVALS`] poll intervals, so an upload that arrives after the read
-//! that should have carried it is read the next time. The first read, at start
-//! and for `--check`, reaches back [`FIRST_READ_WINDOW`]. The reads overlap, so
-//! [`Latest`] and [`Startup`] take each entry once.
+//! **A read's window is a count of lines.** Each read passes `--lines=N`, with
+//! `N = max(200, 14 x the number of [[monitor.nodes]] entries)`. A node writes
+//! about 7 matching lines a minute, 6 metrics documents at 10 seconds and 1
+//! traffic document at 60, so 14 lines for each node cover at least two minutes
+//! of the whole fleet, which is more than two poll intervals at the default 30
+//! seconds. Start-up lines share the window and shorten it a little, and 200 is
+//! the floor so a small fleet still holds a node's start-up record. The window
+//! reads no clock: the reads overlap, and [`Latest`] and [`Startup`] take each
+//! entry once.
 //!
-//! **A document is ordered by the journal's `__REALTIME_TIMESTAMP`.** The
-//! receiving journal sets it on the entry, outside `MESSAGE`, so a node cannot
-//! choose it. Nothing inside `MESSAGE` orders anything, because the node writes
-//! all of it. An entry without the field is counted as malformed, and an older
-//! entry read later never replaces a newer one.
-//!
-//! **A line is attributed by the `node` field inside `MESSAGE`.** That is the
-//! name the node's own `site.toml` gives it, and every m6-http line carries it.
-//! `_HOSTNAME` is not used at all, because a host that runs several nodes
-//! writes one `_HOSTNAME` for all of them: three nodes on one host would
-//! otherwise be one node, and a digest that silently merges three nodes looks
-//! exactly like a digest of one. A line whose document has no node name is
-//! counted and dropped rather than guessed at.
+//! **A document is ordered by the journal's `__REALTIME_TIMESTAMP`.** For a
+//! remote journal that is the uploading node's own clock, which no application
+//! on the node can set but the node itself can. It orders one node's own
+//! entries, which share one clock, and is never compared between nodes. Nothing
+//! inside `MESSAGE` orders anything. An entry without the field is counted as
+//! malformed, and an older entry read later never replaces a newer one.
 //!
 //! # The start-up record
 //!
@@ -67,7 +63,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use m6_core::platform::process::{Child, Io, Streams};
 
@@ -594,8 +590,8 @@ fn unix_ms(time: std::time::SystemTime) -> u64 {
 #[derive(Debug)]
 struct Document {
     /// The entry's `__REALTIME_TIMESTAMP`, in microseconds since the Unix
-    /// epoch. The receiving journal sets it, outside `MESSAGE`, so no node can
-    /// choose it.
+    /// epoch. In a remote journal it is the uploading node's clock, so it
+    /// orders one node's own entries and is never compared between nodes.
     at: u64,
     value: serde_json::Value,
 }
@@ -728,20 +724,17 @@ pub enum Event {
     Exited,
 }
 
-/// How far back the first read looks: one traffic interval, the span a
-/// start-up record takes to close ([`INCOMPLETE_AFTER`]), and room for a node
-/// that restarted before the monitor did, so its latest record is still read.
-/// The first read is the monitor's start and every `--check`.
-pub const FIRST_READ_WINDOW: Duration = Duration::from_secs(60 * 60);
+/// The fewest lines a read asks for, so a small fleet still holds a start-up
+/// record, which is 4 lines and the config files and sections.
+const MIN_LINES: usize = 200;
 
-/// How many poll intervals later reads reach back before the start of the
-/// last successful read. The margin covers an upload that arrives after the
-/// read that should have carried it, and it is never less than one interval.
-const MARGIN_INTERVALS: u32 = 2;
+/// Lines a read asks for per configured node: a node writes about 7 matching
+/// lines a minute, so this is at least two minutes of the fleet.
+const LINES_PER_NODE: usize = 14;
 
 /// The `journalctl` child of one read, and the line being assembled.
 ///
-/// A read starts a child that prints the entries since a time and exits, and
+/// A read starts a child that prints the last `--lines` entries and exits, and
 /// its stdout is one more non-blocking descriptor in the loop. At most one read
 /// starts per poll interval, a read still in flight is not started again, and
 /// a read in flight past the interval is killed. [`Reader::start_if_idle`] and
@@ -759,10 +752,8 @@ pub struct Reader {
     stdout: Option<File>,
     /// When the last read was started, for the spacing and the deadline.
     last_started: Option<Instant>,
-    /// The wall clock at the start of the read in flight, or the last one.
-    began: Option<SystemTime>,
-    /// The wall clock at the start of the last read that ended in success.
-    last_ok: Option<SystemTime>,
+    /// The `--lines` count of each read.
+    window: usize,
     /// The one line being assembled, bounded by a named limit.
     line: Bounded<u8>,
     /// A line past the limit is dropped, and its bytes are ignored until its
@@ -775,20 +766,11 @@ pub struct Reader {
     pub stopped: Option<String>,
 }
 
-/// The `--since` time of a read: the start of the last successful read less
-/// the margin, or [`FIRST_READ_WINDOW`] back when there is none.
-fn since(now: SystemTime, last_ok: Option<SystemTime>, interval: Duration) -> SystemTime {
-    let (from, back) = match last_ok {
-        Some(start) => (start, interval * MARGIN_INTERVALS),
-        None => (now, FIRST_READ_WINDOW),
-    };
-    from.checked_sub(back).unwrap_or(UNIX_EPOCH)
-}
-
 impl Reader {
     /// A reader with nothing started, the one place its fields are set.
     fn new(
         dir: Option<PathBuf>,
+        nodes: usize,
         interval: Duration,
         limit: &Limit,
         stopped: Option<String>,
@@ -800,8 +782,7 @@ impl Reader {
             killed: false,
             stdout: None,
             last_started: None,
-            began: None,
-            last_ok: None,
+            window: MIN_LINES.max(LINES_PER_NODE * nodes),
             line: Bounded::<u8>::new(limit),
             dropping: false,
             lines: 0,
@@ -813,27 +794,29 @@ impl Reader {
     /// A reader with no directory, before the service or the check opens the
     /// journal.
     pub fn idle(limit: &Limit) -> Reader {
-        Reader::new(None, Duration::ZERO, limit, None)
+        Reader::new(None, 0, Duration::ZERO, limit, None)
     }
 
     /// A reader for a journal directory that could not be opened: it starts
     /// nothing on any tick, and `stopped` says why.
     pub fn unavailable(reason: String, limit: &Limit) -> Reader {
-        Reader::new(None, Duration::ZERO, limit, Some(reason))
+        Reader::new(None, 0, Duration::ZERO, limit, Some(reason))
     }
 
     /// Start the first read of `dir`. A child that cannot start is not fatal:
     /// the reason is kept in `stopped`, and the next interval tries again.
-    pub fn open(dir: &Path, interval: Duration, limit: &Limit) -> Reader {
-        let mut reader = Reader::new(Some(dir.to_path_buf()), interval, limit, None);
+    ///
+    /// `nodes` is the configured fleet size, which sets the `--lines` window.
+    pub fn open(dir: &Path, nodes: usize, interval: Duration, limit: &Limit) -> Reader {
+        let mut reader = Reader::new(Some(dir.to_path_buf()), nodes, interval, limit, None);
         reader.start(m6_core::platform::now());
         reader
     }
 
-    /// One run for `--check`: the same first read, and [`Reader::drain`] reads
-    /// the pipe to its end.
-    pub fn once(dir: &Path, limit: &Limit) -> Reader {
-        Reader::open(dir, Duration::ZERO, limit)
+    /// One run for `--check`: the same read, and [`Reader::drain`] reads the
+    /// pipe to its end.
+    pub fn once(dir: &Path, nodes: usize, limit: &Limit) -> Reader {
+        Reader::open(dir, nodes, Duration::ZERO, limit)
     }
 
     /// Start a read when none is in flight and an interval has passed since
@@ -978,10 +961,7 @@ impl Reader {
             return;
         }
         self.stopped = match status {
-            Ok(status) if status.success() => {
-                self.last_ok = self.began;
-                None
-            }
+            Ok(status) if status.success() => None,
             Ok(status) => Some(format!("journalctl {status}")),
             Err(e) => Some(format!("journalctl could not be waited for: {e}")),
         };
@@ -1002,21 +982,20 @@ impl Reader {
         }
     }
 
-    /// The one `journalctl` command: the entries since `since`, with every
-    /// type it reads on it.
+    /// The one `journalctl` command: the last `window` entries of the four
+    /// types it reads, all on one child.
     ///
-    /// One child carries all four types. The window is a time and not a line
-    /// count, because a count shared with every host that uploads into the
-    /// directory covers a span that shrinks as the fleet grows. The read does not
-    /// follow: a follower over a remote journal that two hosts upload into shows
-    /// one host's entries and never the other's.
-    fn command(&self, since: SystemTime) -> Command {
-        let seconds = since
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+    /// The count is not a time, so it reads no clock and a node whose clock is
+    /// wrong is still read. It is sized in [`MIN_LINES`] and
+    /// [`LINES_PER_NODE`]. A count shared with every host that uploads into the
+    /// directory is enough only because it covers more than two poll intervals
+    /// of the whole fleet. The read does not follow: a follower over a remote
+    /// journal that two hosts upload into shows one host's entries and never the
+    /// other's.
+    fn command(&self) -> Command {
         let mut command = Command::new("journalctl");
         command
+            .arg(format!("--lines={}", self.window))
             // JSON output prints a field null when its name and value reach 4096 bytes
             // together, which for MESSAGE is a value of 4088. A metrics document is about
             // 6.4 KB, so every one of them would arrive null. A null is no MESSAGE, which this
@@ -1024,7 +1003,6 @@ impl Reader {
             // that the node has no metrics line at all.
             .arg("--all")
             .arg("--output=json")
-            .arg(format!("--since=@{seconds}"))
             .arg("--directory")
             .arg(self.dir.as_deref().unwrap_or(Path::new("")))
             .arg("M6_TYPE=perf")
@@ -1036,10 +1014,8 @@ impl Reader {
 
     /// Start the read's child.
     fn start(&mut self, now: Instant) {
-        let wall = m6_core::platform::wall();
         self.last_started = Some(now);
-        self.began = Some(wall);
-        let mut command = self.command(since(wall, self.last_ok, self.interval));
+        let mut command = self.command();
         // Only stdout is read. Stderr goes nowhere, as a reader that stops
         // draining it would otherwise stall journalctl.
         let streams = Streams {
@@ -1278,6 +1254,7 @@ mod tests {
     fn running(script: &str, interval: Duration) -> Reader {
         let mut reader = Reader::new(
             Some(PathBuf::from("/var/empty/journal")),
+            1,
             interval,
             &Limit::builtin(&m6_core::limits::JOURNAL_LINE),
             None,
@@ -1340,17 +1317,18 @@ mod tests {
         assert!(reason.contains('3'), "{reason}");
     }
 
-    /// The read does not follow and has no line count, and its window is a
-    /// time: `--since` is one argument.
+    /// The read does not follow, has no `--since`, and carries `--lines=N` as
+    /// one argument: three nodes sit under the floor of 200.
     #[test]
-    fn the_one_read_has_all_four_types_a_since_and_does_not_follow() {
+    fn the_one_read_has_all_four_types_lines_and_does_not_follow() {
         let reader = Reader::new(
             Some(PathBuf::from("/var/empty/journal")),
+            3,
             Duration::from_secs(30),
             &Limit::builtin(&m6_core::limits::JOURNAL_LINE),
             None,
         );
-        let command = reader.command(UNIX_EPOCH + Duration::from_secs(1_763_000_000));
+        let command = reader.command();
         let args: Vec<std::ffi::OsString> = command.get_args().map(|a| a.to_os_string()).collect();
         let types: Vec<String> = args
             .iter()
@@ -1376,14 +1354,13 @@ mod tests {
             "a read prints its window and exits: {text:?}"
         );
         assert!(
-            text.iter()
-                .all(|a| !a.starts_with("--lines") && !a.starts_with("-n")),
-            "the window is a time and not a line count: {text:?}"
+            text.iter().all(|a| !a.starts_with("--since")),
+            "the window reads no clock: {text:?}"
         );
         assert_eq!(
-            text.iter().filter(|a| *a == "--since=@1763000000").count(),
+            text.iter().filter(|a| *a == "--lines=200").count(),
             1,
-            "one --since, as one argument: {text:?}"
+            "one --lines, as one argument: {text:?}"
         );
         assert_eq!(
             args.iter().filter(|a| *a == "--directory").count(),
@@ -1400,49 +1377,63 @@ mod tests {
         );
     }
 
-    /// The first read reaches back past a traffic interval and a start-up
-    /// record. Later reads start before the last successful read by at least
-    /// one whole poll interval, so an upload that arrived late is read again.
+    /// The window is `max(200, 14 x nodes)` lines: a node writes about 7
+    /// matching lines a minute, so 14 per node is at least two minutes of the
+    /// fleet, more than two default poll intervals.
     #[test]
-    fn the_since_covers_an_interval_plus_a_margin() {
-        let interval = Duration::from_secs(30);
-        let now = UNIX_EPOCH + Duration::from_secs(1_763_000_000);
-        let first = now.duration_since(since(now, None, interval)).unwrap();
+    fn the_window_is_the_larger_of_the_floor_and_fourteen_lines_a_node() {
+        let limit = Limit::builtin(&m6_core::limits::JOURNAL_LINE);
+        let args = |nodes| {
+            let reader = Reader::new(
+                Some(PathBuf::from("/var/empty")),
+                nodes,
+                Duration::ZERO,
+                &limit,
+                None,
+            );
+            reader
+                .command()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert!(args(3).contains(&"--lines=200".to_string()), "the floor");
         assert!(
-            first >= Duration::from_secs(60) + INCOMPLETE_AFTER,
-            "the first read covers a traffic interval and a start-up record: {first:?}"
+            args(14).contains(&"--lines=200".to_string()),
+            "14 x 14 is under it"
         );
-        let last_ok = now - Duration::from_secs(5);
-        let next = last_ok
-            .duration_since(since(now, Some(last_ok), interval))
-            .unwrap();
-        assert!(
-            next >= interval,
-            "the margin is at least one interval: {next:?}"
-        );
-        // Nothing written since the last read began is outside the window.
-        assert!(since(now, Some(last_ok), interval) < last_ok);
+        assert!(args(40).contains(&"--lines=560".to_string()), "14 x 40");
+        // Two minutes of 7 lines a minute for each node, past two 30 s polls.
+        let lines = |nodes: usize| MIN_LINES.max(LINES_PER_NODE * nodes);
+        assert!(lines(40) >= 40 * 7 * 2);
     }
 
-    /// A read that fails does not move the next window: it starts from the
-    /// last read that succeeded.
+    /// A read killed at its deadline does not poison the next one: its child
+    /// is reaped, its pipe is closed, and the next read starts at once and with
+    /// the same window.
     #[test]
-    fn a_failed_read_does_not_move_the_window() {
-        let mut reader = running("exit 3", Duration::from_secs(30));
-        let good = UNIX_EPOCH + Duration::from_secs(1_763_000_000);
-        reader.last_ok = Some(good);
-        reader.began = Some(good + Duration::from_secs(30));
-        reader.drain(|_| {});
-        assert_eq!(
-            reader.last_ok,
-            Some(good),
-            "the failed read is not the start"
-        );
-
-        let mut done = running("exit 0", Duration::from_secs(30));
-        done.began = Some(good + Duration::from_secs(60));
-        done.drain(|_| {});
-        assert_eq!(done.last_ok, Some(good + Duration::from_secs(60)));
+    fn the_read_after_a_killed_one_starts_normally() {
+        let mut reader = running("sleep 30", Duration::from_secs(30));
+        let began = m6_core::platform::now();
+        reader.last_started = Some(began);
+        let before = reader
+            .command()
+            .get_args()
+            .map(|a| a.to_owned())
+            .collect::<Vec<_>>();
+        assert!(reader.expire(began + Duration::from_secs(30)));
+        reader.retire();
+        reaped(&mut reader);
+        assert!(reader.child.is_none() && reader.stdout.is_none());
+        let next = began + Duration::from_secs(31);
+        reader.start_if_idle(next);
+        assert_eq!(reader.last_started, Some(next), "the next read was started");
+        let after = reader
+            .command()
+            .get_args()
+            .map(|a| a.to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(before, after, "the same window");
     }
 
     /// A reader with no journal directory runs nothing on any tick, and keeps
@@ -1468,7 +1459,7 @@ mod tests {
     fn a_read_starts_at_most_once_per_interval() {
         let mut reader = running("exit 0", Duration::from_secs(30));
         reader.drain(|_| {});
-        let before = Instant::now();
+        let before = m6_core::platform::now();
         reader.last_started = Some(before);
         assert!(!reader.start_if_idle(before + Duration::from_secs(29)));
         assert_eq!(reader.last_started, Some(before), "nothing was started");
@@ -1481,7 +1472,7 @@ mod tests {
     #[test]
     fn a_stuck_read_past_its_deadline_is_killed() {
         let mut reader = running("sleep 30", Duration::from_secs(30));
-        let began = Instant::now();
+        let began = m6_core::platform::now();
         reader.last_started = Some(began);
         let pid = reader.child.as_ref().expect("a child").id();
         assert!(
@@ -1510,7 +1501,7 @@ mod tests {
 
     /// The reader side of the null: a metrics document of the size a real one is must
     /// arrive whole and be retained, and a null MESSAGE must be counted rather than read.
-    /// The argument itself is covered by `the_one_read_has_all_four_types_a_since_and_does_not_follow`,
+    /// The argument itself is covered by `the_one_read_has_all_four_types_lines_and_does_not_follow`,
     /// which fails if `--all` is removed; this test does not construct the command.
     #[test]
     fn a_metrics_document_over_4096_bytes_is_read_whole() {

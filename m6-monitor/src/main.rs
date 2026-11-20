@@ -214,6 +214,9 @@ fn run_service() -> Result<()> {
     let nodes = fleet
         .resolve(&tls)
         .unwrap_or_else(|e| fail("resolving the fleet", format!("{e:#}")));
+    // The journal read's `--lines` window follows the fleet count, so it is
+    // taken before the fleet moves into the poller.
+    let node_count = nodes.len();
     m6_core::ndjson::set_page_limit(site.limits().get(&m6_core::limits::NDJSON_PAGE));
     let nameserver = m6_core::dns::nameserver()
         .unwrap_or_else(|e| fail("reading the resolver configuration", e));
@@ -250,7 +253,7 @@ fn run_service() -> Result<()> {
     // never a refusal to start: the monitor's own page and check still run.
     let journal_limit = site.limits().get(&m6_core::limits::JOURNAL_LINE).clone();
     poller.journal = match fleet.journal_path(site.site_dir()) {
-        Ok(dir) => journal::Reader::open(&dir, interval, &journal_limit),
+        Ok(dir) => journal::Reader::open(&dir, node_count, interval, &journal_limit),
         Err(e) => {
             m6_core::log::error!(error = %format!("{e:#}"), "the journal cannot be read");
             journal::Reader::unavailable(format!("{e:#}"), &journal_limit)

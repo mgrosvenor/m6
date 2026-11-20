@@ -50,22 +50,23 @@ Section 2 follows one read of the journal, and section 3 the one input that is a
 ## 2. The journal reader
 
 The journal is read once at start and once each poll interval.
-Each read starts a `journalctl` child that prints a window of time and exits, and its stdout is one more descriptor in the monitor's event loop.
+Each read starts a `journalctl` child that prints the last lines and exits, and its stdout is one more descriptor in the monitor's event loop.
 
-`journal::Reader::open` starts `journalctl` with `--since=@<unix seconds>`, `--all`, `--output=json`, `--directory <journal_dir>`, and four matches: `M6_TYPE=perf`, `M6_TYPE=traffic`, `M6_TYPE=startup` and `M6_TYPE=shutdown`.
+`journal::Reader::open` starts `journalctl` with `--lines=<N>`, `--all`, `--output=json`, `--directory <journal_dir>`, and four matches: `M6_TYPE=perf`, `M6_TYPE=traffic`, `M6_TYPE=startup` and `M6_TYPE=shutdown`.
 One child carries all four types.
 `M6_TYPE` is the journal field `m6-log` writes for every line under systemd, set from the line's own `type` (`m6-log/src/journal.rs`), so the child selects the types before any JSON is parsed.
 `--all` is there because JSON output nulls a field whose name and value reach 4096 bytes together, and a metrics document is about 6.4 KB.
-The window is a time and never a line count, because the lines of one read are shared with every host that uploads into the directory.
-`--since` is one argument, and there is no `--lines`.
-The first read, at start and for `--check`, reaches back one hour (`journal::FIRST_READ_WINDOW`), which covers a traffic interval and a node's start-up record.
-Each later read starts two poll intervals before the start of the last read that succeeded, so an upload that arrives late is read the next time.
-A read that failed or was killed does not move the window.
+N is the larger of 200 and 14 for each `[[monitor.nodes]]` entry.
+A node writes about 7 matching lines a minute, 6 metrics documents at 10 seconds and 1 traffic document at 60, so 14 lines for each node cover at least two minutes of the whole fleet, which is more than two poll intervals at the default 30 seconds.
+Start-up lines share the window and shorten it a little, and the floor of 200 keeps a small fleet's window large enough to hold a start-up record.
+The count is not a time, so no read depends on the monitor's clock or a node's.
+The reads overlap, and each entry is taken once.
+A read that failed or was killed changes nothing for the next one.
 
 A read does not follow.
 `journalctl --follow` over a remote journal that two hosts upload into returns only one host's entries, whichever it started behind, and never the other's.
 The uploaders deliver their batches with different delays, so the lagging host's new entries are older than the follower's position and are never returned.
-The same command without `--follow` prints both hosts' entries every time, so the service reads a window of time and exits, the way `--check` always has.
+The same command without `--follow` prints both hosts' entries every time, so the service reads the last lines and exits, the way `--check` always has.
 
 The pipe is made non-blocking and registered under the `JOURNAL` token in `m6-monitor/src/main.rs`.
 The loop reads whole lines from it and hands each to `Poller::read_journal`, so the loop never waits on the child.
@@ -74,9 +75,10 @@ A read still in flight is not started again.
 A read still in flight one interval after it started is killed, reported in `Reader::stopped`, and the next read starts normally.
 The loop never waits for the child: `Reader::retire` reaps it only when it has exited, and a later pass reaps it otherwise.
 `journal::Latest` keeps the newest metrics document and the newest traffic document for each node name, and `Poller::record_journal` reads those two maps when a poll reaches its `Perf` and `Traffic` steps.
-It orders documents by the entry's `__REALTIME_TIMESTAMP`, which the receiving journal sets outside `MESSAGE`, and never by anything inside `MESSAGE`, which the node writes.
-An entry without it is counted as malformed, and an older entry read later does not replace a newer one.
-The windows overlap, so a start-up line that arrives again is counted once, by its recorded time and `seq`.
+It orders each node's documents by the entry's `__REALTIME_TIMESTAMP`, which a remote journal stores as the uploading node's own clock, so it orders one node's own entries and is never compared between nodes.
+Nothing inside `MESSAGE` orders anything, because the node writes all of it.
+An entry without the field is counted as malformed, and an older entry read later does not replace a newer one.
+The reads overlap, so a start-up line that arrives again is counted once, by its recorded time and `seq`.
 The same `ingest` call hands a `startup` or `shutdown` line to `journal::Startup`, which groups the several lines of one record by their shared `run_id`.
 
 A start-up record's node is the record's own `node` field.
@@ -88,8 +90,8 @@ The key the report shows is the node and the app, and the deploy's expectation f
 A record that reports no hostname is attributed to its app alone, and the check warns that a second host running the same app would be merged with it.
 
 A record is judged only when the monitor saw it from its first line.
-The read's window can start in the middle of a record, so a record whose first line seen is not `seq` 1 is counted in `Startup::cut` and neither shown nor judged.
-A record that started before the monitor did is shown as the current run and is not judged for its completeness or its restarts, because the window can cut its last lines as easily as its first.
+The read's `--lines` tail can start in the middle of a record, so a record whose first line seen is not `seq` 1 is counted in `Startup::cut` and neither shown nor judged.
+A record that started before the monitor did is shown as the current run and is not judged for its completeness or its restarts, because the tail can cut its last lines as easily as its first.
 A record still arriving after `journal::INCOMPLETE_AFTER`, 120 seconds, is moved to the report's unfinished list, which is how a start that never finishes becomes a finding.
 
 A `perf` or `traffic` line is attributed by the `node` field of the document inside `MESSAGE`, which is the value the node's own config gives `[node] name`.
@@ -374,7 +376,7 @@ One run with two config files, a clean shutdown and an expected restart before i
 ```
 
 A record that never closed reads `FAULT` on its line with the number of lines it received.
-The section also says when the journal window cut records and when shutdown lines named no run.
+The section also says when the journal tail cut records and when shutdown lines named no run.
 The rest is sections A to I: A LOGGING, B PERFORMANCE, C HOST, D SECURITY AND TRAFFIC, E CRAWLERS, F CACHE HEADERS, G CONNECTION SETUP, H TUNNELS, and I HISTORY.
 Section A judges the node's own log from the traffic document's `logging`, and `LoggingHealth::is_blind` faults a log silent for more than 40 seconds.
 

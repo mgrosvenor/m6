@@ -360,8 +360,9 @@ impl Poller {
         dir: Result<std::path::PathBuf, String>,
         limit: &m6_core::limits::Limit,
     ) {
+        let nodes = self.nodes.len();
         self.journal = match dir {
-            Ok(dir) => crate::journal::Reader::once(&dir, limit),
+            Ok(dir) => crate::journal::Reader::once(&dir, nodes, limit),
             Err(reason) => crate::journal::Reader::unavailable(reason, limit),
         };
         let Poller {
