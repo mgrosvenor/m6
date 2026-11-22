@@ -1,4 +1,4 @@
-{% extends "templates/base.html" %}
+{% extends "templates/base.html.tmpl" %}
 {% block title %}
   {%- set post = documents | filter(attribute="stem", value=stem) | first -%}
   {{ post.title }} · {{ site_name }}

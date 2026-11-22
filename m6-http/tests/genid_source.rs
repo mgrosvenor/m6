@@ -144,8 +144,12 @@ impl Fixture {
         std::fs::create_dir_all(site_dir.join("data")).unwrap();
         std::fs::create_dir_all(site_dir.join("posts")).unwrap();
         std::fs::create_dir_all(site_dir.join("configs")).unwrap();
-        std::fs::write(site_dir.join("templates/index.html"), "first: {{ title }}").unwrap();
-        std::fs::write(site_dir.join("templates/posts.html"), "a post page").unwrap();
+        std::fs::write(
+            site_dir.join("templates/index.html.tmpl"),
+            "first: {{ title }}",
+        )
+        .unwrap();
+        std::fs::write(site_dir.join("templates/posts.html.tmpl"), "a post page").unwrap();
         std::fs::write(site_dir.join("data/page.json"), "{\"title\": \"one\"}").unwrap();
         std::fs::write(site_dir.join("data/site.json"), "{}").unwrap();
         if let Some(conf) = html {
@@ -652,7 +656,7 @@ fn post_genid_needs_the_write_claim() {
 #[test]
 fn a_publish_reaches_the_cache_in_order() {
     let html = "global_params = [\"data/page.json\"]\n\n\
-                [[route]]\npath = \"/\"\ntemplate = \"templates/index.html\"\n";
+                [[route]]\npath = \"/\"\ntemplate = \"templates/index.html.tmpl\"\n";
     let fx = Fixture::new(
         "[[backend]]\nname = \"m6-html\"\nsockets = \"{DIR}/html-*.sock\"\n\n\
          [[route]]\npath = \"/\"\nbackend = \"m6-html\"\n",
@@ -777,7 +781,7 @@ fn a_publish_rebuilds_the_route_table() {
 #[test]
 fn a_failed_member_does_not_stop_the_advance() {
     let html = "global_params = [\"data/page.json\"]\n\n\
-                [[route]]\npath = \"/\"\ntemplate = \"templates/index.html\"\n";
+                [[route]]\npath = \"/\"\ntemplate = \"templates/index.html.tmpl\"\n";
     let fx = Fixture::new(
         "[[backend]]\nname = \"m6-html\"\nsockets = \"{DIR}/html-*.sock\"\n\n\
          [[route]]\npath = \"/\"\nbackend = \"m6-html\"\n\n\

@@ -522,7 +522,7 @@ fn handle_dashboard(req: &Request) -> Result<Response> {
     let drafts = req.list_json("content/drafts/").unwrap_or_default();
     let published = req.list_json("content/posts/").unwrap_or_default();
     Response::render_with(
-        "templates/cms/dashboard.html",
+        "templates/cms/dashboard.html.tmpl",
         req,
         json!({
             "drafts":    drafts,
@@ -533,7 +533,7 @@ fn handle_dashboard(req: &Request) -> Result<Response> {
 }
 
 fn handle_new(req: &Request) -> Result<Response> {
-    Response::render_with("templates/cms/editor.html", req, json!({"new": true}))
+    Response::render_with("templates/cms/editor.html.tmpl", req, json!({"new": true}))
 }
 
 fn handle_edit(req: &Request) -> Result<Response> {
@@ -541,7 +541,7 @@ fn handle_edit(req: &Request) -> Result<Response> {
     let post = req
         .read_json(&format!("content/drafts/{}.json", stem))
         .or_else(|_| req.read_json(&format!("content/posts/{}.json", stem)))?;
-    Response::render_with("templates/cms/editor.html", req, post)
+    Response::render_with("templates/cms/editor.html.tmpl", req, post)
 }
 
 fn handle_create_draft(req: &Request) -> Result<Response> {

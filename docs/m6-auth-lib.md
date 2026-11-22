@@ -420,7 +420,7 @@ fn open_state(site: &Site) -> anyhow::Result<State> {
 }
 
 fn show_form(req: &Request) -> Result<Response> {
-    Response::render("templates/signup.html", req)
+    Response::render("templates/signup.html.tmpl", req)
 }
 
 fn signup(req: &Request, state: &mut State) -> Result<Response> {
@@ -429,7 +429,7 @@ fn signup(req: &Request, state: &mut State) -> Result<Response> {
     match state.db.user_create(&username, &password, &["user"]) {
         Ok(_) => Ok(Response::redirect("/login?registered=1")),
         Err(AuthError::UserExists(_)) => Response::render_with(
-            "templates/signup.html",
+            "templates/signup.html.tmpl",
             req,
             json!({"error": "Username taken"}),
         ),

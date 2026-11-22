@@ -135,7 +135,7 @@ A renderer route names a template and the params file that feeds it:
 ```toml
 [[route]]
 path     = "/blog/{stem}"
-template = "templates/post.html"
+template = "templates/post.html.tmpl"
 params   = ["data/posts.json"]
 ```
 

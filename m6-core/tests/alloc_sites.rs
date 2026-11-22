@@ -142,7 +142,7 @@ fn report(label: &str, sites: &[(String, usize)]) {
 fn site() -> (Site, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().expect("a temp site");
     std::fs::create_dir_all(dir.path().join("templates")).expect("templates");
-    std::fs::write(dir.path().join("templates/page.html"), "<h1>page</h1>").expect("template");
+    std::fs::write(dir.path().join("templates/page.html.tmpl"), "<h1>page</h1>").expect("template");
     std::fs::write(
         dir.path().join("site.toml"),
         "[[backend]]\nname = \"m6-site\"\ncompresses = true\n",
@@ -152,7 +152,7 @@ fn site() -> (Site, tempfile::TempDir) {
     std::fs::write(
         &config_path,
         "[[route]]\npath = \"/ok\"\nhandler = \"ok\"\n\
-         [[route]]\npath = \"/page\"\ntemplate = \"templates/page.html\"\n",
+         [[route]]\npath = \"/page\"\ntemplate = \"templates/page.html.tmpl\"\n",
     )
     .expect("config");
 

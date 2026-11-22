@@ -1,4 +1,4 @@
-{% extends "templates/base.html" %}
+{% extends "templates/base.html.tmpl" %}
 {% block title %}
   {%- set _posts = documents | filter(attribute="stem", value=stem) -%}
   {%- if _posts | length > 0 -%}

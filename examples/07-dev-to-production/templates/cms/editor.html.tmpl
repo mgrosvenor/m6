@@ -1,4 +1,4 @@
-{% extends "templates/base.html" %}
+{% extends "templates/base.html.tmpl" %}
 {% block title %}{% if new %}New Post{% else %}Edit · {{ title | default(value=stem) }}{% endif %} · {{ site_name }}{% endblock %}
 {% block content %}
   <h1>{% if new %}New Post{% else %}Edit: {{ title | default(value=stem) }}{% endif %}</h1>

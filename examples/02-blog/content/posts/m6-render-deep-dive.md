@@ -49,17 +49,17 @@ global_params = ["data/site.json"]
 
 [[route]]
 path     = "/"
-template = "templates/home.html"
+template = "templates/home.html.tmpl"
 params   = ["data/home.json"]
 
 [[route]]
 path     = "/blog/{stem}"
-template = "templates/post.html"
+template = "templates/post.html.tmpl"
 params   = ["data/posts.json"]
 
 [[route]]
 path     = "/_errors"
-template = "templates/error.html"
+template = "templates/error.html.tmpl"
 params   = []
 cache    = "no-store"
 ```

@@ -135,7 +135,7 @@ fn handle_post(req: &Request, global: &Global, smtp: &mut Smtp) -> Result<Respon
         .map_err(|e| Error::Other(e.into()))?;
 
     Response::render_with(
-        "templates/contact.html",
+        "templates/contact.html.tmpl",
         req,
         json!({"sent": true, "name": name}),
     )

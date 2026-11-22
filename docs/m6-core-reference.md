@@ -258,6 +258,11 @@ A page past the limit's maximum is `RenderError::TooLarge`, and the client gets 
 
 `template` is the Tera implementation: `build_tera`, `build_tera_from_paths`, `TeraRenderer`, `TeraFactory` and `NOT_FOUND_SENTINEL`, which is how a template signals a 404 from inside rendering.
 
+Both builders treat a file as a template when its name ends `.tmpl`, and both walk every subdirectory of the template root.
+The Tera name is the path under the site directory with the suffix kept, so an include names the file it reads: `{% include "templates/icons/logo.svg.tmpl" %}`.
+The part before `.tmpl` names the output.
+Autoescaping follows that output part: `.html.tmpl`, `.htm.tmpl` and `.xml.tmpl` escape, and `.svg.tmpl`, `.txt.tmpl` and `.json.tmpl` do not.
+
 Both builders add the site filters and functions in Table 4 to the Tera instance, beside Tera's own.
 
 | name | kind | what it does |

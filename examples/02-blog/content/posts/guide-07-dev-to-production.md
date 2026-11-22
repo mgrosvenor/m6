@@ -100,7 +100,7 @@ global_params = ["data/site.json"]
 
 [[route]]
 path     = "/contact"
-template = "templates/contact.html"
+template = "templates/contact.html.tmpl"
 params   = []
 cache    = "no-store"
 

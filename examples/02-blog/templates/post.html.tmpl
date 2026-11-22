@@ -1,4 +1,4 @@
-{% extends "templates/base.html" %}
+{% extends "templates/base.html.tmpl" %}
 {% block title %}
   {%- set post_list = documents | filter(attribute="stem", value=stem) -%}
   {%- if post_list | length == 0 %}{{ not_found() }}{% endif -%}

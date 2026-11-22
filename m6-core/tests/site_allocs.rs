@@ -98,7 +98,7 @@ fn site() -> (Site, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().expect("a temp site");
     std::fs::create_dir_all(dir.path().join("templates")).expect("templates");
     std::fs::write(
-        dir.path().join("templates/index.html"),
+        dir.path().join("templates/index.html.tmpl"),
         "<html><body><h1>{{ title }}</h1></body></html>",
     )
     .expect("template");
@@ -111,7 +111,7 @@ fn site() -> (Site, tempfile::TempDir) {
     let config_path = dir.path().join("m6-site.toml");
     std::fs::write(
         &config_path,
-        "[[route]]\npath = \"/\"\ntemplate = \"templates/index.html\"\n\
+        "[[route]]\npath = \"/\"\ntemplate = \"templates/index.html.tmpl\"\n\
          params = [\"data.json\"]\n",
     )
     .expect("config");

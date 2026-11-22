@@ -99,18 +99,18 @@ No `[[route_group]]`. The routes are fixed patterns — m6-html handles any `/bl
 ```toml
 [[route]]
 path     = "/blog"
-template = "templates/post-index.html"
+template = "templates/post-index.html.tmpl"
 params   = ["data/posts.json"]
 
 [[route]]
 path     = "/blog/{stem}"
-template = "templates/post.html"
+template = "templates/post.html.tmpl"
 params   = ["data/posts.json"]
 ```
 
 Both routes load the same file. The index template iterates `documents`. The post template filters by `stem`.
 
-## `templates/post-index.html`
+## `templates/post-index.html.tmpl`
 
 ```html
 {% extends "base.html" %}
@@ -129,7 +129,7 @@ Both routes load the same file. The index template iterates `documents`. The pos
 
 Note: links use `/blog/{{ doc.stem }}` — not `{{ doc.path }}`. The `path` field from m6-md is `/{stem}` (without the `/blog/` prefix). Use `doc.stem` to construct URLs in a blog context.
 
-## `templates/post.html`
+## `templates/post.html.tmpl`
 
 ```html
 {% extends "base.html" %}
