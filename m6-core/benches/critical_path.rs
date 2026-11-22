@@ -139,6 +139,19 @@ const JSON_1KB: &[u8] = b"{
 /// Minimal Tera template — one variable substitution.
 const MINIMAL_TEMPLATE: &str = "<!doctype html><html><body><h1>{{ title }}</h1></body></html>";
 
+/// A Tera instance carrying production's autoescaping, for the render benches.
+///
+/// `m6_core::template::new_tera` (`m6-core/src/template.rs:140-142`) is private
+/// to its crate, so the suffixes are repeated here. They must match that list:
+/// without them a template named `page.html.tmpl` does not end in a suffix Tera
+/// knows, renders unescaped, and the bench measures a path production never
+/// runs. Change the two lists together.
+fn production_tera() -> tera::Tera {
+    let mut tera = tera::Tera::default();
+    tera.autoescape_on(vec![".html.tmpl", ".htm.tmpl", ".xml.tmpl"]);
+    tera
+}
+
 fn make_routes() -> RouteTable {
     let patterns = &[
         ("/", RouteMethod::Any),
@@ -309,7 +322,7 @@ fn bench_template_render(c: &mut Criterion) {
     let tmpl_path = dir.path().join("page.html.tmpl");
     std::fs::write(&tmpl_path, MINIMAL_TEMPLATE).unwrap();
 
-    let mut tera = tera::Tera::default();
+    let mut tera = production_tera();
     tera.add_template_file(&tmpl_path, Some("page.html.tmpl"))
         .unwrap();
 
@@ -407,9 +420,9 @@ size = 64
 
         let config = m6_core::config::load(&cfg_path2, &site_dir).unwrap();
 
-        // Build Tera directly.
+        // Build Tera with production's autoescaping.
         let tmpl_path = site_dir.join("templates/page.html.tmpl");
-        let mut tera = tera::Tera::default();
+        let mut tera = production_tera();
         tera.add_template_file(&tmpl_path, Some("templates/page.html.tmpl"))
             .unwrap();
 
@@ -674,7 +687,7 @@ fn main() {
             .unwrap();
         let tmpl_path = dir.path().join("page.html.tmpl");
         std::fs::write(&tmpl_path, MINIMAL_TEMPLATE).unwrap();
-        let mut tera = tera::Tera::default();
+        let mut tera = production_tera();
         tera.add_template_file(&tmpl_path, Some("page.html.tmpl"))
             .unwrap();
         let mut ctx = tera::Context::new();
@@ -732,7 +745,7 @@ size = 64
             let listener = std::os::unix::net::UnixListener::bind(&sock_path2).unwrap();
             let config = m6_core::config::load(&cfg_path2, &site_dir2).unwrap();
             let tmpl_path = site_dir2.join("templates/page.html.tmpl");
-            let mut tera = tera::Tera::default();
+            let mut tera = production_tera();
             tera.add_template_file(&tmpl_path, Some("templates/page.html.tmpl"))
                 .unwrap();
             let routes2 = RouteTable::new(

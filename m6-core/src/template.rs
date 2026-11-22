@@ -122,13 +122,21 @@ pub fn build_tera_from_paths(site_dir: &Path, template_paths: &[String]) -> anyh
     Ok(tera)
 }
 
-/// A Tera instance that escapes the same templates it did before the rename.
+/// A Tera instance that escapes the same output kinds it did before the rename.
 ///
 /// Tera chooses autoescaping from the template name's suffix, and every name now
-/// ends `.tmpl`, which it does not know. The output part of the name still says
-/// what the template produces, so `.html.tmpl`, `.htm.tmpl` and `.xml.tmpl`
-/// escape as `.html`, `.htm` and `.xml` did, and a `.svg.tmpl`, `.txt.tmpl` or
-/// `.json.tmpl` stays unescaped as before.
+/// ends `.tmpl`, which it does not know. The explicit list restores what the old
+/// names got by suffix: `.html.tmpl`, `.htm.tmpl` and `.xml.tmpl` escape as
+/// `.html`, `.htm` and `.xml` did, and `.txt.tmpl` and `.json.tmpl` stay
+/// unescaped as they were.
+///
+/// Two kinds changed class. An icon was `*.svg.html` and the stylesheet was
+/// `_style.css.html`, so both ended `.html` and were escaped; `*.svg.tmpl` and
+/// `*.css.tmpl` are not. Nothing observable changes, because neither is ever
+/// rendered as a root: they are included from an `.html.tmpl` page, and Tera
+/// renders an include with the root's escaping flag, so a value in an icon or
+/// the stylesheet is escaped exactly as before. Rendered as a root instead, the
+/// same file would now emit its substitutions raw.
 fn new_tera() -> Tera {
     let mut tera = Tera::default();
     tera.autoescape_on(vec![".html.tmpl", ".htm.tmpl", ".xml.tmpl"]);
@@ -645,6 +653,12 @@ mod template_loader_tests {
     /// Tera escapes by suffix, and the suffix is now `.tmpl`. Without the
     /// explicit list every HTML template would stop escaping, which changes the
     /// bytes of every page that renders a value.
+    ///
+    /// The suffix decides escaping for a *root* render. An include is rendered
+    /// by the root's processor and inherits the root's flag, so an icon included
+    /// from an `.html.tmpl` page is escaped even though an `.svg.tmpl` root is
+    /// not. Both halves are asserted here: production's icons are includes, so
+    /// the root-only assertion teaches the opposite of what they do.
     #[test]
     fn autoescaping_follows_the_output_part_of_the_name() {
         let site = tempfile::tempdir().unwrap();
@@ -652,6 +666,11 @@ mod template_loader_tests {
         write(site.path(), "templates/feed.xml.tmpl", "{{ value }}");
         write(site.path(), "templates/robots.txt.tmpl", "{{ value }}");
         write(site.path(), "templates/icon.svg.tmpl", "{{ value }}");
+        write(
+            site.path(),
+            "templates/icon-page.html.tmpl",
+            r#"<div>{% include "templates/icon.svg.tmpl" %}</div>"#,
+        );
 
         let tera = build_tera(site.path()).unwrap();
         let mut ctx = tera::Context::new();
@@ -669,9 +688,16 @@ mod template_loader_tests {
             tera.render("templates/robots.txt.tmpl", &ctx).unwrap(),
             "<a & b>"
         );
+        // Root render of an icon: `.svg.tmpl` is not in the escape list.
         assert_eq!(
             tera.render("templates/icon.svg.tmpl", &ctx).unwrap(),
             "<a & b>"
+        );
+        // The same icon as production uses it, included from an HTML page: the
+        // root escapes, so the icon's substitution is escaped too.
+        assert_eq!(
+            tera.render("templates/icon-page.html.tmpl", &ctx).unwrap(),
+            "<div>&lt;a &amp; b&gt;</div>"
         );
     }
 }
