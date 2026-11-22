@@ -2004,7 +2004,7 @@ dependencies = [
 
 [[package]]
 name = "m6-auth"
-version = "1.16.0-rc.1"
+version = "1.17.0-rc.1"
 dependencies = [
  "anyhow",
  "bcrypt",
@@ -2023,7 +2023,7 @@ dependencies = [
 
 [[package]]
 name = "m6-auth-cli"
-version = "1.16.0-rc.1"
+version = "1.17.0-rc.1"
 dependencies = [
  "anyhow",
  "m6-auth",
@@ -2038,7 +2038,7 @@ dependencies = [
 
 [[package]]
 name = "m6-auth-server"
-version = "1.16.0-rc.1"
+version = "1.17.0-rc.1"
 dependencies = [
  "anyhow",
  "hex",
@@ -2056,7 +2056,7 @@ dependencies = [
 
 [[package]]
 name = "m6-core"
-version = "1.16.0-rc.1"
+version = "1.17.0-rc.1"
 dependencies = [
  "aho-corasick 1.1.5",
  "anyhow",
@@ -2107,18 +2107,18 @@ dependencies = [
 
 [[package]]
 name = "m6-example-rust-m6core"
-version = "1.16.0-rc.1"
+version = "1.17.0-rc.1"
 dependencies = [
  "m6-core",
 ]
 
 [[package]]
 name = "m6-example-rust-plain"
-version = "1.16.0-rc.1"
+version = "1.17.0-rc.1"
 
 [[package]]
 name = "m6-file"
-version = "1.16.0-rc.1"
+version = "1.17.0-rc.1"
 dependencies = [
  "anyhow",
  "criterion",
@@ -2134,7 +2134,7 @@ dependencies = [
 
 [[package]]
 name = "m6-html"
-version = "1.16.0-rc.1"
+version = "1.17.0-rc.1"
 dependencies = [
  "anyhow",
  "brotli 6.0.0",
@@ -2146,7 +2146,7 @@ dependencies = [
 
 [[package]]
 name = "m6-http"
-version = "1.16.0-rc.1"
+version = "1.17.0-rc.1"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
@@ -2185,7 +2185,7 @@ dependencies = [
 
 [[package]]
 name = "m6-log"
-version = "1.16.0-rc.1"
+version = "1.17.0-rc.1"
 dependencies = [
  "criterion",
  "itoa",
@@ -2198,7 +2198,7 @@ dependencies = [
 
 [[package]]
 name = "m6-md"
-version = "1.16.0-rc.1"
+version = "1.17.0-rc.1"
 dependencies = [
  "anyhow",
  "comrak",
@@ -2212,7 +2212,7 @@ dependencies = [
 
 [[package]]
 name = "m6-monitor"
-version = "1.16.0-rc.1"
+version = "1.17.0-rc.1"
 dependencies = [
  "anyhow",
  "m6-core",
@@ -2227,7 +2227,7 @@ dependencies = [
 
 [[package]]
 name = "m6-platform"
-version = "1.16.0-rc.1"
+version = "1.17.0-rc.1"
 dependencies = [
  "libc",
  "libproc",
