@@ -561,7 +561,7 @@ Nine binaries that run without libtest's harness (the allocation counters and th
 Five shipping reads that asked the operating system directly now take the time from `m6_core::platform::now()` or `wall()`, and `chrono` only formats a value it is given.
 Verified: the platform gate on Linux and macOS.
 
-**The minimum supported Rust version is 1.89** (was 1.88), the version the updated SQLite binding requires.
+**The minimum supported Rust version is 1.98**, which `oxc` 0.159 requires for the JavaScript minifier. The workspace summary and Migration step 10 above say the same, and no other line in the tree states a current minimum of 1.89.
 
 **m6-http drives only the connections that have events, accepts only when a client is waiting, and resumes a blocked write when the socket can take more.** Every HTTP/1.1 connection shared the listener's token, so any event drove every connection and tried a failing accept, and a response that filled the socket buffer waited for the next unrelated wake-up. Each descriptor now has its own token, each turn reads and writes until the socket would block, a connection with unsent bytes asks for write readiness, and idle and read timeouts are deadlines rather than checks on every pass. On the build host this removed one failing accept4 per loop pass and one or two recvfrom calls per request.
 

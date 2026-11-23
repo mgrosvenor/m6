@@ -419,9 +419,21 @@ fn run_service() -> Result<()> {
                                         drop(stream);
                                         Ok(())
                                     }) {
-                                        Ok(()) => {
+                                        Ok(m6_core::platform::net::RejectOutcome::Refused) => {
                                             refusals.refused();
                                             continue;
+                                        }
+                                        Ok(m6_core::platform::net::RejectOutcome::Nothing) => {
+                                            continue
+                                        }
+                                        Ok(m6_core::platform::net::RejectOutcome::Failed(e)) => {
+                                            m6_core::log::warn!(error = %e, "accept failed while refusing a queued connection");
+                                            poll.registry().reregister(
+                                                &mut listener,
+                                                LISTENER,
+                                                Interest::READABLE,
+                                            )?;
+                                            break;
                                         }
                                         Err(e) => {
                                             // The reserve is gone, so the next
@@ -495,9 +507,11 @@ fn run_service() -> Result<()> {
                             // deadline passes. Nothing accepted means nothing
                             // to wait for.
                             stop_accepting(poll.registry(), &mut listener, &mut accepting)?;
-                            if drain.start(now) {
-                                break 'run;
-                            }
+                            // Do not leave here even when nothing is in
+                            // flight: the zero-timeout turn the drain gives
+                            // the loop is what reads a request already in a
+                            // kept-alive socket. `step` decides, after it.
+                            drain.start(now);
                         }
                     }
                 }

@@ -174,9 +174,22 @@ fn main() -> anyhow::Result<()> {
                                         drop(stream);
                                         Ok(())
                                     }) {
-                                        Ok(()) => {
+                                        Ok(RejectOutcome::Refused) => {
                                             refusals.refused();
                                             continue;
+                                        }
+                                        Ok(RejectOutcome::Nothing) => continue,
+                                        Ok(RejectOutcome::Failed(e)) => {
+                                            m6_core::log::warn!(
+                                                error = %e,
+                                                "accept failed while refusing a queued connection"
+                                            );
+                                            poll.registry().reregister(
+                                                &mut listener,
+                                                LISTENER,
+                                                Interest::READABLE,
+                                            )?;
+                                            break;
                                         }
                                         Err(e) => {
                                             m6_core::log::warn!(
@@ -234,9 +247,11 @@ fn main() -> anyhow::Result<()> {
                                 poll.registry().deregister(&mut listener)?;
                                 accepting = false;
                             }
-                            if drain.start(m6_core::platform::now()) {
-                                break 'run;
-                            }
+                            // Do not leave here: a stop with nothing in
+                            // flight still gets one non-blocking turn, so a
+                            // request already waiting in a kept-alive socket
+                            // is read. `step` decides after that turn.
+                            drain.start(m6_core::platform::now());
                         }
                     }
                 }
@@ -469,7 +484,7 @@ Table 5 is the reserved set, and a key in it never reaches a template.
 | `[params_cache]` | core | `size`, default 256 entries |
 | `[server]` | core | `read_timeout_s`, default 30, `0` disables. `drain_timeout_s`, default 30, how long shutdown waits for accepted requests, `0` waits for none. `socket_mode`, an octal string as systemd writes it, default `"0660"` |
 | `[compression]` | core | brotli and gzip levels per MIME type |
-| `[minification]` | core | on or off per MIME type, plus `inline_js` for classic inline scripts. A module script and a non-JavaScript `<script>` type keep their bytes. A `no-store` response is minified like any other. A build without the `minify` feature refuses a config that turns it on |
+| `[minification]` | core | on or off per MIME type, plus `inline_js` for inline scripts. A `.mjs` file and a `type="module"` inline script are parsed as modules; a non-JavaScript `<script>` type keeps its bytes. A `no-store` response is minified like any other. A build without the `minify` feature refuses a config that turns it on |
 | `[log]` | core | `level`, default `info` |
 | `[limits.<name>]` | core | `start` and `max` of a named buffer or queue, §4.2 and Table 6 |
 | `[[route]]` | core | the configuration route table, §5 |
@@ -553,6 +568,8 @@ A key under `[limits]` that is not in the table stops the process at start with 
 | `connections` | slots | 1024 | 1048576 | services, m6-http | the connection table, lowered by the open-file limit | the kernel backlog holds the connection |
 | `compress_output` | bytes | 64 KiB | 128 MiB | services | the response a compressor reads | 500 |
 | `minify_output` | bytes | 64 KiB | 128 MiB | services | the response a minifier reads | 500 |
+| `minify_parse` | bytes | 1 MiB | 1 MiB | services | the largest JavaScript body a minifier parses, so the loop's parse work per file version | the body is served as written, with one line |
+| `minify_nesting` | levels | 1024 | 1024 | services | the deepest bracket nesting a minifier parses, so a recursive descent cannot exhaust the stack | the body is served as written, with one line |
 | `smtp_reply` | bytes | 512 B | 128 KiB | services with mail | one relay reply | the send fails |
 | `ndjson_page` | bytes | 4 MiB | 64 MiB | m6-monitor | the default page and the largest row of an ndjson stream | the row is refused |
 | `tail_read` | bytes | 64 KiB | 512 KiB | m6-file | one page of a tail response, and the window a last-N-lines request scans | a client further behind reads the next page from `X-Log-End`, and N lines that do not fit in a page are 413 |

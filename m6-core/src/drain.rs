@@ -59,6 +59,11 @@ pub struct Drain {
     in_flight: AtomicUsize,
     /// Whether each connection slot holds accepted work. One byte per slot.
     counted: Vec<bool>,
+    /// Set when the stop arrived with nothing in flight. The loop gets one
+    /// non-blocking turn before it may leave, so a request already waiting in
+    /// a kept-alive connection's socket is read and answered rather than
+    /// closed under the client.
+    idle_turn: bool,
 }
 
 impl Drain {
@@ -69,6 +74,7 @@ impl Drain {
             until: None,
             in_flight: AtomicUsize::new(0),
             counted: vec![false; slots],
+            idle_turn: false,
         }
     }
 
@@ -112,17 +118,35 @@ impl Drain {
         self.until.is_some()
     }
 
-    /// Take the stop. Returns true when nothing is in flight, so the loop
-    /// leaves at once instead of waiting out a deadline with no work.
+    /// Take the stop. Returns true when nothing was in flight, in which case
+    /// the loop still gets one non-blocking turn ([`Self::poll_timeout`] returns
+    /// zero once) before [`Self::step`] lets it leave.
+    ///
+    /// The count is per accepted connection, and a kept-alive connection that
+    /// has answered a request is released. A request the client sent after that
+    /// and that is already in the kernel's receive buffer is accepted work the
+    /// service still owes an answer, but no `begin` has run for it yet, so the
+    /// count alone cannot see it. The turn is what gives its socket the chance
+    /// to report.
     pub fn start(&mut self, now: Instant) -> bool {
         self.until = Some(now + self.timeout);
-        self.in_flight() == 0
+        let idle = self.in_flight() == 0;
+        self.idle_turn = idle;
+        idle
     }
 
     /// The longest the loop may wait while draining. A wait capped at the
     /// deadline is what makes the deadline hold when nothing else wakes the
     /// loop.
-    pub fn poll_timeout(&self, now: Instant) -> Option<Duration> {
+    ///
+    /// The one turn after a stop that found nothing in flight waits zero, so
+    /// the loop asks for readiness without blocking and then leaves if no
+    /// socket reported.
+    pub fn poll_timeout(&mut self, now: Instant) -> Option<Duration> {
+        if self.idle_turn {
+            self.idle_turn = false;
+            return Some(Duration::ZERO);
+        }
         self.until.map(|until| until.saturating_duration_since(now))
     }
 
@@ -130,31 +154,19 @@ impl Drain {
     pub fn step(&mut self, now: Instant) -> Step {
         let left = self.in_flight();
         if left == 0 {
+            // One turn for a request already waiting in a socket. `poll_timeout`
+            // consumes the flag when it gives that turn its zero wait, so this
+            // branch runs once before the next `step` may finish.
+            if self.idle_turn {
+                return Step::Draining;
+            }
             return Step::Finished;
         }
+        self.idle_turn = false;
         match self.until {
             Some(until) if now >= until => Step::DeadlinePassed(left),
             _ => Step::Draining,
         }
-    }
-
-    /// A guard that ends the work on drop.
-    ///
-    /// The loop releases by slot at the close, so it does not need this. It is
-    /// how work that unwinds still stops counting: a caller that runs a
-    /// request under a guard releases it on the panic path too.
-    pub fn guard(&self) -> InFlight<'_> {
-        self.in_flight.fetch_add(1, Ordering::SeqCst);
-        InFlight(&self.in_flight)
-    }
-}
-
-/// One counted request, released when dropped.
-pub struct InFlight<'a>(&'a AtomicUsize);
-
-impl Drop for InFlight<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -226,13 +238,42 @@ mod tests {
         );
     }
 
-    /// Nothing accepted means shutdown is immediate: the loop does not wait out
-    /// a deadline with no work.
+    /// Nothing accepted means shutdown is one non-blocking turn: the loop asks
+    /// for readiness without waiting, then leaves. The turn is what sees a
+    /// request already sitting in a kept-alive socket.
     #[test]
-    fn nothing_in_flight_stops_at_once() {
+    fn nothing_in_flight_stops_after_one_nonblocking_turn() {
         let mut drain = Drain::new(DRAIN_LONG, 1);
         let now = crate::platform::now();
         assert!(drain.start(now));
+        assert_eq!(
+            drain.step(now),
+            Step::Draining,
+            "the zero-in-flight stop gets one turn"
+        );
+        assert_eq!(
+            drain.poll_timeout(now),
+            Some(Duration::ZERO),
+            "that turn must not block"
+        );
+        assert_eq!(drain.step(now), Step::Finished);
+    }
+
+    /// A request that arrives on a kept-alive connection after the stop is
+    /// counted in the turn and holds the drain open. The wrong outcome: the
+    /// stop finds zero and the process closes the socket without reading the
+    /// request the kernel already holds.
+    #[test]
+    fn a_request_waiting_at_the_stop_holds_the_drain_open() {
+        let mut drain = Drain::new(DRAIN_LONG, 1);
+        let now = crate::platform::now();
+        assert!(drain.start(now));
+        assert_eq!(drain.step(now), Step::Draining);
+        // The non-blocking turn sees the ready socket and counts it.
+        assert_eq!(drain.poll_timeout(now), Some(Duration::ZERO));
+        drain.begin(0);
+        assert_eq!(drain.step(now), Step::Draining);
+        drain.end(0);
         assert_eq!(drain.step(now), Step::Finished);
     }
 
@@ -255,19 +296,5 @@ mod tests {
         assert_eq!(drain.step(now), Step::Draining);
         drain.end(0);
         assert_eq!(drain.step(now), Step::Finished);
-    }
-
-    /// Work that panics stops counting, so an unwinding handler cannot hold a
-    /// drain open. The loop itself unwinds the process, so the guard is what a
-    /// caller that catches the panic runs.
-    #[test]
-    fn work_that_panics_is_no_longer_in_flight() {
-        let drain = Drain::new(DRAIN_LONG, 1);
-        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _held = drain.guard();
-            panic!("handler failed");
-        }));
-        assert!(panicked.is_err());
-        assert_eq!(drain.in_flight(), 0);
     }
 }

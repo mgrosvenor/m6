@@ -26,7 +26,7 @@ fn html_response(html: String) -> Response {
 }
 
 use m6_core::compress::{brotli_compress, gzip_compress};
-use m6_core::minify::{minify_css, minify_html, minify_json};
+use m6_core::minify::{minify_css, minify_html, minify_js, minify_json};
 use m6_core::request::{parse_cookies, parse_query_string};
 use m6_core::response::Response;
 use m6_core::server::write_response;
@@ -133,6 +133,11 @@ const JSON_1KB: &[u8] = b"{
   \"read_time_minutes\": 8,
   \"views\": 12483
 }";
+
+/// A realistic third-party script, the same d3 build the JavaScript tests
+/// round-trip. `minify_js`'s cost is the request-path cost the server paid per
+/// request before the minified body was cached per file version.
+const JS_D3: &str = include_str!("../tests/fixtures/d3.v7.9.0.js");
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -562,6 +567,22 @@ fn bench_minify(c: &mut Criterion) {
     group.finish();
 }
 
+/// JavaScript: the uncached parse (the request path before the per-version
+/// cache) against serving the stored body (the cached path). The metric the
+/// owner set is the cached path; a cached body must be a copy, not a parse.
+fn bench_minify_js(c: &mut Criterion) {
+    let mut group = c.benchmark_group("minify_js");
+    group.sample_size(20);
+    group.bench_function("d3_280kb_uncached", |b| {
+        b.iter(|| black_box(minify_js(black_box(JS_D3.as_bytes()))))
+    });
+    let stored = minify_js(JS_D3.as_bytes());
+    group.bench_function("d3_280kb_cached_copy", |b| {
+        b.iter(|| black_box(stored.clone()))
+    });
+    group.finish();
+}
+
 // ── Minify + compress pipeline ────────────────────────────────────────────────
 
 fn bench_minify_then_compress(c: &mut Criterion) {
@@ -594,6 +615,7 @@ criterion_group!(
     bench_socket_round_trip,
     bench_compress,
     bench_minify,
+    bench_minify_js,
     bench_minify_then_compress,
 );
 
@@ -852,6 +874,21 @@ size = 64
     });
     report_percentiles("minify json 1KB", N_MIN, || {
         black_box(minify_json(black_box(JSON_1KB)));
+    });
+    // The cached-path A/B. `uncached` is what rc.1 paid on every request;
+    // `cached_copy` is what rc.2 pays after the first read of a file version.
+    const N_JS: usize = 200;
+    let stored_js = minify_js(JS_D3.as_bytes());
+    println!(
+        "\n── JavaScript minification (d3 7.9.0, {} bytes -> {} bytes) ──────────────",
+        JS_D3.len(),
+        stored_js.len()
+    );
+    report_percentiles("js d3: parse+minify (uncached, rc.1 path)", N_JS, || {
+        black_box(minify_js(black_box(JS_D3.as_bytes())));
+    });
+    report_percentiles("js d3: cached body copy (rc.2 path)", N_MIN, || {
+        black_box(stored_js.clone());
     });
 
     // ── Minify + compress pipeline ────────────────────────────────────────────

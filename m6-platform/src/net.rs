@@ -283,6 +283,21 @@ pub fn accept_error(e: &io::Error) -> Accept {
     }
 }
 
+/// What one [`SpareDescriptor::reject_one`] call did with the queued
+/// connection.
+#[derive(Debug)]
+pub enum RejectOutcome {
+    /// The connection was taken and closed: the service refused it, and it is
+    /// counted.
+    Refused,
+    /// Nothing was taken: the queue was already empty, or the kernel reset the
+    /// connection before `accept` could take it. Nothing was refused.
+    Nothing,
+    /// `accept` failed for a reason that is not a refusal. The reserve is held
+    /// again, and the caller must log this rather than count it.
+    Failed(io::Error),
+}
+
 /// The descriptor an accept loop keeps in reserve, so that running out of
 /// descriptors refuses the queued connection instead of stalling the listener.
 ///
@@ -323,12 +338,6 @@ impl SpareDescriptor {
         Self::new(socket2::Domain::UNIX)
     }
 
-    /// Whether the reserve is held. A reserve that could not be reopened is
-    /// not, and the loop then reports the failure rather than pretending.
-    pub fn is_held(&self) -> bool {
-        self.fd.is_some()
-    }
-
     /// Take and close the connection the kernel has queued, using the reserve.
     ///
     /// The reserve is closed first, then `accept` runs (it must take one
@@ -336,21 +345,39 @@ impl SpareDescriptor {
     /// therefore runs while the reserve's descriptor is free, which is the
     /// descriptor the queued connection is taken in.
     ///
-    /// `Ok` means one connection was refused and the reserve is held again, so
-    /// the caller counts the refusal and keeps draining. The queue entry was
-    /// either taken and closed, or the kernel reset it first, which is what
-    /// macOS does when `accept` cannot allocate the descriptor: either way the
-    /// connection was not served. An error is the reserve failing to reopen,
-    /// and then the next shortage cannot be handled.
-    pub fn reject_one(&mut self, accept: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+    /// The reserve is held again on every return except the one error it can
+    /// report, the reserve failing to reopen. That error is the caller's to
+    /// handle, because the next shortage cannot be.
+    ///
+    /// The accept's own outcome is returned rather than discarded. An accept
+    /// loop writes a line per refusal and the count must be exact, so
+    /// [`RejectOutcome::Refused`] is the only outcome a caller may count:
+    /// an emptied queue (`EAGAIN`) or a connection the kernel reset before
+    /// `accept` could take it (`ECONNABORTED`/`ECONNRESET`) is
+    /// [`RejectOutcome::Nothing`], and any other error is
+    /// [`RejectOutcome::Failed`] and must reach the log instead of being
+    /// counted as a refusal.
+    pub fn reject_one(
+        &mut self,
+        accept: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<RejectOutcome> {
         // Dropping the reserve closes it: the queued connection needs the
         // descriptor number it held.
         self.fd = None;
         let taken = accept();
         let fd = self.open()?;
         self.fd = Some(fd);
-        drop(taken);
-        Ok(())
+        Ok(match taken {
+            Ok(()) => RejectOutcome::Refused,
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::ConnectionAborted
+                    || e.kind() == io::ErrorKind::ConnectionReset =>
+            {
+                RejectOutcome::Nothing
+            }
+            Err(e) => RejectOutcome::Failed(e),
+        })
     }
 
     fn open(&self) -> io::Result<OwnedFd> {
@@ -786,8 +813,53 @@ mod tests {
             Err(io::Error::from(io::ErrorKind::WouldBlock))
         });
         assert!(ran, "the caller's accept ran with the reserve free");
-        assert!(outcome.is_ok(), "the reserve was taken back");
-        assert!(unix.is_held(), "held again after it was spent");
+        assert!(
+            matches!(outcome, Ok(RejectOutcome::Nothing)),
+            "an emptied queue refused nothing, and the reserve was taken back"
+        );
+        assert!(unix.fd.is_some(), "held again after it was spent");
+    }
+
+    /// The reserve reports what the accept did: a taken connection is a
+    /// refusal and is counted; an emptied queue or a connection the kernel
+    /// reset before it could be taken is not; any other failure is carried to
+    /// the caller's log.
+    ///
+    /// Break: `Ok(())` for every outcome, which counts a refusal that never
+    /// happened and swallows a real accept error.
+    #[test]
+    fn reject_one_reports_the_accept_outcome() {
+        let mut spare = SpareDescriptor::for_unix().expect("a unix reserve");
+
+        let refused = spare.reject_one(|| Ok(())).expect("the reserve reopens");
+        assert!(matches!(refused, RejectOutcome::Refused));
+        assert!(spare.fd.is_some(), "the reserve is held again");
+
+        for gone in [
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::ConnectionReset,
+        ] {
+            let outcome = spare
+                .reject_one(|| Err(io::Error::from(gone)))
+                .expect("the reserve reopens");
+            assert!(
+                matches!(outcome, RejectOutcome::Nothing),
+                "{gone:?} refused nothing"
+            );
+            assert!(spare.fd.is_some(), "the reserve is held again");
+        }
+
+        let failed = spare
+            .reject_one(|| Err(io::Error::from(io::ErrorKind::PermissionDenied)))
+            .expect("the reserve reopens");
+        match failed {
+            RejectOutcome::Failed(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("a real accept error must reach the caller: {other:?}"),
+        }
+        assert!(spare.fd.is_some(), "the reserve is held again");
     }
 
     /// A send the socket stops part way reports the datagrams it took, and the

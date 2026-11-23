@@ -272,6 +272,9 @@ impl RendererConfig {
 
         let server = serde_json::json!({
             "read_timeout_s": self.server.read_timeout.map(|d| d.as_secs()),
+            // The setting an operator sizes a supervisor's stop timeout
+            // against is part of the record, not only a number in the docs.
+            "drain_timeout_s": self.server.drain_timeout.as_secs(),
             "socket_mode": format!("{:04o}", self.server.socket_mode),
         });
         root.insert("server".to_string(), server);
@@ -1244,6 +1247,21 @@ template = "templates/home.html"
         assert_eq!(s.read_timeout, Some(std::time::Duration::from_secs(5)));
         assert_eq!(s.drain_timeout, std::time::Duration::from_secs(7));
         assert_eq!(s.socket_mode, 0o600);
+    }
+
+    /// The effective record, which is what the start-up line and
+    /// `--dump-config` show, carries the drain timeout. An operator sets a
+    /// supervisor's stop timeout against this number, so a record that omitted
+    /// it would hide the setting they have to match.
+    #[test]
+    fn the_effective_record_names_the_drain_timeout() {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, "[server]\ndrain_timeout_s = 7").unwrap();
+        let cfg = load(f.path(), Path::new("/tmp")).unwrap();
+        let json = cfg.effective_json(Path::new("/tmp"));
+        assert_eq!(json["server"]["drain_timeout_s"], 7);
+        assert_eq!(json["server"]["read_timeout_s"], 30);
+        assert_eq!(json["server"]["socket_mode"], "0660");
     }
 
     /// `drain_timeout_s = 0` waits for nothing, which is how a service asks

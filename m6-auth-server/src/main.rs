@@ -500,9 +500,21 @@ fn main() -> Result<()> {
                                         drop(stream);
                                         Ok(())
                                     }) {
-                                        Ok(()) => {
+                                        Ok(m6_core::platform::net::RejectOutcome::Refused) => {
                                             refusals.refused();
                                             continue;
+                                        }
+                                        Ok(m6_core::platform::net::RejectOutcome::Nothing) => {
+                                            continue
+                                        }
+                                        Ok(m6_core::platform::net::RejectOutcome::Failed(e)) => {
+                                            m6_core::log::warn!(error = %e, "accept failed while refusing a queued connection");
+                                            poll.registry().reregister(
+                                                listener,
+                                                token,
+                                                Interest::READABLE,
+                                            )?;
+                                            break;
                                         }
                                         Err(e) => {
                                             // The reserve is gone, so the next
@@ -600,9 +612,11 @@ fn main() -> Result<()> {
                                 }
                                 accepting[side.index()] = false;
                             }
-                            if drain.start(now) {
-                                break 'run;
-                            }
+                            // Do not leave here even when nothing is in
+                            // flight: the zero-timeout turn the drain gives
+                            // the loop is what reads a request already in a
+                            // kept-alive socket. `step` decides, after it.
+                            drain.start(now);
                         }
                     }
                 }

@@ -161,9 +161,23 @@ fn main() -> io::Result<()> {
                                         drop(stream);
                                         Ok(())
                                     }) {
-                                        Ok(()) => {
+                                        Ok(m6_core::platform::net::RejectOutcome::Refused) => {
                                             refusals.refused();
                                             continue;
+                                        }
+                                        Ok(m6_core::platform::net::RejectOutcome::Nothing) => {
+                                            continue
+                                        }
+                                        Ok(m6_core::platform::net::RejectOutcome::Failed(e)) => {
+                                            eprintln!(
+                                                "accept failed while refusing a queued connection: {e}"
+                                            );
+                                            poll.registry().reregister(
+                                                &mut listener,
+                                                LISTENER,
+                                                Interest::READABLE,
+                                            )?;
+                                            break;
                                         }
                                         Err(e) => {
                                             // The reserve is gone, so the next

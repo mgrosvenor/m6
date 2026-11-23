@@ -601,9 +601,19 @@ impl Http11Listener {
                             drop(stream);
                             Ok(())
                         }) {
-                            Ok(()) => {
+                            Ok(m6_core::platform::net::RejectOutcome::Refused) => {
                                 self.refusals.refused();
                                 continue;
+                            }
+                            Ok(m6_core::platform::net::RejectOutcome::Nothing) => continue,
+                            Ok(m6_core::platform::net::RejectOutcome::Failed(e)) => {
+                                warn!(
+                                    error = %e,
+                                    "accept failed while refusing a queued connection"
+                                );
+                                self.note_rearm(status);
+                                report_refusals(&mut self.refusals, false);
+                                return None;
                             }
                             Err(e) => {
                                 // The reserve is gone, so the next shortage
@@ -1235,9 +1245,18 @@ impl H2cListener {
                         drop(stream);
                         Ok(())
                     }) {
-                        Ok(()) => {
+                        Ok(m6_core::platform::net::RejectOutcome::Refused) => {
                             self.fd_refusals.refused();
                             H2cAccept::Refused
+                        }
+                        Ok(m6_core::platform::net::RejectOutcome::Nothing) => H2cAccept::Refused,
+                        Ok(m6_core::platform::net::RejectOutcome::Failed(e)) => {
+                            warn!(
+                                error = %e,
+                                "accept failed while refusing a queued connection"
+                            );
+                            self.rearm = true;
+                            H2cAccept::WouldBlock
                         }
                         Err(e) => {
                             // The reserve is gone, so the next shortage cannot

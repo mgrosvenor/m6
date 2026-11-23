@@ -129,13 +129,15 @@ fn an_inline_script_that_does_not_parse_is_served_as_written() {
 /// other script types alone.
 #[test]
 fn inline_scripts_are_minified_and_everything_else_is_left_alone() {
-    let html = br#"<html><body><script>var m = "didn't \u2014"; globalThis.x = m;</script><script type="application/ld+json">{"a": 1}</script><script type="module">import x from "y";</script><script type="text/template"><b>raw</b></script></body></html>"#;
+    let html = br#"<html><body><script>var m = "didn't \u2014"; globalThis.x = m;</script><script type="application/ld+json">{"a": 1}</script><script type="module">// module comment
+import x from "y";
+export default x;</script><script type="text/template"><b>raw</b></script></body></html>"#;
     let out = m6_core::minify::minify_inline_scripts(html);
     let text = String::from_utf8(out).expect("HTML stays UTF-8");
     assert!(text.contains(r#"{"a": 1}"#), "JSON-LD was changed: {text}");
     assert!(
-        text.contains(r#"import x from "y";"#),
-        "the module was changed: {text}"
+        text.contains("import x"),
+        "the module must be parsed as a module and kept: {text}"
     );
     assert!(
         text.contains("<b>raw</b>"),
@@ -144,6 +146,45 @@ fn inline_scripts_are_minified_and_everything_else_is_left_alone() {
     assert!(
         !text.contains("globalThis.x = m"),
         "the classic script was not minified: {text}"
+    );
+}
+
+/// A `type="module"` inline body is parsed as a module, not as a classic
+/// script. The wrong outcome: `import` is a syntax error in classic-script
+/// mode, so the body falls back on every request and the journal fills.
+#[test]
+fn a_module_inline_script_is_parsed_as_a_module() {
+    let html = br#"<script type="module">// remove me
+import x from "y";
+export default x;</script>"#;
+    let out = m6_core::minify::minify_inline_scripts(html);
+    let text = String::from_utf8(out).expect("HTML stays UTF-8");
+    assert!(
+        text.contains("from\"y\""),
+        "the module body was not minified: {text}"
+    );
+    assert!(text.contains("import x"), "the import was lost: {text}");
+    assert!(
+        text.contains("export default"),
+        "the export was lost: {text}"
+    );
+}
+
+/// A module file served by its extension is parsed as a module. The wrong
+/// outcome: `.mjs` is `text/javascript`, and a module parsed as a classic
+/// script fails on every GET.
+#[test]
+fn a_module_file_is_parsed_as_a_module() {
+    let module = b"import x from \"y\";\nexport default x;\n";
+    let kind = m6_core::minify::JsKind::for_path(Path::new("app.mjs"));
+    assert_eq!(kind, m6_core::minify::JsKind::Module);
+    let min =
+        m6_core::minify::try_minify_js_with(kind, module, m6_core::minify::ParseBudget::builtin())
+            .expect("a module parses");
+    assert!(min.len() <= module.len(), "minifying never grows the body");
+    assert_eq!(
+        m6_core::minify::JsKind::for_path(Path::new("app.js")),
+        m6_core::minify::JsKind::Script
     );
 }
 
@@ -202,8 +243,31 @@ fn every_example_script_minifies() {
         let bytes = std::fs::read(path).expect("an example file is readable");
         if path.extension().is_some_and(|ext| ext == "js") {
             before += bytes.len();
-            let min = m6_core::minify::try_minify_js(&bytes)
-                .unwrap_or_else(|| panic!("example script {} does not parse", path.display()));
+            let min = match m6_core::minify::try_minify_js_with(
+                m6_core::minify::JsKind::Script,
+                &bytes,
+                m6_core::minify::ParseBudget::builtin(),
+            ) {
+                Ok(min) => min,
+                // A third-party bundle over the parse budget is served as
+                // written. That is the documented fallback, not a parse error:
+                // the point of the budget is that the loop does not parse it.
+                Err(m6_core::minify::JsFallback::OverBudget { .. }) => {
+                    eprintln!(
+                        "{}: {} bytes, over the parse budget, served as written",
+                        path.display(),
+                        bytes.len()
+                    );
+                    after += bytes.len();
+                    continue;
+                }
+                Err(fallback) => {
+                    panic!(
+                        "example script {} does not parse: {fallback}",
+                        path.display()
+                    )
+                }
+            };
             eprintln!("{}: {} -> {} bytes", path.display(), bytes.len(), min.len());
             after += min.len();
             if let Ok(text) = std::str::from_utf8(&min) {
@@ -222,11 +286,18 @@ fn every_example_script_minifies() {
                 if body.trim().is_empty() || !classic_tag(&tag) {
                     continue;
                 }
-                assert!(
-                    m6_core::minify::try_minify_js(body.as_bytes()).is_some(),
-                    "classic inline script in {} does not parse:\n{body}",
-                    path.display()
-                );
+                match m6_core::minify::try_minify_js_with(
+                    m6_core::minify::JsKind::Script,
+                    body.as_bytes(),
+                    m6_core::minify::ParseBudget::builtin(),
+                ) {
+                    Ok(_) => {}
+                    Err(m6_core::minify::JsFallback::OverBudget { .. }) => {}
+                    Err(fallback) => panic!(
+                        "classic inline script in {} does not parse: {fallback}\n{body}",
+                        path.display()
+                    ),
+                }
             }
         }
     }

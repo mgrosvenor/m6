@@ -179,7 +179,9 @@ Take from it that the loop is assembled from these nine parts, one per concern.
 
 `Drain::begin(key)` runs when the listener accepts a connection and `Drain::end(key)` when that connection's work is finished: after its last response is written and it holds nothing, or at its close.
 The count rises at the accept, so a request that was accepted and not yet read still holds shutdown open.
-`start(now)` takes the stop and answers whether there is anything to wait for, `poll_timeout(now)` caps the loop's wait at the deadline, and `step(now)` returns `Step::Draining`, `Step::Finished` or `Step::DeadlinePassed(unfinished)`.
+`start(now)` takes the stop and answers whether anything was in flight; a stop that finds zero still gets one non-blocking turn, so a request already waiting in a kept-alive socket is read rather than closed under the client.
+`poll_timeout(now)` caps the loop's wait at the deadline, and returns zero for that one turn.
+`step(now)` returns `Step::Draining`, `Step::Finished` or `Step::DeadlinePassed(unfinished)`.
 Nothing waits on a condvar: a service is one event loop, so the loop is the only thing that can finish a request, and the count falling to zero ends the drain on that turn.
 
 ### 4.2. `config`
@@ -710,8 +712,12 @@ The four small modules come first, and SQLite has the rest of the section.
 
 `compress` provides `brotli_compress(data, quality)`, `brotli_decompress(data)`, `gzip_compress(data, level)` and `gzip_decompress(data)`.
 
-`minify` (feature `minify`) provides `minify_html(data)`, `minify_html_with(data, inline_js)`, `minify_inline_scripts(data)`, `minify_js(data)`, `minify_css(data)` and `minify_json(data)`.
-`minify_js` parses a classic script, compresses it and mangles local names. Top-level names and declarations are kept, because another script on the page may use them. A parse failure returns the input bytes, and a module script, `application/ld+json` or any other non-JavaScript `<script>` type is left as written.
+`minify` (feature `minify`) provides `minify_html(data)`, `minify_html_with(data, inline_js)`, `minify_inline_scripts(data)`, `minify_js(data)`, `minify_css(data)` and `minify_json(data)`, plus the budget-aware forms `minify_html_with_budget`, `minify_inline_scripts_budget` and `try_minify_js_with`.
+`try_minify_js_with(JsKind, data, ParseBudget)` is the form a request path uses: `JsKind::for_path` says `.mjs` is a module, and `ParseBudget::from_limits` carries `[limits.minify_parse]` and `[limits.minify_nesting]`.
+It parses a classic script or a module, compresses it and mangles local names. Top-level names and declarations are kept, because another script on the page may use them.
+A body over either budget, a body that is not UTF-8, a diagnostic, or a parser fatal error is `Err(JsFallback)` and the caller serves the input bytes; a partial program from a fatal error is never minified.
+`warn_unminified(subject, fallback)` writes one line per distinct subject and counts every body served as written; `parse_count()` is the per-thread parser count a cache test reads.
+`application/ld+json` and any other non-JavaScript `<script>` type is left as written.
 
 `util` provides `slugify`, `today_iso8601`, `now_iso8601`, `iso8601_minutes_ago` and `html_escape`.
 

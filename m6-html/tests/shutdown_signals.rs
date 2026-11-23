@@ -286,6 +286,75 @@ fn a_request_in_flight_at_sigterm_receives_its_full_response() {
     );
 }
 
+/// A keep-alive connection that has answered one request and has the next
+/// request already in the kernel's receive buffer when SIGTERM lands is
+/// answered, not closed.
+///
+/// The count is per accepted connection, and a connection that has answered a
+/// request is released, so the count alone cannot see the request waiting in
+/// its socket. The drain gives the loop one non-blocking turn after the stop,
+/// which is what reads it.
+#[test]
+fn a_kept_alive_request_waiting_at_sigterm_is_answered() {
+    let (mut server, socket_path) = spawn("term-kept-alive");
+    let mut held = UnixStream::connect(&socket_path).expect("connect the kept-alive request");
+    held.set_read_timeout(Some(Duration::from_secs(10))).ok();
+
+    // First request, answered; the connection stays open.
+    held.write_all(b"GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("send the first request");
+    let first = read_one(&mut held, "GET").expect("read the first answer");
+    assert!(
+        String::from_utf8_lossy(&first).contains("200 OK"),
+        "the first request was not answered\n--- output ---\n{}",
+        server.svc.output()
+    );
+
+    let pid = server.svc.pid().to_string();
+    let stop = std::process::Command::new("kill")
+        .args(["-STOP", &pid])
+        .status()
+        .expect("stop the service");
+    assert!(stop.success(), "kill -STOP");
+    std::thread::sleep(Duration::from_millis(100));
+
+    // The stop lands first, then the second request is written into the
+    // stopped process's socket buffer. Both are pending when it resumes.
+    server.svc.request(m6_core::platform::Signal::Shutdown);
+    held.write_all(b"GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("send the request while stopped");
+    std::thread::sleep(Duration::from_millis(100));
+    let cont = std::process::Command::new("kill")
+        .args(["-CONT", &pid])
+        .status()
+        .expect("continue the service");
+    assert!(cont.success(), "kill -CONT");
+
+    let second = read_one(&mut held, "GET")
+        .expect("the request waiting at SIGTERM must be answered, not closed");
+    let text = String::from_utf8_lossy(&second).into_owned();
+    assert!(
+        text.contains("200 OK") && text.contains("Posts"),
+        "the waiting request was not answered whole: {}",
+        &text[..text.len().min(300)]
+    );
+
+    let status = server
+        .svc
+        .wait_for_exit(Instant::now() + Duration::from_secs(5))
+        .unwrap_or_else(|| {
+            panic!(
+                "m6-html did not exit after draining the kept-alive request\n--- output ---\n{}",
+                server.svc.output()
+            )
+        });
+    assert!(
+        status.success(),
+        "a drained shutdown must exit 0, got {status}\n--- output ---\n{}",
+        server.svc.output()
+    );
+}
+
 /// A connection the listener accepted, with no request read yet, is counted as
 /// accepted work: a shutdown that arrives before the client sends anything
 /// still waits, and the request sent afterwards is answered.

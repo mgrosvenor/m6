@@ -102,6 +102,9 @@ fn main() -> Result<()> {
 
     let read_timeout = site.read_timeout();
     handler::set_tail_limit(site.limits().get(&m6_core::limits::TAIL_READ));
+    // The minified bodies a file version produces are kept for the next
+    // request, bounded by the same cache budget m6-http's response cache uses.
+    handler::set_minify_cache_limit(site.limits().get(&m6_core::limits::CACHE_BYTES));
     let descriptors = raise_fd_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
     // A streamed file holds a second descriptor for as long as its body is
     // being written, so the table takes half of what the limit leaves: one
@@ -230,9 +233,21 @@ fn main() -> Result<()> {
                                         drop(stream);
                                         Ok(())
                                     }) {
-                                        Ok(()) => {
+                                        Ok(m6_core::platform::net::RejectOutcome::Refused) => {
                                             refusals.refused();
                                             continue;
+                                        }
+                                        Ok(m6_core::platform::net::RejectOutcome::Nothing) => {
+                                            continue
+                                        }
+                                        Ok(m6_core::platform::net::RejectOutcome::Failed(e)) => {
+                                            m6_core::log::warn!(error = %e, "accept failed while refusing a queued connection");
+                                            poll.registry().reregister(
+                                                &mut listener,
+                                                LISTENER,
+                                                Interest::READABLE,
+                                            )?;
+                                            break;
                                         }
                                         Err(e) => {
                                             // The reserve is gone, so the next
@@ -306,9 +321,11 @@ fn main() -> Result<()> {
                             // deadline passes. Nothing accepted means nothing
                             // to wait for.
                             stop_accepting(poll.registry(), &mut listener, &mut accepting)?;
-                            if drain.start(now) {
-                                break 'run;
-                            }
+                            // Do not leave here even when nothing is in
+                            // flight: the zero-timeout turn the drain gives
+                            // the loop is what reads a request already in a
+                            // kept-alive socket. `step` decides, after it.
+                            drain.start(now);
                         }
                     }
                 }

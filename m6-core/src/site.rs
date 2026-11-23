@@ -998,7 +998,12 @@ impl Site {
                         error!("{}: {refusal}", self.name);
                         resp = Response::status(500);
                         in_area = false;
-                    } else if let Some(m) = minified(mime, bytes, minification) {
+                    } else if let Some(m) = minified(
+                        mime,
+                        bytes,
+                        minification,
+                        crate::minify::ParseBudget::from_limits(&self.state.config.limits),
+                    ) {
                         resp.body = crate::response::Body::Bytes(m);
                         minified_here = true;
                     }
@@ -2843,11 +2848,12 @@ fn print_dump(
         crate::socket_path_from_config(config_path).display()
     );
     println!(
-        "server      read_timeout={} socket_mode={:04o}",
+        "server      read_timeout={} drain_timeout={}s socket_mode={:04o}",
         config
             .server
             .read_timeout
             .map_or("none".into(), |d| format!("{}s", d.as_secs())),
+        config.server.drain_timeout.as_secs(),
         config.server.socket_mode
     );
     for p in &config.global_params {
@@ -3006,15 +3012,39 @@ fn minified(
     mime: &str,
     bytes: &[u8],
     config: &crate::config::MinificationConfig,
+    budget: crate::minify::ParseBudget,
 ) -> Option<Vec<u8>> {
+    use crate::minify::JsKind;
     if !config.is_enabled(mime) {
         return None;
     }
     match mime {
-        "text/html" => Some(crate::minify::minify_html_with(bytes, config.inline_js)),
+        "text/html" => Some(crate::minify::minify_html_with_budget(
+            bytes,
+            config.inline_js,
+            budget,
+        )),
         "text/css" => Some(crate::minify::minify_css(bytes)),
         "application/json" => Some(crate::minify::minify_json(bytes)),
-        "application/javascript" | "text/javascript" => Some(crate::minify::minify_js(bytes)),
+        "application/javascript" | "text/javascript" => {
+            // A rendered response has no extension to say whether it is a
+            // module. A file and an inline `type="module"` script are parsed as
+            // modules where they are read; a body a handler returns is treated
+            // as a classic script, and one that does not parse is served as
+            // written. Guessing a module from a failed script parse could
+            // change a classic script's semantics, which is the corruption the
+            // fallback exists to prevent.
+            match crate::minify::try_minify_js_with(JsKind::Script, bytes, budget) {
+                Ok(minified) => Some(minified),
+                Err(fallback) => {
+                    crate::minify::warn_unminified(
+                        &crate::minify::body_subject("response", bytes),
+                        &fallback,
+                    );
+                    None
+                }
+            }
+        }
         _ => None,
     }
 }

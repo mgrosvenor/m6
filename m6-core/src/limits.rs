@@ -108,6 +108,24 @@ pub const CONNECTIONS: LimitSpec = count("connections", 1024, 1_048_576);
 pub const COMPRESS_OUTPUT: LimitSpec = bytes("compress_output", 64 * KIB, 128 * MIB);
 /// The minified form of one response.
 pub const MINIFY_OUTPUT: LimitSpec = bytes("minify_output", 64 * KIB, 128 * MIB);
+/// The largest JavaScript body the minifier parses. This is a PARSE budget, not
+/// a response-buffer allowance: the parser runs on the single event loop, so a
+/// body above this is served as written rather than allowed to spend the loop
+/// on one file. `minify_output` (128 MiB) is a buffer ceiling and is far too
+/// large to bound that work. The default is 1 MiB: a parse of that size is
+/// about ten milliseconds on the loop's own thread, and a larger body gains
+/// little from minification after compression. Raise `[limits.minify_parse]`
+/// if a site's own bundle is larger and it wants the bytes.
+pub const MINIFY_PARSE: LimitSpec = bytes("minify_parse", MIB, MIB);
+/// How deep a JavaScript body may nest brackets before the minifier refuses to
+/// parse it. A recursive-descent parser's stack use follows nesting depth, and
+/// this process aborts on a stack overflow, so a deeply nested file on disk
+/// would take every site down and do it again on every restart. Measured on a
+/// development build: 2,000 levels parse and 4,000 overflow an 8 MiB stack, so
+/// the default of 1,024 leaves room while no ordinary script comes near it. The
+/// scan that measures this runs before the parser and is linear in the file's
+/// size.
+pub const MINIFY_NESTING: LimitSpec = count("minify_nesting", 1_024, 1_024);
 /// The reply of a mail relay to one command.
 pub const SMTP_REPLY: LimitSpec = bytes("smtp_reply", 512, 128 * KIB);
 /// A page of an ndjson stream: `start` is the default page size and `max` the
@@ -171,6 +189,8 @@ pub const KNOWN: &[LimitSpec] = &[
     CONNECTIONS,
     COMPRESS_OUTPUT,
     MINIFY_OUTPUT,
+    MINIFY_PARSE,
+    MINIFY_NESTING,
     SMTP_REPLY,
     NDJSON_PAGE,
     TAIL_READ,
