@@ -47,6 +47,7 @@
 
 mod check;
 mod digest;
+mod events;
 mod fleet;
 mod history;
 mod journal;
@@ -84,6 +85,9 @@ const SIGNALS: Token = Token(usize::MAX - 1);
 const LOG: Token = Token(usize::MAX - 2);
 /// The journal reader's pipe: the `journalctl` child of the read in flight.
 const JOURNAL: Token = Token(usize::MAX - 3);
+/// The event series' own journal read. A second descriptor, so the two
+/// readers cannot take each other's lines.
+const EVENTS_JOURNAL: Token = Token(usize::MAX - 4);
 /// The accounting tick, and the longest the loop waits when nothing happens.
 const TICK: Duration = Duration::from_secs(1);
 const EVENTS: usize = 256;
@@ -247,19 +251,27 @@ fn run_service() -> Result<()> {
             .clone(),
         expected_file: fleet.expected_deploy_path(site.site_dir()),
         environment: fleet.environment.clone(),
+        event_series: fleet.event_series.clone(),
     });
 
     // The journal is where a node's metrics and traffic lines are read from.
     // A directory that is not there is said once and reported as a fault,
     // never a refusal to start: the monitor's own page and check still run.
     let journal_limit = site.limits().get(&m6_core::limits::JOURNAL_LINE).clone();
-    poller.journal = match fleet.journal_path(site.site_dir()) {
-        Ok(dir) => journal::Reader::open(&dir, node_count, interval, &journal_limit),
-        Err(e) => {
-            m6_core::log::error!(error = %format!("{e:#}"), "the journal cannot be read");
-            journal::Reader::unavailable(format!("{e:#}"), &journal_limit)
+    // One answer for both readers: the documents read and the event-series
+    // read are given the same directory, and the same reason when it is not
+    // there, so the page cannot report one of them working and the other not.
+    let journal_dir = fleet
+        .journal_path(site.site_dir())
+        .map_err(|e| format!("{e:#}"));
+    poller.journal = match &journal_dir {
+        Ok(dir) => journal::Reader::open(dir, node_count, interval, &journal_limit),
+        Err(reason) => {
+            m6_core::log::error!(error = %reason, "the journal cannot be read");
+            journal::Reader::unavailable(reason.clone(), &journal_limit)
         }
     };
+    poller.open_event_read(journal_dir, &journal_limit, interval);
 
     let ceiling = raise_fd_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
     if ceiling == 0 {
@@ -333,6 +345,15 @@ fn run_service() -> Result<()> {
             .unwrap_or_else(|e| fail("registering the journal", e));
         journal_fd = Some(fd);
     }
+    // The event-series read is its own child and its own pipe, so it cannot
+    // take the documents read's turn.
+    let mut events_fd = None;
+    if let Some(fd) = poller.events_journal.fd() {
+        poll.registry()
+            .register_fd(fd, EVENTS_JOURNAL, Interest::READABLE)
+            .unwrap_or_else(|e| fail("registering the event-series journal", e));
+        events_fd = Some(fd);
+    }
 
     // The first poll starts with the service, so the page and the check have a
     // reading before the first interval passes.
@@ -368,7 +389,7 @@ fn run_service() -> Result<()> {
             Some(LISTENER) => 0,
             Some(SIGNALS) => 5,
             Some(LOG) => 6,
-            Some(JOURNAL) => 6,
+            Some(JOURNAL) | Some(EVENTS_JOURNAL) => 6,
             Some(Token(t)) if t < poll::CLIENT_BASE => 1,
             Some(Token(t)) => {
                 let slot = t - poll::CLIENT_BASE;
@@ -524,6 +545,14 @@ fn run_service() -> Result<()> {
                         poller.journal.retire();
                     }
                 }
+                EVENTS_JOURNAL => {
+                    if poller.read_events_journal() == journal::Event::Exited {
+                        if let Some(fd) = events_fd.take() {
+                            let _ = poll.registry().deregister_fd(fd);
+                        }
+                        poller.events_journal.retire();
+                    }
+                }
                 // One connection's turn: answer from the snapshot, or from
                 // the history for the two paged routes.
                 Token(k) if k < poll::CLIENT_BASE => {
@@ -653,6 +682,23 @@ fn run_service() -> Result<()> {
                 poll.registry()
                     .register_fd(fd, JOURNAL, Interest::READABLE)?;
                 journal_fd = Some(fd);
+            }
+        }
+        if poller.events_journal.expire(now) {
+            if let Some(fd) = events_fd.take() {
+                let _ = poll.registry().deregister_fd(fd);
+            }
+            poller.events_journal.retire();
+            m6_core::log::error!(
+                error = poller.events_journal.stopped.as_deref().unwrap_or_default(),
+                "the event-series journal read overran"
+            );
+        }
+        if poller.events_journal.start_if_idle(now) {
+            if let Some(fd) = poller.events_journal.fd() {
+                poll.registry()
+                    .register_fd(fd, EVENTS_JOURNAL, Interest::READABLE)?;
+                events_fd = Some(fd);
             }
         }
 
@@ -1017,6 +1063,12 @@ fn publish(
     // The start-up record's checks: the deploy's expectation file and the
     // journal's own records, judged beside every other reading.
     startup::judge(&mut d, &polled.startup);
+    // The event series: the counts on the page, and a Fault for any series
+    // whose refusal names the service's own configuration.
+    d.events = polled.events;
+    for f in events::findings(&d.events) {
+        d.add_finding(f);
+    }
     let h = history.digest();
     if let Some(f) = history::finding(&h) {
         d.add_finding(f);
@@ -1103,6 +1155,10 @@ fn run_check(config_path: &Path) -> Result<()> {
     let polled = poll::drive_to_end(&mut poller, &mut out, None)?;
     let mut d = digest::build(&polled.readings, &thresholds, now_iso8601());
     startup::judge(&mut d, &polled.startup);
+    d.events = polled.events;
+    for f in events::findings(&d.events) {
+        d.add_finding(f);
+    }
     // The report goes through `print!`, so stop the log first: it flushes and
     // puts stdout back to the blocking flag the process started with.
     m6_core::log::stop()?;

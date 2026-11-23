@@ -218,6 +218,9 @@ pub struct Polled {
     /// The start-up records the journal carried and the deploy's expected
     /// values, read at the same poll as everything else.
     pub startup: crate::startup::Facts,
+    /// The configured event series, with what their lines have said since the
+    /// monitor started reading.
+    pub events: Vec<crate::events::EventSeries>,
 }
 
 /// The poll in flight.
@@ -277,6 +280,9 @@ pub struct Setup {
     pub expected_file: Option<std::path::PathBuf>,
     /// `[monitor] environment`, when the config declares one.
     pub environment: Option<String>,
+    /// `[[monitor.event_series]]`, the services whose accepted and refused
+    /// events the digest counts.
+    pub event_series: Vec<crate::events::SeriesConfig>,
 }
 
 /// Every node's own view, driven by a service's loop.
@@ -288,6 +294,11 @@ pub struct Poller {
     header_checks: Vec<HeaderCheck>,
     /// The newest metrics and traffic document the journal carried, by node.
     latest: crate::journal::Latest,
+    /// The event-series journal read. A second reader, selecting by
+    /// `SYSLOG_IDENTIFIER`, so a service's event lines never enter the
+    /// documents read's window and the two readers cannot take each other's
+    /// lines.
+    pub events_journal: crate::journal::Reader,
     /// The one journal reader. The service starts a read each poll interval,
     /// and a check starts one and drains it; a read is never a follower. Its
     /// `stopped` is the one record of why the last read failed.
@@ -345,6 +356,45 @@ impl Poller {
         journal.read(|line| latest.ingest(line))
     }
 
+    /// The `SYSLOG_IDENTIFIER`s the event-series read selects. Empty when the
+    /// deployment declares no series, which is when no second read is started.
+    pub fn event_identifiers(&self) -> Vec<String> {
+        self.latest.events.identifiers()
+    }
+
+    /// Open the event-series read, when the deployment declared a series.
+    ///
+    /// `dir` is the same journal directory the documents read uses, resolved
+    /// by the caller so both readers are given one answer. A directory that
+    /// could not be opened makes both readers unavailable and says why.
+    pub fn open_event_read(
+        &mut self,
+        dir: Result<std::path::PathBuf, String>,
+        limit: &m6_core::limits::Limit,
+        interval: Duration,
+    ) {
+        let identifiers = self.event_identifiers();
+        let nodes = self.nodes.len();
+        self.events_journal = match (dir, self.latest.events.is_empty()) {
+            (_, true) => crate::journal::Reader::idle(limit),
+            (Ok(dir), false) => {
+                crate::journal::Reader::open_matching(&dir, &identifiers, nodes, interval, limit)
+            }
+            (Err(reason), false) => crate::journal::Reader::unavailable(reason, limit),
+        };
+    }
+
+    /// Drive the event-series read one step, the same way `read_journal` drives
+    /// the documents read.
+    pub fn read_events_journal(&mut self) -> crate::journal::Event {
+        let Poller {
+            events_journal,
+            latest,
+            ..
+        } = self;
+        events_journal.read(|line| latest.ingest(line))
+    }
+
     /// Point the poller at the deploy's expectation file.
     ///
     /// A one-shot run knows the config's directory, so it resolves the key
@@ -361,6 +411,12 @@ impl Poller {
         limit: &m6_core::limits::Limit,
     ) {
         let nodes = self.nodes.len();
+        // The directory is kept: the event-series read needs the same one, and
+        // the documents read takes it by value below.
+        let opened = match &dir {
+            Ok(dir) => Some(dir.clone()),
+            Err(_) => None,
+        };
         self.journal = match dir {
             Ok(dir) => crate::journal::Reader::once(&dir, nodes, limit),
             Err(reason) => crate::journal::Reader::unavailable(reason, limit),
@@ -369,6 +425,14 @@ impl Poller {
             journal, latest, ..
         } = self;
         journal.drain(|line| latest.ingest(line));
+        // The second read, from the same directory, selecting the event
+        // series' service identifiers and nothing else.
+        let identifiers = latest.events.identifiers();
+        if let Some(dir) = opened.filter(|_| !identifiers.is_empty()) {
+            let mut events =
+                crate::journal::Reader::once_matching(&dir, &identifiers, nodes, limit);
+            events.drain(|line| latest.ingest(line));
+        }
     }
 
     /// At start: the reading table, the lookup cache and every deadline, all
@@ -386,6 +450,7 @@ impl Poller {
             upstream_request,
             expected_file,
             environment,
+            event_series,
         } = setup;
         let (expectations, expected_state) = crate::startup::load(expected_file.as_deref());
         let readings = nodes
@@ -430,8 +495,11 @@ impl Poller {
             readings,
             timeout,
             header_checks,
-            latest: crate::journal::Latest::new(),
+            latest: crate::journal::Latest::with_events(crate::events::Counters::new(event_series)),
             journal: crate::journal::Reader::idle(&m6_core::limits::Limit::builtin(
+                &m6_core::limits::JOURNAL_LINE,
+            )),
+            events_journal: crate::journal::Reader::idle(&m6_core::limits::Limit::builtin(
                 &m6_core::limits::JOURNAL_LINE,
             )),
             cache: VerdictCache::with_cap(lookup_cap),
@@ -1295,12 +1363,17 @@ impl Poller {
             orphan_shutdowns: self.latest.startup.orphan_shutdowns,
             journal_unavailable: self.journal.stopped.clone(),
         };
+        let events = self
+            .latest
+            .events
+            .digests(self.events_journal.stopped.is_none());
         self.running.active = false;
         Ok(Progress::Done(Polled {
             readings: self.readings.clone(),
             verdicts,
             at: now,
             startup,
+            events,
         }))
     }
 }
@@ -1327,6 +1400,7 @@ pub fn one_shot_poller(
         upstream_request: m6_core::limits::Limit::builtin(&m6_core::limits::UPSTREAM_REQUEST),
         expected_file: None,
         environment: fleet.environment.clone(),
+        event_series: fleet.event_series.clone(),
     }))
 }
 
@@ -1491,6 +1565,7 @@ mod tests {
             health_last_ok_max_age_s: None,
             environment: None,
             expected_deploy_file: None,
+            event_series: Vec::new(),
         }
     }
 

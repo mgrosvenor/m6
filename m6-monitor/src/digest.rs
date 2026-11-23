@@ -156,6 +156,12 @@ pub struct Digest {
     /// values beside it. Filled by `startup::judge` after this build, so the
     /// two readers of the journal cannot disagree about what a record says.
     pub startup: crate::startup::StartupDigest,
+    /// One entry per configured event series, filled after this build by
+    /// `events::findings`. Absent from the JSON when the deployment declares
+    /// none, so a monitor that was never asked about a series says nothing
+    /// rather than reporting a zero.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<crate::events::EventSeries>,
 }
 
 /// One node's processes added together: the node's real traffic, where one
@@ -1636,6 +1642,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
         history: None,
         process_groups: process_groups(readings),
         startup: crate::startup::StartupDigest::default(),
+        events: Vec::new(),
     }
 }
 

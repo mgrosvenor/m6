@@ -198,6 +198,19 @@ pub struct Fleet {
     /// never a refusal to start.
     #[serde(default)]
     pub expected_deploy_file: Option<String>,
+    /// Services whose journal events the digest counts, and what their two
+    /// messages mean.
+    ///
+    /// **Declared by the deployment, not by m6.** Which messages matter, which
+    /// field names a cause and which causes are the service's own fault are all
+    /// properties of one site's services, and m6 has no business knowing them.
+    /// The engine is generic: it counts a configured identifier's events and
+    /// faults on a configured code. The names live here, in the config.
+    ///
+    /// Empty by default, so a monitor that was never asked about a service says
+    /// nothing about it rather than reporting a zero.
+    #[serde(default)]
+    pub event_series: Vec<crate::events::SeriesConfig>,
 }
 
 /// The seconds between polls, read from the top level of the service config.
@@ -378,6 +391,10 @@ impl Fleet {
         if fleet.nodes.is_empty() {
             anyhow::bail!("[monitor] lists no nodes");
         }
+        // A series that could not do what it says is refused here, at start,
+        // for the reason every other config mistake is: a series that silently
+        // matches nothing looks exactly like a service nobody calls.
+        crate::events::validate(&fleet.event_series).map_err(|e| anyhow::anyhow!("{e}"))?;
         // The top-level key, through the function the poller uses.
         let poll_interval_s = poll_interval_s(|k| {
             value
