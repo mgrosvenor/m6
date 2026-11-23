@@ -6,12 +6,15 @@
 //! yet read unanswered, which is the defect issue #338 measured: 57 failures in
 //! 150 loaded runs of the m6-html shutdown test.
 //!
-//! [`Drain`] is the count and the deadline in one place, so the four services
-//! whose loops share [`crate::h1::ServerConn`] make the same decision with the
-//! same code. A loop calls [`Drain::begin`] at the accept and [`Drain::end`]
-//! when that connection's work is finished: after its last response is written
-//! and it is idle, or when it closes. [`Drain::start`] takes the stop, and
-//! [`Drain::step`] decides each turn whether the loop may leave.
+//! [`Drain`](crate::drain::Drain) is the count and the deadline in one place,
+//! so the four services whose loops share [`crate::h1::ServerConn`] make the
+//! same decision with the same code. A loop calls
+//! [`Drain::begin`](crate::drain::Drain::begin) at the accept and
+//! [`Drain::end`](crate::drain::Drain::end) when that connection's work is
+//! finished: after its last response is written and it is idle, or when it
+//! closes. [`Drain::start`](crate::drain::Drain::start) takes the stop, and
+//! [`Drain::step`](crate::drain::Drain::step) decides each turn whether the
+//! loop may leave.
 //!
 //! # The deadline, and why nothing waits on a condvar
 //!
@@ -20,9 +23,10 @@
 //! condvar that the last worker signalled. A service is one event loop now
 //! (2f4b831a), so the loop is the only thing that can finish a request. A wait
 //! on a condvar would stop the work it was waiting for, so the loop runs on,
-//! polls for at most the time left on the deadline, and asks [`Drain::step`]
-//! after every turn. The count falling to zero ends the drain on that turn,
-//! which is the promptness the condvar used to provide.
+//! polls for at most the time left on the deadline, and asks
+//! [`Drain::step`](crate::drain::Drain::step) after every turn. The count
+//! falling to zero ends the drain on that turn, which is the promptness the
+//! condvar used to provide.
 //!
 //! # The request path
 //!

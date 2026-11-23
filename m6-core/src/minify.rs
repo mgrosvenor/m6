@@ -15,13 +15,13 @@
 //!
 //! The parser runs on the single event loop, so an ordinary request must not be
 //! able to spend an unbounded amount of it. Before a body is parsed,
-//! [`try_minify_js_with`] checks two limits from config: the body's size
-//! ([`crate::limits::MINIFY_PARSE`]) and its bracket nesting
-//! ([`crate::limits::MINIFY_NESTING`]). A body over either is served as written,
-//! with one log line, never truncated. A recursive-descent parser's stack use
-//! follows nesting, and this workspace aborts on a stack overflow, so the depth
-//! check is what keeps a file on disk from taking the process down on every
-//! restart.
+//! [`try_minify_js_with`](crate::minify::try_minify_js_with) checks two limits
+//! from config: the body's size ([`crate::limits::MINIFY_PARSE`]) and its
+//! bracket nesting ([`crate::limits::MINIFY_NESTING`]). A body over either is
+//! served as written, with one log line, never truncated. A recursive-descent
+//! parser's stack use follows nesting, and this workspace aborts on a stack
+//! overflow, so the depth check is what keeps a file on disk from taking the
+//! process down on every restart.
 //!
 //! A parse is used only when `diagnostics` is empty AND the parser did not
 //! report a fatal error. `fatal_error` is the parser's own "I stopped early"
@@ -30,13 +30,15 @@
 //!
 //! # Logging one fallback
 //!
-//! [`warn_unminified`] writes at most one line per distinct subject (a file
-//! version, or a template's inline body) and carries the running total, so a
-//! client looping on one URL cannot flood the journal. The file path itself
-//! calls this only on the parse, from a cache keyed by path, size and mtime.
-//! [`warn_unminified_render`] serves a rendered body, which has no version, so
-//! it also caps new subjects in time. A handler that varies a failing body on
-//! every request writes one line a second rather than one a request.
+//! [`warn_unminified`](crate::minify::warn_unminified) writes at most one line
+//! per distinct subject (a file version, or a template's inline body) and
+//! carries the running total, so a client looping on one URL cannot flood the
+//! journal. The file path itself calls this only on the parse, from a cache
+//! keyed by path, size and mtime.
+//! [`warn_unminified_render`](crate::minify::warn_unminified_render) serves a
+//! rendered body, which has no version, so it also caps new subjects in time. A
+//! handler that varies a failing body on every request writes one line a second
+//! rather than one a request.
 
 use oxc::allocator::Allocator;
 use oxc::codegen::{Codegen, CodegenOptions};

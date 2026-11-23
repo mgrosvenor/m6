@@ -430,7 +430,7 @@ impl Http11Listener {
 
     /// Write the refusal count this listener still owes when the process
     /// stops. The status listener reports through the same count, because both
-    /// accepts feed one [`Refusals`].
+    /// accepts feed one [`Refusals`](m6_core::net::Refusals).
     pub fn close_refusals(&mut self) {
         m6_core::net::close_refusals("m6-http", &mut self.refusals);
     }

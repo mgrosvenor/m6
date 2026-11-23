@@ -10,8 +10,9 @@
 #   1. Build (dev binaries)
 #   2. Clippy minimum-score check — BLOCKS the push
 #   3. Unit + integration tests
-#   4. Conformance minimum-score check (h1spec / h2spec / h3spec) — BLOCKS the push
-#   5. Benchmarks: their numbers are informational and never block the push, but
+#   4. The targets `cargo test --workspace` omits, then the rustdoc build — BLOCK the push
+#   5. Conformance minimum-score check (h1spec / h2spec / h3spec) — BLOCKS the push
+#   6. Benchmarks: their numbers are informational and never block the push, but
 #      the bench targets must compile, and a build failure blocks it like any other
 #
 # Why benches don't gate:
@@ -150,6 +151,35 @@ if with_port_lock ./tools/feature-gated-tests.sh 2>&1; then
 else
   fail "Feature-gated tests failed — one of the targets the workspace suite omits"
 fi
+
+# ── 3c. Rustdoc ───────────────────────────────────────────────────────────────
+# A broken intra-doc link is a rustdoc warning, and the zero-warnings rule counts
+# pre-existing warnings, so `-D warnings` makes one fail the push. CI has run this
+# since 2026-11-17 and the build host since the same commit. THIS GATE DID NOT,
+# and on 2026-11-23 a whole-workspace run found ten links across three files that
+# had been failing the doc build since they were written, while every local run
+# here ended on "All checks passed."
+#
+# `--all-features` second, because `testkit`, m6-core's `sqlite`, `email` and
+# `multipart` and m6-http's allocation counters are off by default, so the first
+# command never compiles their docs.
+info "Checking documentation (rustdoc)..."
+RUSTDOC_LOG="$(mktemp)"
+if RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps >"$RUSTDOC_LOG" 2>&1; then
+  pass "Rustdoc, default features, silent"
+else
+  cat "$RUSTDOC_LOG"
+  rm -f "$RUSTDOC_LOG"
+  fail "Rustdoc: a broken intra-doc link (default features)"
+fi
+if RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features >"$RUSTDOC_LOG" 2>&1; then
+  pass "Rustdoc, --all-features, silent"
+else
+  cat "$RUSTDOC_LOG"
+  rm -f "$RUSTDOC_LOG"
+  fail "Rustdoc: a broken intra-doc link (--all-features)"
+fi
+rm -f "$RUSTDOC_LOG"
 
 # ── 4. Conformance: HTTP/1.1, HTTP/2, HTTP/3 ─────────────────────────────────
 # A minimum score against independent testers (h1spec, h2spec, h3spec). Floors live
