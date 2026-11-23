@@ -45,7 +45,8 @@ Read a row left to right: the contract is what every target guarantees, and the 
 | `now`, `wall` | thin wrappers over the monotonic and wall clocks, read once per loop wake and passed down the turn | `CLOCK_MONOTONIC`, `CLOCK_REALTIME` | `CLOCK_UPTIME_RAW`, `gettimeofday` |
 | `Signals` | SIGTERM and SIGINT are one `Shutdown` request, read once, a burst coalesces and none is lost, SIGUSR1 is read and discarded, the signals stay blocked for the life of the process | `signalfd`, whose read dequeues the signal | kqueue `EVFILT_SIGNAL`, which reports the signal and leaves it pending, so the three are also `SIG_IGN` and discarded once reported |
 | `process::spawn` | a child starts with no signal blocked, SIGTERM, SIGINT, SIGUSR1 and SIGPIPE at their default disposition, and only the three standard streams `Streams` names, whichever thread opened another descriptor and whatever its close-on-exec flag, and it stays in the parent's process group so a terminal's interrupt reaches it | `std`'s spawn, where every descriptor is created close-on-exec in one call, and a `pre_exec` that clears the mask, restores the dispositions and marks every descriptor above stderr close-on-exec with `close_range` | `posix_spawnp` with `POSIX_SPAWN_CLOEXEC_DEFAULT`, because a socket here gets close-on-exec in a second call and a fork by another thread between the two would copy it, with the mask and dispositions set by the spawn's attributes |
-| `net::accept_error` | an accept loop drains to `Drained` (`WouldBlock`), continues past `SkipOne` (a connection gone before it was accepted, an interrupted call) and on `Stop` (any other error) logs it once and stops accepting for the turn | `ECONNABORTED` and `EINTR` are `SkipOne` | the same |
+| `net::accept_error` | an accept loop drains to `Drained` (`WouldBlock`), continues past `SkipOne` (a connection gone before it was accepted, an interrupted call), refuses the queued connection and keeps draining on `Exhausted` (out of descriptors), and on `Stop` (any other error) logs once, re-registers the listener and stops draining, so a queued connection is reported again | `ECONNABORTED` and `EINTR` are `SkipOne`, `EMFILE` and `ENFILE` are `Exhausted` | the same |
+| `net::SpareDescriptor` | one descriptor of the listener's own socket family, held from start, so descriptor exhaustion can refuse the connection already queued: the reserve is closed, the connection is taken in the descriptor it frees and closed at once, and the reserve is opened again. The listener ends the turn with an empty queue, so it is never left edge-triggered with a connection nobody will read | a stream socket, `AF_UNIX` or `AF_INET`/`AF_INET6` from the listener's address | the same |
 | `ChildExit` | a readable descriptor when the child exits, at once when it already has, and `reap` returns at once | `pidfd_open`, which needs Linux 5.3 | kqueue `EVFILT_PROC` with `NOTE_EXIT`, or one triggered user event when the kernel answers `ESRCH` for an exited child |
 | `net::connect_unix` | a refused connect is a listener that is gone, a missing file is `NotFound`, and a full queue fails at once with `WouldBlock` and does not wait | `EAGAIN` for a full queue | `ECONNREFUSED` for a full queue too, so it reads as a listener that is gone |
 | `net::connect_tcp` | `Connected` or `InProgress`, and `EINPROGRESS` is reported as `InProgress` | `WouldBlock` | the raw errno |
@@ -88,10 +89,15 @@ Five behaviours differ between the targets.
 - **Readings.** Three readings have no macOS source without IOKit and are absent there: disk throughput, pressure stall averages and thermal zones. Interface drop counters read 0 on macOS.
 - **Socket buffers.** The default socket buffers are about 128 KiB on macOS and about 208 KiB on Linux, so a test that depends on a size asks for it through `net::set_buffer_sizes`.
 - **Listen queue.** A full TCP listen queue shows differently on the two kernels. macOS refuses the next connection at once with `ECONNREFUSED`. Linux leaves it pending and the client waits for its own timeout. m6 passes the kernel's answer through.
+- **A shrunk backlog.** After an `accept` takes one connection of several queued, kqueue may report the listener again for the ones left, and epoll reports nothing until a new connection arrives. A loop never relies on the first: it drains to `WouldBlock` in the same turn, which is the only behaviour that is correct on both.
 
-Two limits follow from the design.
-When a process runs out of file descriptors, `accept_error` returns `Stop`, the loop stops accepting for the turn, and the listener is edge-triggered, so the connections already queued wait until the next new connection arrives.
-`raise_fd_limit` sets the connection ceiling, and m6 has no further handling for descriptor exhaustion.
+Descriptor exhaustion is refused, never waited out.
+`raise_fd_limit` sets the connection ceiling, and one descriptor of the listener's family sits in reserve.
+When `accept` fails with `EMFILE` or `ENFILE`, the loop closes the reserve, takes the connection already queued in the descriptor that frees, closes that connection at once, opens the reserve again, writes one rate-limited line at `warn` with the exact count of refusals since the previous line, and keeps draining.
+The count matters as much as the line: an operator reads how many connections were refused, not only that some were.
+A listener that stops accepting under that pressure cannot recover on its own. An edge-triggered registration has already reported the readiness that woke it, so the only thing that reports it again is another connection, and a full queue lets no other connection complete.
+The audit of `1179b991` found exactly that: a backend that stopped accepting for good, silently, with no line at all.
+The reserve is `libuv`'s `uv__emfile_trick`, and it is what `nginx`-style servers do for the same reason.
 
 `net::listen_shared` is the only place m6 sets `SO_REUSEPORT`.
 Its use in m6-http is the `[server] reuse_port` key, and `[server] reuse_port_processes` gives the group size.
@@ -172,7 +178,7 @@ Table 3 maps them.
 | process facts | `m6-platform/tests/platform_process_facts.rs` | thread and descriptor counts, run in a child process so nothing else moves them |
 | child exit | `m6-platform/tests/platform_child_exit_leak.rs` | that a dropped `ChildExit` leaks no descriptor |
 | the gate | `m6-platform/tests/platform_gate.rs` | the rule in section 1 |
-| the reference app | `m6-core/examples/echo.rs`, `echo_tls.rs`, `m6-core/tests/echo_example.rs` | the loop every service follows, built on the layer alone, with checks that include zero allocations, a shutdown that drains and queued clients served once descriptors free |
+| the reference app | `m6-core/examples/echo.rs`, `echo_tls.rs`, `m6-core/tests/echo_example.rs` | the loop every service follows, built on the layer alone, with checks that include zero allocations, a shutdown that drains, queued clients refused with no new connection arriving, and a listener serving again as soon as a descriptor frees |
 
 **Table 3: where each contract is held.**
 

@@ -373,6 +373,13 @@ fn main() -> Result<()> {
     poll.registry()
         .register_fd(signals.raw_fd(), SIGNALS, Interest::READABLE)
         .unwrap_or_else(|e| fail("registering the signal descriptor", e));
+    // The reserve each accept loop spends to refuse a connection when the
+    // process is out of descriptors. One reserve serves both listeners,
+    // because both are unix sockets and either loop can spend it: opened
+    // here, before any pressure, on the listener's own socket family.
+    let mut spare = m6_core::platform::net::SpareDescriptor::for_unix()
+        .unwrap_or_else(|e| fail("opening the reserve descriptor", e));
+    let mut refusals = m6_core::net::Refusals::new();
 
     // The started line and the shutdown cleanup name the socket this process
     // binds when it binds only one. A process that binds both names the
@@ -448,6 +455,7 @@ fn main() -> Result<()> {
                         Side::Check => check_listener.as_mut(),
                     }
                     .expect("a listener with a registered token is bound");
+                    let mut served = false;
                     while let Some(taken) = conns.take() {
                         if let Some(new_len) = taken.grew_to {
                             deadlines.grow(new_len);
@@ -468,11 +476,52 @@ fn main() -> Result<()> {
                                     conns.free(taken.key);
                                     continue;
                                 }
-                                // Any other error: say so once, give the slot back and stop
-                                // accepting for this turn.
+                                // Out of descriptors: refuse the connection
+                                // that is already queued by spending the
+                                // reserve, so it is not left waiting for a
+                                // wakeup that a full queue cannot deliver.
+                                // Then keep draining.
+                                m6_core::platform::net::Accept::Exhausted => {
+                                    conns.free(taken.key);
+                                    match spare.reject_one(|| {
+                                        let (stream, _) = listener.accept()?;
+                                        drop(stream);
+                                        Ok(())
+                                    }) {
+                                        Ok(()) => {
+                                            refusals.refused();
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            // The reserve is gone, so the next
+                                            // shortage cannot be handled.
+                                            // Arm the listener and stop
+                                            // draining rather than spinning.
+                                            m6_core::log::warn!(
+                                                error = %e,
+                                                "the reserve descriptor could not be reopened"
+                                            );
+                                            poll.registry().reregister(
+                                                listener,
+                                                token,
+                                                Interest::READABLE,
+                                            )?;
+                                            break;
+                                        }
+                                    }
+                                }
+                                // Any other error: say so once and keep the
+                                // listener armed, so a connection still
+                                // queued is reported again rather than left
+                                // edge-triggered and unread.
                                 m6_core::platform::net::Accept::Stop => {
                                     conns.free(taken.key);
-                                    eprintln!("m6-auth-server: accept error: {e}");
+                                    m6_core::log::warn!(error = %e, "accept failed");
+                                    poll.registry().reregister(
+                                        listener,
+                                        token,
+                                        Interest::READABLE,
+                                    )?;
                                     break;
                                 }
                             },
@@ -487,6 +536,15 @@ fn main() -> Result<()> {
                             deadlines.touch(Token(taken.key), now);
                         }
                         conns.get_mut(taken.key).attach(stream);
+                        served = true;
+                    }
+                    let counts = if served {
+                        refusals.flush(now)
+                    } else {
+                        refusals.due(now)
+                    };
+                    if let Some(counts) = counts {
+                        m6_core::net::warn_refused("m6-auth-server", counts);
                     }
                     if conns.is_full() {
                         // At the ceiling: stop accepting on both listeners. New

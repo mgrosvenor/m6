@@ -121,6 +121,10 @@ fn main() -> anyhow::Result<()> {
     let mut poll = Poll::new()?;
     let mut signals = Signals::new()?;
     let mut listener = listen_unix(site.socket_path(), site.socket_mode())?;
+    // The reserve the accept loop spends when the process is out of
+    // descriptors: one descriptor of the listener's family, held from now on.
+    let mut spare = m6_core::platform::net::SpareDescriptor::for_unix()?;
+    let mut refusals = m6_core::net::Refusals::new();
     poll.registry()
         .register(&mut listener, LISTENER, Interest::READABLE)?;
     poll.registry()
@@ -138,18 +142,60 @@ fn main() -> anyhow::Result<()> {
         for event in &events {
             match event.token() {
                 LISTENER => {
+                    let mut served = false;
                     while let Some(taken) = conns.take() {
                         let mut stream = match listener.accept() {
                             Ok((stream, _)) => stream,
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                conns.free(taken.key);
-                                break;
-                            }
-                            Err(e) => {
-                                conns.free(taken.key);
-                                eprintln!("my-service: accept error: {e}");
-                                break;
-                            }
+                            Err(e) => match m6_core::platform::net::accept_error(&e) {
+                                m6_core::platform::net::Accept::Drained => {
+                                    conns.free(taken.key);
+                                    break;
+                                }
+                                m6_core::platform::net::Accept::SkipOne => {
+                                    conns.free(taken.key);
+                                    continue;
+                                }
+                                // Out of descriptors: refuse the connection
+                                // already queued, using the reserve, and keep
+                                // draining.
+                                m6_core::platform::net::Accept::Exhausted => {
+                                    conns.free(taken.key);
+                                    match spare.reject_one(|| {
+                                        let (stream, _) = listener.accept()?;
+                                        drop(stream);
+                                        Ok(())
+                                    }) {
+                                        Ok(()) => {
+                                            refusals.refused();
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            m6_core::log::warn!(
+                                                error = %e,
+                                                "the reserve descriptor could not be reopened"
+                                            );
+                                            poll.registry().reregister(
+                                                &mut listener,
+                                                LISTENER,
+                                                Interest::READABLE,
+                                            )?;
+                                            break;
+                                        }
+                                    }
+                                }
+                                // Any other error: say so once, re-register
+                                // the listener and stop draining.
+                                m6_core::platform::net::Accept::Stop => {
+                                    conns.free(taken.key);
+                                    m6_core::log::warn!(error = %e, "accept failed");
+                                    poll.registry().reregister(
+                                        &mut listener,
+                                        LISTENER,
+                                        Interest::READABLE,
+                                    )?;
+                                    break;
+                                }
+                            },
                         };
                         poll.registry()
                             .register(&mut stream, Token(taken.key), Interest::READABLE)?;
@@ -157,6 +203,15 @@ fn main() -> anyhow::Result<()> {
                             deadlines.touch(Token(taken.key), m6_core::platform::now());
                         }
                         conns.get_mut(taken.key).attach(stream);
+                        served = true;
+                    }
+                    let counts = if served {
+                        refusals.flush(m6_core::platform::now())
+                    } else {
+                        refusals.due(m6_core::platform::now())
+                    };
+                    if let Some(counts) = counts {
+                        m6_core::net::warn_refused("my-service", counts);
                     }
                 }
                 SIGNALS => {
@@ -270,7 +325,10 @@ Every other token is one connection, and `turn` reads, dispatches and writes unt
 `watch` registers stdout only while a write has returned `EAGAIN`, and `tick` flushes the log buffer once a second.
 `deadlines.expired` closes a peer that sent nothing before its read deadline.
 
-Two details keep the shape correct.
+Three details keep the shape correct.
+`accept_error` is the only place an accept failure is classified, and the `Exhausted` arm is the one a service must not get wrong.
+Running out of descriptors is refused, never waited out: the loop closes the reserve, takes the queued connection in the descriptor it frees, closes that connection at once, opens the reserve again, counts the refusal and keeps draining.
+A listener that stops there cannot recover on its own. Its readiness was reported once, the edge is consumed, and the only thing that reports it again is another connection, which a full queue lets no other connection deliver.
 `close_conn` clears the deadline, detaches the stream, deregisters it and frees the slot, in that order, so every exit from a connection goes through it.
 `turn` reads again after a flush that kept the connection alive, because a pipelined request may already be buffered and an edge-triggered reactor reports a descriptor once per change.
 

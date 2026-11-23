@@ -2951,6 +2951,55 @@ fn register_listeners(poll: &Poll, tcp: Option<&Http11Listener>, h2c: Option<&H2
     }
 }
 
+/// Re-register any listener whose accept failed for a reason other than
+/// descriptor pressure. The registration reaches the kernel, so a connection
+/// still queued is reported again: the listener is never left registered with
+/// an edge already consumed and nobody left to read it.
+///
+/// `armed` is false while the listeners are deregistered at the token table's
+/// ceiling: those connections are meant to wait, and `register_listeners` arms
+/// them again when a slot frees.
+fn rearm_listeners(
+    poll: &Poll,
+    tcp: Option<&mut Http11Listener>,
+    h2c: Option<&mut H2cListener>,
+    armed: bool,
+) {
+    if !armed {
+        // Take the flags anyway: a pass that failed before the table filled is
+        // not left asking to be armed later.
+        if let Some(t) = tcp {
+            let _ = t.take_rearm();
+        }
+        if let Some(h) = h2c {
+            let _ = h.take_rearm();
+        }
+        return;
+    }
+    if let Some(t) = tcp {
+        let (main, status) = t.take_rearm();
+        if main {
+            let _ =
+                poll.registry()
+                    .reregister_fd(t.raw_fd(), TOKEN_TLS_LISTENER, Interest::READABLE);
+        }
+        if status {
+            if let Some(fd) = t.status_fd() {
+                let _ =
+                    poll.registry()
+                        .reregister_fd(fd, TOKEN_STATUS_LISTENER, Interest::READABLE);
+            }
+        }
+    }
+    if let Some(h) = h2c {
+        if h.take_rearm() {
+            let _ =
+                poll.registry()
+                    .reregister_fd(h.raw_fd(), TOKEN_H2C_LISTENER, Interest::READABLE);
+        }
+    }
+}
+
 fn event_loop(
     io: EventLoopIo,
     state: &mut ServerState,
@@ -3131,6 +3180,7 @@ fn event_loop(
             deregister_listeners(&poll, tcp.as_ref(), h2c.as_ref());
             accepting = false;
         }
+        rearm_listeners(&poll, tcp.as_mut(), h2c.as_mut(), accepting);
 
         match poll.poll(&mut events, Some(poll_timeout)) {
             Ok(()) => {}
@@ -3187,32 +3237,39 @@ fn event_loop(
                     }
                 }
                 TOKEN_TLS_LISTENER => {
-                    if let Some(t) = tcp.as_mut() {
-                        let full = accept_tls(t, false, state, poll.registry(), now);
-                        if full && accepting {
-                            deregister_listeners(&poll, tcp.as_ref(), h2c.as_ref());
-                            accepting = false;
-                        }
+                    let full = tcp
+                        .as_mut()
+                        .is_some_and(|t| accept_tls(t, false, state, poll.registry(), now));
+                    if full && accepting {
+                        deregister_listeners(&poll, tcp.as_ref(), h2c.as_ref());
+                        accepting = false;
                     }
+                    rearm_listeners(&poll, tcp.as_mut(), h2c.as_mut(), accepting);
                 }
                 TOKEN_STATUS_LISTENER => {
-                    if let Some(t) = tcp.as_mut() {
-                        let full = accept_tls(t, true, state, poll.registry(), now);
-                        if full && accepting {
-                            deregister_listeners(&poll, tcp.as_ref(), h2c.as_ref());
-                            accepting = false;
-                        }
+                    let full = tcp
+                        .as_mut()
+                        .is_some_and(|t| accept_tls(t, true, state, poll.registry(), now));
+                    if full && accepting {
+                        deregister_listeners(&poll, tcp.as_ref(), h2c.as_ref());
+                        accepting = false;
                     }
+                    rearm_listeners(&poll, tcp.as_mut(), h2c.as_mut(), accepting);
                 }
                 TOKEN_H2C_LISTENER => {
-                    if let Some(h) = h2c.as_mut() {
-                        let (full, again) = accept_h2c(h, state, poll.registry(), now);
-                        h.set_accept_again(again);
-                        if full && accepting {
-                            deregister_listeners(&poll, tcp.as_ref(), h2c.as_ref());
-                            accepting = false;
+                    let full = match h2c.as_mut() {
+                        Some(h) => {
+                            let (full, again) = accept_h2c(h, state, poll.registry(), now);
+                            h.set_accept_again(again);
+                            full
                         }
+                        None => false,
+                    };
+                    if full && accepting {
+                        deregister_listeners(&poll, tcp.as_ref(), h2c.as_ref());
+                        accepting = false;
                     }
+                    rearm_listeners(&poll, tcp.as_mut(), h2c.as_mut(), accepting);
                 }
                 Token(k) => match *state.sources.get(k) {
                     Source::TlsConn(_) | Source::H2cConn(_) => {

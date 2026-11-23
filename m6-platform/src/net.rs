@@ -247,15 +247,21 @@ fn connect_in_progress(e: &io::Error) -> bool {
 ///
 /// The loop drains the listener to [`Accept::Drained`]. [`Accept::SkipOne`]
 /// is a connection that went away before it was accepted (`ECONNABORTED`) or
-/// an interrupted call: keep draining. [`Accept::Stop`] is any other failure:
-/// log it once and stop accepting for this turn.
+/// an interrupted call: keep draining. [`Accept::Exhausted`] is `EMFILE` or
+/// `ENFILE`: take the queued connection with the reserve descriptor
+/// ([`SpareDescriptor`]), refuse it, and keep draining. [`Accept::Stop`] is
+/// any other failure: log it once, leave the listener armed and stop
+/// draining.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Accept {
     /// `WouldBlock`: the queue is empty.
     Drained,
     /// The connection is gone or the call was interrupted: accept the next.
     SkipOne,
-    /// Any other failure: log it and stop accepting for this turn.
+    /// Out of descriptors (`EMFILE`, `ENFILE`): refuse the queued connection
+    /// through the reserve and accept the next.
+    Exhausted,
+    /// Any other failure: log it, leave the listener armed, stop draining.
     Stop,
 }
 
@@ -266,7 +272,91 @@ pub fn accept_error(e: &io::Error) -> Accept {
         io::ErrorKind::WouldBlock => Accept::Drained,
         io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted => Accept::SkipOne,
         _ if e.raw_os_error() == Some(Errno::ECONNABORTED as i32) => Accept::SkipOne,
+        _ if matches!(
+            e.raw_os_error(),
+            Some(n) if n == Errno::EMFILE as i32 || n == Errno::ENFILE as i32
+        ) =>
+        {
+            Accept::Exhausted
+        }
         _ => Accept::Stop,
+    }
+}
+
+/// The descriptor an accept loop keeps in reserve, so that running out of
+/// descriptors refuses the queued connection instead of stalling the listener.
+///
+/// It is opened at start, before any pressure, and it is of the same socket
+/// family as the listener it serves, so the descriptor the kernel hands back
+/// is one this process can always make again.
+///
+/// On `EMFILE` or `ENFILE` the loop closes the reserve, takes the queued
+/// connection in the descriptor that frees, closes that connection at once,
+/// and opens the reserve again. That is `libuv`'s `uv__emfile_trick`, and it
+/// is what keeps the listener draining. An edge-triggered listener has already
+/// consumed the readiness that woke it, so the only thing that can wake it
+/// again is another connection, and a full queue lets no other connection
+/// complete: a loop that stops accepting there waits for the life of the
+/// process. Taking and refusing the queued connection empties the queue, so
+/// the turn ends with nothing unread and no re-arm to get wrong.
+#[derive(Debug)]
+pub struct SpareDescriptor {
+    domain: socket2::Domain,
+    fd: Option<OwnedFd>,
+}
+
+impl SpareDescriptor {
+    /// A reserve for a listener of `domain`.
+    pub fn new(domain: socket2::Domain) -> io::Result<Self> {
+        let mut spare = SpareDescriptor { domain, fd: None };
+        spare.fd = Some(spare.open()?);
+        Ok(spare)
+    }
+
+    /// A reserve for a TCP listener bound at `local`, on that address's family.
+    pub fn for_tcp(local: SocketAddr) -> io::Result<Self> {
+        Self::new(domain_of(local))
+    }
+
+    /// A reserve for a unix listener.
+    pub fn for_unix() -> io::Result<Self> {
+        Self::new(socket2::Domain::UNIX)
+    }
+
+    /// Whether the reserve is held. A reserve that could not be reopened is
+    /// not, and the loop then reports the failure rather than pretending.
+    pub fn is_held(&self) -> bool {
+        self.fd.is_some()
+    }
+
+    /// Take and close the connection the kernel has queued, using the reserve.
+    ///
+    /// The reserve is closed first, then `accept` runs (it must take one
+    /// connection and close it), then the reserve is opened again. `accept`
+    /// therefore runs while the reserve's descriptor is free, which is the
+    /// descriptor the queued connection is taken in.
+    ///
+    /// `Ok` means one connection was refused and the reserve is held again, so
+    /// the caller counts the refusal and keeps draining. The queue entry was
+    /// either taken and closed, or the kernel reset it first, which is what
+    /// macOS does when `accept` cannot allocate the descriptor: either way the
+    /// connection was not served. An error is the reserve failing to reopen,
+    /// and then the next shortage cannot be handled.
+    pub fn reject_one(&mut self, accept: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+        // Dropping the reserve closes it: the queued connection needs the
+        // descriptor number it held.
+        self.fd = None;
+        let taken = accept();
+        let fd = self.open()?;
+        self.fd = Some(fd);
+        drop(taken);
+        Ok(())
+    }
+
+    fn open(&self) -> io::Result<OwnedFd> {
+        let sock = socket2::Socket::new(self.domain, socket2::Type::STREAM, None)?;
+        os::prepare_socket(&sock)?;
+        Ok(OwnedFd::from(sock))
     }
 }
 
@@ -624,6 +714,81 @@ pub fn limit_send_queue(fd: RawFd, bytes: usize) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Descriptor exhaustion is its own answer, so an accept loop can refuse
+    /// the queued connection instead of stopping.
+    ///
+    /// Break: `EMFILE` and `ENFILE` classified as `Stop`, which leaves the
+    /// listener edge-triggered with a connection queued and no wakeup left.
+    #[test]
+    fn descriptor_exhaustion_is_its_own_accept_answer() {
+        use nix::errno::Errno;
+        for errno in [Errno::EMFILE, Errno::ENFILE] {
+            let e = io::Error::from_raw_os_error(errno as i32);
+            assert_eq!(accept_error(&e), Accept::Exhausted, "{errno}");
+        }
+        // The three answers that were already classified keep theirs.
+        assert_eq!(
+            accept_error(&io::Error::from(io::ErrorKind::WouldBlock)),
+            Accept::Drained
+        );
+        assert_eq!(
+            accept_error(&io::Error::from(io::ErrorKind::Interrupted)),
+            Accept::SkipOne
+        );
+        assert_eq!(
+            accept_error(&io::Error::from_raw_os_error(Errno::ECONNABORTED as i32)),
+            Accept::SkipOne
+        );
+        assert_eq!(
+            accept_error(&io::Error::from_raw_os_error(Errno::EBADF as i32)),
+            Accept::Stop
+        );
+    }
+
+    /// The reserve is a stream socket of the listener's own family, held from
+    /// start, and spending it takes a queued connection and holds it again.
+    ///
+    /// Break: a reserve opened as a file rather than a socket of the same
+    /// family, or one that is not reopened after it is spent (the next
+    /// shortage then cannot be handled at all).
+    #[test]
+    fn the_reserve_is_a_socket_of_the_listeners_family() {
+        use nix::sys::socket::{getsockname, AddressFamily, SockaddrLike};
+
+        let mut unix = SpareDescriptor::for_unix().expect("a unix reserve");
+        let tcp = SpareDescriptor::for_tcp("127.0.0.1:9".parse().expect("an address"))
+            .expect("a tcp reserve");
+        let family = |spare: &SpareDescriptor| {
+            let fd = spare.fd.as_ref().expect("a held reserve");
+            getsockname::<nix::sys::socket::SockaddrStorage>(fd.as_raw_fd())
+                .expect("the reserve's address")
+                .family()
+                .expect("a family")
+        };
+        assert_eq!(family(&unix), AddressFamily::Unix, "a unix reserve");
+        assert_eq!(family(&tcp), AddressFamily::Inet, "a TCP reserve");
+        let fd = unix.fd.as_ref().expect("a held reserve");
+        assert_eq!(
+            socket2::SockRef::from(fd)
+                .r#type()
+                .expect("the socket type"),
+            socket2::Type::STREAM,
+            "the reserve is a stream socket, so the descriptor it frees is the \
+             one an accepted connection needs"
+        );
+
+        // Spending it runs the caller's accept with the reserve's descriptor
+        // free, and holds the reserve again afterwards.
+        let mut ran = false;
+        let outcome = unix.reject_one(|| {
+            ran = true;
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        });
+        assert!(ran, "the caller's accept ran with the reserve free");
+        assert!(outcome.is_ok(), "the reserve was taken back");
+        assert!(unix.is_held(), "held again after it was spent");
+    }
 
     /// A send the socket stops part way reports the datagrams it took, and the
     /// retry sends only the rest: every datagram arrives once, in order.

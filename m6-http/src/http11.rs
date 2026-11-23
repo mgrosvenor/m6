@@ -301,6 +301,20 @@ pub struct Http11Listener {
     /// Reused buffer a drive reports its pending dispatches through, so a turn
     /// that parks a request allocates nothing.
     pending: Vec<PendingDispatch>,
+    /// The descriptor this listener refuses a queued connection with when the
+    /// process is out of descriptors.
+    spare: m6_core::platform::net::SpareDescriptor,
+    /// The same for the status listener, which may be bound on another address
+    /// family.
+    status_spare: Option<m6_core::platform::net::SpareDescriptor>,
+    /// The refusals it has made, rate limited and counted.
+    refusals: m6_core::net::Refusals,
+    /// An accept on the main listener failed for a reason other than
+    /// descriptor pressure, with connections possibly still queued: the loop
+    /// re-registers it.
+    rearm: bool,
+    /// The same for the status listener.
+    status_rearm: bool,
 }
 
 /// The connection table's starting size, shared by every owner in the process.
@@ -318,6 +332,22 @@ pub fn resolve_bind(addr: &str) -> anyhow::Result<std::net::SocketAddr> {
     addr.to_socket_addrs()?
         .next()
         .ok_or_else(|| anyhow::anyhow!("bind address {addr:?} resolved to nothing"))
+}
+
+/// Write the refusal line an accept pass owes, if any. `served` says a
+/// connection was accepted in this pass, which ends a burst: the counts a burst
+/// left unwritten go out with it, so the operator sees the exact number
+/// refused rather than only that some were.
+fn report_refusals(refusals: &mut m6_core::net::Refusals, served: bool) {
+    let now = m6_core::platform::now();
+    let counts = if served {
+        refusals.flush(now)
+    } else {
+        refusals.due(now)
+    };
+    if let Some(counts) = counts {
+        m6_core::net::warn_refused("m6-http", counts);
+    }
 }
 
 impl Http11Listener {
@@ -376,6 +406,9 @@ impl Http11Listener {
         ceiling: usize,
     ) -> anyhow::Result<Self> {
         listener.set_nonblocking(true)?;
+        // The reserve is opened before any pressure, on this listener's own
+        // address family.
+        let spare = m6_core::platform::net::SpareDescriptor::for_tcp(listener.local_addr()?)?;
         Ok(Http11Listener {
             listener,
             status: None,
@@ -383,6 +416,11 @@ impl Http11Listener {
             conns: Slots::new(initial, ceiling, Conn::empty),
             max_requests,
             pending: Vec::with_capacity(8),
+            spare,
+            status_spare: None,
+            refusals: m6_core::net::Refusals::new(),
+            rearm: false,
+            status_rearm: false,
         })
     }
 
@@ -393,6 +431,11 @@ impl Http11Listener {
     /// Add the status listener, bound by the caller. Start only.
     pub fn with_status(mut self, listener: TcpListener) -> anyhow::Result<Self> {
         listener.set_nonblocking(true)?;
+        // Its own reserve, because a status bind may be on another address
+        // family than the main listener.
+        self.status_spare = Some(m6_core::platform::net::SpareDescriptor::for_tcp(
+            listener.local_addr()?,
+        )?);
         self.status = Some(listener);
         Ok(self)
     }
@@ -409,8 +452,27 @@ impl Http11Listener {
 
     /// [`Self::accept_one`] for the status listener.
     pub fn accept_status(&mut self) -> Option<Conn> {
-        let listener = self.status.as_ref()?;
-        self.accept_on(listener, true)
+        self.accept_on(true)
+    }
+
+    /// Whether an accept failed for a reason other than descriptor pressure,
+    /// for the main listener and for the status listener. The loop re-registers
+    /// each one, so a connection still queued is reported again instead of
+    /// waiting behind an edge already consumed.
+    pub fn take_rearm(&mut self) -> (bool, bool) {
+        (
+            std::mem::take(&mut self.rearm),
+            std::mem::take(&mut self.status_rearm),
+        )
+    }
+
+    /// Record that the accept pass on `status`'s listener could not drain.
+    fn note_rearm(&mut self, status: bool) {
+        if status {
+            self.status_rearm = true;
+        } else {
+            self.rearm = true;
+        }
     }
 
     pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
@@ -447,10 +509,18 @@ impl Http11Listener {
     /// slot, sets `conn.token` and `conn.registered_interest`, registers the descriptor,
     /// and stores the `Conn` back into the slot.
     pub fn accept_one(&mut self) -> Option<Conn> {
-        self.accept_on(&self.listener, false)
+        self.accept_on(false)
     }
 
-    fn accept_on(&self, listener: &TcpListener, status: bool) -> Option<Conn> {
+    fn accept_on(&mut self, status: bool) -> Option<Conn> {
+        let listener = match status {
+            true => self.status.as_ref()?,
+            false => &self.listener,
+        };
+        let spare = match status {
+            true => self.status_spare.as_mut()?,
+            false => &mut self.spare,
+        };
         loop {
             match listener.accept() {
                 Ok((stream, peer)) => {
@@ -501,6 +571,7 @@ impl Http11Listener {
                             expect_handled: false,
                         })
                     };
+                    report_refusals(&mut self.refusals, true);
                     return Some(Conn {
                         handshake_ns: None,
                         handshake_h2: false,
@@ -515,10 +586,44 @@ impl Http11Listener {
                     });
                 }
                 Err(e) => match m6_core::platform::net::accept_error(&e) {
-                    m6_core::platform::net::Accept::Drained => return None,
+                    m6_core::platform::net::Accept::Drained => {
+                        report_refusals(&mut self.refusals, false);
+                        return None;
+                    }
                     m6_core::platform::net::Accept::SkipOne => continue,
+                    // Out of descriptors: refuse the connection already
+                    // queued by spending the reserve, so it is not left
+                    // waiting for a wakeup that a full queue cannot deliver.
+                    // Then keep draining.
+                    m6_core::platform::net::Accept::Exhausted => {
+                        match spare.reject_one(|| {
+                            let (stream, _) = listener.accept()?;
+                            drop(stream);
+                            Ok(())
+                        }) {
+                            Ok(()) => {
+                                self.refusals.refused();
+                                continue;
+                            }
+                            Err(e) => {
+                                // The reserve is gone, so the next shortage
+                                // cannot be handled. The loop re-registers
+                                // the listener and stops draining.
+                                warn!(error = %e, "the reserve descriptor could not be reopened");
+                                self.note_rearm(status);
+                                report_refusals(&mut self.refusals, false);
+                                return None;
+                            }
+                        }
+                    }
+                    // Any other error: say so once and have the loop
+                    // re-register the listener, so a connection still queued
+                    // is reported again rather than left edge-triggered and
+                    // unread.
                     m6_core::platform::net::Accept::Stop => {
                         warn!("tcp accept: {e}");
+                        self.note_rearm(status);
+                        report_refusals(&mut self.refusals, false);
                         return None;
                     }
                 },
@@ -812,6 +917,15 @@ pub struct H2cListener {
     /// Reused buffer a drive reports its pending dispatches through, so a turn
     /// that parks a request allocates nothing.
     pending: Vec<PendingDispatch>,
+    /// The descriptor this listener refuses a queued connection with when the
+    /// process is out of descriptors.
+    spare: m6_core::platform::net::SpareDescriptor,
+    /// The refusals it has made for want of a descriptor, counted and rate
+    /// limited. The peer refusals above are a different log line.
+    fd_refusals: m6_core::net::Refusals,
+    /// An accept failed for a reason other than descriptor pressure, with
+    /// connections possibly still queued: the loop re-registers the listener.
+    rearm: bool,
 }
 
 /// The most connections one `accept_pending` call handles. A peer that
@@ -1007,6 +1121,9 @@ impl H2cListener {
             );
         }
 
+        // The reserve is opened before any pressure, on this listener's own
+        // address family.
+        let spare = m6_core::platform::net::SpareDescriptor::for_tcp(listener.local_addr()?)?;
         Ok(H2cListener {
             listener,
             conns: Slots::new(initial, ceiling, H2cPlainConn::empty),
@@ -1014,6 +1131,9 @@ impl H2cListener {
             refusals: RefusalLog::new(REFUSAL_LOG_INTERVAL, REFUSAL_LOG_MAX_PEERS),
             accept_again: false,
             pending: Vec::with_capacity(8),
+            spare,
+            fd_refusals: m6_core::net::Refusals::new(),
+            rearm: false,
         })
     }
 
@@ -1032,6 +1152,13 @@ impl H2cListener {
 
     pub fn set_accept_again(&mut self, again: bool) {
         self.accept_again = again;
+    }
+
+    /// Whether an accept failed for a reason other than descriptor pressure.
+    /// The loop re-registers the listener, so a connection still queued is
+    /// reported again instead of waiting behind an edge already consumed.
+    pub fn take_rearm(&mut self) -> bool {
+        std::mem::take(&mut self.rearm)
     }
 
     /// A free slot in this listener's connection table.
@@ -1097,8 +1224,37 @@ impl H2cListener {
                 m6_core::platform::net::Accept::Drained => H2cAccept::WouldBlock,
                 // Gone before it was accepted: counted and passed over.
                 m6_core::platform::net::Accept::SkipOne => H2cAccept::Refused,
+                // Out of descriptors: refuse the connection already queued by
+                // spending the reserve, so it is not left waiting for a wakeup
+                // that a full queue cannot deliver. The caller keeps accepting
+                // while its budget lasts.
+                m6_core::platform::net::Accept::Exhausted => {
+                    let listener = &self.listener;
+                    match self.spare.reject_one(|| {
+                        let (stream, _) = listener.accept()?;
+                        drop(stream);
+                        Ok(())
+                    }) {
+                        Ok(()) => {
+                            self.fd_refusals.refused();
+                            H2cAccept::Refused
+                        }
+                        Err(e) => {
+                            // The reserve is gone, so the next shortage cannot
+                            // be handled. The loop re-registers the listener
+                            // and stops draining.
+                            warn!(error = %e, "the reserve descriptor could not be reopened");
+                            self.rearm = true;
+                            H2cAccept::WouldBlock
+                        }
+                    }
+                }
+                // Any other error: say so once and have the loop re-register
+                // the listener, so a connection still queued is reported again
+                // rather than left edge-triggered and unread.
                 m6_core::platform::net::Accept::Stop => {
                     warn!("h2c accept: {e}");
+                    self.rearm = true;
                     H2cAccept::WouldBlock
                 }
             },
@@ -1114,10 +1270,12 @@ impl H2cListener {
         mut store: impl FnMut(&mut H2cListener, H2cPlainConn) -> bool,
     ) -> usize {
         let mut handled = 0;
+        let mut served = false;
         while handled < max {
             match self.accept_one() {
                 H2cAccept::Admitted(conn) => {
                     handled += 1;
+                    served = true;
                     if !store(self, conn) {
                         break;
                     }
@@ -1126,6 +1284,7 @@ impl H2cListener {
                 H2cAccept::WouldBlock => break,
             }
         }
+        report_refusals(&mut self.fd_refusals, served);
         handled
     }
 

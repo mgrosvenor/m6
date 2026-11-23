@@ -193,6 +193,26 @@ fn read_exact_now(s: &mut TcpStream, n: usize) -> Vec<u8> {
     out
 }
 
+/// One integer count beside `key` in a refusal line, in either the JSON log
+/// line a service writes or the plain stderr line the echo program writes.
+fn count_field(line: &str, key: &str) -> u64 {
+    let at = line
+        .find(key)
+        .unwrap_or_else(|| panic!("no {key} in {line}"))
+        + key.len();
+    let rest = &line[at..];
+    let start = rest
+        .find(|c: char| c.is_ascii_digit())
+        .unwrap_or_else(|| panic!("no count after {key} in {line}"));
+    let rest = &rest[start..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end]
+        .parse()
+        .unwrap_or_else(|e| panic!("{key} in {line}: {e}"))
+}
+
 fn assert_zero_allocations(tail: &str) {
     assert!(
         tail.contains(" 0 allocation(s) during the run outside table growth"),
@@ -545,6 +565,161 @@ fn the_loop_never_waits() {
         "slowest round trip {slowest:?}"
     );
     drop((held, fast));
+    let tail = srv.tail();
+    assert_zero_allocations(&tail);
+}
+
+/// E10 (restored). Out of descriptors while clients queue: every client that
+/// is already queued reaches a definite outcome with no new connection
+/// arriving, and the listener serves again once descriptors free.
+///
+/// The shell lowers the limit to 40 descriptors while the table is told it may
+/// hold 64, so `accept` fails with `EMFILE` once about thirty connections are
+/// open and the rest wait in the kernel's queue. This is the case the audit
+/// found: the accept arm stopped on the error, the listener was left
+/// edge-triggered with a connection queued, and the only thing that could wake
+/// it was another connection, which a full queue cannot deliver. The queued
+/// client therefore waited for the life of the process.
+///
+/// **Break:** an accept loop that returns from the arm on `EMFILE` (the queued
+/// clients then sit in the queue: this test's read times out), one that logs
+/// the refusal and stops draining, or an echo that returns the error and exits.
+#[test]
+fn queued_clients_are_refused_with_no_new_connection_arriving() {
+    let cmd = m6_core::testkit::lowered_fd_limit_command(40, 0, bin("echo"));
+    let srv = Server::start_cmd(cmd, &["127.0.0.1:0"], 10_000, 64, Some(64));
+    let addr = srv.addr;
+
+    // Each client writes one byte and waits for it back. The ones the limit
+    // cannot take are refused by the loop with the reserve descriptor, so the
+    // outcome is written to the socket and no client is left waiting.
+    let mut served: Vec<TcpStream> = Vec::new();
+    let mut refused = 0usize;
+    let mut waiting: Vec<TcpStream> = Vec::new();
+    for i in 0..48 {
+        let mut c = TcpStream::connect(addr).unwrap_or_else(|e| panic!("client {i}: connect: {e}"));
+        c.set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap_or_else(|e| panic!("client {i}: read timeout: {e}"));
+        // The kernel may have reset the connection already, because accepting
+        // it failed for want of a descriptor. That is the refusal.
+        let _ = c.write_all(b"q");
+        let mut b = [0u8; 1];
+        match c.read(&mut b) {
+            Ok(1) if b[0] == b'q' => served.push(c),
+            // Closed by the loop: the connection was refused.
+            Ok(0) => refused += 1,
+            Ok(n) => panic!("client {i}: unexpected read of {n}"),
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                waiting.push(c)
+            }
+            Err(e) if e.kind() == ErrorKind::ConnectionReset => refused += 1,
+            Err(e) => panic!("client {i}: read: {e}"),
+        }
+    }
+
+    assert!(
+        served.len() >= 8,
+        "some clients were served: {}",
+        served.len()
+    );
+    assert!(refused >= 1, "the descriptor limit refused nobody");
+    // The audit's finding, as an assertion: with no descriptor free, a queued
+    // connection is refused in the same turn instead of waiting for a new
+    // connection that a full queue cannot deliver.
+    assert!(
+        waiting.is_empty(),
+        "{} client(s) were left waiting for a wakeup that cannot arrive: the \
+         listener consumed the readiness and never drained",
+        waiting.len()
+    );
+    srv.wait_for(m6_core::net::REFUSED_MESSAGE, Duration::from_secs(10));
+
+    // Descriptors free when the served clients close. The listener serves
+    // again, and the line said how many it refused.
+    drop(served);
+    let mut fresh = TcpStream::connect(addr).expect("connect");
+    fresh.write_all(b"new\n").expect("send");
+    assert_eq!(recv_exact(&mut fresh, 4, Duration::from_secs(10)), b"new\n");
+    drop(fresh);
+
+    let tail = srv.tail();
+    // The echo program has no log sink: it writes the refusal to stderr with
+    // the same message every service logs, and the counts beside it.
+    let refused_lines: Vec<&str> = tail
+        .lines()
+        .filter(|line| line.contains(m6_core::net::REFUSED_MESSAGE) && line.contains("total"))
+        .collect();
+    assert!(
+        !refused_lines.is_empty(),
+        "the refusals were not logged:\n{tail}"
+    );
+    // Rate limiting delays a count and never loses one: the counts the lines
+    // carry add up to the total, and the total is what the clients saw.
+    let mut counted = 0u64;
+    let mut total = 0u64;
+    for line in &refused_lines {
+        counted += count_field(line, "rejected");
+        total = total.max(count_field(line, "total"));
+    }
+    assert_eq!(
+        counted, total,
+        "the counts in the lines add up to the total:\n{tail}"
+    );
+    assert_eq!(
+        total, refused as u64,
+        "every refused connection is counted once:\n{tail}"
+    );
+}
+
+/// The listener serves again as soon as a descriptor frees, with no new
+/// connection needed.
+///
+/// Four clients fill a four-slot table and a fifth waits in the kernel's
+/// queue. Nothing new connects after that: the fifth is served because closing
+/// one held connection frees a descriptor, and the loop re-registers the
+/// listener it deregistered at the ceiling. That re-registration reaches the
+/// kernel, so a connection still queued is reported again.
+///
+/// **Break:** a listener left registered and unread, or one whose re-arm is
+/// gated on a condition that cannot be true: the fifth client's read times out.
+#[test]
+fn the_listener_serves_again_as_soon_as_descriptors_free_with_no_new_connection() {
+    let srv = Server::start(&bin("echo"), &["127.0.0.1:0"], 30_000, 4, Some(4));
+    let addr = srv.addr;
+
+    // Four connections fill the table: each answers before the next connects,
+    // so none of them is the queued one.
+    let mut held: Vec<TcpStream> = Vec::new();
+    for i in 0..4 {
+        let mut c = TcpStream::connect(addr).unwrap_or_else(|e| panic!("client {i}: {e}"));
+        c.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        c.write_all(b"a").expect("send");
+        assert_eq!(read_exact_now(&mut c, 1), b"a");
+        held.push(c);
+    }
+
+    // The fifth is queued: the table is full, so the listener is deregistered
+    // and no accept happens for it.
+    let mut queued = TcpStream::connect(addr).expect("connect");
+    queued
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .expect("read timeout");
+    queued.write_all(b"b").expect("send");
+    let mut byte = [0u8; 1];
+    assert!(
+        queued.read(&mut byte).is_err(),
+        "the fifth client was served with the table full"
+    );
+
+    // One descriptor frees, and no new connection arrives: the queued client
+    // is served.
+    drop(held.remove(0));
+    queued
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("read timeout");
+    assert_eq!(read_exact_now(&mut queued, 1), b"b");
+    drop((queued, held));
     let tail = srv.tail();
     assert_zero_allocations(&tail);
 }

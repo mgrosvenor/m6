@@ -811,6 +811,286 @@ fn a_lowered_open_file_limit_leaves_room_for_every_streamed_file() {
     more.clear();
 }
 
+// ─── Descriptor pressure ─────────────────────────────────────────────────────
+
+/// The refusal line a service writes when it is out of descriptors: the
+/// `rejected` and `total` counts of every such line in `output`.
+fn refusal_lines(output: &str) -> Vec<(u64, u64)> {
+    output
+        .lines()
+        .filter(|line| line.contains(m6_core::net::REFUSED_MESSAGE) && line.contains("\"total\":"))
+        .map(|line| (count_field(line, "rejected"), count_field(line, "total")))
+        .collect()
+}
+
+/// One integer field of a JSON log line.
+fn count_field(line: &str, key: &str) -> u64 {
+    let pat = format!("\"{key}\":");
+    let at = line
+        .find(&pat)
+        .unwrap_or_else(|| panic!("no {key} in {line}"))
+        + pat.len();
+    let rest = &line[at..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end]
+        .parse()
+        .unwrap_or_else(|e| panic!("{key} in {line}: {e}"))
+}
+
+/// Connections beyond a lowered open-file limit are refused at once, with one
+/// counted log line per burst, and the listener keeps serving.
+///
+/// The launcher opens 40 descriptors before the exec, so a hard limit of 64
+/// leaves room for about seventeen accepted connections while the table is 24.
+/// A client that arrives after that is queued by the kernel, and `accept` there
+/// fails with `EMFILE`. A loop that stops accepting on that error leaves the
+/// listener edge-triggered with a connection queued and no wakeup left: with a
+/// full queue no new connection can complete, so the client waits for the life
+/// of the process. The loop must refuse the queued connection instead, with the
+/// reserve descriptor, and keep draining.
+///
+/// The burst is made deterministic by stopping the process: three connections
+/// are queued while it is stopped, so the arm that runs on resume sees all
+/// three. A loop that refuses one and stops leaves the other two in the queue,
+/// and nothing can wake it for them.
+///
+/// Break: a loop that returns from the accept arm on `EMFILE`, one that refuses
+/// one connection and stops draining, one that logs a line per refusal, and one
+/// whose rate limit drops the count.
+#[test]
+fn connections_beyond_a_lowered_open_file_limit_are_refused_with_one_counted_line() {
+    const HARD: u64 = 64;
+    /// Opened by the launcher before the exec. stdio, the listener, the signal
+    /// descriptor, the poll and the reserve take about eight, so accept runs
+    /// out well before the 24-slot table fills.
+    const INHERITED: usize = 40;
+    /// Enough for any plausible free count. Reaching it means the inherited
+    /// descriptors never brought the service near its limit.
+    const MAX_CLIENTS: usize = 40;
+
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
+    let site = dir.path();
+    std::fs::create_dir_all(site.join("assets")).unwrap();
+    std::fs::write(site.join("site.toml"), "").unwrap();
+    // Larger than any socket buffer, so a served request keeps its file
+    // descriptor until the client reads.
+    let big: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+    std::fs::write(site.join("assets").join("big.bin"), &big).unwrap();
+    let config = site.join("m6-file.conf");
+    std::fs::write(&config, ASSETS_ROUTE).unwrap();
+
+    let socket_path = dir.path().join("pressure.sock");
+    let mut command =
+        m6_core::testkit::lowered_fd_limit_command(HARD, INHERITED, binary("m6-file"));
+    command
+        .arg(site)
+        .arg(&config)
+        .env("M6_SOCKET_OVERRIDE", &socket_path);
+    let mut svc = Service::spawn("m6-file", &mut command);
+    svc.wait_for_path(&socket_path, Duration::from_secs(10));
+    assert!(
+        wait::for_unix(&socket_path, Duration::from_secs(10)),
+        "m6-file never accepted a connection"
+    );
+
+    let request =
+        b"GET /assets/big.bin HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\r\n";
+
+    /// A client that has not been answered: `Ok(true)` refused (the service
+    /// closed it, or the kernel reset it), `Ok(false)` still waiting.
+    fn outcome(client: &UnixStream) -> (bool, bool) {
+        let mut byte = [std::mem::MaybeUninit::<u8>::uninit(); 1];
+        match socket2::SockRef::from(client).peek(&mut byte) {
+            Ok(0) => (false, true),
+            Ok(_) => (true, false),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => (false, true),
+            Err(_) => (false, false),
+        }
+    }
+
+    fn connect(socket_path: &Path, request: &[u8]) -> UnixStream {
+        let mut client = UnixStream::connect(socket_path).expect("connect");
+        client.set_nonblocking(true).expect("non-blocking client");
+        // The kernel may have reset the connection already, because accepting
+        // it failed for want of a descriptor. That is the refusal.
+        let _ = client.write_all(request);
+        client
+    }
+
+    // One client at a time, waiting for each outcome before the next exists,
+    // so the pass that runs out of descriptors is the last listener event of
+    // the burst.
+    let mut clients: Vec<UnixStream> = Vec::new();
+    let mut refusals = 0u64;
+    loop {
+        assert!(
+            clients.len() < MAX_CLIENTS,
+            "{} inherited descriptors never brought accept to its limit at the table's ceiling\n\
+             --- output ---\n{}",
+            INHERITED,
+            svc.output()
+        );
+        let client = connect(&socket_path, request);
+        let settled = wait::until(Duration::from_secs(10), || {
+            !refusal_lines(&svc.output()).is_empty() || outcome(&client) != (false, false)
+        });
+        assert!(
+            settled,
+            "connection {} was neither answered nor refused within 10 s, which is the stall\n\
+             --- output ---\n{}",
+            clients.len(),
+            svc.output()
+        );
+        let (_, refused) = outcome(&client);
+        if refused {
+            refusals += 1;
+        }
+        clients.push(client);
+        // Three refusals, each the last listener event of its own pass, so the
+        // burst spans three passes inside one interval.
+        if refusals >= 3 {
+            break;
+        }
+    }
+
+    // One line for the burst, not one for each refusal: three passes inside
+    // the interval write one line, and the count that is held back is owed to
+    // the next one.
+    assert_eq!(
+        refusal_lines(&svc.output()).len(),
+        1,
+        "the burst wrote one line\n--- output ---\n{}",
+        svc.output()
+    );
+    assert_eq!(refusals, 3, "three connections were refused");
+
+    // The interval passes, and one more connection is refused: its line
+    // carries the refusals the rate limit held back, so no count is lost.
+    std::thread::sleep(m6_core::net::REFUSED_INTERVAL + Duration::from_millis(300));
+    let client = connect(&socket_path, request);
+    let settled = wait::until(Duration::from_secs(10), || {
+        outcome(&client) != (false, false)
+    });
+    assert!(
+        settled,
+        "a connection under sustained pressure was neither answered nor refused\n--- output ---\n{}",
+        svc.output()
+    );
+    assert!(outcome(&client).1, "the sustained pressure refused nothing");
+    clients.push(client);
+    let after_second_burst = {
+        let lines = refusal_lines(&svc.output());
+        let total = lines.iter().map(|(_, total)| *total).max().unwrap();
+        let counted: u64 = lines.iter().map(|(rejected, _)| *rejected).sum();
+        assert_eq!(
+            counted,
+            total,
+            "the counts in the lines add up to the total\n--- output ---\n{}",
+            svc.output()
+        );
+        assert!(
+            total >= 1,
+            "the burst was counted\n--- output ---\n{}",
+            svc.output()
+        );
+        total
+    };
+
+    // Three connections queue while the process is stopped, so one arm sees
+    // all three. Refusing the first and stopping leaves the other two waiting
+    // for a wakeup that cannot arrive.
+    let lines_before = refusal_lines(&svc.output()).len();
+    let pid = svc.pid().to_string();
+    let stop = std::process::Command::new("kill")
+        .args(["-STOP", &pid])
+        .status()
+        .expect("stop the service");
+    assert!(stop.success(), "kill -STOP");
+    let queued: Vec<UnixStream> = (0..3).map(|_| connect(&socket_path, request)).collect();
+    let cont = std::process::Command::new("kill")
+        .args(["-CONT", &pid])
+        .status()
+        .expect("continue the service");
+    assert!(cont.success(), "kill -CONT");
+    let all_settled = wait::until(Duration::from_secs(10), || {
+        queued
+            .iter()
+            .all(|client| outcome(client) != (false, false))
+    });
+    assert!(
+        all_settled,
+        "a connection queued while the process was stopped was not handled, so the arm \
+         stopped draining with the queue full\n--- output ---\n{}",
+        svc.output()
+    );
+    let refused_while_stopped = queued.iter().filter(|c| outcome(c).1).count();
+    assert_eq!(
+        refused_while_stopped,
+        3,
+        "all three queued connections were refused\n--- output ---\n{}",
+        svc.output()
+    );
+    clients.extend(queued);
+    // The burst wrote at most one line, not one for each refusal.
+    assert!(
+        refusal_lines(&svc.output()).len() <= lines_before + 1,
+        "a burst of three refusals wrote a line each\n--- output ---\n{}",
+        svc.output()
+    );
+
+    // One more connection after the interval flushes what the rate limit held
+    // back. The three refusals the loop made above are in the count, and the
+    // counts in the lines add up to it. A connection the kernel resets before
+    // the loop can take it is the kernel's refusal, and it is not counted here:
+    // the service counts the ones it refused.
+    std::thread::sleep(m6_core::net::REFUSED_INTERVAL + Duration::from_millis(300));
+    let flush = connect(&socket_path, request);
+    let _ = wait::until(Duration::from_secs(10), || {
+        outcome(&flush) != (false, false)
+            || refusal_lines(&svc.output())
+                .iter()
+                .map(|(_, total)| *total)
+                .max()
+                .unwrap_or(0)
+                > after_second_burst
+    });
+    let lines = refusal_lines(&svc.output());
+    let total = lines.iter().map(|(_, total)| *total).max().unwrap();
+    let counted: u64 = lines.iter().map(|(rejected, _)| *rejected).sum();
+    assert!(
+        total >= after_second_burst + 3,
+        "the three refusals in one burst are counted, total {total} after {after_second_burst}\n\
+         --- output ---\n{}",
+        svc.output()
+    );
+    assert_eq!(
+        counted,
+        total,
+        "the counts in the lines add up to the total\n--- output ---\n{}",
+        svc.output()
+    );
+    clients.push(flush);
+
+    svc.assert_alive("after refusing connections for want of descriptors");
+
+    // An accepted connection is still answered: the loop kept its table and
+    // its arm through the shortage.
+    let mut first = clients.remove(0);
+    first.set_nonblocking(false).expect("blocking client");
+    first
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .expect("timeout");
+    let response = m6_core::testkit::read_one(&mut first, "GET")
+        .expect("an accepted connection was not answered");
+    let status = String::from_utf8_lossy(&response[..response.len().min(32)]).to_string();
+    assert!(
+        status.contains("200"),
+        "the accepted connection was answered with {status}"
+    );
+}
+
 // ─── Conditional requests (RFC 9110 13.2.2) ───────────────────────────────────
 
 /// All four precondition steps, in order, against a real m6-file.

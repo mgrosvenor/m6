@@ -507,6 +507,11 @@ fn main() -> io::Result<()> {
     let mut signals = Signals::new().unwrap_or_else(|e| fail("opening the signal descriptor", e));
     let mut listener = listen_unix(site.socket_path(), site.socket_mode())
         .unwrap_or_else(|e| fail(&format!("binding {}", site.socket_path().display()), e));
+    // The reserve the accept loop spends to refuse a connection when the
+    // process is out of descriptors. Opened here, before any pressure, and on
+    // the listener's own socket family.
+    let mut spare = m6_core::platform::net::SpareDescriptor::for_unix()?;
+    let mut refusals = m6_core::net::Refusals::new();
     poll.registry()
         .register(&mut listener, LISTENER, Interest::READABLE)?;
     poll.registry()
@@ -557,6 +562,7 @@ fn main() -> io::Result<()> {
                 // New connections: a free slot for each, registered, with a
                 // read deadline.
                 LISTENER => {
+                    let mut served = false;
                     while let Some(taken) = conns.take() {
                         if let Some(new_len) = taken.grew_to {
                             deadlines.grow(new_len);
@@ -569,8 +575,50 @@ fn main() -> io::Result<()> {
                                 match m6_core::platform::net::accept_error(&e) {
                                     m6_core::platform::net::Accept::Drained => break,
                                     m6_core::platform::net::Accept::SkipOne => continue,
+                                    // Out of descriptors: refuse the
+                                    // connection that is already queued by
+                                    // spending the reserve, so it is not left
+                                    // waiting for a wakeup that a full queue
+                                    // cannot deliver. Then keep draining.
+                                    m6_core::platform::net::Accept::Exhausted => {
+                                        match spare.reject_one(|| {
+                                            let (stream, _) = listener.accept()?;
+                                            drop(stream);
+                                            Ok(())
+                                        }) {
+                                            Ok(()) => {
+                                                refusals.refused();
+                                                continue;
+                                            }
+                                            Err(e) => {
+                                                // The reserve is gone, so the
+                                                // next shortage cannot be
+                                                // handled. Arm the listener and
+                                                // stop draining.
+                                                m6_core::log::warn!(
+                                                    error = %e,
+                                                    "the reserve descriptor could not be reopened"
+                                                );
+                                                poll.registry().reregister(
+                                                    &mut listener,
+                                                    LISTENER,
+                                                    Interest::READABLE,
+                                                )?;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    // Any other error: say so once and keep
+                                    // the listener armed, so a connection
+                                    // still queued is reported again rather
+                                    // than left edge-triggered and unread.
                                     m6_core::platform::net::Accept::Stop => {
-                                        eprintln!("{NAME}: accept error: {e}");
+                                        m6_core::log::warn!(error = %e, "accept failed");
+                                        poll.registry().reregister(
+                                            &mut listener,
+                                            LISTENER,
+                                            Interest::READABLE,
+                                        )?;
                                         break;
                                     }
                                 }
@@ -584,9 +632,18 @@ fn main() -> io::Result<()> {
                         if read_timeout.is_some() {
                             deadlines.touch(Token(taken.key), now);
                         }
+                        served = true;
                         let conn = conns.get_mut(taken.key);
                         conn.conn.attach(stream);
                         conn.interest = Interest::READABLE;
+                    }
+                    let counts = if served {
+                        refusals.flush(now)
+                    } else {
+                        refusals.due(now)
+                    };
+                    if let Some(counts) = counts {
+                        m6_core::net::warn_refused(NAME, counts);
                     }
                     // At the ceiling, stop accepting: new clients wait in the
                     // kernel's backlog.
