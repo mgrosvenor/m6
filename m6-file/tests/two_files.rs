@@ -102,6 +102,71 @@ fn dump_config_names_the_site_toml() {
     assert!(line.ends_with("apps/file/site.toml"), "{line}");
 }
 
+/// The dump prints the resolved server settings, so a deploy that validates
+/// with `--dump-config` reads the drain deadline the start will use. The wrong
+/// outcome: the line is missing or carries the default while the config says
+/// otherwise, and a test that only asserts exit 0 never notices.
+#[test]
+fn dump_config_prints_the_drain_timeout() {
+    let tmp = tree("");
+    let root = tmp.path().join("apps/file");
+    let conf = config(
+        &root,
+        &format!("{ROUTE}\n[server]\ndrain_timeout_s = 7\nread_timeout_s = 11\n"),
+    );
+
+    let out = run(&root, &conf, Some("--dump-config"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with("server "))
+        .unwrap_or_else(|| panic!("no server line in:\n{stdout}"));
+    assert!(
+        line.contains("drain_timeout=7s"),
+        "the dump does not carry the configured drain timeout: {line}"
+    );
+    assert!(
+        line.contains("read_timeout=11s"),
+        "the dump does not carry the configured read timeout: {line}"
+    );
+}
+
+/// A cache larger than the heap reservation is named at start. The wrong
+/// outcome: the service allows a cache larger than the memory it reserved for
+/// the heap, so the hot data falls outside the reservation and the operator is
+/// never told.
+#[test]
+fn a_cache_above_the_heap_reservation_is_named_and_bounded() {
+    let tmp = tree("");
+    let root = tmp.path().join("apps/file");
+    let conf = config(
+        &root,
+        &format!(
+            "{ROUTE}\n[limits.heap_reserve]\nstart = \"16MiB\"\nmax = \"64MiB\"\n\
+             [limits.cache_bytes]\nstart = \"64MiB\"\nmax = \"64MiB\"\n"
+        ),
+    );
+
+    let mut svc = Service::spawn(
+        "m6-file",
+        Command::new(binary("m6-file"))
+            .arg(&root)
+            .arg(&conf)
+            .env("M6_SOCKET_OVERRIDE", root.join("cache.sock")),
+    );
+    let named = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
+        svc.output()
+            .contains("is above [limits.heap_reserve] start")
+    });
+    assert!(
+        named,
+        "the start did not name a cache above the reservation:\n{}",
+        svc.output()
+    );
+    svc.terminate(m6_core::testkit::STARTUP_BOUND);
+}
+
 #[test]
 fn dump_config_refuses_a_site_toml_the_start_would_refuse() {
     let tmp = tree("");

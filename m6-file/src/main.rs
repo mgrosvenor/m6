@@ -71,7 +71,8 @@ fn main() -> Result<()> {
 
     // ── start: blocking and allocation are fine ──────────────────────────
     let mut site = Site::load("m6-file", &[], &[HANDLER], &NoTemplates);
-    m6_core::alloc::reserve(site.limits().get(&m6_core::limits::HEAP_RESERVE).start());
+    let reserve = site.limits().get(&m6_core::limits::HEAP_RESERVE).start();
+    m6_core::alloc::reserve(reserve);
 
     // What the document roots carry is a start question, asked once. A leak
     // here is a file nobody meant to publish, and a route's root is the only
@@ -102,9 +103,26 @@ fn main() -> Result<()> {
 
     let read_timeout = site.read_timeout();
     handler::set_tail_limit(site.limits().get(&m6_core::limits::TAIL_READ));
-    // The minified bodies a file version produces are kept for the next
-    // request, bounded by the same cache budget m6-http's response cache uses.
-    handler::set_minify_cache_limit(site.limits().get(&m6_core::limits::CACHE_BYTES));
+    // The minified bodies a file version produces are this service's only
+    // cache, and they are the hot data the heap reservation exists for.
+    // Bound the cache by the reservation so the reservation always covers it.
+    // m6-http derives its reservation from `cache_bytes` and warns when an
+    // explicit start leaves the cache outside it. m6-file has no response
+    // cache to derive from, and its reservation defaults to 32 MiB, so a
+    // default `cache_bytes` of 128 MiB would sit outside it.
+    let cache = site.limits().get(&m6_core::limits::CACHE_BYTES);
+    let cache_limit = cache.max().min(reserve);
+    if cache.max() > reserve {
+        eprintln!(
+            "m6-file: [limits.cache_bytes] max = {} is above [limits.heap_reserve] start = {}, \
+             so the minified-body cache is bounded by the reservation. Raise heap_reserve start \
+             to at least {} to hold the whole cache.",
+            cache.text(cache.max()),
+            cache.text(reserve),
+            cache.text(cache.max()),
+        );
+    }
+    handler::set_minify_cache_limit(cache_limit);
     let descriptors = raise_fd_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
     // A streamed file holds a second descriptor for as long as its body is
     // being written, so the table takes half of what the limit leaves: one
@@ -421,6 +439,13 @@ fn main() -> Result<()> {
     // Reaching here means nothing accepted is left, or the drain deadline
     // passed and the warning already named how many were. `complete` removes
     // the socket and logs the line.
+    //
+    // A refusal the rate limit was still holding back when the loop ended is
+    // written here. There is no later turn to carry it, so the interval does
+    // not apply: the last line reports every count the process took.
+    if let Some(counts) = refusals.closing(m6_core::platform::now()) {
+        m6_core::net::warn_refused("m6-file", counts);
+    }
     lifecycle.complete();
     m6_core::log::stop()?;
     Ok(())

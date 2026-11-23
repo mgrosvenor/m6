@@ -455,17 +455,22 @@ struct MinifyCache {
 /// The most file versions the table holds, whatever their size.
 const MINIFIED_ENTRIES: usize = 256;
 
-static MINIFY_CACHE_LIMIT: std::sync::OnceLock<m6_core::limits::Limit> = std::sync::OnceLock::new();
+static MINIFY_CACHE_LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
-/// Set the `cache_bytes` limit the minified-body cache follows. Start only.
-pub fn set_minify_cache_limit(limit: &m6_core::limits::Limit) {
-    let _ = MINIFY_CACHE_LIMIT.set(limit.clone());
+/// Set the byte limit the minified-body cache follows. Start only.
+///
+/// The caller passes the smaller of `[limits.cache_bytes]` max and
+/// `[limits.heap_reserve]` start, so the cache is inside the reservation this
+/// service takes from the OS.
+pub fn set_minify_cache_limit(max_bytes: usize) {
+    let _ = MINIFY_CACHE_LIMIT.set(max_bytes);
 }
 
 fn minify_cache_limit() -> usize {
     MINIFY_CACHE_LIMIT
         .get()
-        .map_or(m6_core::limits::MINIFY_PARSE.max, |limit| limit.max())
+        .copied()
+        .unwrap_or(m6_core::limits::MINIFY_PARSE.max)
 }
 
 thread_local! {
@@ -1065,6 +1070,102 @@ mod tests {
             "the changed file is served from a new version"
         );
         assert_eq!(parse_count(), before + 2, "a changed file is parsed again");
+    }
+
+    /// A same-length replacement with a changed mtime is a new version and is
+    /// served. The wrong outcome: the cache key ignores mtime, so a `cp -p`, a
+    /// tar extract or a reproducible build that replaces a file with one of
+    /// the same length serves the old minified bytes until the service
+    /// restarts.
+    #[test]
+    fn a_same_length_replacement_with_a_new_mtime_is_served() {
+        use m6_core::minify::parse_count;
+        use std::fs::FileTimes;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        let path = dir.path().join("assets/app.js");
+        let first_body = "var aaaa = 'one';\n";
+        let second_body = "var bbbb = 'two';\n";
+        assert_eq!(
+            first_body.len(),
+            second_body.len(),
+            "the replacement must keep the length, so only mtime can move the key"
+        );
+        std::fs::write(&path, first_body).unwrap();
+        let first_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let mut conf = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut conf, b"").unwrap();
+        let cfg = std::sync::Arc::new(m6_core::config::load(conf.path(), dir.path()).unwrap());
+
+        let before = parse_count();
+        let get = asset_req(dir.path(), "app.js", None, &[]).with_config(cfg);
+        let (status, _, first) = wire(&get);
+        assert_eq!(status, 200);
+        let first_text = String::from_utf8_lossy(&first).into_owned();
+        assert!(
+            first_text.contains("aaaa"),
+            "the first body was not minified: {first_text}"
+        );
+        assert_eq!(parse_count(), before + 1, "the first GET parses");
+
+        // Same length, different bytes, and a mtime moved forward explicitly.
+        // The length half of the key is unchanged, so only mtime can make this
+        // a new version.
+        std::fs::write(&path, second_body).unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_times(FileTimes::new().set_modified(first_mtime + Duration::from_secs(7)))
+            .unwrap();
+        drop(file);
+
+        let (status, _, second) = wire(&get);
+        assert_eq!(status, 200);
+        let second_text = String::from_utf8_lossy(&second).into_owned();
+        assert!(
+            second_text.contains("bbbb") && !second_text.contains("aaaa"),
+            "the replacement was served from the old version: {second_text}"
+        );
+        assert_eq!(
+            parse_count(),
+            before + 2,
+            "the same-length replacement is parsed again"
+        );
+    }
+
+    /// A file over `[limits.minify_output]` max is served as written, and the
+    /// parser never runs on it. The check is before the parse, so a body the
+    /// response buffer cannot hold is never handed to the parser.
+    #[test]
+    fn a_file_over_the_minify_output_limit_is_served_as_written_unparsed() {
+        use m6_core::minify::parse_count;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        let script = "var answer = 1 + 2 + 3 + 4;\n";
+        std::fs::write(dir.path().join("assets/app.js"), script).unwrap();
+        let mut conf = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(
+            &mut conf,
+            b"[limits.minify_output]\nstart = \"16B\"\nmax = \"16B\"\n",
+        )
+        .unwrap();
+        let cfg = std::sync::Arc::new(m6_core::config::load(conf.path(), dir.path()).unwrap());
+
+        let before = parse_count();
+        let get = asset_req(dir.path(), "app.js", None, &[]).with_config(cfg);
+        let (status, _, body) = wire(&get);
+        assert_eq!(status, 200);
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            script,
+            "a body over the output limit is served byte for byte"
+        );
+        assert_eq!(
+            parse_count(),
+            before,
+            "the parser was never run on a body over the output limit"
+        );
     }
 
     /// A script over the parse budget is served as written and attempted once

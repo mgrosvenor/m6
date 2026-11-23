@@ -1000,6 +1000,14 @@ fn connections_beyond_a_lowered_open_file_limit_are_refused_with_one_counted_lin
         client
     }
 
+    /// A client that connects and sends nothing, so the read it sees is not
+    /// confused with a response to a request.
+    fn connect_quiet(socket_path: &Path) -> UnixStream {
+        let client = UnixStream::connect(socket_path).expect("connect");
+        client.set_nonblocking(true).expect("non-blocking client");
+        client
+    }
+
     // One client at a time, waiting for each outcome before the next exists,
     // so the pass that runs out of descriptors is the last listener event of
     // the burst.
@@ -1038,14 +1046,12 @@ fn connections_beyond_a_lowered_open_file_limit_are_refused_with_one_counted_lin
 
     // One line for the burst, not one for each refusal: three passes inside
     // the interval write at most one line, and the count that is held back is
-    // owed to the next one. On macOS the kernel may consume a queued
-    // connection when accept cannot allocate the descriptor, so the service
-    // has nothing left to refuse and correctly counts nothing; on Linux the
-    // connection stays queued and the reserve takes it.
-    // At most one line for the burst, not one per refusal. A platform whose
-    // kernel consumes the queued connection when accept cannot allocate the
-    // descriptor may leave the service nothing to refuse, so the count can be
-    // zero; either way the lines that exist add up to the total.
+    // owed to the next one.
+    //
+    // This phase's clients write a request, so a connection the service closes
+    // and one the kernel resets look the same to them. The count is therefore
+    // only bounded here. The stopped burst below is the one that forces a count
+    // the test can hold to a non-zero lower bound.
     let burst_lines = refusal_lines(&svc.output());
     assert!(
         burst_lines.len() <= 1,
@@ -1090,6 +1096,19 @@ fn connections_beyond_a_lowered_open_file_limit_are_refused_with_one_counted_lin
     // Three connections queue while the process is stopped, so one arm sees
     // all three. Refusing the first and stopping leaves the other two waiting
     // for a wakeup that cannot arrive.
+    //
+    // **The client side cannot say which of them the service counted.** When
+    // `accept` fails for want of a descriptor, the kernel may drop a queued
+    // connection itself, and the peer reads that as end-of-file, the same read
+    // as the service's close over a connection that sent nothing. So the count
+    // is bounded below only, and the bound is one: with three connections
+    // queued in one arm, a kernel can consume at most two of them, and the
+    // reserve takes the last.
+    //
+    // The interval passes while the process is stopped, so the arm that takes
+    // the burst writes its line as it ends. The total can then be read without
+    // another connection to flush it.
+    std::thread::sleep(m6_core::net::REFUSED_INTERVAL + Duration::from_millis(300));
     let lines_before = refusal_lines(&svc.output()).len();
     let pid = svc.pid().to_string();
     let stop = std::process::Command::new("kill")
@@ -1097,7 +1116,7 @@ fn connections_beyond_a_lowered_open_file_limit_are_refused_with_one_counted_lin
         .status()
         .expect("stop the service");
     assert!(stop.success(), "kill -STOP");
-    let queued: Vec<UnixStream> = (0..3).map(|_| connect(&socket_path, request)).collect();
+    let queued: Vec<UnixStream> = (0..3).map(|_| connect_quiet(&socket_path)).collect();
     let cont = std::process::Command::new("kill")
         .args(["-CONT", &pid])
         .status()
@@ -1129,33 +1148,31 @@ fn connections_beyond_a_lowered_open_file_limit_are_refused_with_one_counted_lin
         svc.output()
     );
 
-    // One more connection after the interval flushes what the rate limit held
-    // back. The three refusals the loop made above are in the count, and the
-    // counts in the lines add up to it. A connection the kernel resets before
-    // the loop can take it is the kernel's refusal, and it is not counted here:
-    // the service counts the ones it refused.
-    std::thread::sleep(m6_core::net::REFUSED_INTERVAL + Duration::from_millis(300));
-    let flush = connect(&socket_path, request);
-    let _ = wait::until(Duration::from_secs(10), || {
-        outcome(&flush) != (false, false)
-            || refusal_lines(&svc.output())
-                .iter()
-                .map(|(_, total)| *total)
-                .max()
-                .unwrap_or(0)
-                > after_second_burst
+    // The line that arm wrote carries the burst. The count must rise by at
+    // least one, because three connections were queued in one arm and the
+    // reserve takes the one the kernel cannot consume. It can rise by no more
+    // than three, because only three were there. A service that counted
+    // nothing fails the lower bound.
+    let flushed = wait::until(Duration::from_secs(5), || {
+        refusal_lines(&svc.output())
+            .iter()
+            .map(|(_, total)| *total)
+            .max()
+            .unwrap_or(0)
+            > after_second_burst
     });
+    assert!(
+        flushed,
+        "the burst wrote no line at all\n--- output ---\n{}",
+        svc.output()
+    );
     let lines = refusal_lines(&svc.output());
     let total = lines.iter().map(|(_, total)| *total).max().unwrap_or(0);
     let counted: u64 = lines.iter().map(|(rejected, _)| *rejected).sum();
-    // The service counts the connections IT refused. A queued connection the
-    // kernel resets before `accept` can take it is the kernel's refusal, and
-    // the client sees it as refused while the service correctly counts
-    // nothing. So the count can rise by fewer than three, but never by more.
     let counted_in_burst = total - after_second_burst;
     assert!(
-        counted_in_burst <= 3,
-        "the burst counted {counted_in_burst}, more than the three connections it queued\n\
+        (1..=3).contains(&counted_in_burst),
+        "the burst counted {counted_in_burst} of the three connections it queued\n\
          --- output ---\n{}",
         svc.output()
     );
@@ -1165,9 +1182,63 @@ fn connections_beyond_a_lowered_open_file_limit_are_refused_with_one_counted_lin
         "the counts in the lines add up to the total\n--- output ---\n{}",
         svc.output()
     );
-    clients.push(flush);
 
     svc.assert_alive("after refusing connections for want of descriptors");
+
+    // A count the rate limit is still holding when the process is asked to
+    // stop must be written on the way out. The burst above wrote its line, so
+    // the interval is open. Three more connections are queued while the process
+    // is stopped, and the arm that refuses them ends inside the interval, so
+    // the count is owed. No further listener event can occur, which makes the
+    // shutdown path the only thing that can write it.
+    //
+    // This runs before the held connection is read: reading a streamed body
+    // frees the file descriptor behind it, and one free descriptor would let
+    // the arm serve a queued connection instead of refusing it.
+    let before_shutdown = refusal_lines(&svc.output())
+        .iter()
+        .map(|(_, total)| *total)
+        .max()
+        .unwrap_or(0);
+    let pid = svc.pid().to_string();
+    let stop = std::process::Command::new("kill")
+        .args(["-STOP", &pid])
+        .status()
+        .expect("stop the service");
+    assert!(stop.success(), "kill -STOP");
+    let queued_shutdown: Vec<UnixStream> = (0..3).map(|_| connect_quiet(&socket_path)).collect();
+    let cont = std::process::Command::new("kill")
+        .args(["-CONT", &pid])
+        .status()
+        .expect("continue the service");
+    assert!(cont.success(), "kill -CONT");
+    let all_settled = wait::until(Duration::from_secs(10), || {
+        queued_shutdown
+            .iter()
+            .all(|client| outcome(client) != (false, false))
+    });
+    assert!(
+        all_settled,
+        "a connection queued for the shutdown count was not handled (outcomes {:?})\n\
+         --- output ---\n{}",
+        queued_shutdown.iter().map(outcome).collect::<Vec<_>>(),
+        svc.output()
+    );
+    // Let the arm end. A line here would mean the interval had turned and this
+    // phase did not exercise the shutdown path.
+    std::thread::sleep(Duration::from_millis(100));
+    let still_owed = refusal_lines(&svc.output())
+        .iter()
+        .map(|(_, total)| *total)
+        .max()
+        .unwrap_or(0);
+    assert_eq!(
+        still_owed,
+        before_shutdown,
+        "the last burst was written before the stop, so it did not owe a count at shutdown\n\
+         --- output ---\n{}",
+        svc.output()
+    );
 
     // An accepted connection is still answered: the loop kept its table and
     // its arm through the shortage.
@@ -1182,6 +1253,24 @@ fn connections_beyond_a_lowered_open_file_limit_are_refused_with_one_counted_lin
     assert!(
         status.contains("200"),
         "the accepted connection was answered with {status}"
+    );
+
+    let exit = svc.terminate(m6_core::testkit::STARTUP_BOUND);
+    assert!(exit.success(), "the stop did not exit cleanly: {exit}");
+    let lines = refusal_lines(&svc.output());
+    let total = lines.iter().map(|(_, total)| *total).max().unwrap_or(0);
+    let counted: u64 = lines.iter().map(|(rejected, _)| *rejected).sum();
+    assert!(
+        total > before_shutdown,
+        "the count owed when the process stopped was never written, total {total} after \
+         {before_shutdown}\n--- output ---\n{}",
+        svc.output()
+    );
+    assert_eq!(
+        counted,
+        total,
+        "the counts in the lines add up to the total after shutdown\n--- output ---\n{}",
+        svc.output()
     );
 }
 

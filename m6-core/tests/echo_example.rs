@@ -147,6 +147,12 @@ impl Server {
         panic!("{needle:?} never appeared:\n{out}");
     }
 
+    /// Everything the program has written so far, without stopping it.
+    fn output_so_far(&self) -> String {
+        let out = self.output.lock().unwrap_or_else(|e| e.into_inner());
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
     /// A shutdown request, wait for exit 0, and return the whole stderr tail.
     fn tail(mut self) -> String {
         platform::send(self.child.id(), Signal::Shutdown).expect("send shutdown");
@@ -211,6 +217,22 @@ fn count_field(line: &str, key: &str) -> u64 {
     rest[..end]
         .parse()
         .unwrap_or_else(|e| panic!("{key} in {line}: {e}"))
+}
+
+/// The sum of the `rejected` fields and the greatest `total` in the refusal
+/// lines of `output`. A service that has written every count it took has the
+/// two equal.
+fn refused_totals(output: &str) -> (u64, u64) {
+    let mut counted = 0u64;
+    let mut total = 0u64;
+    for line in output
+        .lines()
+        .filter(|line| line.contains(m6_core::net::REFUSED_MESSAGE) && line.contains("total"))
+    {
+        counted += count_field(line, "rejected");
+        total = total.max(count_field(line, "total"));
+    }
+    (counted, total)
 }
 
 fn assert_zero_allocations(tail: &str) {
@@ -587,7 +609,10 @@ fn the_loop_never_waits() {
 #[test]
 fn queued_clients_are_refused_with_no_new_connection_arriving() {
     let cmd = m6_core::testkit::lowered_fd_limit_command(40, 0, bin("echo"));
-    let srv = Server::start_cmd(cmd, &["127.0.0.1:0"], 10_000, 64, Some(64));
+    // A long idle deadline: the served clients are held across two intervals
+    // and a stopped burst, and an idle close would free descriptors under the
+    // burst.
+    let srv = Server::start_cmd(cmd, &["127.0.0.1:0"], 120_000, 64, Some(64));
     let addr = srv.addr;
 
     // Each client writes one byte and waits for it back. The ones the limit
@@ -632,6 +657,95 @@ fn queued_clients_are_refused_with_no_new_connection_arriving() {
          listener consumed the readiness and never drained",
         waiting.len()
     );
+    // The interval passes, and one more connection is refused: its turn ends by
+    // writing what the rate limit held back, so the burst below starts with
+    // nothing owed. When the service counted nothing for the clients above,
+    // there is nothing to write and this leaves the totals where they are.
+    std::thread::sleep(m6_core::net::REFUSED_INTERVAL + Duration::from_millis(300));
+    let before_flush = refused_totals(&srv.output_so_far()).1;
+    let mut flush = TcpStream::connect(addr).expect("flush connect");
+    flush
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("flush read timeout");
+    let _ = flush.write_all(b"flush\n");
+    let mut byte = [0u8; 1];
+    let _ = flush.read(&mut byte);
+    drop(flush);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let before = loop {
+        let totals = refused_totals(&srv.output_so_far());
+        if totals.1 > before_flush || Instant::now() >= deadline {
+            break totals;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    // A burst the service must count, with clients that send nothing.
+    //
+    // Three connections queue while the process is stopped, so one arm sees
+    // all three.
+    //
+    // **The client side cannot say which of them the service counted.** When
+    // `accept` fails for want of a descriptor, the kernel may drop a queued
+    // connection itself, and the peer reads that as end-of-file, the same read
+    // as the service's close over a connection that sent nothing. So the count
+    // is bounded below only, and the bound is one: with three connections
+    // queued in one arm, a kernel can consume at most two of them, and the
+    // reserve takes the last.
+    //
+    // The interval passes while the process is stopped, so the arm writes its
+    // line as it ends and the total can be read without another connection.
+    std::thread::sleep(m6_core::net::REFUSED_INTERVAL + Duration::from_millis(300));
+    let pid = srv.child.id().to_string();
+    let stop = std::process::Command::new("kill")
+        .args(["-STOP", &pid])
+        .status()
+        .expect("stop the echo");
+    assert!(stop.success(), "kill -STOP");
+    let mut probes: Vec<TcpStream> = (0..3)
+        .map(|_| TcpStream::connect(addr).expect("probe connect"))
+        .collect();
+    for probe in &probes {
+        probe
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("probe read timeout");
+    }
+    let cont = std::process::Command::new("kill")
+        .args(["-CONT", &pid])
+        .status()
+        .expect("continue the echo");
+    assert!(cont.success(), "kill -CONT");
+    for probe in &mut probes {
+        let mut byte = [0u8; 1];
+        match probe.read(&mut byte) {
+            Ok(0) => {}
+            Err(e) if e.kind() == ErrorKind::ConnectionReset => {}
+            other => panic!(
+                "a connection queued while the echo was stopped was neither closed nor reset: \
+                 {other:?}"
+            ),
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let after = loop {
+        let totals = refused_totals(&srv.output_so_far());
+        if totals.1 > before.1 {
+            break totals;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the queued burst wrote no line at all:\n{}",
+            srv.output_so_far()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let counted_in_burst = after.1 - before.1;
+    assert!(
+        (1..=3).contains(&counted_in_burst),
+        "the service counted {counted_in_burst} of the three connections queued in one arm\n{}",
+        srv.output_so_far()
+    );
+
     // Descriptors free when the served clients close. The listener serves
     // again, and the line said how many it refused.
     drop(served);
@@ -641,32 +755,20 @@ fn queued_clients_are_refused_with_no_new_connection_arriving() {
     drop(fresh);
 
     let tail = srv.tail();
-    // The echo program has no log sink: it writes the refusal to stderr with
-    // the same message every service logs, and the counts beside it.
-    let refused_lines: Vec<&str> = tail
-        .lines()
-        .filter(|line| line.contains(m6_core::net::REFUSED_MESSAGE) && line.contains("total"))
-        .collect();
     // Rate limiting delays a count and never loses one: the counts the lines
     // carry add up to the total, and the total is what the service refused.
-    let mut counted = 0u64;
-    let mut total = 0u64;
-    for line in &refused_lines {
-        counted += count_field(line, "rejected");
-        total = total.max(count_field(line, "total"));
-    }
+    let (counted, total) = refused_totals(&tail);
     assert_eq!(
         counted, total,
         "the counts in the lines add up to the total:\n{tail}"
     );
-    // The service counts the connections it actually refused. On a platform
-    // whose kernel consumes the queued connection when `accept` cannot
-    // allocate the descriptor, the client sees the refusal and the service
-    // has nothing left to take, so it counts fewer than the clients saw. It
-    // must never count more, and the lines it does write must add up.
+    // Everything the service counted before the burst is still bounded by the
+    // clients that were refused. The burst itself is tied to the arm that
+    // queued three connections in one turn.
     assert!(
-        total <= refused as u64,
-        "the service counted {total} refusals but {refused} clients were refused:\n{tail}"
+        total - counted_in_burst <= refused as u64 + 1,
+        "the service counted {} refusals beyond the burst, but {refused} clients were refused:\n{tail}",
+        total - counted_in_burst
     );
 }
 

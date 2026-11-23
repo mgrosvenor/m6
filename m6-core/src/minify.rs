@@ -34,6 +34,9 @@
 //! version, or a template's inline body) and carries the running total, so a
 //! client looping on one URL cannot flood the journal. The file path itself
 //! calls this only on the parse, from a cache keyed by path, size and mtime.
+//! [`warn_unminified_render`] serves a rendered body, which has no version, so
+//! it also caps new subjects in time. A handler that varies a failing body on
+//! every request writes one line a second rather than one a request.
 
 use oxc::allocator::Allocator;
 use oxc::codegen::{Codegen, CodegenOptions};
@@ -195,7 +198,7 @@ pub fn parse_count() -> u64 {
 }
 
 /// Bodies served as written since start, whether or not their line was
-/// rate-limited by [`warn_unminified`]'s one-per-subject rule.
+/// rate-limited by [`warn_unminified`] or [`warn_unminified_render`].
 pub fn unminified_total() -> u64 {
     UNMINIFIED.load(Ordering::Relaxed)
 }
@@ -208,6 +211,30 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// Fallback lines this thread has written, on either path. A test has no
+    /// log sink, so this is how it counts what reached the log.
+    static LINES_WRITTEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+    /// When this thread last wrote a render-path line.
+    static LAST_RENDER_LINE: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The shortest gap between two render-path fallback lines.
+///
+/// A rendered body has no file version, and a handler that returns a different
+/// body on every request would make every body a new subject. The render path
+/// therefore caps new subjects in time as well: a loop on a failing handler
+/// writes at most one line a second, and the running total still counts every
+/// request that was served as written.
+pub const UNMINIFIED_RENDER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Fallback lines written on this thread since it started, on either path.
+pub fn unminified_lines() -> u64 {
+    LINES_WRITTEN.with(std::cell::Cell::get)
+}
+
 /// Write the one line a body served as written gets, and count it.
 ///
 /// `subject` names the body's version: for a file, its path, size and mtime;
@@ -217,13 +244,49 @@ thread_local! {
 pub fn warn_unminified(subject: &str, fallback: &JsFallback) {
     let total = UNMINIFIED.fetch_add(1, Ordering::Relaxed) + 1;
     if subject_is_new(subject) {
-        crate::log::warn!(
-            subject,
-            reason = %fallback,
-            served_unminified = total,
-            "minify_js: {fallback}; serving the original bytes"
-        );
+        write_line(subject, fallback, total);
     }
+}
+
+/// Write the one line a rendered body served as written gets, and count it.
+///
+/// A rendered body has no version, so a handler that varies the body on every
+/// request cannot be made a finite set of subjects. This path caps new
+/// subjects in time ([`UNMINIFIED_RENDER_INTERVAL`]) and still writes once per
+/// subject, so a body that does not parse cannot write a line per request.
+pub fn warn_unminified_render(subject: &str, fallback: &JsFallback) {
+    let total = UNMINIFIED.fetch_add(1, Ordering::Relaxed) + 1;
+    if render_line_due(subject, crate::platform::now()) {
+        write_line(subject, fallback, total);
+    }
+}
+
+fn write_line(subject: &str, fallback: &JsFallback, total: u64) {
+    LINES_WRITTEN.with(|lines| lines.set(lines.get() + 1));
+    crate::log::warn!(
+        subject,
+        reason = %fallback,
+        served_unminified = total,
+        "minify_js: {fallback}; serving the original bytes"
+    );
+}
+
+/// Whether the render path may write a line for `subject` at `now`.
+///
+/// The interval is checked before the subject, so a subject held back by the
+/// interval is not recorded and can log when the interval turns. A subject
+/// already logged stays silent whatever the interval.
+fn render_line_due(subject: &str, now: std::time::Instant) -> bool {
+    let open = LAST_RENDER_LINE.with(|last| {
+        !last
+            .get()
+            .is_some_and(|last| now.duration_since(last) < UNMINIFIED_RENDER_INTERVAL)
+    });
+    if !open || !subject_is_new(subject) {
+        return false;
+    }
+    LAST_RENDER_LINE.with(|last| last.set(Some(now)));
+    true
 }
 
 /// Whether `subject` has not been logged on this thread yet, recording it if
@@ -292,15 +355,7 @@ pub fn try_minify_js_with(
     PARSES.with(|parses| parses.set(parses.get() + 1));
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, kind.source_type()).parse();
-    // `fatal_error` first: the parser documents that a fatal error leaves the
-    // program empty and a diagnostic, but the truncated-script guard must not
-    // depend on that agreement. A partial program is never minified.
-    if parsed.fatal_error {
-        return Err(JsFallback::Aborted);
-    }
-    if let Some(first) = parsed.diagnostics.first() {
-        return Err(JsFallback::Parse(first.to_string()));
-    }
+    parse_verdict(&parsed.diagnostics, parsed.fatal_error)?;
     let mut program = parsed.program;
     // Top-level names are the page's globals. Another script may call them, and
     // an inline handler may name them, so they keep their names and no
@@ -337,12 +392,25 @@ pub fn try_minify_js_with(
     Ok(code.into_bytes())
 }
 
-/// Whether a parse that reported `fatal_error` completed far enough to serve.
-/// The parser's own contract says a fatal error leaves a diagnostic, and the
-/// fallback must hold even if that contract ever stops being true.
-#[cfg(test)]
-fn parse_completed(diagnostics_empty: bool, fatal_error: bool) -> bool {
-    diagnostics_empty && !fatal_error
+/// Whether a finished parse may be minified, which is the rule the production
+/// path applies to every parse.
+///
+/// `fatal_error` is checked first. The parser's contract says a fatal error
+/// leaves the program empty and a diagnostic, but the truncated-script guard
+/// must not depend on that agreement: a fatal error is a fallback even with no
+/// diagnostic. Any diagnostic is a fallback too, because a program from a
+/// recoverable error is not the program that was written.
+fn parse_verdict(
+    diagnostics: &oxc::diagnostics::Diagnostics,
+    fatal_error: bool,
+) -> Result<(), JsFallback> {
+    if fatal_error {
+        return Err(JsFallback::Aborted);
+    }
+    match diagnostics.first() {
+        Some(first) => Err(JsFallback::Parse(first.to_string())),
+        None => Ok(()),
+    }
 }
 
 /// The deepest bracket nesting `source` reaches, ignoring string literals and
@@ -1202,14 +1270,22 @@ mod tests {
         );
     }
 
-    /// The completion rule that closes the truncated-script hole: a fatal
-    /// error is a fallback even if the diagnostics list were empty.
+    /// The completion rule that closes the truncated-script hole, against the
+    /// production verdict rather than a copy of it: a fatal error is a fallback
+    /// even if the diagnostics list is empty.
     #[test]
     fn a_fatal_error_is_a_fallback_even_with_no_diagnostics() {
-        assert!(parse_completed(true, false));
-        assert!(!parse_completed(true, true), "fatal with no diagnostics");
-        assert!(!parse_completed(false, false), "a diagnostic");
-        assert!(!parse_completed(false, true), "both");
+        let empty = oxc::diagnostics::Diagnostics::new();
+        assert_eq!(
+            parse_verdict(&empty, true),
+            Err(JsFallback::Aborted),
+            "fatal with no diagnostics"
+        );
+        assert_eq!(
+            parse_verdict(&empty, false),
+            Ok(()),
+            "a clean parse is minified"
+        );
     }
 
     /// One line per subject: a loop on the same file version writes once, and a

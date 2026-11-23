@@ -82,6 +82,30 @@ info "Building (dev)..."
 cargo build --workspace --bins --quiet
 pass "Build"
 
+# ── 1b. Lean core build ───────────────────────────────────────────────────────
+# A workspace build unifies features, so it never compiles m6-core with its
+# default `templates` and `minify` off. A call to either gated module from
+# outside its gate compiles green there and fails for a user who depends on
+# core with `default-features = false`. This is the only build that asks the
+# lean question, and it must be silent as well as compile.
+info "Checking the lean m6-core build (no default features)..."
+LEAN_LOG="$(mktemp)"
+if cargo check -p m6-core --no-default-features >"$LEAN_LOG" 2>&1; then
+  LEAN_WARNINGS="$(grep -c '^warning' "$LEAN_LOG" || true)"
+  if [[ "$LEAN_WARNINGS" -eq 0 ]]; then
+    pass "Lean m6-core build (no default features, zero warnings)"
+  else
+    cat "$LEAN_LOG"
+    rm -f "$LEAN_LOG"
+    fail "Lean m6-core build: $LEAN_WARNINGS warning(s)"
+  fi
+else
+  cat "$LEAN_LOG"
+  rm -f "$LEAN_LOG"
+  fail "Lean m6-core build failed — a gated module is used outside its gate"
+fi
+rm -f "$LEAN_LOG"
+
 # ── 2. Clippy ─────────────────────────────────────────────────────────────────
 # A minimum-score check, not `-D warnings`: the count may fall and may never rise. See
 # tools/clippy.sh for why, and tools/clippy-ceiling.txt for where it stands.

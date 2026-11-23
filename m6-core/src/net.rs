@@ -222,6 +222,19 @@ impl Refusals {
         Some(self.write(now))
     }
 
+    /// The count the process owes when it is leaving, or `None` when nothing
+    /// is owed.
+    ///
+    /// The interval does not apply. A process that is exiting has no later turn
+    /// to carry a count the rate limit held back, so the last line reports
+    /// whatever is owed.
+    pub fn closing(&mut self, now: Instant) -> Option<RefusedCounts> {
+        if self.owed == 0 {
+            return None;
+        }
+        Some(self.write(now))
+    }
+
     fn write(&mut self, now: Instant) -> RefusedCounts {
         let counts = RefusedCounts {
             since_last: self.owed,
@@ -377,6 +390,41 @@ mod tests {
             })
         );
         assert_eq!(refusals.total(), 3);
+    }
+
+    /// A count the rate limit is holding when the process leaves is written on
+    /// the way out. The wrong outcome: the refusals of the last interval are
+    /// never reported.
+    #[test]
+    fn a_count_owed_at_exit_is_written() {
+        let mut refusals = Refusals::new();
+        let start = crate::platform::now();
+        refusals.refused();
+        assert_eq!(
+            refusals.due(start),
+            Some(RefusedCounts {
+                since_last: 1,
+                total: 1
+            })
+        );
+
+        // A second refusal inside the interval is owed, and the loop's own
+        // flush will not write it.
+        refusals.refused();
+        assert_eq!(refusals.flush(start + REFUSED_INTERVAL / 2), None);
+        assert_eq!(refusals.owed(), 1);
+
+        // Leaving writes it anyway, with the interval still open.
+        assert_eq!(
+            refusals.closing(start + REFUSED_INTERVAL / 2),
+            Some(RefusedCounts {
+                since_last: 1,
+                total: 2
+            })
+        );
+        assert_eq!(refusals.owed(), 0);
+        // Nothing owed is no empty line.
+        assert_eq!(refusals.closing(start + REFUSED_INTERVAL / 2), None);
     }
 
     fn private(s: &str) -> bool {

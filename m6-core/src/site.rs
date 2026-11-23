@@ -998,12 +998,9 @@ impl Site {
                         error!("{}: {refusal}", self.name);
                         resp = Response::status(500);
                         in_area = false;
-                    } else if let Some(m) = minified(
-                        mime,
-                        bytes,
-                        minification,
-                        crate::minify::ParseBudget::from_limits(&self.state.config.limits),
-                    ) {
+                    } else if let Some(m) =
+                        minified_response(mime, bytes, minification, &self.state.config.limits)
+                    {
                         resp.body = crate::response::Body::Bytes(m);
                         minified_here = true;
                     }
@@ -3037,7 +3034,7 @@ fn minified(
             match crate::minify::try_minify_js_with(JsKind::Script, bytes, budget) {
                 Ok(minified) => Some(minified),
                 Err(fallback) => {
-                    crate::minify::warn_unminified(
+                    crate::minify::warn_unminified_render(
                         &crate::minify::body_subject("response", bytes),
                         &fallback,
                     );
@@ -3049,10 +3046,36 @@ fn minified(
     }
 }
 
-/// Without the `minify` feature the config loader has already refused any
-/// config that turns minification on, so there is nothing to do.
+/// Minify a rendered body with the service's parse budget, or `None` when its
+/// type is not enabled.
+///
+/// The budget is built here so the response path never names the
+/// feature-gated module. A call to [`crate::minify`] from outside a
+/// `#[cfg(feature = "minify")]` item compiles only while some other crate in
+/// the workspace unifies the feature on, so a lean `m6-core` build would fail.
+#[cfg(feature = "minify")]
+fn minified_response(
+    mime: &str,
+    bytes: &[u8],
+    config: &crate::config::MinificationConfig,
+    limits: &crate::limits::Limits,
+) -> Option<Vec<u8>> {
+    minified(
+        mime,
+        bytes,
+        config,
+        crate::minify::ParseBudget::from_limits(limits),
+    )
+}
+
+/// Without the `minify` feature no rendered body is minified.
 #[cfg(not(feature = "minify"))]
-fn minified(_: &str, _: &[u8], _: &crate::config::MinificationConfig) -> Option<Vec<u8>> {
+fn minified_response(
+    _: &str,
+    _: &[u8],
+    _: &crate::config::MinificationConfig,
+    _: &crate::limits::Limits,
+) -> Option<Vec<u8>> {
     None
 }
 
@@ -3400,6 +3423,43 @@ mod tests {
         let config = format!("{BIG_ROUTE}{render}");
         let (site, _dir) = site_from(&config, &[]);
         assert_eq!(get_big(&site).status, 200);
+    }
+
+    /// A rendered body that differs on every request and cannot be parsed
+    /// writes one fallback line, not one per request.
+    ///
+    /// The file path keys its line on a version (path, size and mtime), so a
+    /// loop on one file writes once. A rendered body has no version, and a
+    /// handler that varies it on every request makes every body a new subject.
+    /// The render path caps new subjects in time instead.
+    #[test]
+    #[cfg(feature = "minify")]
+    fn a_varying_rendered_body_writes_one_fallback_line() {
+        use crate::minify::{unminified_lines, ParseBudget};
+
+        let mut config = crate::config::MinificationConfig::default();
+        config
+            .enabled
+            .insert("application/javascript".to_string(), true);
+        let before = unminified_lines();
+        for i in 0..20 {
+            let body = format!("function ( {{ varying rendered body {i}\n");
+            assert!(
+                minified(
+                    "application/javascript",
+                    body.as_bytes(),
+                    &config,
+                    ParseBudget::builtin(),
+                )
+                .is_none(),
+                "a body that cannot parse is served as written"
+            );
+        }
+        assert_eq!(
+            unminified_lines() - before,
+            1,
+            "20 rendered bodies wrote 20 fallback lines"
+        );
     }
 
     #[test]

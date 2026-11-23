@@ -167,6 +167,23 @@ jobs:
           echo "test-build warnings: $n"
           [ "$n" -eq 0 ] || { echo "::error::$n test-build warning(s)"; exit 1; }
 
+      # A workspace build unifies features, so neither build above compiles
+      # m6-core with its default `templates` and `minify` off. A call to a gated
+      # module from outside its gate then compiles green here and fails for a
+      # user who depends on core with `default-features = false`. The lean
+      # build is the only one that asks that question, so it is a separate
+      # command and not part of the workspace run.
+      - name: Lean core build, zero warnings
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          status=0
+          cargo check -p m6-core --no-default-features > lean-core.log 2>&1 || status=$?
+          cat lean-core.log
+          [ "$status" -eq 0 ] || { echo "::error::the no-default-features build failed with status $status"; exit 1; }
+          n=$(grep -c '^warning' lean-core.log || true)
+          echo "lean-core warnings: $n"
+          [ "$n" -eq 0 ] || { echo "::error::$n lean-core warning(s)"; exit 1; }
+
       # Capture in full, then report. Grepping the pipe drops the assertion
       # message and leaves a bare `panicked at <file>:<line>`, which names the
       # place and not the reason.

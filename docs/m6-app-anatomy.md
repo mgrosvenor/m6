@@ -586,11 +586,13 @@ A key under `[limits]` that is not in the table stops the process at start with 
 | `request_dict` | entries | 32 | 4096 | services | the fields of one request: query, form, path parameters, cookies and built-ins | the request is refused with a 400 |
 | `refresh_queue` | entries | 16 | 4096 | m6-http | stale cache entries waiting for a background fetch | the refresh is refused |
 | `rate_limit_addresses` | entries | 1024 | 50000 | m6-http | client addresses the request counter tracks | a new address is answered 429 |
-| `cache_bytes` | bytes | 128 MiB | 128 MiB | m6-http | the response cache, which evicts the least recently read entry | the cache evicts |
+| `cache_bytes` | bytes | 128 MiB | 128 MiB | m6-http, m6-file | m6-http's response cache and m6-file's minified bodies, each evicting the least recently used entry | the cache evicts |
 | `heap_reserve` | bytes | 32 MiB (m6-http: `cache_bytes` max plus 64 MiB) | 4 GiB | services | the heap reserved from the OS at start, on huge pages where the kernel has them | the heap still grows from the OS, logged once, and is never a failure |
 
 **Table 6: the named limits, their defaults, the process that reads each, and what happens past the maximum.**
 Take from it that every limit is one `start` and one `max`, and that the last column says what happens past `max`.
+m6-file bounds its minified-body cache by the smaller of `cache_bytes` max and `heap_reserve` start, so the reservation always covers the cache.
+m6-http derives its reservation from `cache_bytes` and warns when an explicit `start` leaves the cache outside it.
 The start-up record's platform line lists every limit a process runs with, its `start`, its `max` and whether each came from the file or the default ([`m6-log.md`](m6-log.md) §9).
 
 The HTTP/1.1 head limits of 8 KiB per field and 32 KiB per head are protocol limits answered 400 (414 for a request line).
