@@ -121,6 +121,12 @@ A node that cannot be reached finishes its poll at the `Health` step, so it carr
 The same reader serves the one-shot check: `Reader::once` starts one read, `Reader::drain` reads the pipe to its end, and `m6-monitor --check` reads with the built-in `journal_line` limit.
 A relative `journal_dir` resolves against the config file's directory under `--check`, and against the site directory in the service.
 
+A second reader serves the event series, and it is separate for one reason: its entries are `M6_TYPE=event`, and adding that type to the documents read would fill the `--lines` window with every service's operational lines and starve the metrics documents the digest is built from.
+`Reader::open_matching` selects by `SYSLOG_IDENTIFIER` and nothing else, so the two reads select disjoint sets of entries and cannot take each other's lines.
+A reader with no configured identifier starts nothing, because `journalctl` with no match reads the whole journal.
+The two reads overlap in time, and an entry delivered twice counts once: each series keeps the newest `__REALTIME_TIMESTAMP` it has counted, and an entry at or below that is the same entry arriving again.
+Section 5.3 describes the keys a deployment declares.
+
 Section 3 turns to the one input that is a request.
 
 ## 3. What the log cannot answer
@@ -200,6 +206,7 @@ Table 3 lists the `[monitor]` keys, their defaults, and what each one decides.
 | `health_last_ok_max_age_s` | three poll intervals | the age above which a node's last 200 is flagged |
 | `environment` | absent | `dev`, `staging` or `prod`. A dirty build is refused anywhere but `dev`, and a pre-release is refused on `prod` |
 | `expected_deploy_file` | absent | the deploy's record of what it expects on each node, resolved against the site directory |
+| `event_series` | empty | the services whose accepted and refused events the digest counts, as `[[monitor.event_series]]` entries |
 
 **Table 3: the `[monitor]` keys.**
 
@@ -302,6 +309,54 @@ role = "cache"
 ```
 
 Section 6 turns to what the service answers.
+
+### 5.3 The event series
+
+The digest counts one service's accepted and refused events, and faults when a refusal names a cause that is the deployment's own configuration.
+The engine is generic and every name in it comes from the config, because which messages matter and which causes are bad are properties of one deployment's services.
+
+A service can refuse every caller and look exactly like a service under attack.
+That happens when a wrong credential, which is the service's own state, produces the same refusal a bad caller produces.
+The only trace is a log line, and a run of those reads as traffic from outside.
+The distinction costs a field on that line, and this section is where it is read.
+
+Table 4 lists the keys of one `[[monitor.event_series]]` entry.
+
+| key | default | what it decides |
+|---|---|---|
+| `identifier` | required | the service's `SYSLOG_IDENTIFIER`, which m6-log sets from the program's name |
+| `accepted` | required | the message written when the service accepted work |
+| `rejected` | required | the message written when the service refused work |
+| `split_by` | absent | the field on the refusal that says whether a credential was presented. Absent, every refusal is judged by its code alone and the split stays at zero |
+| `fault_field` | absent | the field on the refusal that names a cause |
+| `fault_codes` | empty | values of `fault_field` that mean the service's own configuration is wrong. A refusal carrying one is a Fault at once |
+
+**Table 4: the `[[monitor.event_series]]` keys.**
+
+Three rules follow from those keys.
+A refusal that carried a credential and named a listed code is a Fault at once, with no window and no averaging.
+A refusal that named any other code is a count, because the caller's credential was bad, stale or reused and the service behaved correctly.
+A refusal with no credential is a count and never a Fault, because that is traffic the service exists to refuse, and a Fault that fires on it gets ignored.
+
+The Fault clears on the first acceptance after it.
+A fault that stands once it has ever been true teaches a reader to ignore the page, and an acceptance is the evidence that the cause is gone.
+
+The counts are since the monitor started reading, which is one poll interval after it started.
+A series whose reader stopped is reported as unread rather than as zero, because a zero and a stopped reader look the same and only one of them is evidence.
+
+```toml
+[[monitor.event_series]]
+identifier  = "example-app"
+accepted    = "job accepted"
+rejected    = "job rejected"
+split_by = "credential_present"
+fault_field = "error_codes"
+fault_codes = ["invalid-credential", "missing-credential"]
+```
+
+The section appears on the digest page as `EVENT SERIES`, and the JSON carries the same counts under `events`.
+A `Fault` finding names the service, the code, the time and both counts, so a reader can tell one refusal from a run of them without opening the journal.
+A series that could not do what it says stops the start, naming the table, because a series that silently matches nothing looks exactly like a service nobody calls.
 
 ## 6. The routes
 

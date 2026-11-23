@@ -39,6 +39,25 @@ The released versions, newest first:
 
 ---
 
+## 1.17.0-rc.1, 2026-11-23
+
+**The digest counts a service's accepted and refused events, and faults when a refusal names the service's own configuration.**
+A service can refuse every caller and look exactly like a service under attack, because the refusal a wrong credential causes is written the same way as the refusal a bad caller causes.
+The only trace is a log line, and a run of those reads as traffic from outside.
+`[[monitor.event_series]]` names a service by its journal identifier, the message it writes when it accepted work, the message it writes when it refused work, and optionally the field on the refusal that names a cause plus the causes that are the service's own fault.
+A refusal that carried a credential and named a listed cause is a Fault at once, with no window.
+A refusal carrying any other cause is a count, because the caller's credential was bad, stale or reused and the service behaved correctly.
+A refusal with no credential is a count and never a Fault, because that is traffic the service exists to refuse.
+The Fault clears on the first acceptance after it.
+The counts appear on the digest page as `EVENT SERIES` and in the JSON under `events`, and a series whose reader stopped is reported as unread rather than as zero.
+
+The reader is a second `journalctl` child selected by `SYSLOG_IDENTIFIER`, because adding `M6_TYPE=event` to the documents read would fill its `--lines` window with every service's operational lines and starve the metrics documents the digest is built from.
+The two reads overlap in time, and an entry counts once: each series keeps the newest journal time it has counted and ignores anything at or below it.
+An entry below the newest counted time is the same entry arriving again, whether from this reader's previous read or from the other reader.
+
+**Verified by:** the workspace suite, including eleven unit tests over the counting and fault rules, a test that a reader with no configured identifier starts no read, a test that the page prints the fault and the counts, and four tests that drive a declared series through a `journalctl` on `PATH` that answers only the identifier it was asked for.
+Those four cover the counts on the page, a fault from a refusal that named the service's own cause, two refusals with no credential producing no fault, a series with a mismatched `fault_field` and `fault_codes` stopping the start, and the service starting with a declared series.
+
 ## 1.16.0-rc.1, 2026-11-18
 
 **m6 keeps one log stream, and the monitoring endpoints and their credentials are gone.**
