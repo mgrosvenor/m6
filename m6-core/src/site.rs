@@ -971,14 +971,12 @@ impl Site {
         // Both are skipped for a `verbatim` response, which a handler has
         // already decided. A streamed body has no bytes and no flag.
         //
-        // A cache keeps what it stores, so minification is paid once per fill
-        // and its saving collected on every hit. A `no-store` response has no
-        // second hit, so the cost lands on every request, where it is about
-        // what rendering the page costs, for a few bytes saved after
-        // compression. The default ETag is skipped by the same rule in
-        // `response.rs`.
+        // Every enabled type is minified, `Cache-Control: no-store` included.
+        // Skipping a no-store body would save the work on a response no cache
+        // keeps, and it would also serve that body as written, which is the
+        // exception the owner's rule does not allow.
         let mut minified_here = false;
-        if !resp.verbatim && !crate::response::cache_control_no_store(&resp.headers) {
+        if !resp.verbatim {
             let area = self.state.page_area.borrow();
             let source = if in_area {
                 Some(area.as_bytes())
@@ -3013,9 +3011,10 @@ fn minified(
         return None;
     }
     match mime {
-        "text/html" => Some(crate::minify::minify_html(bytes)),
+        "text/html" => Some(crate::minify::minify_html_with(bytes, config.inline_js)),
         "text/css" => Some(crate::minify::minify_css(bytes)),
         "application/json" => Some(crate::minify::minify_json(bytes)),
+        "application/javascript" | "text/javascript" => Some(crate::minify::minify_js(bytes)),
         _ => None,
     }
 }
@@ -3869,13 +3868,18 @@ mod tests {
                 m.insert("text/html".to_string(), true);
                 m.insert("text/css".to_string(), true);
                 m.insert("application/json".to_string(), true);
+                m.insert("application/javascript".to_string(), true);
+                m.insert("text/javascript".to_string(), true);
                 m
             },
+            inline_js: true,
         };
         assert!(cfg.is_enabled("text/html"));
         assert!(cfg.is_enabled("text/css"));
         assert!(cfg.is_enabled("application/json"));
-        assert!(!cfg.is_enabled("application/javascript"));
+        assert!(cfg.is_enabled("application/javascript"));
+        assert!(cfg.is_enabled("text/javascript"));
+        assert!(cfg.inline_js);
         assert!(!cfg.is_enabled("image/png"));
     }
 
@@ -5274,11 +5278,10 @@ mod minify_tests {
         site.handle(&head)
     }
 
-    /// A cache keeps nothing of a `no-store` page, so minifying it is paid on
-    /// every request and never repaid. The page must leave `handle` with the
-    /// bytes the template rendered, spaces and blank line intact.
+    /// A `no-store` page is minified like any other. It cost a second hit once,
+    /// and the rule is that every enabled type is minified.
     #[test]
-    fn a_no_store_page_is_sent_unminified() {
+    fn a_no_store_page_is_minified() {
         let (site, _dir) = site_from(
             "[[route]]\npath = \"/login\"\ntemplate = \"templates/login.html\"\n\
              cache = \"no-store\"\n",
@@ -5287,11 +5290,21 @@ mod minify_tests {
         match handle_get(&site, "/login", "identity") {
             Handled::Done(resp) => {
                 let body = resp.body.as_bytes().expect("a rendered page is buffered");
-                assert_eq!(
+                assert_ne!(
                     body,
                     LOGIN_PAGE.as_bytes(),
-                    "a no-store page must carry the template's whitespace: {:?}",
+                    "a no-store page must not carry the template's whitespace"
+                );
+                assert!(
+                    !body.windows(2).any(|pair| pair == b"  "),
+                    "a no-store page is minified, so no two spaces remain: {:?}",
                     String::from_utf8_lossy(body)
+                );
+                assert!(
+                    body.len() < LOGIN_PAGE.len(),
+                    "the minified page must be smaller: {} against {}",
+                    body.len(),
+                    LOGIN_PAGE.len()
                 );
             }
             _ => panic!("a template route comes back Done"),
@@ -5319,11 +5332,11 @@ mod minify_tests {
         }
     }
 
-    /// A config route naming a handler defaults to `no-store`, so its answer
-    /// is unminified for the same reason. JSON is a minified type by default,
-    /// and this body is deliberately spaced.
+    /// A config route naming a handler defaults to `no-store`, and its JSON is
+    /// minified too. JSON is a minified type by default, and this body is
+    /// deliberately spaced.
     #[test]
-    fn a_no_store_json_answer_is_sent_unminified() {
+    fn a_no_store_json_answer_is_minified() {
         let (site, _dir) = site_from(
             "[[route]]\npath = \"/api\"\nhandler = \"json\"\n",
             &["json"],
@@ -5341,8 +5354,8 @@ mod minify_tests {
             resp.body
                 .as_bytes()
                 .expect("a handler's JSON answer is buffered"),
-            b"{ \"a\": 1 }".as_slice(),
-            "a no-store JSON answer must not be minified"
+            b"{\"a\":1}".as_slice(),
+            "a no-store JSON answer must be minified"
         );
     }
 }

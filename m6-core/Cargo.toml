@@ -42,11 +42,12 @@ multipart = ["dep:multer", "dep:bytes", "dep:futures-util", "dep:futures-executo
 # `NoTemplates`, and a route that names a template is a configuration error.
 templates = ["dep:tera", "dep:comrak"]
 
-# The minifiers for HTML, CSS and JSON, run on the response path
-# when the config enables them. minify-html brings a full CSS engine, which a
-# service that never minifies should not link. Without the feature, a config
-# that enables minification fails to load and names it.
-minify    = ["dep:minify-html"]
+# The minifiers for HTML, CSS, JSON and JavaScript, run on the response path
+# when the config enables them. minify-html brings a full CSS engine and oxc
+# brings a parser, compressor and code generator, which a service that never
+# minifies should not link. Without the feature, a config that enables
+# minification fails to load and names it.
+minify    = ["dep:minify-html", "dep:oxc"]
 flash     = ["dep:hmac"]
 csrf      = []
 
@@ -103,6 +104,10 @@ hickory-proto = { version = "0.26", default-features = false, features = ["std"]
 resolv-conf   = { version = "0.7", default-features = false }
 
 minify-html   = { version = "0.15", optional = true }
+# The JavaScript minifier. `minifier` is the compressor and mangler, `codegen`
+# prints the result. It is the only engine here that keeps a string's value
+# rather than its spelling, and it escapes `</script` in its output.
+oxc           = { version = "0.159.0", optional = true, features = ["minifier", "codegen"] }
 tera          = { version = "1",    optional = true }
 comrak        = { version = "0.21", optional = true, default-features = false }
 multer        = { version = "3",    optional = true }
@@ -162,6 +167,10 @@ time      = "0.3"
 # The secret-field test reads every config struct's fields from the source.
 # syn 2 is already in the lockfile through serde_derive.
 syn       = { version = "2", features = ["full", "visit"] }
+# The behaviour tests run each original script and its minified form in a real
+# ECMAScript engine and compare what they return. In-process, so the check
+# cannot pass by finding no engine on the machine.
+boa_engine = "0.22.0"
 
 # The echo programs prove the loop serves with no heap allocation outside table
 # growth. They use the counting allocator behind `testkit`. They are `[[bin]]`

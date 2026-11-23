@@ -46,8 +46,22 @@ Every log line carries a `type`, and under systemd each line is one datagram on 
 `/perf` and `/traffic` are removed on every node, and the two documents are read from the `type=perf` and `type=traffic` lines.
 A config that still names a removed key stops the service at start with exit 2.
 This release also fixes the cache storage rule and the refresh-token lifetime, and gives every auth token a kind, an audience and an id.
-Migration lists the nine changes an operator makes, and Removed lists every removal.
+Migration lists the ten changes an operator makes, and Removed lists every removal.
 The examples moved into `examples/` in this repository and are built from the same commit as the crates they use. The old m6-examples repository is archived.
+
+**JavaScript is minified again, in a script file and in a classic inline `<script>`, by `oxc_minifier` 0.159.0.**
+1.16.0-rc.1 served every script as written because minify-js 0.5.6 re-emitted a string holding an apostrophe as a template literal with doubled escapes.
+`[minification]` takes `application/javascript`, `text/javascript` and `inline_js`, all on by default.
+A module script, `application/ld+json` and every other non-JavaScript script type keep their bytes.
+A classic script's top-level names are kept, because another script or an inline handler may use them, and a script the parser cannot read is served as written with a warning.
+The workspace minimum Rust version moves to 1.98, which `oxc` 0.159 requires.
+Verified by ten tests in `m6-core/tests/js_minify.rs`: the #357 string, a corpus of apostrophes, quotes, `\u` escapes, template literals, regex literals, `</script>` in a string and unicode, each original and minified form run in Boa and their results compared, the d3 7.9.0 build round-tripped with identical behaviour, every example script and classic inline script parsed, the inline scanner's treatment of JSON and modules, and the fallback that serves the input bytes for a script that does not parse, in a file and inline. `m6-file` has a request-level test of the same fallback.
+The examples' JavaScript fell from 4,519,425 bytes to 3,994,677, and their own scripts fell further: `logs.js` 6,678 to 3,131, `bench.js` 15,120 to 10,367 and `editor-init.js` 8,881 to 7,202.
+
+**A `Cache-Control: no-store` response is minified again.**
+1.16.0-rc.1 skipped the minifier for those responses to save work on a body no cache keeps, and that skipped the rule that everything enabled is minified.
+Every enabled type is minified now, HTML and JSON included.
+Verified by `a_no_store_page_is_minified` and `a_no_store_json_answer_is_minified` in `m6-core/src/site.rs`, which assert the minified bytes and that the page is smaller.
 
 **Socket paths in tests no longer depend on `TMPDIR`.** `m6_platform::socket_scratch_root` names the shortest writable temporary root, and every test that binds a unix socket creates its scratch directory there, so a long `TMPDIR` can no longer spend the 104-byte `sun_path` before the file name. The reported intermittent `m6-auth-server` failure ("103 limit") was this: the test measured the host's temporary directory rather than the behaviour it asserts. The platform still refuses a path that cannot fit, naming its length and the limit. That refusal is tested, not worked around. Verified by the workspace suite with `TMPDIR` set to a 93-character path, where the named test failed before the change and passes after it.
 
@@ -67,7 +81,7 @@ Three gaps remain, and the Not measured section lists each.
 
 ### Migration
 
-An operator makes nine changes.
+An operator makes ten changes.
 
 1. Read the `type=perf` or `type=traffic` line from the journal where a script read `/perf` or `/traffic`. `m6-monitor` already reads them this way, and a firewall-stats collector moves to the `type=traffic` line.
 2. Enable `systemd-journal-upload` on every node and `systemd-journal-remote` on the monitor host.
@@ -78,6 +92,7 @@ An operator makes nine changes.
 7. The workspace version is `1.16.0-rc.1`. The staging pin moves to the `v1.16.0-rc.1` tag. The release commit sets `1.16.0` and is tagged `v1.16.0`.
 8. A monitor that names neither `[monitor] environment` nor `[monitor] expected_deploy_file` keeps running and gains two warnings per check. Set the first to `dev`, `staging` or `prod`, and the second to the file the deploy writes.
 9. A monitor's history file rebuilds its `build` table under migration 3 the first time this release opens it. The old build rows are dropped, because their `hash` was an executable md5 this release no longer reads and their `version` carried no build metadata, so no old row is comparable with a new one. Every `health` row survives, and one that named a discarded build keeps its figures with `build_id` set to `NULL`. The open writes one `type=event` line that says the table was rebuilt and why.
+10. A build uses Rust 1.98 or newer, which the JavaScript minifier requires. `[minification]` accepts `application/javascript`, `text/javascript` and `inline_js` again, all on by default.
 
 The entries below give the detail behind each step and the behaviour changes that need no config edit.
 

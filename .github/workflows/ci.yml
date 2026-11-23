@@ -247,7 +247,7 @@ jobs:
           [ "$n" -eq 0 ] || { cat nofeat.log; echo "::error::$n warning(s) building m6-core with no features"; exit 1; }
           for p in m6-http m6-monitor m6-auth-server m6-auth-cli; do
             tree=$(cargo tree -e normal -p "$p") || { echo "::error::cargo tree failed for $p"; exit 1; }
-            if grep -E ' (lightningcss|minify-html|tera|comrak) v' <<< "$tree"; then
+            if grep -E ' (lightningcss|minify-html|oxc|boa_engine|tera|comrak) v' <<< "$tree"; then
               echo "::error::$p links a template engine or a minifier"; exit 1
             fi
           done

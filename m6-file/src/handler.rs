@@ -295,9 +295,12 @@ pub fn serve(req: &Request) -> Result<Response> {
     // treatment here as it would through the render path.
     let data = if minify_this {
         match mime_base.as_str() {
-            "text/html" => m6_core::minify::minify_html(&data),
+            "text/html" => {
+                m6_core::minify::minify_html_with(&data, minification.is_some_and(|m| m.inline_js))
+            }
             "text/css" => m6_core::minify::minify_css(&data),
             "application/json" => m6_core::minify::minify_json(&data),
+            "application/javascript" | "text/javascript" => m6_core::minify::minify_js(&data),
             _ => data,
         }
     } else {
@@ -748,14 +751,58 @@ mod tests {
         req
     }
 
-    /// A script is served as the bytes on disk. The JavaScript minifier m6
-    /// used to run re-emitted a string holding an apostrophe as a template
-    /// literal with its escapes doubled, so `"didn't \u2014 tab\there"` went
-    /// out as `` `didn't \\u2014 tab\\there` ``. The config is the default
-    /// one, so this is the path a site with no `[minification]` table takes.
+    /// A script is minified on the wire, and the string that used to be
+    /// corrupted keeps its characters. The old minifier re-emitted it as a
+    /// template literal with doubled escapes, so `"didn't \u2014 tab\there"`
+    /// was served as `` `didn't \\u2014 tab\\there` ``. The default config
+    /// is the path a site with no `[minification]` table takes.
     #[test]
-    fn a_script_is_served_byte_identical_under_the_default_config() {
+    fn a_script_is_minified_and_the_string_keeps_its_escape() {
         let script = "var m = \"That didn't verify \u{2014} \\u2014 tab\\there.\";\n";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("assets/app.js"), script).unwrap();
+        let mut conf = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut conf, b"").unwrap();
+        let cfg = m6_core::config::load(conf.path(), dir.path()).unwrap();
+        let req = asset_req(dir.path(), "app.js", None, &[]).with_config(std::sync::Arc::new(cfg));
+        let (status, _, body) = wire(&req);
+        assert_eq!(status, 200);
+        let served = String::from_utf8_lossy(&body);
+        assert!(
+            body.len() < script.len(),
+            "the script must shrink: {served}"
+        );
+        assert!(served.contains("didn't"), "the string changed: {served}");
+        assert!(
+            !served.contains("\\\\u2014"),
+            "the escape was doubled: {served}"
+        );
+    }
+
+    /// A config that switches the JavaScript key off serves the file as it is,
+    /// and one that leaves it on is the default above.
+    #[test]
+    fn a_script_is_served_unminified_when_its_key_is_off() {
+        let script = "var m = \"That didn't verify \\u2014 tab\\there.\";\n";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("assets/app.js"), script).unwrap();
+        let mut conf = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut conf, b"[minification]\n\"text/javascript\" = false\n")
+            .unwrap();
+        let cfg = m6_core::config::load(conf.path(), dir.path()).unwrap();
+        let req = asset_req(dir.path(), "app.js", None, &[]).with_config(std::sync::Arc::new(cfg));
+        let (status, _, body) = wire(&req);
+        assert_eq!(status, 200);
+        assert_eq!(String::from_utf8_lossy(&body), script);
+    }
+
+    /// A script the minifier cannot parse is served as the bytes on disk, with
+    /// a warning, rather than as a corrupted or failed response.
+    #[test]
+    fn a_script_that_does_not_parse_is_served_byte_identical() {
+        let script = "function ( { this is not javascript\n";
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("assets")).unwrap();
         std::fs::write(dir.path().join("assets/app.js"), script).unwrap();
@@ -768,7 +815,7 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(&body),
             script,
-            "the script must be served unchanged"
+            "the fallback must serve the original bytes"
         );
     }
 
