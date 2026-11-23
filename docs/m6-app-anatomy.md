@@ -100,6 +100,7 @@ Below is a one-route service with the shape every service follows: start, run, s
 use std::io;
 use std::time::Duration;
 
+use m6_core::drain::{Drain, Step};
 use m6_core::prelude::*;
 use m6_core::signal::{Action, Lifecycle};
 use m6_core::site::finish_reload;
@@ -128,13 +129,21 @@ fn main() -> anyhow::Result<()> {
     let mut lifecycle = Lifecycle::new(site.name(), Some(site.socket_path().to_path_buf()));
     lifecycle.started();
     let mut conns = Slots::new(1024, 1024, || ServerConn::new(READ_CAP, WRITE_CAP));
+    let drain_timeout = site.drain_timeout();
+    let mut drain = Drain::new(drain_timeout, 1024);
     let mut deadlines = Timeouts::new(1024, read_timeout.unwrap_or(Duration::ZERO));
     let mut events = Events::with_capacity(256);
+    let mut accepting = true;
     let mut last_tick = m6_core::platform::now();
 
     // Run: nothing blocks.
     'run: loop {
-        poll.poll(&mut events, Some(deadlines.timeout(m6_core::platform::now(), TICK)))?;
+        // While draining, the wait is capped at the deadline.
+        let mut wait = deadlines.timeout(m6_core::platform::now(), TICK);
+        if let Some(left) = drain.poll_timeout(m6_core::platform::now()) {
+            wait = wait.min(left);
+        }
+        poll.poll(&mut events, Some(wait))?;
         for event in &events {
             match event.token() {
                 LISTENER => {
@@ -157,21 +166,30 @@ fn main() -> anyhow::Result<()> {
                             deadlines.touch(Token(taken.key), m6_core::platform::now());
                         }
                         conns.get_mut(taken.key).attach(stream);
+                        // Counted at the accept, not when a turn reads the
+                        // request.
+                        drain.begin(taken.key);
                     }
                 }
                 SIGNALS => {
-                    let mut stop = false;
                     while let Some(signal) = signals.read() {
                         if lifecycle.on_signal(signal) == Action::Stop {
-                            stop = true;
+                            // Stop accepting, then answer what was accepted.
+                            if accepting {
+                                poll.registry().deregister(&mut listener)?;
+                                accepting = false;
+                            }
+                            if drain.start(m6_core::platform::now()) {
+                                break 'run;
+                            }
                         }
-                    }
-                    if stop {
-                        break 'run;
                     }
                 }
                 LOG => m6_core::log::flush(),
                 Token(k) => {
+                    // A turn is accepted work, plus a new request on a
+                    // kept-alive connection.
+                    drain.begin(k);
                     let conn = conns.get_mut(k);
                     let was = conn.interest();
                     match turn(conn, &mut site) {
@@ -186,8 +204,15 @@ fn main() -> anyhow::Result<()> {
                             if read_timeout.is_some() {
                                 deadlines.touch(Token(k), m6_core::platform::now());
                             }
+                            // Answered and holding nothing: idle.
+                            if conn.served() > 0 && !conn.pending() {
+                                drain.end(k);
+                            }
                         }
-                        _ => m6_core::h1::close_conn(&poll, &mut conns, &mut deadlines, k)?,
+                        _ => {
+                            drain.end(k);
+                            m6_core::h1::close_conn(&poll, &mut conns, &mut deadlines, k)?;
+                        }
                     }
                 }
             }
@@ -204,7 +229,24 @@ fn main() -> anyhow::Result<()> {
             last_tick = m6_core::platform::now();
         }
         while let Some(Token(k)) = deadlines.expired(m6_core::platform::now()) {
+            drain.end(k);
             m6_core::h1::close_conn(&poll, &mut conns, &mut deadlines, k)?;
+        }
+        // The drain: leave when the count is zero, or at the deadline with a
+        // warning that names what was left.
+        if drain.draining() {
+            match drain.step(m6_core::platform::now()) {
+                Step::Draining => {}
+                Step::Finished => break 'run,
+                Step::DeadlinePassed(unfinished) => {
+                    m6_core::log::warn!(
+                        unfinished,
+                        timeout_s = drain_timeout.as_secs(),
+                        "drain deadline passed with requests still in flight"
+                    );
+                    break 'run;
+                }
+            }
         }
     }
 
@@ -265,10 +307,12 @@ fn turn(conn: &mut ServerConn, site: &mut Site) -> io::Result<bool> {
 The loop has one `match` on the event's token.
 `LISTENER` takes free slots and accepts until the kernel has no more.
 `SIGNALS` drains the signal descriptor through `Lifecycle`, which answers whether to stop.
+A stop closes the listener and starts the drain, and the loop leaves on the turn `Drain::step` reports the count is zero or the deadline has passed.
 `LOG` writes what a full stdout held.
 Every other token is one connection, and `turn` reads, dispatches and writes until its socket would block.
 `watch` registers stdout only while a write has returned `EAGAIN`, and `tick` flushes the log buffer once a second.
 `deadlines.expired` closes a peer that sent nothing before its read deadline.
+`Drain::begin` runs at the accept and `Drain::end` when the connection's work is finished, so the count is right without a lock on the request path.
 
 Two details keep the shape correct.
 `close_conn` clears the deadline, detaches the stream, deregisters it and frees the slot, in that order, so every exit from a connection goes through it.
@@ -365,7 +409,7 @@ Table 5 is the reserved set, and a key in it never reaches a template.
 | key | read by | what it sets |
 |---|---|---|
 | `[params_cache]` | core | `size`, default 256 entries |
-| `[server]` | core | `read_timeout_s`, default 30, `0` disables. `socket_mode`, an octal string as systemd writes it, default `"0660"` |
+| `[server]` | core | `read_timeout_s`, default 30, `0` disables. `drain_timeout_s`, default 30, how long shutdown waits for accepted requests, `0` waits for none. `socket_mode`, an octal string as systemd writes it, default `"0660"` |
 | `[compression]` | core | brotli and gzip levels per MIME type |
 | `[minification]` | core | on or off per MIME type. JavaScript is never minified. A build without the `minify` feature refuses a config that turns it on. The `no-store` exception is in Table 9 of `m6-architecture.md` |
 | `[log]` | core | `level`, default `info` |
@@ -646,10 +690,16 @@ The descriptor opens before the socket exists.
 The socket is how a caller knows the service is ready, so a caller that waits for it and then sends SIGTERM must find the descriptor open.
 A stop that arrives while the mask is blocked and no descriptor is open is discarded on macOS, and the service would then ignore the stop that followed its own bind.
 
-The first signal stops accepting, removes the socket and exits 0.
-It does not wait for a request in progress, so a request cut off by a restart is lost, and a service that needs state to survive a restart cannot depend on a shutdown hook.
+The first signal stops accepting, answers every request the listener already accepted, then removes the socket and exits 0.
+The wait ends when the last accepted request finishes, or at `[server] drain_timeout_s`, whichever comes first.
+Past the deadline the service logs `drain deadline passed with requests still in flight` with the count in `unfinished`, and exits anyway, so the supervisor's own stop timeout never kills it mid-response.
 A second signal removes the socket, logs `<name> shutdown forced` and exits 0 at once.
 A socket left behind keeps a dead member in the edge's backend pool.
+
+**The drain counts a connection when the listener accepts it**, not when a turn reads its request.
+`m6_core::drain::Drain` owns the count and the deadline, so the four services whose loops share `ServerConn` make the same decision with the same code.
+A request that was accepted and not yet read is work the service owes an answer, and a drain that waits only for work already being served closes the listener under it.
+`docs/m6-architecture.md` §7.3 gives the defect that measured.
 
 `Lifecycle::on_signal` decides what a signal means: `Action::Stop` breaks the loop and `Action::Continue` carries on.
 `Lifecycle::complete()` removes the socket and writes the completion line.
@@ -803,7 +853,7 @@ Table 8 is the whole contract in one place.
 | routes as `CodeRoute` values, handlers registered by name, or both | route matching, the configuration route table and the dispatch |
 | plain state in `main`, passed to the arms | the request dictionary, rendering, minification, compression and logging |
 | a configuration file whose stem is the service's name | the socket path, the backend name and the reserved keys of Table 5 |
-| a systemd unit naming the two paths and what it writes | `Lifecycle`: the start line, the signal line, the socket unlink and the exit |
+| a systemd unit naming the two paths and what it writes | `Lifecycle`: the start line, the signal line, the socket unlink and the exit. `Drain`: the accepted-work count and the drain deadline |
 | one call to `assert_app_lifecycle` | the assertion behind it |
 
 **Table 8: the division of labour between a service and `m6-core`.**

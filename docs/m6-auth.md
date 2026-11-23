@@ -476,11 +476,11 @@ This section gives the signals, the exit codes and the log lines, beginning with
 ### 11.1. Signals
 
 Table 8 gives the shutdown signals.
-Take from it that a second signal forces the exit.
+Take from it that the first signal answers what it already accepted, and a second forces the exit.
 
 | signal | first receipt | second receipt |
 |---|---|---|
-| `SIGTERM` or `SIGINT` | leave the loop, remove the sockets, exit 0 | exit 0 at once |
+| `SIGTERM` or `SIGINT` | stop accepting, answer the accepted requests up to `[server] drain_timeout_s`, remove the sockets, exit 0 | remove the sockets, log `<name> shutdown forced`, exit 0 at once |
 
 **Table 8: the shutdown signals and what each receipt does.**
 

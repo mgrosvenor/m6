@@ -615,12 +615,19 @@ A content file that could redefine the request path could make a page misreport 
 
 ### 7.3 Why startup and shutdown belong to core
 
-**A service stops on SIGTERM by refusing new connections, removing its socket and exiting.**
-It does not wait for requests in progress: the supervisor restarts it on a deploy, and a request cut off by a restart is acceptable.
-The first signal exits 0 and the second exits immediately.
-The sequence is the service's `main`, with m6-core supplying the parts it calls: `signal::block()` first, `Lifecycle` for the lines and the signal meanings, and the socket path that `Lifecycle::complete` unlinks.
+**A service that drops work on SIGTERM turns every deploy into a handful of failed requests.**
+So the first signal refuses new connections, answers the requests the listener already accepted, up to `[server] drain_timeout_s`, and exits 0.
+The second exits immediately.
+A request cut off by a restart is the one case the drain could not finish, and the deadline is what bounds it.
+The sequence is the service's `main`, with m6-core supplying the parts it calls: `signal::block()` first, `Lifecycle` for the lines and the signal meanings, `Drain` for the accepted-work count and the deadline, and the socket path that `Lifecycle::complete` unlinks.
 A service supplies two pieces of data: the name in its lifecycle lines and the socket to unlink on every exit path.
 Core owning the lifecycle lines means a journal search for a shutdown means the same thing for every unit.
+
+**The count is taken at the accept, and that is the whole point.**
+A drain that counts a request when a turn dispatches it sees nothing in flight in the window between the listener accepting the connection and the loop reading the request, and it exits under a client that has already connected.
+Issue #338 measured that window: 57 failures in 150 loaded runs of the shutdown test before the count moved to the accept.
+The other half is the deadline.
+A request that never finishes cannot hold a deploy past `drain_timeout_s`, so the loop logs the count it left and exits anyway.
 
 **Blocking signals is the first statement of `main`, the one ordering rule in m6 that cannot be relaxed.**
 A thread inherits the signal mask as it stands when the thread is created, and a library a service links can start one.
