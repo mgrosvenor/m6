@@ -13,6 +13,7 @@ The heading is the version, and a number would break the pattern `tag.sh` and CI
 
 The released versions, newest first:
 
+- [1.17.0-rc.1, 2026-11-23](#1170-rc1-2026-11-23)
 - [1.16.0-rc.1, 2026-11-18](#1160-rc1-2026-11-18)
 - [1.15.0, 2026-10-29](#1150-2026-10-29)
 - [1.14.0, 2026-10-27](#1140-2026-10-27)
@@ -41,61 +42,28 @@ The released versions, newest first:
 
 ## 1.17.0-rc.1, 2026-11-23
 
-**Templates are named for what they produce, and the loader reads only `.tmpl` files.**
-A template file is `page.html.tmpl`, `icon.svg.tmpl` or `robots.txt.tmpl`, and the part before `.tmpl` is the output it produces.
-The loader walks every subdirectory of `templates/`, so an icon can live in `templates/icons/`.
-The Tera name is the full path with the suffix kept, so an include names the file it includes: `{% include "templates/icons/logo.svg.tmpl" %}`.
-This is a breaking change: a file that does not end `.tmpl` is no longer a template, and there is no compatibility shim.
+**This release restores JavaScript minification and the shutdown drain, refuses a connection the process has no descriptor for, names every node in `Via`, and renames every example template to `*.html.tmpl`.**
+It also batches the HTTP/3 send and receive paths, and adds a monitor series that counts a service's accepted and refused events and raises a fault when the service's own configuration caused the refusal.
 The version is `1.17.0-rc.1`, a develop build: `main` is still 1.15.0 and there is no `v1.16.0` tag.
-Every example and test fixture in this repository is renamed in the same commit.
+Migration lists the three changes an operator makes, and Verified lists the cross-cutting proof.
 
-### Migration
+**A connection the process cannot accept for want of a descriptor is refused, and the listener keeps draining.**
+Running out of descriptors left the accept arm no answer: it stopped for the turn with the listener still registered and edge-triggered, so the readiness that woke it was consumed and nothing could wake it again until another connection arrived. A full listen queue lets no other connection complete, so the clients already queued waited for the life of the process.
+Every accept loop now holds one descriptor of its listener's socket family from start, before any pressure. On `EMFILE` or `ENFILE` it closes the reserve, takes the connection already queued in the descriptor that frees, closes that connection at once, opens the reserve again, counts the refusal, and keeps draining, so the turn ends with an empty queue. That is libuv's `uv__emfile_trick`. Any other accept error logs once, re-registers the listener so a queued connection is reported again, and stops draining.
+The refusal writes one line at warn, "connection rejected: no free file descriptors", rate limited to one a second, carrying the exact count since the previous line and the total since start. Rate limiting delays a count and never loses one.
+The loops that changed are m6-file, m6-html, m6-auth-server (both listeners), m6-monitor, and m6-http (its HTTP/1.1 and h2c listeners). Each keeps `m6_core::net::Refusals` and writes the count it still owes when it stops, through `m6_core::net::close_refusals`.
+Verified by `connections_beyond_a_lowered_open_file_limit_are_refused_with_one_counted_line` in `m6-file/tests/integration.rs`, which lowers the open-file limit, queues three connections while the process is stopped, and requires one line per burst whose counts add up to the total. `m6-core/tests/echo_example.rs` proves the same contract on the reference loop in `m6-core/examples/echo.rs`, with no new connection arriving. Reverting the arm that refuses and keeps draining, the count, or the rate limit failed a test.
 
-Rename every template file by appending `.tmpl` to its name: `templates/page.html` becomes `templates/page.html.tmpl`, and `templates/icon.svg` becomes `templates/icon.svg.tmpl`.
-Update every `template` value in every route config, every `{% extends %}` and `{% include %}` name, and every `Response::render` and `Response::render_with` call to the new name.
-A file that keeps its old name is never loaded, so a route that still names it fails at the first render with `template not found`.
-Templates in subdirectories are found by the updated loader, so a renamed icon can move to `templates/icons/` in the same change.
-
-### Changed
-
-**Both template builders load only `.tmpl` files, recursively.**
-`build_tera` walks every subdirectory of `templates/`.
-`build_tera_from_paths` walks the whole template root as well, because an include may cross folders, and then loads any named template outside the root.
-Tera chooses autoescaping from the template name, and the name now ends `.tmpl`, so the builders set the suffixes explicitly: `.html.tmpl`, `.htm.tmpl` and `.xml.tmpl` escape, and `.svg.tmpl`, `.txt.tmpl` and `.json.tmpl` do not.
-A page therefore renders the same bytes under its new name as it did under its old `.html` name.
-
-### Verified
-
-- `a_template_in_a_subfolder_is_found`, `a_file_without_the_tmpl_suffix_is_not_a_template` and `an_include_across_folders_renders` in `m6-core/src/template.rs`.
-- `build_tera_from_paths_loads_the_whole_root_and_only_tmpl_files` and `autoescaping_follows_the_output_part_of_the_name`, which fails if the autoescape suffixes are left at Tera's defaults.
-- The full workspace suite, with every example and fixture template renamed.
-
----
-**The digest counts a service's accepted and refused events, and faults when a refusal names the service's own configuration.**
-A service can refuse every caller and look exactly like a service under attack, because the refusal a wrong credential causes is written the same way as the refusal a bad caller causes.
-The only trace is a log line, and a run of those reads as traffic from outside.
-`[[monitor.event_series]]` names a service by its journal identifier, the message it writes when it accepted work, the message it writes when it refused work, and optionally the field on the refusal that names a cause plus the causes that are the service's own fault.
-A refusal that carried a credential and named a listed cause is a Fault at once, with no window.
-A refusal carrying any other cause is a count, because the caller's credential was bad, stale or reused and the service behaved correctly.
-A refusal with no credential is a count and never a Fault, because that is traffic the service exists to refuse.
-The Fault clears on the first acceptance after it.
-The counts appear on the digest page as `EVENT SERIES` and in the JSON under `events`, and a series whose reader stopped is reported as unread rather than as zero.
-
-The reader is a second `journalctl` child selected by `SYSLOG_IDENTIFIER`, because adding `M6_TYPE=event` to the documents read would fill its `--lines` window with every service's operational lines and starve the metrics documents the digest is built from.
-The two reads overlap in time, and an entry counts once: each series keeps the newest journal time it has counted and ignores anything at or below it.
-An entry below the newest counted time is the same entry arriving again, whether from this reader's previous read or from the other reader.
-
-**Verified by:** the workspace suite, including eleven unit tests over the counting and fault rules, a test that a reader with no configured identifier starts no read, a test that the page prints the fault and the counts, and four tests that drive a declared series through a `journalctl` on `PATH` that answers only the identifier it was asked for.
-Those four cover the counts on the page, a fault from a refusal that named the service's own cause, two refusals with no credential producing no fault, a series with a mismatched `fault_field` and `fault_codes` stopping the start, and the service starting with a declared series.
-## 1.16.0-rc.1, 2026-11-18
-
-**m6 keeps one log stream, and the monitoring endpoints and their credentials are gone.**
-Every log line carries a `type`, and under systemd each line is one datagram on journald's native socket.
-`/perf` and `/traffic` are removed on every node, and the two documents are read from the `type=perf` and `type=traffic` lines.
-A config that still names a removed key stops the service at start with exit 2.
-This release also fixes the cache storage rule and the refresh-token lifetime, and gives every auth token a kind, an audience and an id.
-Migration lists the ten changes an operator makes, and Removed lists every removal.
-The examples moved into `examples/` in this repository and are built from the same commit as the crates they use. The old m6-examples repository is archived.
+**On SIGTERM or SIGINT a service stops accepting, answers the requests the listener already accepted, removes its socket and exits 0 (#338).**
+The wait ends when the last accepted request finishes, or at `[server] drain_timeout_s`, default 30 and inside the 90 s systemd allows a stop.
+Past the deadline the service logs `drain deadline passed with requests still in flight` with the count in `unfinished`, and exits anyway, so the supervisor's stop timeout never kills it mid-response.
+`0` waits for nothing.
+1.16.0-rc.1 stopped and exited without waiting, which cut off a request that was still running.
+`m6_core::drain::Drain` now holds the count and the deadline for the four services whose loops share `h1::ServerConn`: m6-html, m6-file, m6-auth-server and m6-monitor. m6-http keeps its own loop and its own stop sequence.
+The count is taken when the listener accepts a connection, so a request accepted and not yet read holds shutdown open. Issue #338 measured that window at 57 failures in 150 loaded runs.
+A kept-alive connection that has answered its request and holds nothing stops counting, so an idle client cannot hold a deploy, and a request that arrives on a kept-alive connection during the drain is counted again and answered.
+The test harness's `Service::wait_for_exit` and `terminate` still wait for the output threads to copy a child's last lines, which a test reading `output()` straight after the exit could miss.
+Verified against the real m6-html binary: a request held open at SIGTERM receives its complete response before the process exits, a connection accepted with nothing read from it is answered when its request arrives after the signal, a stalled request meets the deadline and the warning names it as `"unfinished":1`, a second SIGTERM exits at once, and a shutdown with nothing in flight exits within a second.
 
 **JavaScript is minified again, in a script file and in a classic inline `<script>`, by `oxc_minifier` 0.159.0.**
 1.16.0-rc.1 served every script as written because minify-js 0.5.6 re-emitted a string holding an apostrophe as a template literal with doubled escapes.
@@ -129,6 +97,122 @@ A cache node's entry survives to the origin and the backend reads `1.1 edge-a, 2
 An internal listener keeps and appends a peer's entry, and the same h2c listener declared public strips it.
 Each direction is a caught revert: ignoring the listener's trust fails five of the six, sending the fixed pseudonym fails all six, and putting this node's entry first fails the two that carry a chain.
 
+**Templates are named for what they produce, and the loader reads only `.tmpl` files.**
+A template file is `page.html.tmpl`, `icon.svg.tmpl` or `robots.txt.tmpl`, and the part before `.tmpl` is the output it produces.
+The loader walks every subdirectory of `templates/`, so an icon can live in `templates/icons/`.
+The Tera name is the full path with the suffix kept, so an include names the file it includes: `{% include "templates/icons/logo.svg.tmpl" %}`.
+This is a breaking change: a file that does not end `.tmpl` is no longer a template, and there is no compatibility shim.
+Every example and test fixture in this repository is renamed in the same commit.
+
+**Both template builders load only `.tmpl` files, recursively.**
+`build_tera` walks every subdirectory of `templates/`.
+`build_tera_from_paths` walks the whole template root as well, because an include may cross folders, and then loads any named template outside the root.
+Tera chooses autoescaping from the template name, and the name now ends `.tmpl`, so the builders set the suffixes explicitly: `.html.tmpl`, `.htm.tmpl` and `.xml.tmpl` escape, and `.svg.tmpl`, `.txt.tmpl` and `.json.tmpl` do not.
+A page therefore renders the same bytes under its new name as it did under its old `.html` name.
+
+**The mixed handshake bench names no TLS provider, because the tree builds one.**
+Its header printed `features=none (ring)` after aws-lc-rs became the only provider the workspace builds, so the line named a provider the tree does not compile. The header prints `features=none` now, and the handshake suite's own `provider=aws-lc-rs` line is unchanged.
+
+**The HTTP/3 server reads its socket's local address once per socket.**
+Every received datagram needs the local address the connection answered on, and the receive loop asked the kernel for it again for each one.
+A bound socket's local address cannot change, so the call returned the same value every time.
+The server now reads it when the socket is created, carries it beside the socket, and uses the stored value for every `RecvInfo`.
+A server that receives a burst therefore pays one lookup for the socket.
+Interface classification is unchanged, because it is chosen from the peer address the receive reports.
+The test `local_addr_is_read_once` counts the reads and shows that a stored read does not go back to the kernel.
+
+**The HTTP/3 benchmark client reads its per-socket facts once per connection, and closes a connection before replacing it.**
+The client set its read timeout and asked the kernel for the peer and local addresses once per received datagram, and all three are facts about a connected socket that cannot change during the connection.
+The read timeout is the turn's wait.
+The timeout and the connection's `RecvInfo` are now taken once at connect, and each request reuses them.
+The client also reconnects after a fixed number of requests.
+It used to drop the old connection and its socket without a QUIC close, so the server kept every replaced connection until its idle timeout and carried them all on every loop turn.
+Each reconnect now sends CONNECTION_CLOSE and flushes it before the socket is dropped.
+A run therefore measures the server's HTTP/3 path and leaves no growing set of idle connections behind.
+This changes the benchmark client only, and the server is untouched.
+The test `close_and_flush_sends_the_close` has a real quiche peer receive the close and report the connection closed.
+
+**The platform layer gains a UDP batch, so one call sends a packed buffer as many datagrams and one call takes in many datagrams.**
+`net::UdpBatch` is the API, and it states a batch in a service's terms.
+`for_socket` probes a socket once at setup, `send` sends a buffer packed as segments of one size, and `recv` takes up to `MAX_BATCH` datagrams into one contiguous buffer, one per slot, with the length and source of each in a `RecvMeta`.
+On Linux the send is one `sendmsg` carrying a `UDP_SEGMENT` control message, so the kernel cuts the packed buffer into the datagrams the caller described, and the receive is one `recvmmsg`.
+The macOS arm takes the same calls as a loop of one `sendto` and one `recvfrom` per datagram.
+The fallback is the same code path, so a batch puts the same bytes on the wire in the same order wherever it runs.
+The probe sets the option and reads it back, because a bare read reports zero on every kernel, and it clears the option afterwards so an ordinary send on that socket stays one datagram per call.
+`without_gso` runs the fallback on a socket that has segmentation, so the contract suite compares the segmented path against the fallback over loopback on one machine.
+Four `platform_contract` tests run unchanged on every target: four segments with a short last one, the fallback against the path a socket takes by default, a batch of one datagram, and a malformed batch refused before any system call.
+The Linux-only behaviour is the one segmented send and the one receive call.
+The API and its contract are the same on every supported target.
+
+**An HTTP/2 header view validates no bytes a decode has already validated.**
+`core::str::converts::from_utf8` was 6.2% of the server's cycles on the HTTP/2 profile, and the calls re-checked bytes already known valid, twice per field per pass on a cache hit.
+The cache's header block now keeps its field text in an `Arc<str>` beside the slot array and every field view is a `str` range, so a view checks two character boundaries and validates nothing. The decode buffer is a `String`, and `field_name` and `field_value` are ranges of it, so the request path validates each field once.
+CPU per response fell 1.7% at one connection and 0.6% at four on a 51 KB cache hit over loopback, against a profile that attributed 6.2% to the validation. Throughput moved within the spread of its own rounds, so no throughput gain is claimed. Allocations are unchanged, and syscalls fell from 10.99 to 10.68 per response.
+The one validation that stays is `push_field_bytes`, which replaces an invalid part with U+FFFD and so decides what a non-UTF-8 field becomes.
+
+**The HTTP/3 server packs a flush into one buffer and sends it in one call, and one readiness event drains up to sixteen datagrams.**
+While quiche's packets have one destination and every packet but the last is one size, the loop packs them into its own buffer.
+It stops at 64 KiB, 64 segments or the connection's send quantum, then sends the buffer as one batch.
+On Linux that is one `sendmsg` with `UDP_SEGMENT`, and the kernel does the split.
+The one-system-call send and the one-system-call receive are Linux-only.
+Where the socket cannot segment, the platform layer sends one datagram per call, with the same bytes in the same order, so a flush is one code path on every platform.
+The receive side takes up to sixteen datagrams per readiness event and feeds each one to the connection with its own `RecvInfo`, and the socket's local address is read once at setup.
+The batch buffer belongs to the loop and is allocated once, so a flush allocates nothing.
+The receive slots are a slice of the buffer the loop already has, so a readiness event allocates nothing either.
+A server therefore spends fewer system calls per response and per burst of received datagrams.
+The `h3_transfer` test sends a body whose last segment is short through a real m6-http over HTTP/3 and compares every byte, so a batch that drops or mis-sizes its last segment fails.
+
+**The digest counts a service's accepted and refused events, and faults when a refusal names the service's own configuration.**
+A service can refuse every caller and look exactly like a service under attack, because the refusal a wrong credential causes is written the same way as the refusal a bad caller causes.
+The only trace is a log line, and a run of those reads as traffic from outside.
+`[[monitor.event_series]]` names a service by its journal identifier, the message it writes when it accepted work, the message it writes when it refused work, and optionally the field on the refusal that names a cause plus the causes that are the service's own fault.
+A refusal that carried a credential and named a listed cause is a Fault at once, with no window.
+A refusal carrying any other cause is a count, because the caller's credential was bad, stale or reused and the service behaved correctly.
+A refusal with no credential is a count and never a Fault, because that is traffic the service exists to refuse.
+The Fault clears on the first acceptance after it.
+The counts appear on the digest page as `EVENT SERIES` and in the JSON under `events`, and a series whose reader stopped is reported as unread.
+
+The reader is a second `journalctl` child selected by `SYSLOG_IDENTIFIER`, because adding `M6_TYPE=event` to the documents read would fill its `--lines` window with every service's operational lines and starve the metrics documents the digest is built from.
+The two reads overlap in time, and an entry counts once: each series keeps the newest journal time it has counted and ignores anything at or below it.
+An entry below the newest counted time is the same entry arriving again, whether from this reader's previous read or from the other reader.
+
+**Verified by:** the workspace suite, including eleven unit tests over the counting and fault rules, a test that a reader with no configured identifier starts no read, a test that the page prints the fault and the counts, and four tests that drive a declared series through a `journalctl` on `PATH` that answers only the identifier it was asked for.
+Those four cover the counts on the page, a fault from a refusal that named the service's own cause, two refusals with no credential producing no fault, a series with a mismatched `fault_field` and `fault_codes` stopping the start, and the service starting with a declared series.
+
+**m6-file reserves the minified-body cache its record prints, and warns only about a reservation the config set.**
+Its default `[limits.heap_reserve] start` was 32 MiB against a `[limits.cache_bytes] max` of 128 MiB, so every default start bounded the cache at 32 MiB while the record printed 128 MiB, and told the operator to raise a limit they never set.
+The reservation is now `cache_bytes` max plus 64 MiB, rounded up to 2 MiB, the rule m6-http already used, so the 128 MiB the record prints is the bound the cache has.
+An explicit `heap_reserve` start below the cache still bounds it and writes one line naming both keys.
+An operator sees one change: a default m6-file reserves 192 MiB of address space at start, and the kernel backs the pages as they are touched.
+Verified by `a_default_cache_and_reservation_warn_about_nothing` in `m6-file/tests/two_files.rs` and `the_default_reservation_holds_the_default_cache_with_no_warning` in `m6-core/src/limits.rs`.
+
+### Migration
+
+An operator makes three changes.
+
+1. Rename every template file by appending `.tmpl` to its name, so `templates/page.html` becomes `templates/page.html.tmpl` and `templates/icon.svg` becomes `templates/icon.svg.tmpl`. Update every `template` value in every route config, every `{% extends %}` and `{% include %}` name, and every `Response::render` and `Response::render_with` call to the new name. A file that keeps its old name is never loaded, so a route that still names it fails at the first render with `template not found`. Templates in subdirectories are found by the updated loader, so a renamed icon can move to `templates/icons/` in the same change.
+2. A config that sets `[server] drain_timeout_s` sets the wait, a config that does not gets 30 s, and a config that sets `0` keeps the stop-at-once behaviour. `ThreadPool::drain`, `ThreadPool::in_flight` and the `on_destroy` shutdown hook stay removed with `App`, whose place the per-service loops took. A service's teardown runs after its loop leaves, which is after the drain.
+3. A build uses Rust 1.98 or newer, which the JavaScript minifier requires. `[minification]` accepts `application/javascript`, `text/javascript` and `inline_js` again, all on by default.
+
+### Verified
+
+- `a_template_in_a_subfolder_is_found`, `a_file_without_the_tmpl_suffix_is_not_a_template` and `an_include_across_folders_renders` in `m6-core/src/template.rs`.
+- `build_tera_from_paths_loads_the_whole_root_and_only_tmpl_files` and `autoescaping_follows_the_output_part_of_the_name`, which fails if the autoescape suffixes are left at Tera's defaults.
+- `connections_beyond_a_lowered_open_file_limit_are_refused_with_one_counted_line` in `m6-file/tests/integration.rs`, which covers the refusal line, the rate limit and the count written at stop, and `m6-core/tests/echo_example.rs` for the same contract on the reference loop.
+- The full workspace suite, with every example and fixture template renamed.
+
+---
+
+## 1.16.0-rc.1, 2026-11-18
+
+**m6 keeps one log stream, and the monitoring endpoints and their credentials are gone.**
+Every log line carries a `type`, and under systemd each line is one datagram on journald's native socket.
+`/perf` and `/traffic` are removed on every node, and the two documents are read from the `type=perf` and `type=traffic` lines.
+A config that still names a removed key stops the service at start with exit 2.
+This release also fixes the cache storage rule and the refresh-token lifetime, and gives every auth token a kind, an audience and an id.
+Migration lists the nine changes an operator makes, and Removed lists every removal.
+The examples moved into `examples/` in this repository and are built from the same commit as the crates they use. The old m6-examples repository is archived.
+
 **Socket paths in tests no longer depend on `TMPDIR`.** `m6_platform::socket_scratch_root` names the shortest writable temporary root, and every test that binds a unix socket creates its scratch directory there, so a long `TMPDIR` can no longer spend the 104-byte `sun_path` before the file name. The reported intermittent `m6-auth-server` failure ("103 limit") was this: the test measured the host's temporary directory rather than the behaviour it asserts. The platform still refuses a path that cannot fit, naming its length and the limit. That refusal is tested, not worked around. Verified by the workspace suite with `TMPDIR` set to a 93-character path, where the named test failed before the change and passes after it.
 
 **Every m6 binary reports the build it is running, from constants fixed at compile time.**
@@ -145,49 +229,6 @@ Three gaps remain, and the Not measured section lists each.
 
 **The HTTP/2 send queue starts at 64 KiB, not 16 KiB.** At 16 KiB a 484 KB response took 30 writes and 30 TLS records, and requests per second on large bodies at four connections fell 8 to 16 percent below the previous release. `[limits.h2_send] start` is now 64 KiB. On Linux it is also the kernel's unsent-bytes mark, so a more urgent stream on the same connection waits behind at most 64 KiB. A site that serves large bodies and cares more about large-body throughput than that ordering can raise it in the system config.
 
-**The HTTP/3 server reads its socket's local address once per socket, not once per received datagram.**
-Every received datagram needs the local address the connection answered on, and the receive loop asked the kernel for it again for each one.
-A bound socket's local address cannot change, so the call returned the same value every time.
-The server now reads it when the socket is created, carries it beside the socket, and uses the stored value for every `RecvInfo`.
-A server that receives a burst therefore pays one lookup for the socket rather than one for each datagram it takes in.
-Interface classification is unchanged, because it is chosen from the peer address the receive reports.
-The test `local_addr_is_read_once` counts the reads and shows that a stored read does not go back to the kernel.
-
-**The HTTP/3 benchmark client reads its per-socket facts once per connection, and closes a connection before replacing it.**
-The client set its read timeout and asked the kernel for the peer and local addresses once per received datagram, and all three are facts about a connected socket that cannot change during the connection.
-The read timeout is the turn's wait rather than a deadline per datagram.
-The timeout and the connection's `RecvInfo` are now taken once at connect, and each request reuses them.
-The client also reconnects after a fixed number of requests.
-It used to drop the old connection and its socket without a QUIC close, so the server kept every replaced connection until its idle timeout and carried them all on every loop turn.
-Each reconnect now sends CONNECTION_CLOSE and flushes it before the socket is dropped.
-A run therefore measures the server's HTTP/3 path rather than the client's own per-datagram calls, and leaves no growing set of idle connections behind.
-This changes the benchmark client only, and the server is untouched.
-The test `close_and_flush_sends_the_close` has a real quiche peer receive the close and report the connection closed.
-
-**The platform layer gains a UDP batch, so one call sends a packed buffer as many datagrams and one call takes in many datagrams.**
-`net::UdpBatch` is the API, and it states a batch in a service's terms.
-`for_socket` probes a socket once at setup, `send` sends a buffer packed as segments of one size, and `recv` takes up to `MAX_BATCH` datagrams into one contiguous buffer, one per slot, with the length and source of each in a `RecvMeta`.
-On Linux the send is one `sendmsg` carrying a `UDP_SEGMENT` control message, so the kernel cuts the packed buffer into the datagrams the caller described, and the receive is one `recvmmsg`.
-The macOS arm takes the same calls as a loop of one `sendto` and one `recvfrom` per datagram.
-The fallback is the same code path rather than a second implementation, so a batch puts the same bytes on the wire in the same order wherever it runs.
-The probe sets the option and reads it back, because a bare read reports zero on every kernel, and it clears the option afterwards so an ordinary send on that socket stays one datagram per call.
-`without_gso` runs the fallback on a socket that has segmentation, so the contract suite compares the segmented path against the fallback over loopback on one machine.
-Four `platform_contract` tests run unchanged on every target: four segments with a short last one, the fallback against the path a socket takes by default, a batch of one datagram, and a malformed batch refused before any system call.
-The Linux-only behaviour is the one segmented send and the one receive call.
-The API and its contract are the same on every supported target.
-
-**The HTTP/3 server packs a flush into one buffer and sends it in one call, and one readiness event drains up to sixteen datagrams.**
-While quiche's packets have one destination and every packet but the last is one size, the loop packs them into its own buffer.
-It stops at 64 KiB, 64 segments or the connection's send quantum, then sends the buffer as one batch.
-On Linux that is one `sendmsg` with `UDP_SEGMENT`, and the kernel does the split.
-The one-system-call send and the one-system-call receive are Linux-only.
-Where the socket cannot segment, the platform layer sends one datagram per call, with the same bytes in the same order, so a flush is one code path on every platform.
-The receive side takes up to sixteen datagrams per readiness event and feeds each one to the connection with its own `RecvInfo`, and the socket's local address is read once at setup.
-The batch buffer belongs to the loop and is allocated once, so a flush allocates nothing.
-The receive slots are a slice of the buffer the loop already has, so a readiness event allocates nothing either.
-A server therefore spends fewer system calls per response and per burst of received datagrams.
-The `h3_transfer` test sends a body whose last segment is short through a real m6-http over HTTP/3 and compares every byte, so a batch that drops or mis-sizes its last segment fails.
-
 **A test that executes a copied file takes the copy from a directory the build owns rather than the temporary directory, because a host may mount its temporary directory `noexec`.**
 `the_first_tick_reads_no_executable` copies the `m6-http` binary and runs the copy, and the copy lived in a temporary directory that follows `TMPDIR`.
 On a build host whose temporary directory is mounted `noexec` the spawn fails with "Permission denied", so the release-build proof failed for a reason about where the file lived rather than about what the test asserts.
@@ -200,7 +241,7 @@ A sweep of the workspace found every other place that writes or copies a binary 
 
 ### Migration
 
-An operator makes ten changes.
+An operator makes nine changes.
 
 1. Read the `type=perf` or `type=traffic` line from the journal where a script read `/perf` or `/traffic`. `m6-monitor` already reads them this way, and a firewall-stats collector moves to the `type=traffic` line.
 2. Enable `systemd-journal-upload` on every node and `systemd-journal-remote` on the monitor host.
@@ -211,7 +252,6 @@ An operator makes ten changes.
 7. The workspace version is `1.16.0-rc.1`. The staging pin moves to the `v1.16.0-rc.1` tag. The release commit sets `1.16.0` and is tagged `v1.16.0`.
 8. A monitor that names neither `[monitor] environment` nor `[monitor] expected_deploy_file` keeps running and gains two warnings per check. Set the first to `dev`, `staging` or `prod`, and the second to the file the deploy writes.
 9. A monitor's history file rebuilds its `build` table under migration 3 the first time this release opens it. The old build rows are dropped, because their `hash` was an executable md5 this release no longer reads and their `version` carried no build metadata, so no old row is comparable with a new one. Every `health` row survives, and one that named a discarded build keeps its figures with `build_id` set to `NULL`. The open writes one `type=event` line that says the table was rebuilt and why.
-10. A build uses Rust 1.98 or newer, which the JavaScript minifier requires. `[minification]` accepts `application/javascript`, `text/javascript` and `inline_js` again, all on by default.
 
 The entries below give the detail behind each step and the behaviour changes that need no config edit.
 
@@ -680,7 +720,7 @@ Nine binaries that run without libtest's harness (the allocation counters and th
 Five shipping reads that asked the operating system directly now take the time from `m6_core::platform::now()` or `wall()`, and `chrono` only formats a value it is given.
 Verified: the platform gate on Linux and macOS.
 
-**The minimum supported Rust version is 1.98**, which `oxc` 0.159 requires for the JavaScript minifier. The workspace summary and Migration step 10 above say the same, and no other line in the tree states a current minimum of 1.89.
+**The minimum supported Rust version is 1.89** (was 1.88), the version the updated SQLite binding requires.
 
 **m6-http drives only the connections that have events, accepts only when a client is waiting, and resumes a blocked write when the socket can take more.** Every HTTP/1.1 connection shared the listener's token, so any event drove every connection and tried a failing accept, and a response that filled the socket buffer waited for the next unrelated wake-up. Each descriptor now has its own token, each turn reads and writes until the socket would block, a connection with unsent bytes asks for write readiness, and idle and read timeouts are deadlines rather than checks on every pass. On the build host this removed one failing accept4 per loop pass and one or two recvfrom calls per request.
 
@@ -840,7 +880,7 @@ The minifier re-emitted a string that held an apostrophe as a template literal, 
 `"That didn't verify \u2014 please try again."` was served as `` `That didn't verify \\u2014 please try again.` ``, so the page showed the six characters `\u2014` where it should show one dash.
 `"tab\there"` was served as `` `tab\\there` ``.
 Its newest release decodes the escape and then inserts a NUL byte after it, so upgrading did not help, and an inline `<script>` switched on with `inline_js` produced the same bytes.
-`minify_js`, m6's own dependency on `minify-js`, the JavaScript arm of the minification step in core and in `m6-file`, and the `inline_js` option are removed.
+1.16.0-rc.1 removed `minify_js`, m6's own dependency on `minify-js`, the JavaScript arm of the minification step in core and in `m6-file`, and the `inline_js` option.
 `minify-html` still links `minify-js` for its own use, and m6 never turns it on, so an inline `<script>` is left as written.
 HTML, CSS and JSON minification are unchanged, and the default compression types still include JavaScript.
 Verified by a request-level test in `m6-file` that serves a script holding `\u2014`, `\t` and an apostrophe in one string under the default config and expects the bytes on disk, which failed on the old code with `var a=`That didn't verify \\u2014 tab\\there.``, and by a test that `minify_html` leaves the same inline script unchanged.
@@ -1003,17 +1043,12 @@ It is now malformed at ingress and its stream is reset, as RFC 9113 8.1.1 and RF
 A request refused when forwarded, for example one with a CR or LF in a header value, no longer counts against the backend.
 A member's failure count now counts transport failures in a row: a completed exchange clears it, and the backoff is capped before it is computed.
 
-**On SIGTERM or SIGINT a service stops accepting, answers the requests the listener already accepted, removes its socket and exits 0 (#338).**
-The wait ends when the last accepted request finishes, or at `[server] drain_timeout_s`, default 30 and inside the 90 s systemd allows a stop.
-Past the deadline the service logs `drain deadline passed with requests still in flight` with the count in `unfinished`, and exits anyway, so the supervisor's stop timeout never kills it mid-response.
-`0` waits for nothing.
-The 1.16.0-rc.1 build on staging stopped and exited without waiting, which cut off a request that was still running; that was a shortcut against issue #338's done-when, and it was taken with no owner instruction on record.
-`m6_core::drain::Drain` now holds the count and the deadline for the four services whose loops share `h1::ServerConn`: m6-html, m6-file, m6-auth-server and m6-monitor. m6-http keeps its own loop and its own stop sequence.
-The count is taken when the listener accepts a connection, not when a turn dispatches the request, so a request accepted and not yet read holds shutdown open. Issue #338 measured that window at 57 failures in 150 loaded runs.
-A kept-alive connection that has answered its request and holds nothing stops counting, so an idle client cannot hold a deploy, and a request that arrives on a kept-alive connection during the drain is counted again and answered.
-The test harness's `Service::wait_for_exit` and `terminate` still wait for the output threads to copy a child's last lines, which a test reading `output()` straight after the exit could miss.
-Verified against the real m6-html binary: a request held open at SIGTERM receives its complete response before the process exits, a connection accepted with nothing read from it is answered when its request arrives after the signal, a stalled request meets the deadline and the warning names it as `"unfinished":1`, a second SIGTERM exits at once, and a shutdown with nothing in flight exits within a second.
-Migration: a config that sets `[server] drain_timeout_s` sets the wait; a config that does not gets 30 s, and a config that sets `0` keeps the stop-at-once behaviour. `ThreadPool::drain`, `ThreadPool::in_flight` and the `on_destroy` shutdown hook stay removed with `App`, whose place the per-service loops took. A service's teardown runs after its loop leaves, which is after the drain.
+**On SIGTERM or SIGINT a service stops accepting, removes its socket and exits, without waiting for requests in progress (#338).**
+A restart on a deploy cuts off a request that is still running, and that is accepted: the supervisor starts the service again at once.
+Waiting for accepted requests took a request counter, a condition variable, a deadline setting and a shutdown hook, and gained nothing a restart does not already do.
+The m6-html shutdown test now holds a request open at SIGTERM and again at SIGINT, and asserts only that the service exits 0 within five seconds with its socket removed.
+The test harness's `Service::wait_for_exit` and `terminate` now also wait for the output threads to copy a child's last lines, which a test reading `output()` straight after the exit could miss.
+Migration: `ThreadPool::drain`, `ThreadPool::in_flight`, `ServerConfig::drain_timeout`, `server::DEFAULT_DRAIN_TIMEOUT_SECS`, `[server] drain_timeout_s` and the `on_destroy` registration on `AppWithGlobal` and `AppWithState` are removed, along with the shutdown hook they fed. A caller does nothing: a `drain_timeout_s` key left in a config is ignored, and a service that needs durable state must not depend on a shutdown hook, because none runs.
 
 **The config reloader reports a rename of a service's config once, and decides what changed from the file's bytes, mode, owner and modification time (#300).**
 A rename over the config showed to `stat` a moment before its inotify event was queued, so a poll in that gap reported the change and the event reported it again. The old file's `ctime` also changes just before the name moves, which a second `stat` read as another change. The fingerprint is now a hash of the bytes with the mode, owner and modification time, and leaves out the inode and `ctime`, so a rename's transient state, which has the old bytes and times, is no change and the finished rename is one. Each check opens a file once. A check runs on every event from the watcher, named or not, and once a second. The first change after quiet is still reported at once and bursts are held as before. A `touch`, a `chmod` and a same-length rewrite in one timestamp tick are each a change. A `touch` forces a reload only when it moves the modification time, so on a filesystem with one-second timestamps a second touch in the same second, with unchanged bytes, is not seen.

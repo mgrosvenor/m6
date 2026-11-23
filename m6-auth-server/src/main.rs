@@ -806,6 +806,11 @@ fn main() -> Result<()> {
     // the socket it was given and logs the line. The check socket is removed
     // here when the primary was that socket, which is the case in
     // both-listener and login-listener modes.
+    //
+    // A refusal the rate limit was still holding back when the loop ended is
+    // written here. There is no later turn to carry it, so the interval does
+    // not apply: the last line reports every count the process took.
+    m6_core::net::close_refusals("m6-auth-server", &mut refusals);
     lifecycle.complete();
     if bind.check {
         let _ = std::fs::remove_file(&check_socket);

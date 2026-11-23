@@ -536,6 +536,43 @@ impl Limits {
     }
 }
 
+/// Room beyond the cache for connections, buffers and the rest of the heap.
+const HEAP_HEADROOM: usize = 64 * 1024 * 1024;
+/// The huge page size the reservation is rounded to.
+const HUGE_PAGE: usize = 2 * 1024 * 1024;
+
+/// The heap reservation a service makes, and a warning when an explicit
+/// `[limits.heap_reserve] start` cannot hold `[limits.cache_bytes] max`.
+///
+/// The cache is the hot data, so its memory is carved from the huge-page
+/// reservation. Unless the config sets `start`, the reservation is the cache's
+/// max plus headroom, rounded up to the huge page size, so a default start
+/// reserves for the whole cache and the record's cache max is the bound the
+/// cache really has. A `start` the config does set is used as written, and a
+/// cache above it is named: the caller then bounds the cache to the
+/// reservation, so the reported max overstates what the cache can hold and the
+/// operator hears why.
+///
+/// A default start warns about nothing. A warning on every default start is a
+/// warning nobody reads.
+pub fn heap_reserve(limits: &Limits) -> (usize, Option<String>) {
+    let reserve = limits.get(&HEAP_RESERVE);
+    let cache = limits.get(&CACHE_BYTES).max();
+    if !reserve.start_set() {
+        return ((cache + HEAP_HEADROOM).next_multiple_of(HUGE_PAGE), None);
+    }
+    let warning = (reserve.start() < cache).then(|| {
+        format!(
+            "[limits.cache_bytes] max = {} is above [limits.heap_reserve] start = {}, so the cache is bounded by the reservation. Raise [limits.heap_reserve] start to at least {} in {}",
+            limits.get(&CACHE_BYTES).text(cache),
+            reserve.text(reserve.start()),
+            reserve.text((cache + HEAP_HEADROOM).next_multiple_of(HUGE_PAGE)),
+            limits.file().display()
+        )
+    });
+    (reserve.start(), warning)
+}
+
 /// The value a limit of `unit` takes for `n`: `page * 2^k` for a large area, a
 /// power of two for a small one, and `n` for a count.
 fn round_unit(unit: Unit, n: usize, page: usize) -> usize {
@@ -843,6 +880,39 @@ mod tests {
             assert_eq!(render_page(&l).max(), 4 * MIB);
             assert!(l.warnings().is_empty());
         }
+    }
+
+    /// The default reservation covers the default cache, and says nothing. The
+    /// wrong outcome is the one this replaces: every default start reserved
+    /// 32 MiB for a cache the record reported at 128 MiB, so the cache was
+    /// silently a quarter of the bound the operator read and each start told
+    /// them to raise a limit they never set.
+    #[test]
+    fn the_default_reservation_holds_the_default_cache_with_no_warning() {
+        let l = parse("", 4096).unwrap();
+        let (bytes, warning) = heap_reserve(&l);
+        assert!(warning.is_none(), "{warning:?}");
+        assert_eq!(bytes, 192 * MIB);
+        // The cache really can hold its reported max inside it.
+        assert!(l.get(&CACHE_BYTES).max() <= bytes);
+    }
+
+    /// A reservation below the cache warns, naming both keys and the value to
+    /// set, and the reservation is the one the config set.
+    #[test]
+    fn an_explicit_reservation_below_the_cache_warns_and_is_used_as_written() {
+        let l = parse("[limits.heap_reserve]\nstart = \"64MiB\"\n", 4096).unwrap();
+        let (bytes, warning) = heap_reserve(&l);
+        assert_eq!(bytes, 64 * MIB);
+        let warning = warning.expect("128 MiB of cache cannot fit in 64 MiB");
+        assert!(warning.contains("[limits.cache_bytes] max"), "{warning}");
+        assert!(
+            warning.contains("is above [limits.heap_reserve] start"),
+            "{warning}"
+        );
+        assert!(warning.contains(FILE), "{warning}");
+        let l = parse("[limits.heap_reserve]\nstart = \"256MiB\"\n", 4096).unwrap();
+        assert!(heap_reserve(&l).1.is_none());
     }
 
     #[test]

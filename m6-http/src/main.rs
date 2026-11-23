@@ -3616,6 +3616,17 @@ fn event_loop(
         trace.worked(first_index, last - now);
     }
 
+    // A refusal either listener's accept loop was still holding back when the
+    // loop ended is written here. There is no later turn to carry it, so the
+    // interval does not apply: the last line reports every count the process
+    // took.
+    if let Some(listener) = tcp.as_mut() {
+        listener.close_refusals();
+    }
+    if let Some(listener) = h2c.as_mut() {
+        listener.close_refusals();
+    }
+
     // One operational line, which `tests/allocations.rs` reads from
     // the child's output. It is written after the count is taken, so logging
     // the number is not part of it.

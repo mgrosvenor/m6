@@ -71,7 +71,13 @@ fn main() -> Result<()> {
 
     // ── start: blocking and allocation are fine ──────────────────────────
     let mut site = Site::load("m6-file", &[], &[HANDLER], &NoTemplates);
-    let reserve = site.limits().get(&m6_core::limits::HEAP_RESERVE).start();
+    // The minified bodies a file version produces are this service's only
+    // cache, and they are the hot data the heap reservation exists for. The
+    // reservation is the cache plus headroom unless the config sets one, the
+    // rule m6-http uses, so a default start reserves for the whole cache and
+    // the bound the record prints is the bound the cache has. An explicit
+    // reservation below the cache still bounds it, and says so once.
+    let (reserve, cache_warning) = m6_core::limits::heap_reserve(site.limits());
     m6_core::alloc::reserve(reserve);
 
     // What the document roots carry is a start question, asked once. A leak
@@ -103,24 +109,13 @@ fn main() -> Result<()> {
 
     let read_timeout = site.read_timeout();
     handler::set_tail_limit(site.limits().get(&m6_core::limits::TAIL_READ));
-    // The minified bodies a file version produces are this service's only
-    // cache, and they are the hot data the heap reservation exists for.
-    // Bound the cache by the reservation so the reservation always covers it.
-    // m6-http derives its reservation from `cache_bytes` and warns when an
-    // explicit start leaves the cache outside it. m6-file has no response
-    // cache to derive from, and its reservation defaults to 32 MiB, so a
-    // default `cache_bytes` of 128 MiB would sit outside it.
+    // An explicit reservation below the cache is the one case where the cache
+    // is smaller than the max the record prints. The line names both keys and
+    // the value that would hold the whole cache.
     let cache = site.limits().get(&m6_core::limits::CACHE_BYTES);
     let cache_limit = cache.max().min(reserve);
-    if cache.max() > reserve {
-        eprintln!(
-            "m6-file: [limits.cache_bytes] max = {} is above [limits.heap_reserve] start = {}, \
-             so the minified-body cache is bounded by the reservation. Raise heap_reserve start \
-             to at least {} to hold the whole cache.",
-            cache.text(cache.max()),
-            cache.text(reserve),
-            cache.text(cache.max()),
-        );
+    if let Some(warning) = cache_warning {
+        eprintln!("{}: {warning}", site.name());
     }
     handler::set_minify_cache_limit(cache_limit);
     let descriptors = raise_fd_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
@@ -443,9 +438,7 @@ fn main() -> Result<()> {
     // A refusal the rate limit was still holding back when the loop ended is
     // written here. There is no later turn to carry it, so the interval does
     // not apply: the last line reports every count the process took.
-    if let Some(counts) = refusals.closing(m6_core::platform::now()) {
-        m6_core::net::warn_refused("m6-file", counts);
-    }
+    m6_core::net::close_refusals("m6-file", &mut refusals);
     lifecycle.complete();
     m6_core::log::stop()?;
     Ok(())

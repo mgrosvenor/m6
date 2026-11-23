@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 
 use m6_core::limits::{
     Limit, Limits, CACHE_BYTES, EDGE_REQUEST, EDGE_RESPONSE, H2_HEADER_BLOCK, H2_RECV, H2_SEND,
-    H2_STREAM_BODY, HEAP_RESERVE, RATE_LIMIT_ADDRESSES, REFRESH_QUEUE,
+    H2_STREAM_BODY, RATE_LIMIT_ADDRESSES, REFRESH_QUEUE,
 };
 
 /// The edge's limits, each a [`Limit`] copied out of the config table.
@@ -71,33 +71,15 @@ pub fn log_growth(limit: &Limit, before: usize, after: usize, what: &str) {
     }
 }
 
-/// Room beyond the cache for connections, buffers and the rest of the heap.
-const HEAP_HEADROOM: usize = 64 * 1024 * 1024;
-/// The huge page size the reservation is rounded to.
-const HUGE_PAGE: usize = 2 * 1024 * 1024;
-
 /// What m6-http reserves for its heap, and a warning to print when the
 /// operator's `[limits.heap_reserve]` leaves the cache outside it.
 ///
-/// The cache is the hot data, so its memory is carved from the huge-page
-/// reservation: unless `start` is set, the reservation is `cache_bytes` max plus
-/// 64 MiB, rounded up to the huge page size.
+/// The rule is [`m6_core::limits::heap_reserve`], shared with m6-file so the
+/// two services cannot drift: unless `start` is set, the reservation is
+/// `cache_bytes` max plus 64 MiB, rounded up to the huge page size, and the
+/// cache holds the max the record prints.
 pub fn heap_reserve(limits: &Limits) -> (usize, Option<String>) {
-    let reserve = limits.get(&HEAP_RESERVE);
-    let cache = limits.get(&CACHE_BYTES).max();
-    if !reserve.start_set() {
-        return ((cache + HEAP_HEADROOM).next_multiple_of(HUGE_PAGE), None);
-    }
-    let warning = (reserve.start() < cache).then(|| {
-        format!(
-            "[limits.heap_reserve] start = {} is below [limits.cache_bytes] max = {}, so the cache cannot fit in the reservation: raise heap_reserve start to at least {} in {}",
-            reserve.text(reserve.start()),
-            limits.get(&CACHE_BYTES).text(cache),
-            reserve.text((cache + HEAP_HEADROOM).next_multiple_of(HUGE_PAGE)),
-            limits.file().display()
-        )
-    });
-    (reserve.start(), warning)
+    m6_core::limits::heap_reserve(limits)
 }
 
 #[cfg(test)]

@@ -428,6 +428,13 @@ impl Http11Listener {
         self.listener.as_raw_fd()
     }
 
+    /// Write the refusal count this listener still owes when the process
+    /// stops. The status listener reports through the same count, because both
+    /// accepts feed one [`Refusals`].
+    pub fn close_refusals(&mut self) {
+        m6_core::net::close_refusals("m6-http", &mut self.refusals);
+    }
+
     /// Add the status listener, bound by the caller. Start only.
     pub fn with_status(mut self, listener: TcpListener) -> anyhow::Result<Self> {
         listener.set_nonblocking(true)?;
@@ -1149,6 +1156,12 @@ impl H2cListener {
 
     pub fn raw_fd(&self) -> RawFd {
         self.listener.as_raw_fd()
+    }
+
+    /// Write the refusal count this listener still owes when the process
+    /// stops.
+    pub fn close_refusals(&mut self) {
+        m6_core::net::close_refusals("m6-http", &mut self.fd_refusals);
     }
 
     pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {

@@ -366,6 +366,11 @@ fn main() -> Result<()> {
     // Reaching here means nothing accepted is left, or the drain deadline
     // passed and the warning already named how many were. `complete` removes
     // the socket and logs the line.
+    //
+    // A refusal the rate limit was still holding back when the loop ended is
+    // written here. There is no later turn to carry it, so the interval does
+    // not apply: the last line reports every count the process took.
+    m6_core::net::close_refusals("m6-html", &mut refusals);
     lifecycle.complete();
     m6_core::log::stop()?;
     Ok(())

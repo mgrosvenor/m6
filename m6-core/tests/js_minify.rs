@@ -232,6 +232,12 @@ fn a_third_party_sized_script_round_trips() {
 
 /// Every example's JavaScript file parses, and every classic inline script in
 /// an example template parses. The examples gate then builds and runs them.
+///
+/// The templates half reads `*.html.tmpl` as well as `*.html`. The loader reads
+/// only `.tmpl` files, so an extension test for `html` alone read only the one
+/// `index.html` after the rename: that left the three examples with classic
+/// inline JavaScript unchecked while the test still passed. The floors below
+/// fail if a later rename shrinks what is scanned again.
 #[test]
 fn every_example_script_minifies() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples");
@@ -239,6 +245,9 @@ fn every_example_script_minifies() {
     walk(&root, &mut files);
     let mut before = 0usize;
     let mut after = 0usize;
+    let mut templates = 0usize;
+    let mut inline_checked = 0usize;
+    let mut with_inline: Vec<&Path> = Vec::new();
     for path in &files {
         let bytes = std::fs::read(path).expect("an example file is readable");
         if path.extension().is_some_and(|ext| ext == "js") {
@@ -277,15 +286,16 @@ fn every_example_script_minifies() {
                     path.display()
                 );
             }
-        } else if matches!(
-            path.extension().and_then(std::ffi::OsStr::to_str),
-            Some("html")
-        ) {
+        } else if is_template(path) {
+            templates += 1;
             let text = std::str::from_utf8(&bytes).expect("a template is UTF-8");
+            let mut found = false;
             for (tag, body) in inline_scripts(text) {
                 if body.trim().is_empty() || !classic_tag(&tag) {
                     continue;
                 }
+                found = true;
+                inline_checked += 1;
                 match m6_core::minify::try_minify_js_with(
                     m6_core::minify::JsKind::Script,
                     body.as_bytes(),
@@ -299,6 +309,9 @@ fn every_example_script_minifies() {
                     ),
                 }
             }
+            if found {
+                with_inline.push(path);
+            }
         }
     }
     eprintln!("example JavaScript: {before} bytes before, {after} after");
@@ -307,6 +320,46 @@ fn every_example_script_minifies() {
         after <= before,
         "minification grew the examples' JavaScript"
     );
+    // The examples carry 55 `*.html.tmpl` templates and one `index.html`. A
+    // floor, so a new example does not fail the test and a rename that takes
+    // templates out of the scan does.
+    assert!(
+        templates >= 56,
+        "the inline half scanned {templates} example templates, not at least 56. \
+         A template is `*.html`, `*.htm` or `*.tmpl` here: a scan that names only \
+         `html` reads only `index.html` after the rename to `.html.tmpl`"
+    );
+    // Three examples carry substantive classic inline JavaScript, and the
+    // admin dashboard a fourth. A floor on the scripts checked fails if any of
+    // them leaves the scan, which is the failure this guard exists for.
+    assert!(
+        inline_checked >= 4,
+        "the inline half checked {inline_checked} classic inline scripts, not at least 4"
+    );
+    for want in [
+        "05-cms/templates/login.html.tmpl",
+        "05-cms/templates/cms/dashboard.html.tmpl",
+        "07-dev-to-production/templates/cms/editor.html.tmpl",
+    ] {
+        assert!(
+            with_inline.iter().any(|path| path.ends_with(want)),
+            "the inline half no longer scans {want}, which carries classic inline JavaScript. \
+             Scanned with inline scripts: {:?}",
+            with_inline
+        );
+    }
+}
+
+/// Whether `path` is an example template the inline half reads.
+///
+/// The loader reads only `.tmpl` files and every example template is
+/// `*.html.tmpl`. `html` and `htm` stay in the set because a template copied
+/// from an older example still uses them.
+fn is_template(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(std::ffi::OsStr::to_str),
+        Some("html" | "htm" | "tmpl")
+    )
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {

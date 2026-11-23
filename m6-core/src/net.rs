@@ -246,6 +246,19 @@ impl Refusals {
     }
 }
 
+/// Write the refusal count a stopping accept loop still owes, if any.
+///
+/// A process that is leaving has no later turn to carry a count the rate limit
+/// held back, so every service calls this once at its stop, before its
+/// lifecycle line. One function keeps the five loops on one path: the rule
+/// lives in [`Refusals::closing`], and the service name is the only thing a
+/// loop chooses.
+pub fn close_refusals(service: &str, refusals: &mut Refusals) -> Option<RefusedCounts> {
+    let counts = refusals.closing(crate::platform::now())?;
+    warn_refused(service, counts);
+    Some(counts)
+}
+
 /// Write the one line a refused connection gets, at `warn`, naming the service
 /// that refused and the counts the caller's [`Refusals`] reports.
 pub fn warn_refused(service: &str, counts: RefusedCounts) {

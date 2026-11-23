@@ -167,6 +167,37 @@ fn a_cache_above_the_heap_reservation_is_named_and_bounded() {
     svc.terminate(m6_core::testkit::STARTUP_BOUND);
 }
 
+/// A default cache and a default reservation warn about nothing, and the
+/// reservation covers the cache. The wrong outcome, and the one this
+/// replaces: every default start told the operator to raise a limit they never
+/// set, while the cache was silently a quarter of the max the record printed.
+///
+/// `the_default_reservation_holds_the_default_cache_with_no_warning` in
+/// `m6-core/src/limits.rs` proves the reservation is cache plus headroom, so
+/// the 128 MiB the record prints is the bound the cache really has.
+#[test]
+fn a_default_cache_and_reservation_warn_about_nothing() {
+    let tmp = tree("");
+    let root = tmp.path().join("apps/file");
+    let conf = config(&root, ROUTE);
+    let socket = root.join("default-cache.sock");
+
+    let mut svc = Service::spawn(
+        "m6-file",
+        Command::new(binary("m6-file"))
+            .arg(&root)
+            .arg(&conf)
+            .env("M6_SOCKET_OVERRIDE", &socket),
+    );
+    svc.wait_for_path(&socket, m6_core::testkit::STARTUP_BOUND);
+    let output = svc.output();
+    assert!(
+        !output.contains("is above [limits.heap_reserve] start"),
+        "a default start warned about a cache the default reservation holds:\n{output}"
+    );
+    svc.terminate(m6_core::testkit::STARTUP_BOUND);
+}
+
 #[test]
 fn dump_config_refuses_a_site_toml_the_start_would_refuse() {
     let tmp = tree("");
