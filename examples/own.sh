@@ -112,11 +112,14 @@ own_wait_port_free() {
 # socket leaves the file behind, and a path a backend created and then unlinked
 # is not a listener either. lsof names the bound socket, which is the fact the
 # wait needs. own.sh already needs lsof for own_port_holder.
+#
+# `-t` prints only the pids that hold the path. `-F n` was used here and did not
+# work on Linux: it prints `n/path type=STREAM`, so an exact match on `n/path`
+# never found a listening socket and every stack waited forever. The pid field
+# is the same on every platform and carries no suffix to parse.
 own_socket_listening() {
-    local names
     [ -S "$1" ] || return 1
-    names=$(lsof -nP -F n -- "$1" 2>/dev/null) || true
-    grep -Fxq "n$1" <<< "$names"
+    [ -n "$(lsof -nP -t -- "$1" 2>/dev/null)" ]
 }
 
 # The pids this run recorded that are gone, on one line, empty when all are
@@ -169,25 +172,17 @@ own_wait_sockets() {
         echo "ERROR: $who: lsof is needed to see whether a backend socket is listening" >&2
         return 1
     }
-    local -a missing=() present=() seen=()
-    local n=0 i s names dead
+    local -a seen=()
+    local n=0 i s dead
     for s in "$@"; do seen+=(""); done
     while :; do
-        present=(); n=0
-        for s in "$@"; do
-            [ -S "$s" ] && present+=("$s")
-        done
-        names=""
-        if [ "${#present[@]}" -gt 0 ]; then
-            names=$(lsof -nP -F n -- "${present[@]}" 2>/dev/null) || true
-        fi
-        missing=()
+        n=0
         i=0
         for s in "$@"; do
-            if grep -Fxq "n$s" <<< "$names"; then
+            if own_socket_listening "$s"; then
                 seen[i]=1
             else
-                missing+=("$s"); n=$((n + 1))
+                n=$((n + 1))
             fi
             i=$((i + 1))
         done

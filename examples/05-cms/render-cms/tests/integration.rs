@@ -585,13 +585,19 @@ impl ServerStack {
 
         // System config: the node's own bind, certificate, check backend and
         // the claims that gate `/genid`.
+        //
+        // `lock_memory = false` because this test asserts the site's pages and
+        // the CMS lifecycle, not memory pinning, and pinning needs an unlimited
+        // RLIMIT_MEMLOCK that an ordinary `cargo test` shell does not have. The
+        // service still refuses to pin, with a named limit, when the key is left
+        // at its default, and m6-http's own suite covers that.
         let state = w.join("state");
         std::fs::create_dir_all(&state).expect("create the state directory");
         let sys_toml = w.join("system.toml");
         std::fs::write(
             &sys_toml,
             format!(
-                "[server]\nbind     = \"{tls_addr}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\n\n\
+                "[server]\nbind     = \"{tls_addr}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\nlock_memory = false\n\n\
                  [auth]\nbackend = \"m6-auth-check\"\n\n\
                  [genid]\nread_require  = \"role:genid-read\"\nwrite_require = \"role:genid-write\"\n\n\
                  [node]\nname = \"test\"\n",

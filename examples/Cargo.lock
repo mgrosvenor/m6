@@ -1552,7 +1552,7 @@ dependencies = [
 
 [[package]]
 name = "m6-core"
-version = "1.16.0-rc.1"
+version = "1.17.0-rc.1"
 dependencies = [
  "aho-corasick 1.1.4",
  "anyhow",
@@ -1588,7 +1588,7 @@ dependencies = [
 
 [[package]]
 name = "m6-log"
-version = "1.16.0-rc.1"
+version = "1.17.0-rc.1"
 dependencies = [
  "itoa",
  "m6-platform",
@@ -1598,7 +1598,7 @@ dependencies = [
 
 [[package]]
 name = "m6-platform"
-version = "1.16.0-rc.1"
+version = "1.17.0-rc.1"
 dependencies = [
  "libc",
  "libproc",

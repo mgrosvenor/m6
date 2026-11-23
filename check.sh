@@ -75,6 +75,21 @@ fail() { echo -e "${RED}FAIL${RESET} $1"; exit 1; }
 info() { echo -e "${YELLOW}----${RESET} $1"; }
 warn() { echo -e "${YELLOW}WARN${RESET} $1"; }
 
+# ── RLIMIT_MEMLOCK ────────────────────────────────────────────────────────────
+# m6-http pins its pages as they are faulted (`[server] lock_memory`, on by
+# default), and an ordinary account's RLIMIT_MEMLOCK is a finite number of
+# bytes. CI raises the limit in every job that starts m6-http. The gate did not,
+# so 32 m6-http test targets failed here on 2026-11-23 while every CI job
+# passed. Raise it once, for this shell and every child it starts.
+if [[ "$(uname -s)" == "Linux" ]]; then
+  if command -v prlimit >/dev/null 2>&1 &&
+     sudo -n prlimit --pid $$ --memlock=unlimited:unlimited 2>/dev/null; then
+    pass "RLIMIT_MEMLOCK raised for the tests"
+  else
+    warn "RLIMIT_MEMLOCK was not raised; m6-http tests that pin memory will fail"
+  fi
+fi
+
 # ── 1. Build ──────────────────────────────────────────────────────────────────
 # The dev profile is the tests' profile. The suites run the binaries cargo built
 # here, and testkit::binary never runs cargo, so this build is what puts them
@@ -245,6 +260,35 @@ else
   fail "Conformance regressed — see above, and tools/conformance-scores.txt"
 fi
 rm -f "$CONF_OUT"
+
+# ── 4b. The examples (a separate workspace) ────────────────────────────────
+# The examples are examples/ in this repository, their own Cargo workspace, and
+# the `cargo test --workspace` above never builds them. That gap let a red
+# examples job through a green local gate on 2026-11-23. This runs the same
+# workspace commands CI's examples job runs: the build, the format check, clippy
+# and the tests, against the release binaries built above. The three dev.sh
+# stacks stay in CI and on the build host, because they take minutes and bind
+# 8443, and a gate that binds a fixed port cannot run beside another.
+info "Examples (the separate workspace)..."
+EG_LOG="$(mktemp)"
+EG_STATUS=0
+(
+  cd examples
+  ./dev-keys.sh
+  cargo build --release
+  cargo fmt --all --check
+  cargo clippy --workspace --all-targets --release
+  with_port_lock cargo test --workspace
+) >"$EG_LOG" 2>&1 || EG_STATUS=$?
+EG_WARNINGS="$(grep -c '^warning' "$EG_LOG" || true)"
+if [[ "$EG_STATUS" -ne 0 || "$EG_WARNINGS" -ne 0 ]]; then
+  cat "$EG_LOG"
+  rm -f "$EG_LOG"
+  [[ "$EG_STATUS" -eq 0 ]] || fail "The examples workspace failed (build, fmt, clippy or tests)"
+  fail "The examples workspace produced $EG_WARNINGS warning(s)"
+fi
+rm -f "$EG_LOG"
+pass "Examples (build, fmt, clippy and tests, zero warnings)"
 
 # ── 5. Performance (informational) ────────────────────────────────────────────
 if [[ "$RUN_BENCH" == "false" ]]; then

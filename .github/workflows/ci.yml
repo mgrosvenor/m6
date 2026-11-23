@@ -654,6 +654,10 @@ jobs:
   examples:
     name: the examples build and work
     runs-on: ubuntu-latest
+    # It normally finishes in about nine minutes. Without a limit a hung stack
+    # kept this job for the default six hours. A hang now fails inside the time
+    # a slow but working run takes.
+    timeout-minutes: 20
     steps:
       # The examples are examples/ in this repository, their own Cargo
       # workspace. The renderer crates depend on m6-core by relative path, so

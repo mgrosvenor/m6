@@ -222,11 +222,10 @@ fn main() -> io::Result<()> {
                                 match m6_core::platform::net::accept_error(&e) {
                                     m6_core::platform::net::Accept::Drained => break,
                                     m6_core::platform::net::Accept::SkipOne => continue,
-                                                                        // Out of descriptors: close the reserve and take and
+                                    // Out of descriptors: close the reserve and take and
                                     // close every connection already queued, so the turn
                                     // ends with the queue empty and nothing waiting for a
                                     // wakeup that a full queue cannot deliver.
-
                                     m6_core::platform::net::Accept::Exhausted => {
                                         let drained = spare.drain(|| {
                                             let (stream, _) = listener.accept()?;
@@ -243,7 +242,11 @@ fn main() -> io::Result<()> {
                                             m6_core::log::warn!(error = %e, "the reserve descriptor could not be reopened");
                                         }
                                         if drained.needs_rearm() {
-                                            poll.registry().reregister(&mut listener, LISTENER, Interest::READABLE)?;
+                                            poll.registry().reregister(
+                                                &mut listener,
+                                                LISTENER,
+                                                Interest::READABLE,
+                                            )?;
                                         }
                                         break;
                                     }

@@ -186,6 +186,10 @@ An explicit `heap_reserve` start below the cache still bounds it and writes one 
 An operator sees one change: a default m6-file reserves 192 MiB of address space at start, and the kernel backs the pages as they are touched.
 Verified by `a_default_cache_and_reservation_warn_about_nothing` in `m6-file/tests/two_files.rs` and `the_default_reservation_holds_the_default_cache_with_no_warning` in `m6-core/src/limits.rs`.
 
+**The examples build, format and run end to end again, and their CI job can no longer hold a runner for six hours.**
+`examples/own.sh` decided whether a backend was listening by matching an exact `lsof -F n` line. On Linux that line ends with ` type=STREAM`, so no socket ever matched, every `dev.sh` waited in `own_wait_sockets` while all of its backends were alive, and the examples job that starts the 05, 03 and 04 stacks ran for its default six hours. The wait now asks `lsof -t` for the pids that hold the path, which has no suffix to parse and reads the same on macOS and Linux. The 11-admin-dashboard test driver retries `poll` after `EINTR` instead of panicking, the example sources are formatted with the rest of the tree, and the two Rust end-to-end tests turn memory pinning off in the system config they generate, so an ordinary `cargo test` needs no raised `RLIMIT_MEMLOCK`. The examples job has `timeout-minutes: 20`, and `check.sh` runs the examples workspace, so a local gate can no longer pass while `examples/` fails.
+Verified by `./dev-keys.sh && cargo test --workspace` in `examples/` with no raised limit, the 05, 03 and 04 end-to-end stacks, and 30 consecutive runs of the render-admin suite.
+
 ### Migration
 
 An operator makes three changes.
