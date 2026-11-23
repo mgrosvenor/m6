@@ -22,6 +22,7 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::time::Instant;
 
 fn v4_is_private(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
@@ -115,6 +116,162 @@ pub fn listen_tcp(addr: SocketAddr) -> std::io::Result<crate::platform::net::Tcp
     crate::platform::net::listen_tcp(addr)
 }
 
+// ── Descriptor pressure ─────────────────────────────────────────────────────
+
+/// The message an accept loop writes when it refuses a connection for want of
+/// a file descriptor. One wording, so one search finds every service.
+pub const REFUSED_MESSAGE: &str = "connection rejected: no free file descriptors";
+
+/// How often a refusal burst may write a line: no more than one a second while
+/// the pressure lasts.
+pub const REFUSED_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What one [`REFUSED_MESSAGE`] line reports.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RefusedCounts {
+    /// Refusals since the previous line. Exact, so the counts in two lines add
+    /// up to what happened between them.
+    pub since_last: u64,
+    /// Refusals since the process started.
+    pub total: u64,
+}
+
+/// The refusal count and the rate limit an accept loop keeps beside its
+/// listener.
+///
+/// Every refusal is counted. A line carries the count since the previous line,
+/// so rate limiting delays a count and never loses one. [`Self::due`] asks for
+/// a line at the end of a turn that refused and wrote nothing it could serve,
+/// which is one line a burst and no more than one a second while the pressure
+/// lasts. [`Self::flush`] asks for the last line of a burst, at the first
+/// connection the loop serves again; a flush inside the interval does not
+/// write, and it does not reset the interval either, so a pass that both
+/// refused and served cannot turn a burst into a line per accepted
+/// connection.
+#[derive(Debug)]
+pub struct Refusals {
+    last: Option<Instant>,
+    owed: u64,
+    total: u64,
+}
+
+impl Default for Refusals {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Refusals {
+    pub const fn new() -> Self {
+        Refusals {
+            last: None,
+            owed: 0,
+            total: 0,
+        }
+    }
+
+    /// Count one refused connection.
+    pub fn refused(&mut self) {
+        self.owed += 1;
+        self.total += 1;
+    }
+
+    /// Refusals not yet written in a line.
+    pub fn owed(&self) -> u64 {
+        self.owed
+    }
+
+    /// Refusals since start.
+    pub fn total(&self) -> u64 {
+        self.total
+    }
+
+    /// The counts a line should carry now, or `None` while the rate limit holds
+    /// the line back or nothing is owed.
+    pub fn due(&mut self, now: Instant) -> Option<RefusedCounts> {
+        if self.owed == 0 {
+            return None;
+        }
+        if self
+            .last
+            .is_some_and(|last| now.duration_since(last) < REFUSED_INTERVAL)
+        {
+            return None;
+        }
+        Some(self.write(now))
+    }
+
+    /// The counts the last line of a burst should carry now, or `None` when
+    /// every refusal has been reported or the interval has not turned.
+    ///
+    /// Flushing reports the count; it does not reset the interval. `last` is
+    /// when a line was last written, so a pass that both served and refused
+    /// cannot write a line per accepted connection: if the last line is inside
+    /// the interval, this returns `None` and the count stays owed for the next
+    /// turn that asks.
+    pub fn flush(&mut self, now: Instant) -> Option<RefusedCounts> {
+        if self.owed == 0 {
+            return None;
+        }
+        if self
+            .last
+            .is_some_and(|last| now.duration_since(last) < REFUSED_INTERVAL)
+        {
+            return None;
+        }
+        Some(self.write(now))
+    }
+
+    /// The count the process owes when it is leaving, or `None` when nothing
+    /// is owed.
+    ///
+    /// The interval does not apply. A process that is exiting has no later turn
+    /// to carry a count the rate limit held back, so the last line reports
+    /// whatever is owed.
+    pub fn closing(&mut self, now: Instant) -> Option<RefusedCounts> {
+        if self.owed == 0 {
+            return None;
+        }
+        Some(self.write(now))
+    }
+
+    fn write(&mut self, now: Instant) -> RefusedCounts {
+        let counts = RefusedCounts {
+            since_last: self.owed,
+            total: self.total,
+        };
+        self.owed = 0;
+        self.last = Some(now);
+        counts
+    }
+}
+
+/// Write the refusal count a stopping accept loop still owes, if any.
+///
+/// A process that is leaving has no later turn to carry a count the rate limit
+/// held back, so every service calls this once at its stop, before its
+/// lifecycle line. One function keeps the five loops on one path: the rule
+/// lives in [`Refusals::closing`], and the service name is the only thing a
+/// loop chooses.
+pub fn close_refusals(service: &str, refusals: &mut Refusals) -> Option<RefusedCounts> {
+    let counts = refusals.closing(crate::platform::now())?;
+    warn_refused(service, counts);
+    Some(counts)
+}
+
+/// Write the one line a refused connection gets, at `warn`, naming the service
+/// that refused and the counts the caller's [`Refusals`] reports.
+pub fn warn_refused(service: &str, counts: RefusedCounts) {
+    crate::log::warn!(
+        target: "m6_core::net",
+        service,
+        rejected = counts.since_last,
+        total = counts.total,
+        "{}",
+        REFUSED_MESSAGE
+    );
+}
+
 #[cfg(test)]
 mod listener_tests {
     use super::*;
@@ -145,6 +302,143 @@ mod listener_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rate limit writes one line a second and carries every count: a
+    /// burst inside one interval writes one line, and the refusals it held back
+    /// ride out on the next one.
+    ///
+    /// Break: a line per refusal, or a line that reports one refusal when
+    /// several happened since the last one.
+    #[test]
+    fn refusals_write_once_an_interval_and_carry_every_count() {
+        let mut refusals = Refusals::new();
+        let start = crate::platform::now();
+        // Three refusals in one burst, the last listener event of each of three
+        // passes, all inside the interval.
+        for _ in 0..3 {
+            refusals.refused();
+        }
+        assert_eq!(
+            refusals.due(start),
+            Some(RefusedCounts {
+                since_last: 3,
+                total: 3
+            })
+        );
+        assert_eq!(
+            refusals.due(start + std::time::Duration::from_millis(1)),
+            None
+        );
+        assert_eq!(refusals.total(), 3);
+
+        // Two more, still inside the interval: held back, not dropped.
+        refusals.refused();
+        refusals.refused();
+        assert_eq!(refusals.due(start + REFUSED_INTERVAL / 2), None);
+        assert_eq!(refusals.owed(), 2);
+
+        // The interval turns, and the line carries both.
+        assert_eq!(
+            refusals.due(start + REFUSED_INTERVAL),
+            Some(RefusedCounts {
+                since_last: 2,
+                total: 5
+            })
+        );
+        // Nothing owed: no line, however long the loop waits.
+        assert_eq!(refusals.due(start + REFUSED_INTERVAL * 4), None);
+
+        // A burst that ends after the interval flushes its own count, so the
+        // last refusals of a shortage are never left uncounted.
+        refusals.refused();
+        assert_eq!(
+            refusals.flush(start + REFUSED_INTERVAL * 4),
+            Some(RefusedCounts {
+                since_last: 1,
+                total: 6
+            })
+        );
+        assert_eq!(refusals.flush(start + REFUSED_INTERVAL * 4), None);
+        assert_eq!(refusals.total(), 6);
+    }
+
+    /// A flush inside the interval writes nothing and leaves the owed count
+    /// where it was. The wrong outcome: an accept that succeeds after a refusal
+    /// ends the interval, so a loop alternating refuse and serve writes a line
+    /// per accepted connection.
+    #[test]
+    fn a_flush_does_not_defeat_the_interval() {
+        let mut refusals = Refusals::new();
+        let start = crate::platform::now();
+        refusals.refused();
+        assert_eq!(
+            refusals.due(start),
+            Some(RefusedCounts {
+                since_last: 1,
+                total: 1
+            })
+        );
+
+        // Pressure eases and one connection is served: the loop flushes. The
+        // interval has not turned, so no line and nothing is lost.
+        refusals.refused();
+        assert_eq!(refusals.flush(start + REFUSED_INTERVAL / 4), None);
+        assert_eq!(refusals.owed(), 1);
+        assert_eq!(refusals.due(start + REFUSED_INTERVAL / 2), None);
+
+        // A refusal one microsecond before the interval still waits.
+        refusals.refused();
+        assert_eq!(
+            refusals.flush(start + REFUSED_INTERVAL - std::time::Duration::from_micros(1)),
+            None
+        );
+        assert_eq!(refusals.owed(), 2);
+
+        // At the interval, one line carries both, and the counts add up.
+        assert_eq!(
+            refusals.flush(start + REFUSED_INTERVAL),
+            Some(RefusedCounts {
+                since_last: 2,
+                total: 3
+            })
+        );
+        assert_eq!(refusals.total(), 3);
+    }
+
+    /// A count the rate limit is holding when the process leaves is written on
+    /// the way out. The wrong outcome: the refusals of the last interval are
+    /// never reported.
+    #[test]
+    fn a_count_owed_at_exit_is_written() {
+        let mut refusals = Refusals::new();
+        let start = crate::platform::now();
+        refusals.refused();
+        assert_eq!(
+            refusals.due(start),
+            Some(RefusedCounts {
+                since_last: 1,
+                total: 1
+            })
+        );
+
+        // A second refusal inside the interval is owed, and the loop's own
+        // flush will not write it.
+        refusals.refused();
+        assert_eq!(refusals.flush(start + REFUSED_INTERVAL / 2), None);
+        assert_eq!(refusals.owed(), 1);
+
+        // Leaving writes it anyway, with the interval still open.
+        assert_eq!(
+            refusals.closing(start + REFUSED_INTERVAL / 2),
+            Some(RefusedCounts {
+                since_last: 1,
+                total: 2
+            })
+        );
+        assert_eq!(refusals.owed(), 0);
+        // Nothing owed is no empty line.
+        assert_eq!(refusals.closing(start + REFUSED_INTERVAL / 2), None);
+    }
 
     fn private(s: &str) -> bool {
         is_private_ip(s.parse().unwrap())

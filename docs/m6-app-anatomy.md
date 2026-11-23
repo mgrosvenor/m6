@@ -100,6 +100,7 @@ Below is a one-route service with the shape every service follows: start, run, s
 use std::io;
 use std::time::Duration;
 
+use m6_core::drain::{Drain, Step};
 use m6_core::prelude::*;
 use m6_core::signal::{Action, Lifecycle};
 use m6_core::site::finish_reload;
@@ -121,6 +122,10 @@ fn main() -> anyhow::Result<()> {
     let mut poll = Poll::new()?;
     let mut signals = Signals::new()?;
     let mut listener = listen_unix(site.socket_path(), site.socket_mode())?;
+    // The reserve the accept loop spends when the process is out of
+    // descriptors: one descriptor of the listener's family, held from now on.
+    let mut spare = m6_core::platform::net::SpareDescriptor::for_unix()?;
+    let mut refusals = m6_core::net::Refusals::new();
     poll.registry()
         .register(&mut listener, LISTENER, Interest::READABLE)?;
     poll.registry()
@@ -128,28 +133,84 @@ fn main() -> anyhow::Result<()> {
     let mut lifecycle = Lifecycle::new(site.name(), Some(site.socket_path().to_path_buf()));
     lifecycle.started();
     let mut conns = Slots::new(1024, 1024, || ServerConn::new(READ_CAP, WRITE_CAP));
+    let drain_timeout = site.drain_timeout();
+    let mut drain = Drain::new(drain_timeout, 1024);
     let mut deadlines = Timeouts::new(1024, read_timeout.unwrap_or(Duration::ZERO));
     let mut events = Events::with_capacity(256);
+    let mut accepting = true;
     let mut last_tick = m6_core::platform::now();
 
     // Run: nothing blocks.
     'run: loop {
-        poll.poll(&mut events, Some(deadlines.timeout(m6_core::platform::now(), TICK)))?;
+        // While draining, the wait is capped at the deadline.
+        let mut wait = deadlines.timeout(m6_core::platform::now(), TICK);
+        if let Some(left) = drain.poll_timeout(m6_core::platform::now()) {
+            wait = wait.min(left);
+        }
+        poll.poll(&mut events, Some(wait))?;
         for event in &events {
             match event.token() {
                 LISTENER => {
+                    let mut served = false;
                     while let Some(taken) = conns.take() {
                         let mut stream = match listener.accept() {
                             Ok((stream, _)) => stream,
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                conns.free(taken.key);
-                                break;
-                            }
-                            Err(e) => {
-                                conns.free(taken.key);
-                                eprintln!("my-service: accept error: {e}");
-                                break;
-                            }
+                            Err(e) => match m6_core::platform::net::accept_error(&e) {
+                                m6_core::platform::net::Accept::Drained => {
+                                    conns.free(taken.key);
+                                    break;
+                                }
+                                m6_core::platform::net::Accept::SkipOne => {
+                                    conns.free(taken.key);
+                                    continue;
+                                }
+                                // Out of descriptors: close the reserve, take
+                                // and close every connection already queued,
+                                // open the reserve again, then end the turn.
+                                m6_core::platform::net::Accept::Exhausted => {
+                                    conns.free(taken.key);
+                                    let drained = spare.drain(|| {
+                                        let (stream, _) = listener.accept()?;
+                                        drop(stream);
+                                        Ok(())
+                                    });
+                                    for _ in 0..drained.refused {
+                                        refusals.refused();
+                                    }
+                                    if let Some(e) = &drained.stopped {
+                                        m6_core::log::warn!(
+                                            error = %e,
+                                            "accept failed while draining the queued connections"
+                                        );
+                                    }
+                                    if let Some(e) = &drained.lost {
+                                        m6_core::log::warn!(
+                                            error = %e,
+                                            "the reserve descriptor could not be reopened"
+                                        );
+                                    }
+                                    if drained.needs_rearm() {
+                                        poll.registry().reregister(
+                                            &mut listener,
+                                            LISTENER,
+                                            Interest::READABLE,
+                                        )?;
+                                    }
+                                    break;
+                                }
+                                // Any other error: say so once, re-register
+                                // the listener and stop draining.
+                                m6_core::platform::net::Accept::Stop => {
+                                    conns.free(taken.key);
+                                    m6_core::log::warn!(error = %e, "accept failed");
+                                    poll.registry().reregister(
+                                        &mut listener,
+                                        LISTENER,
+                                        Interest::READABLE,
+                                    )?;
+                                    break;
+                                }
+                            },
                         };
                         poll.registry()
                             .register(&mut stream, Token(taken.key), Interest::READABLE)?;
@@ -157,21 +218,41 @@ fn main() -> anyhow::Result<()> {
                             deadlines.touch(Token(taken.key), m6_core::platform::now());
                         }
                         conns.get_mut(taken.key).attach(stream);
+                        // Counted at the accept, not when a turn reads the
+                        // request.
+                        drain.begin(taken.key);
+                        served = true;
+                    }
+                    let counts = if served {
+                        refusals.flush(m6_core::platform::now())
+                    } else {
+                        refusals.due(m6_core::platform::now())
+                    };
+                    if let Some(counts) = counts {
+                        m6_core::net::warn_refused("my-service", counts);
                     }
                 }
                 SIGNALS => {
-                    let mut stop = false;
                     while let Some(signal) = signals.read() {
                         if lifecycle.on_signal(signal) == Action::Stop {
-                            stop = true;
+                            // Stop accepting, then answer what was accepted.
+                            if accepting {
+                                poll.registry().deregister(&mut listener)?;
+                                accepting = false;
+                            }
+                            // Do not leave here: a stop with nothing in
+                            // flight still gets one non-blocking turn, so a
+                            // request already waiting in a kept-alive socket
+                            // is read. `step` decides after that turn.
+                            drain.start(m6_core::platform::now());
                         }
-                    }
-                    if stop {
-                        break 'run;
                     }
                 }
                 LOG => m6_core::log::flush(),
                 Token(k) => {
+                    // A turn is accepted work, plus a new request on a
+                    // kept-alive connection.
+                    drain.begin(k);
                     let conn = conns.get_mut(k);
                     let was = conn.interest();
                     match turn(conn, &mut site) {
@@ -186,8 +267,15 @@ fn main() -> anyhow::Result<()> {
                             if read_timeout.is_some() {
                                 deadlines.touch(Token(k), m6_core::platform::now());
                             }
+                            // Answered and holding nothing: idle.
+                            if conn.served() > 0 && !conn.pending() {
+                                drain.end(k);
+                            }
                         }
-                        _ => m6_core::h1::close_conn(&poll, &mut conns, &mut deadlines, k)?,
+                        _ => {
+                            drain.end(k);
+                            m6_core::h1::close_conn(&poll, &mut conns, &mut deadlines, k)?;
+                        }
                     }
                 }
             }
@@ -204,7 +292,24 @@ fn main() -> anyhow::Result<()> {
             last_tick = m6_core::platform::now();
         }
         while let Some(Token(k)) = deadlines.expired(m6_core::platform::now()) {
+            drain.end(k);
             m6_core::h1::close_conn(&poll, &mut conns, &mut deadlines, k)?;
+        }
+        // The drain: leave when the count is zero, or at the deadline with a
+        // warning that names what was left.
+        if drain.draining() {
+            match drain.step(m6_core::platform::now()) {
+                Step::Draining => {}
+                Step::Finished => break 'run,
+                Step::DeadlinePassed(unfinished) => {
+                    m6_core::log::warn!(
+                        unfinished,
+                        timeout_s = drain_timeout.as_secs(),
+                        "drain deadline passed with requests still in flight"
+                    );
+                    break 'run;
+                }
+            }
         }
     }
 
@@ -265,12 +370,17 @@ fn turn(conn: &mut ServerConn, site: &mut Site) -> io::Result<bool> {
 The loop has one `match` on the event's token.
 `LISTENER` takes free slots and accepts until the kernel has no more.
 `SIGNALS` drains the signal descriptor through `Lifecycle`, which answers whether to stop.
+A stop closes the listener and starts the drain, and the loop leaves on the turn `Drain::step` reports the count is zero or the deadline has passed.
 `LOG` writes what a full stdout held.
 Every other token is one connection, and `turn` reads, dispatches and writes until its socket would block.
 `watch` registers stdout only while a write has returned `EAGAIN`, and `tick` flushes the log buffer once a second.
 `deadlines.expired` closes a peer that sent nothing before its read deadline.
+`Drain::begin` runs at the accept and `Drain::end` when the connection's work is finished, so the count is right without a lock on the request path.
 
-Two details keep the shape correct.
+Three details keep the shape correct.
+`accept_error` is the only place an accept failure is classified, and the `Exhausted` arm is the one a service must not get wrong.
+Running out of descriptors is refused, never waited out: the loop closes the reserve, takes and closes every queued connection until `accept` answers `WouldBlock`, opens the reserve again, counts each refusal and ends the turn with the queue empty. `WouldBlock`, not `EMFILE`, is the empty answer: Linux consults the descriptor table before the listen queue, so a full table reports `EMFILE` even with nothing queued, and a loop that retries that spins.
+A listener that stops there cannot recover on its own. Its readiness was reported once, the edge is consumed, and the only thing that reports it again is another connection, which a full queue lets no other connection deliver.
 `close_conn` clears the deadline, detaches the stream, deregisters it and frees the slot, in that order, so every exit from a connection goes through it.
 `turn` reads again after a flush that kept the connection alive, because a pipelined request may already be buffered and an edge-triggered reactor reports a descriptor once per change.
 
@@ -365,9 +475,9 @@ Table 5 is the reserved set, and a key in it never reaches a template.
 | key | read by | what it sets |
 |---|---|---|
 | `[params_cache]` | core | `size`, default 256 entries |
-| `[server]` | core | `read_timeout_s`, default 30, `0` disables. `socket_mode`, an octal string as systemd writes it, default `"0660"` |
+| `[server]` | core | `read_timeout_s`, default 30, `0` disables. `drain_timeout_s`, default 30, how long shutdown waits for accepted requests, `0` waits for none. `socket_mode`, an octal string as systemd writes it, default `"0660"` |
 | `[compression]` | core | brotli and gzip levels per MIME type |
-| `[minification]` | core | on or off per MIME type. JavaScript is never minified. A build without the `minify` feature refuses a config that turns it on. The `no-store` exception is in Table 9 of `m6-architecture.md` |
+| `[minification]` | core | on or off per MIME type, plus `inline_js` for inline scripts. A `.mjs` file and a `type="module"` inline script are parsed as modules; a non-JavaScript `<script>` type keeps its bytes. A `no-store` response is minified like any other. A build without the `minify` feature refuses a config that turns it on |
 | `[log]` | core | `level`, default `info` |
 | `[limits.<name>]` | core | `start` and `max` of a named buffer or queue, §4.2 and Table 6 |
 | `[[route]]` | core | the configuration route table, §5 |
@@ -451,6 +561,8 @@ A key under `[limits]` that is not in the table stops the process at start with 
 | `connections` | slots | 1024 | 1048576 | services, m6-http | the connection table, lowered by the open-file limit | the kernel backlog holds the connection |
 | `compress_output` | bytes | 64 KiB | 128 MiB | services | the response a compressor reads | 500 |
 | `minify_output` | bytes | 64 KiB | 128 MiB | services | the response a minifier reads | 500 |
+| `minify_parse` | bytes | 1 MiB | 1 MiB | services | the largest JavaScript body a minifier parses, so the loop's parse work per file version | the body is served as written, with one line |
+| `minify_nesting` | levels | 1024 | 1024 | services | the deepest bracket nesting a minifier parses, so a recursive descent cannot exhaust the stack | the body is served as written, with one line |
 | `smtp_reply` | bytes | 512 B | 128 KiB | services with mail | one relay reply | the send fails |
 | `ndjson_page` | bytes | 4 MiB | 64 MiB | m6-monitor | the default page and the largest row of an ndjson stream | the row is refused |
 | `tail_read` | bytes | 64 KiB | 512 KiB | m6-file | one page of a tail response, and the window a last-N-lines request scans | a client further behind reads the next page from `X-Log-End`, and N lines that do not fit in a page are 413 |
@@ -467,11 +579,13 @@ A key under `[limits]` that is not in the table stops the process at start with 
 | `request_dict` | entries | 32 | 4096 | services | the fields of one request: query, form, path parameters, cookies and built-ins | the request is refused with a 400 |
 | `refresh_queue` | entries | 16 | 4096 | m6-http | stale cache entries waiting for a background fetch | the refresh is refused |
 | `rate_limit_addresses` | entries | 1024 | 50000 | m6-http | client addresses the request counter tracks | a new address is answered 429 |
-| `cache_bytes` | bytes | 128 MiB | 128 MiB | m6-http | the response cache, which evicts the least recently read entry | the cache evicts |
-| `heap_reserve` | bytes | 32 MiB (m6-http: `cache_bytes` max plus 64 MiB) | 4 GiB | services | the heap reserved from the OS at start, on huge pages where the kernel has them | the heap still grows from the OS, logged once, and is never a failure |
+| `cache_bytes` | bytes | 128 MiB | 128 MiB | m6-http, m6-file | m6-http's response cache and m6-file's minified bodies, each evicting the least recently used entry | the cache evicts |
+| `heap_reserve` | bytes | 32 MiB (m6-http and m6-file: `cache_bytes` max plus 64 MiB) | 4 GiB | services | the heap reserved from the OS at start, on huge pages where the kernel has them | the heap still grows from the OS, logged once, and is never a failure |
 
 **Table 6: the named limits, their defaults, the process that reads each, and what happens past the maximum.**
 Take from it that every limit is one `start` and one `max`, and that the last column says what happens past `max`.
+m6-http and m6-file both derive the reservation from `cache_bytes` and warn when an explicit `start` leaves the cache outside it.
+m6-file therefore bounds its minified-body cache by `cache_bytes` max at a default start, and by the reservation when the config sets one.
 The start-up record's platform line lists every limit a process runs with, its `start`, its `max` and whether each came from the file or the default ([`m6-log.md`](m6-log.md) §9).
 
 The HTTP/1.1 head limits of 8 KiB per field and 32 KiB per head are protocol limits answered 400 (414 for a request line).
@@ -646,10 +760,16 @@ The descriptor opens before the socket exists.
 The socket is how a caller knows the service is ready, so a caller that waits for it and then sends SIGTERM must find the descriptor open.
 A stop that arrives while the mask is blocked and no descriptor is open is discarded on macOS, and the service would then ignore the stop that followed its own bind.
 
-The first signal stops accepting, removes the socket and exits 0.
-It does not wait for a request in progress, so a request cut off by a restart is lost, and a service that needs state to survive a restart cannot depend on a shutdown hook.
+The first signal stops accepting, answers every request the listener already accepted, then removes the socket and exits 0.
+The wait ends when the last accepted request finishes, or at `[server] drain_timeout_s`, whichever comes first.
+Past the deadline the service logs `drain deadline passed with requests still in flight` with the count in `unfinished`, and exits anyway, so the supervisor's own stop timeout never kills it mid-response.
 A second signal removes the socket, logs `<name> shutdown forced` and exits 0 at once.
 A socket left behind keeps a dead member in the edge's backend pool.
+
+**The drain counts a connection when the listener accepts it**, not when a turn reads its request.
+`m6_core::drain::Drain` owns the count and the deadline, so the four services whose loops share `ServerConn` make the same decision with the same code.
+A request that was accepted and not yet read is work the service owes an answer, and a drain that waits only for work already being served closes the listener under it.
+`docs/m6-architecture.md` §7.3 gives the defect that measured.
 
 `Lifecycle::on_signal` decides what a signal means: `Action::Stop` breaks the loop and `Action::Continue` carries on.
 `Lifecycle::complete()` removes the socket and writes the completion line.
@@ -749,7 +869,7 @@ This section lists it.
 - `listen_unix`, which binds a non-blocking socket with the mode set.
 - Content-coding negotiation with real q-values, so `br;q=0` is honoured, `*` supplies the quality for anything unnamed, and an explicitly named coding beats `*` in either direction.
 - Conditional requests: `If-Match`, `If-None-Match`, `If-Modified-Since` and `If-Unmodified-Since`, with weak comparison where the specification requires it.
-- brotli and gzip, and HTML, CSS and JSON minification, both configurable per MIME type, with minification before compression.
+- brotli and gzip, and HTML, CSS, JSON and JavaScript minification, both configurable per MIME type, with minification before compression.
 - Configuration, templates and params files read at start and again on `POST /genid` (§5.1). The log level is fixed for the life of the process.
 - Structured logging as JSON lines, flushed by the loop that writes them.
 - A request dictionary layered over a shared base, assembled from twelve sources in a fixed order.
@@ -803,7 +923,7 @@ Table 8 is the whole contract in one place.
 | routes as `CodeRoute` values, handlers registered by name, or both | route matching, the configuration route table and the dispatch |
 | plain state in `main`, passed to the arms | the request dictionary, rendering, minification, compression and logging |
 | a configuration file whose stem is the service's name | the socket path, the backend name and the reserved keys of Table 5 |
-| a systemd unit naming the two paths and what it writes | `Lifecycle`: the start line, the signal line, the socket unlink and the exit |
+| a systemd unit naming the two paths and what it writes | `Lifecycle`: the start line, the signal line, the socket unlink and the exit. `Drain`: the accepted-work count and the drain deadline |
 | one call to `assert_app_lifecycle` | the assertion behind it |
 
 **Table 8: the division of labour between a service and `m6-core`.**

@@ -92,6 +92,14 @@ pub struct ServerConfig {
     /// holds its connection slot until it disconnects. Configure
     /// `read_timeout_s = 0` to ask for that deliberately.
     pub read_timeout: Option<std::time::Duration>,
+    /// How long shutdown waits for accepted requests to finish, from
+    /// `drain_timeout_s`.
+    ///
+    /// When it passes, the service warns with how many requests were still
+    /// running and exits anyway, so a deploy finishes inside the supervisor's
+    /// own stop timeout instead of being killed mid-response. Zero waits for
+    /// nothing.
+    pub drain_timeout: std::time::Duration,
     /// Mode applied to the unix socket after bind, from `socket_mode`.
     ///
     /// Written the way systemd writes it, as an octal string:
@@ -264,6 +272,9 @@ impl RendererConfig {
 
         let server = serde_json::json!({
             "read_timeout_s": self.server.read_timeout.map(|d| d.as_secs()),
+            // The setting an operator sizes a supervisor's stop timeout
+            // against is part of the record, not only a number in the docs.
+            "drain_timeout_s": self.server.drain_timeout.as_secs(),
             "socket_mode": format!("{:04o}", self.server.socket_mode),
         });
         root.insert("server".to_string(), server);
@@ -277,9 +288,13 @@ impl RendererConfig {
         );
 
         // The minification table is flat in the file: `[minification]` holds
-        // one `<mime> = true` key per type, so the record and the rebuilt
-        // file use the same shape.
+        // `inline_js` plus one `<mime> = true` key per type, so the record and
+        // the rebuilt file use the same shape.
         let mut minification = Map::new();
+        minification.insert(
+            "inline_js".to_string(),
+            Value::Bool(self.minification.inline_js),
+        );
         for (mime, on) in &self.minification.enabled {
             minification.insert(mime.clone(), Value::Bool(*on));
         }
@@ -391,6 +406,11 @@ fn json_option(value: &Option<String>) -> Value {
 pub struct MinificationConfig {
     /// Which MIME types have minification enabled.
     pub enabled: std::collections::HashMap<String, bool>,
+    /// Whether to minify classic inline `<script>` bodies inside HTML.
+    ///
+    /// Module scripts and non-JavaScript script types are left as written.
+    /// Set in config with `[minification] inline_js`.
+    pub inline_js: bool,
 }
 
 impl MinificationConfig {
@@ -405,7 +425,12 @@ fn default_minification() -> MinificationConfig {
     m.insert("text/html".to_string(), true);
     m.insert("text/css".to_string(), true);
     m.insert("application/json".to_string(), true);
-    MinificationConfig { enabled: m }
+    m.insert("application/javascript".to_string(), true);
+    m.insert("text/javascript".to_string(), true);
+    MinificationConfig {
+        enabled: m,
+        inline_js: true,
+    }
 }
 
 /// Framework-consumed top-level keys that must not appear in the request dict.
@@ -645,7 +670,11 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
         );
     }
     check_keys(&tv, "params_cache", &["size"])?;
-    check_keys(&tv, "server", &["read_timeout_s", "socket_mode"])?;
+    check_keys(
+        &tv,
+        "server",
+        &["read_timeout_s", "drain_timeout_s", "socket_mode"],
+    )?;
     // The one `[log]` parse, kept here so a bad log table is refused before the
     // rest of the file is read.
     let log = LogConfig::from_toml(tv.get("log"))?;
@@ -695,6 +724,10 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
             0 => None,
             secs => Some(std::time::Duration::from_secs(secs)),
         };
+    let drain_timeout = std::time::Duration::from_secs(server_secs(
+        "drain_timeout_s",
+        crate::server::DEFAULT_DRAIN_TIMEOUT_SECS,
+    )?);
 
     // An octal string, as systemd writes it. See `ServerConfig::socket_mode`
     // for why this is not an integer.
@@ -790,6 +823,7 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
         params_cache: ParamsCacheConfig { size: pc_size },
         server: ServerConfig {
             read_timeout,
+            drain_timeout,
             socket_mode,
         },
         compression,
@@ -818,10 +852,14 @@ fn parse_minification(
             let on = val.as_bool().ok_or_else(|| {
                 anyhow::anyhow!("[minification] {key} must be true or false, got {val}")
             })?;
-            minification.enabled.insert(key.clone(), on);
+            if key == "inline_js" {
+                minification.inline_js = on;
+            } else {
+                minification.enabled.insert(key.clone(), on);
+            }
         }
     }
-    let asked = minification.enabled.values().any(|&on| on);
+    let asked = minification.inline_js || minification.enabled.values().any(|&on| on);
     if asked && !minifiers_linked {
         anyhow::bail!(
             "[minification] turns minification on, but this build of m6-core has no minifiers: \
@@ -987,12 +1025,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     /// Compressed by default and deliberately not minified.
-    const NOT_MINIFIED: &[&str] = &[
-        "image/svg+xml",
-        "text/plain",
-        "application/javascript",
-        "text/javascript",
-    ];
+    const NOT_MINIFIED: &[&str] = &["image/svg+xml", "text/plain"];
 
     #[test]
     fn every_minified_type_is_also_compressed_by_default() {
@@ -1042,9 +1075,24 @@ mod tests {
 
     #[test]
     fn a_build_with_the_minify_feature_minifies_by_default() {
-        assert!(parse_minification(None, true)
-            .unwrap()
-            .is_enabled("text/html"));
+        let minification = parse_minification(None, true).unwrap();
+        assert!(minification.is_enabled("text/html"));
+        assert!(minification.is_enabled("application/javascript"));
+        assert!(minification.is_enabled("text/javascript"));
+        assert!(minification.inline_js);
+    }
+
+    #[test]
+    fn the_javascript_keys_and_inline_js_can_be_turned_off() {
+        let table: toml::Value = toml::from_str(
+            "[minification]\n\"application/javascript\" = false\n\"text/javascript\" = false\ninline_js = false\n",
+        )
+        .unwrap();
+        let minification = parse_minification(table.get("minification"), true).unwrap();
+        assert!(!minification.is_enabled("application/javascript"));
+        assert!(!minification.is_enabled("text/javascript"));
+        assert!(minification.is_enabled("text/html"));
+        assert!(!minification.inline_js);
     }
 
     #[test]
@@ -1058,7 +1106,7 @@ site_name = "Test"
 
 [[route]]
 path = "/"
-template = "templates/home.html"
+template = "templates/home.html.tmpl"
 "#
         )
         .unwrap();
@@ -1188,14 +1236,43 @@ template = "templates/home.html"
             cfg.server.read_timeout,
             Some(std::time::Duration::from_secs(30))
         );
+        assert_eq!(cfg.server.drain_timeout, std::time::Duration::from_secs(30));
         assert_eq!(cfg.server.socket_mode, 0o660);
     }
 
     #[test]
     fn server_keys_are_read() {
-        let s = server_cfg("read_timeout_s = 5\nsocket_mode = \"0600\"").unwrap();
+        let s =
+            server_cfg("read_timeout_s = 5\ndrain_timeout_s = 7\nsocket_mode = \"0600\"").unwrap();
         assert_eq!(s.read_timeout, Some(std::time::Duration::from_secs(5)));
+        assert_eq!(s.drain_timeout, std::time::Duration::from_secs(7));
         assert_eq!(s.socket_mode, 0o600);
+    }
+
+    /// The effective record, which is what the start-up line and
+    /// `--dump-config` show, carries the drain timeout. An operator sets a
+    /// supervisor's stop timeout against this number, so a record that omitted
+    /// it would hide the setting they have to match.
+    #[test]
+    fn the_effective_record_names_the_drain_timeout() {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, "[server]\ndrain_timeout_s = 7").unwrap();
+        let cfg = load(f.path(), Path::new("/tmp")).unwrap();
+        let json = cfg.effective_json(Path::new("/tmp"));
+        assert_eq!(json["server"]["drain_timeout_s"], 7);
+        assert_eq!(json["server"]["read_timeout_s"], 30);
+        assert_eq!(json["server"]["socket_mode"], "0660");
+    }
+
+    /// `drain_timeout_s = 0` waits for nothing, which is how a service asks
+    /// for the stop-at-once behaviour that every service had while the drain
+    /// was removed.
+    #[test]
+    fn a_zero_drain_timeout_waits_for_nothing() {
+        assert_eq!(
+            server_cfg("drain_timeout_s = 0").unwrap().drain_timeout,
+            std::time::Duration::ZERO
+        );
     }
 
     /// Zero is the documented way to ask for the old no-timeout behaviour, so
@@ -1232,6 +1309,8 @@ template = "templates/home.html"
         for body in [
             "read_timeout_s = -1",
             "read_timeout_s = \"30\"",
+            "drain_timeout_s = -1",
+            "drain_timeout_s = \"30\"",
             "socket_mode = 660",
             "socket_mode = \"rw-rw----\"",
             "socket_mode = \"0999\"",

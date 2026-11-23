@@ -345,6 +345,7 @@ It asks that upstream for the ID and follows it.
 
 1. **Heartbeat.**
    At start, and then once `heartbeat_secs` (default 10) have passed since the last one finished, the node sends `GET /genid` to the upstream with `Authorization: Bearer <token from token_file>`.
+   The heartbeat takes the transport the upstream's URL scheme names: an h2 stream for `h2c://` and `h2s://`, and an HTTP/1.1 upstream slot for `http://` and `https://`.
    One heartbeat is in flight at most, on the accounting tick, under the backend's `backend_timeout_secs` deadline.
    The address is the one resolved at start, so an address change needs a restart.
 2. **A new ID is a full flush.**
@@ -605,6 +606,16 @@ Table 8 gives what each signal does to m6-http.
 **Table 8: the signals m6-http handles.**
 A second termination signal exits at once.
 
+**m6-http does not drain before it stops, by design.**
+A drain on the edge would hold a restart open for requests that already recover without one:
+
+- A client retries an idempotent request (`GET`, `HEAD`) when the connection it reused closes, so a page or asset request cut by the stop is sent again.
+- A request that arrives while the process restarts fails whether or not the old process drained, because no listener is bound in that gap.
+- A non-idempotent request such as a `POST` cut mid-flight ends in a connection error, and the client can send it again.
+
+An edge restarts only at a deploy, so a stop costs at most the requests in flight at that moment.
+The backends behind it do drain, up to `[server] drain_timeout_s`, because a backend restart can cut work a client cannot see or repeat.
+
 A clean exit writes one `type=shutdown` line with the run's `run_id`, its uptime and reason `signal`, and a forced exit on the second signal writes reason `forced` ([`m6-log.md`](m6-log.md) §9).
 
 ---
@@ -648,7 +659,8 @@ The unit's `LoadCredential` lines deliver the two files, as `m6-user-guide.md` s
 
 The H2C listener speaks HTTP/2 framing over plain TCP, and routes and handles each request as it does a TLS request.
 
-The listener is internal, and trusts the `X-Forwarded-For` a cache node sends, only when `[server] internal_binds` names it.
+The listener is internal, and trusts the `X-Forwarded-For` and the `Via` a cache node sends, only when `[server] internal_binds` names it.
+On the public listener a client's `Via` is dropped at ingress, and every forwarded request carries this node's `[node] name` instead.
 m6-http refuses to start with `h2c_bind` set and `internal_binds` absent.
 `internal_binds = []` declares the listener public.
 An internal listener closes a connection from any address not in `[server] internal_peers`, and m6-http refuses to start with `internal_binds` set and `internal_peers` absent.
@@ -836,8 +848,23 @@ One thread, one edge-triggered `m6_core::platform::Poll` loop, no async runtime.
 The H2C and H2S client pools run in the loop beside the TLS and QUIC listeners.
 
 An HTTP/2 connection sends in the same way: `send_until_blocked` frames and writes until the socket would block or no stream has credit left, and the writable edge the loop then waits for runs it again.
-The send queue starts at 64 KiB (`[limits.h2_send] start`; the same value is the kernel's unsent-bytes mark on Linux), so a body of any size is sent in many passes, and a socket that took every byte never reports a new edge.
+The send queue starts at 64 KiB (`[limits.h2_send] start`, the same value as the kernel's unsent-bytes mark on Linux), so a body of any size is sent in many passes, and a socket that took every byte never reports a new edge.
 `rfc9113_6_9_h2_serves_a_37_kib_body`, `_300_kib_body` and `_2_mib_body` in `m6-http/tests/rfc_conformance.rs` fetch each size with a client that announces a browser's windows.
+
+### 17.1 The HTTP/3 send and receive path
+
+A QUIC connection sends through one flush and receives through one readiness event, and both use the platform layer's UDP batch (section 2.1 of [`m6-platform.md`](m6-platform.md)).
+The flush packs the datagrams quiche has queued into the loop's own buffer while they have one destination and every one but the last is the same size, and it stops at 64 KiB, 64 segments or the connection's send quantum.
+It then sends the packed buffer with one `m6_core::platform::net::UdpBatch::send`.
+On Linux that call is one `sendmsg` carrying a `UDP_SEGMENT` control message, so the kernel splits the buffer into the datagrams the flush packed.
+A socket without segmentation offload takes the same call down one datagram per send, with the same bytes in the same order, so the flush is one code path on every platform.
+The batch buffer is allocated once with the loop, so a flush allocates nothing.
+
+The receive side takes up to `MAX_BATCH`, 16, datagrams per call from one readiness event, one slot of the loop's buffer each, and feeds each one to `conn.recv` with its own `RecvInfo`.
+The receive slots are a slice of the buffer the loop already holds, so a readiness event allocates nothing.
+The local address in each `RecvInfo` is read once at socket setup rather than once per datagram, because a bound socket's local address cannot change.
+The peer's interface class is chosen from the peer address the receive reports, so the classification keeps the value it had.
+A server therefore spends fewer system calls for the same datagrams, and the receive path no longer pays a lookup for every datagram it takes in.
 
 The fixed tokens are `TOKEN_TLS_LISTENER`, `TOKEN_STATUS_LISTENER`, `TOKEN_H2C_LISTENER`, `TOKEN_UDP`, `TOKEN_SIGNAL` and `TOKEN_LOG`.
 Every connection and every upstream gets its own `Token(k)` in the `Slots` table.

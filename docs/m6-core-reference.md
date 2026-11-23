@@ -66,7 +66,7 @@ Table 1 gives the eleven features.
 | feature | default | what it adds |
 |---|---|---|
 | `templates` | **on** | `template` module, `TeraFactory`, `TeraRenderer`. Pulls tera and comrak. Without it a service passes `NoTemplates`. |
-| `minify` | **on** | `minify` module, and the minification step in `site`. Pulls minify-html, which brings a CSS engine. Without it a config that turns minification on fails to load and names this feature. |
+| `minify` | **on** | `minify` module, and the minification step in `site`. Pulls minify-html, which brings a CSS engine, and oxc, which brings a JavaScript parser and code generator. Without it a config that turns minification on fails to load and names this feature. |
 | `testkit` | off | The `testkit` module, and `alloc-count`. Enable from `[dev-dependencies]` only. |
 | `alloc-count` | off | The counting allocator on its own, so a service binary can count its loop's allocations. |
 | `alloc-trace` | off | A backtrace per allocation, for the `alloc_sites` diagnostic target. |
@@ -105,6 +105,7 @@ Table 2 is the index, and it uses six abbreviations: *HTTP* (Hypertext Transfer 
 | | `event` | `Timeouts`, `Slots` and `LoopTrace`, the deadlines, connection table and accounting of a service's loop. |
 | | `alloc` | `M6Alloc`, the allocator every m6 binary installs, with `never_return`, `reserve` and `note_growth`. |
 | | `signal` | `block()` and `Lifecycle`. Signal-safe shutdown. |
+| | `drain` | `Drain` and `Step`: the accepted-work count a loop takes at the accept, its flag per connection slot, and the `[server] drain_timeout_s` deadline. |
 | | `render` | The `Renderer` and `RendererFactory` traits, plus `NoTemplates`. The only thing `Site` needs from a template engine. A `Renderer` writes the page into the service's page area. |
 | | `limits` | Named limits: `Limits`, `Limit`, `LimitSpec` and `Bounded<T>`. One `start` and `max` per buffer or queue, read from `[limits.<name>]`, with the one growth rule and the over-max error. `m6-app-anatomy.md` §4.2 lists the limits. |
 | | `build_info` | `BuildIdentity`, the `build_identity!` macro, `emit` for a service's `build.rs`, `linked` and `handle_version_flags` for `--version` and `--version-full`. The constants are fixed at build time and the type comes from `m6-platform`. |
@@ -158,7 +159,7 @@ It uses *HTTP* (Hypertext Transfer Protocol) for the wire protocol and *TOML* (T
 
 ### 4.1. The parts a loop uses
 
-**A service's loop is written in its own `main` from eight parts.**
+**A service's loop is written in its own `main` from nine parts.**
 Table 3 names them, and `docs/m6-app-anatomy.md` §2 is the loop in full.
 
 | part | module | what it supplies |
@@ -171,9 +172,17 @@ Table 3 names them, and `docs/m6-app-anatomy.md` §2 is the loop in full.
 | one connection | `h1::ServerConn` | read, parse, buffer and write through the slot's own buffers |
 | the listener | `net::listen_unix` | a non-blocking unix listener with its mode set |
 | the site | `site::Site` | routes, the request dictionary, templates and the finish |
+| the drain | `drain::Drain` | the accepted-work count taken at the accept, and the deadline a shutdown gives it |
 
 **Table 3: the parts a service's loop builds from.**
-Take from it that the loop is assembled from these eight parts, one per concern.
+Take from it that the loop is assembled from these nine parts, one per concern.
+
+`Drain::begin(key)` runs when the listener accepts a connection and `Drain::end(key)` when that connection's work is finished: after its last response is written and it holds nothing, or at its close.
+The count rises at the accept, so a request that was accepted and not yet read still holds shutdown open.
+`start(now)` takes the stop and answers whether anything was in flight; a stop that finds zero still gets one non-blocking turn, so a request already waiting in a kept-alive socket is read rather than closed under the client.
+`poll_timeout(now)` caps the loop's wait at the deadline, and returns zero for that one turn.
+`step(now)` returns `Step::Draining`, `Step::Finished` or `Step::DeadlinePassed(unfinished)`.
+Nothing waits on a condvar: a service is one event loop, so the loop is the only thing that can finish a request, and the count falling to zero ends the drain on that turn.
 
 ### 4.2. `config`
 
@@ -188,7 +197,7 @@ pub struct RendererConfig {
     pub global_params: Vec<String>,
     pub routes:        Vec<RouteConfig>,
     pub params_cache:  ParamsCacheConfig,    // size
-    pub server:        ServerConfig,         // read_timeout, socket_mode
+    pub server:        ServerConfig,         // read_timeout, drain_timeout, socket_mode
     pub compression:   HashMap<String, CompressionLevel>,  // per-mime brotli/gzip
     pub minification:  MinificationConfig,   // per-mime enabled
     pub log:           LogConfig,            // level
@@ -214,6 +223,12 @@ A `RouteConfig` carries ten fields: `path`, `template`, `params`, `status`, `cac
 `[server] read_timeout_s` is the read deadline applied to every accepted connection, defaulting to `server::DEFAULT_READ_TIMEOUT_SECS` (30).
 `0` means no timeout.
 It is read once at startup and applied at accept time.
+
+`[server] drain_timeout_s` is how long shutdown waits for accepted requests, defaulting to `server::DEFAULT_DRAIN_TIMEOUT_SECS` (30), inside the 90 s systemd allows a stop.
+The wait ends the moment the last accepted request finishes.
+When the deadline passes first the service logs `drain deadline passed with requests still in flight` with the count in `unfinished`, and exits anyway.
+`0` waits for nothing, and a negative or non-integer value stops the service at start.
+It is read once at startup, by `Site::drain_timeout`.
 
 `[server] socket_mode` is the mode applied to the unix socket after bind, defaulting to `server::DEFAULT_SOCKET_MODE` (`0o660`).
 It is an **octal string** such as `"0660"`, as systemd writes it, because TOML has no octal literal and `660` as a decimal integer is `0o1224`.
@@ -257,6 +272,11 @@ A page past the limit's maximum is `RenderError::TooLarge`, and the client gets 
 `NoTemplates` implements both traits and errors if anything asks it to render.
 
 `template` is the Tera implementation: `build_tera`, `build_tera_from_paths`, `TeraRenderer`, `TeraFactory` and `NOT_FOUND_SENTINEL`, which is how a template signals a 404 from inside rendering.
+
+Both builders treat a file as a template when its name ends `.tmpl`, and both walk every subdirectory of the template root.
+The Tera name is the path under the site directory with the suffix kept, so an include names the file it reads: `{% include "templates/icons/logo.svg.tmpl" %}`.
+The part before `.tmpl` names the output.
+Autoescaping follows that output part: `.html.tmpl`, `.htm.tmpl` and `.xml.tmpl` escape, and `.svg.tmpl`, `.txt.tmpl` and `.json.tmpl` do not.
 
 Both builders add the site filters and functions in Table 4 to the Tera instance, beside Tera's own.
 
@@ -360,6 +380,7 @@ Neither blocks, and neither starts a thread.
 `Relay::new` refuses plain SMTP (no `starttls`) to any host but `127.0.0.1`, `::1` or `localhost`, resolves the host once with `net::resolve`, and reads the EHLO name.
 A host that does not resolve is an error, so the service stops at start, and a relay whose address changes needs a restart.
 `Smtp::new(read_cap, write_cap)` makes one slot per outgoing table entry, with its buffers.
+The reply buffer grows within `[limits.smtp_reply] max`. A reply longer than the free buffer grows it and reads again, so a long EHLO reply arrives without waiting for a new socket edge.
 `Smtp::start` keeps the bytes from `Message::formatted()` and begins a non-blocking connect.
 `fd()` is `None` while the slot has no connection.
 The service registers `fd()` with `interest()`, keeps the deadline from `deadline()` in its outgoing `Timeouts`, and calls `drive()` when the token fires.
@@ -370,6 +391,7 @@ The connection's state is one `enum` of steps inside the slot, so the service's 
 
 **client::Endpoint.** `Endpoint::new(url, tls)` runs at start: it parses an `http` or `https` URL, resolves the host once, and keeps the `Host` header, path and query.
 `post_form(&mut up, fields, deadline)` encodes `application/x-www-form-urlencoded` straight into the `Upstream`'s request buffer and starts it, and the service drives the `Upstream` as it drives an `Smtp`.
+The `Upstream` drains each TLS record as it arrives and grows its read buffer within `[limits.upstream_read] max`, so a response larger than the first buffer arrives whole.
 Each call opens one connection and sends `Connection: close`.
 `m6_core::rustls` re-exports the TLS library, so a service names `m6_core::rustls::ClientConfig` and takes no `rustls` dependency of its own.
 
@@ -697,8 +719,12 @@ The four small modules come first, and SQLite has the rest of the section.
 
 `compress` provides `brotli_compress(data, quality)`, `brotli_decompress(data)`, `gzip_compress(data, level)` and `gzip_decompress(data)`.
 
-`minify` (feature `minify`) provides `minify_html(data)`, `minify_css(data)` and `minify_json(data)`.
-There is no JavaScript minifier, and `minify_html` leaves an inline `<script>` as written.
+`minify` (feature `minify`) provides `minify_html(data)`, `minify_html_with(data, inline_js)`, `minify_inline_scripts(data)`, `minify_js(data)`, `minify_css(data)` and `minify_json(data)`, plus the budget-aware forms `minify_html_with_budget`, `minify_inline_scripts_budget` and `try_minify_js_with`.
+`try_minify_js_with(JsKind, data, ParseBudget)` is the form a request path uses: `JsKind::for_path` says `.mjs` is a module, and `ParseBudget::from_limits` carries `[limits.minify_parse]` and `[limits.minify_nesting]`.
+It parses a classic script or a module, compresses it and mangles local names. Top-level names and declarations are kept, because another script on the page may use them.
+A body over either budget, a body that is not UTF-8, a diagnostic, or a parser fatal error is `Err(JsFallback)` and the caller serves the input bytes; a partial program from a fatal error is never minified.
+`warn_unminified(subject, fallback)` writes one line per distinct subject and counts every body served as written; `parse_count()` is the per-thread parser count a cache test reads.
+`application/ld+json` and any other non-JavaScript `<script>` type is left as written.
 
 `util` provides `slugify`, `today_iso8601`, `now_iso8601`, `iso8601_minutes_ago` and `html_escape`.
 

@@ -1005,6 +1005,7 @@ mod tests {
             history: None,
             process_groups: Vec::new(),
             startup: StartupDigest::default(),
+            events: Vec::new(),
         }
     }
 

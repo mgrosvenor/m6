@@ -168,6 +168,18 @@ pub(super) fn prepare_socket(sock: &socket2::Socket) -> io::Result<()> {
     sock.set_nosigpipe(true)
 }
 
+/// macOS consults the listen queue before the descriptor table, so an `EMFILE`
+/// has already taken and dropped the queued connection, and an empty queue
+/// answers `WouldBlock`.
+pub(super) const EMFILE_TAKES_QUEUED: bool = true;
+
+/// macOS has no `/proc`, and kqueue reports a listener as readable without
+/// saying how many connections are behind it, so there is no queue depth to
+/// return.
+pub(super) fn accept_queue(_local: SocketAddr) -> io::Result<Option<usize>> {
+    Ok(None)
+}
+
 /// macOS has no `TCP_NOTSENT_LOWAT`. The kernel takes what the socket gives it
 /// and its own order stands, so there is nothing to set and nothing to undo:
 /// the caller's frames still leave in the order they were written.

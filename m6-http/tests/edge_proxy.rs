@@ -189,7 +189,7 @@ fn setup_site(dir: &std::path::Path, html_sock: &str, file_sock: &str) {
     std::fs::create_dir_all(dir.join("configs")).unwrap();
 
     std::fs::write(
-        dir.join("templates/home.html"),
+        dir.join("templates/home.html.tmpl"),
         b"<!doctype html><html><body><h1>global</h1></body></html>",
     )
     .unwrap();
@@ -247,11 +247,11 @@ global_params = ["data/site.json"]
 
 [[route]]
 path     = "/"
-template = "templates/home.html"
+template = "templates/home.html.tmpl"
 
 [[route]]
 path     = "/nocache/"
-template = "templates/home.html"
+template = "templates/home.html.tmpl"
 cache    = "no-store"
 "#,
     )

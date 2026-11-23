@@ -147,6 +147,12 @@ impl Server {
         panic!("{needle:?} never appeared:\n{out}");
     }
 
+    /// Everything the program has written so far, without stopping it.
+    fn output_so_far(&self) -> String {
+        let out = self.output.lock().unwrap_or_else(|e| e.into_inner());
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
     /// A shutdown request, wait for exit 0, and return the whole stderr tail.
     fn tail(mut self) -> String {
         platform::send(self.child.id(), Signal::Shutdown).expect("send shutdown");
@@ -191,6 +197,42 @@ fn read_exact_now(s: &mut TcpStream, n: usize) -> Vec<u8> {
         }
     }
     out
+}
+
+/// One integer count beside `key` in a refusal line, in either the JSON log
+/// line a service writes or the plain stderr line the echo program writes.
+fn count_field(line: &str, key: &str) -> u64 {
+    let at = line
+        .find(key)
+        .unwrap_or_else(|| panic!("no {key} in {line}"))
+        + key.len();
+    let rest = &line[at..];
+    let start = rest
+        .find(|c: char| c.is_ascii_digit())
+        .unwrap_or_else(|| panic!("no count after {key} in {line}"));
+    let rest = &rest[start..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end]
+        .parse()
+        .unwrap_or_else(|e| panic!("{key} in {line}: {e}"))
+}
+
+/// The sum of the `rejected` fields and the greatest `total` in the refusal
+/// lines of `output`. A service that has written every count it took has the
+/// two equal.
+fn refused_totals(output: &str) -> (u64, u64) {
+    let mut counted = 0u64;
+    let mut total = 0u64;
+    for line in output
+        .lines()
+        .filter(|line| line.contains(m6_core::net::REFUSED_MESSAGE) && line.contains("total"))
+    {
+        counted += count_field(line, "rejected");
+        total = total.max(count_field(line, "total"));
+    }
+    (counted, total)
 }
 
 fn assert_zero_allocations(tail: &str) {
@@ -545,6 +587,324 @@ fn the_loop_never_waits() {
         "slowest round trip {slowest:?}"
     );
     drop((held, fast));
+    let tail = srv.tail();
+    assert_zero_allocations(&tail);
+}
+
+/// E10 (restored). Out of descriptors while clients queue: every client that
+/// is already queued reaches a definite outcome with no new connection
+/// arriving, and the listener serves again once descriptors free.
+///
+/// The shell lowers the limit to 40 descriptors while the table is told it may
+/// hold 64, so `accept` fails with `EMFILE` once about thirty connections are
+/// open and the rest wait in the kernel's queue. This is the case the audit
+/// found: the accept arm stopped on the error, the listener was left
+/// edge-triggered with a connection queued, and the only thing that could wake
+/// it was another connection, which a full queue cannot deliver. The queued
+/// client therefore waited for the life of the process.
+///
+/// **The Linux defect this pins.** `EMFILE` is not the empty-queue answer.
+/// Linux consults the process's descriptor table before the listen queue, so
+/// with every descriptor in use `accept` answers `EMFILE` even when nothing is
+/// queued, and it leaves a queued connection queued. A loop that closes the
+/// reserve, takes one connection, opens the reserve again and retries `EMFILE`
+/// therefore never reaches `WouldBlock` on Linux: it spins in the accept arm,
+/// never returns to `poll`, never reads the connection it accepted last, and
+/// never writes a refusal line. macOS answers `WouldBlock` for an empty queue,
+/// so the same loop ends its turn there and the test passed on macOS only.
+///
+/// **The test runs on both kernels and each asserts its own answer.** Linux:
+/// every queued client reaches an outcome with no new connection arriving; the
+/// refusal line is written, which only happens when the arm ends its turn; the
+/// accept queue the platform layer reads is empty afterwards; and the listener
+/// serves again, which it can only do if the arm returned to `poll`. macOS:
+/// the service counts fewer refusals than the clients the kernel refused,
+/// because an `EMFILE` there takes and drops the queued connection, and the
+/// stopped burst counts at most two of its three. The two kernel facts behind
+/// the split are measured on the running kernel by `m6-platform`'s
+/// `accept_exhaustion` test, which also runs on every target.
+///
+/// **Break:** an accept loop that returns from the arm on `EMFILE` (the queued
+/// clients then sit in the queue: this test's read times out), one that takes
+/// one connection per `EMFILE` and retries (it spins on Linux, leaving the
+/// client it accepted unread and the refusal uncounted), one that logs the
+/// refusal and stops draining, or an echo that returns the error and exits.
+#[test]
+fn queued_clients_are_refused_with_no_new_connection_arriving() {
+    let cmd = m6_core::testkit::lowered_fd_limit_command(40, 0, bin("echo"));
+    // A long idle deadline: the served clients are held across two intervals
+    // and a stopped burst, and an idle close would free descriptors under the
+    // burst.
+    let srv = Server::start_cmd(cmd, &["127.0.0.1:0"], 120_000, 64, Some(64));
+    let addr = srv.addr;
+
+    // Each client writes one byte and waits for it back. The ones the limit
+    // cannot take are refused by the loop with the reserve descriptor, so the
+    // outcome is written to the socket and no client is left waiting.
+    let mut served: Vec<TcpStream> = Vec::new();
+    let mut refused = 0usize;
+    let mut waiting: Vec<TcpStream> = Vec::new();
+    for i in 0..48 {
+        let mut c = TcpStream::connect(addr).unwrap_or_else(|e| panic!("client {i}: connect: {e}"));
+        c.set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap_or_else(|e| panic!("client {i}: read timeout: {e}"));
+        // The kernel may have reset the connection already, because accepting
+        // it failed for want of a descriptor. That is the refusal.
+        let _ = c.write_all(b"q");
+        let mut b = [0u8; 1];
+        match c.read(&mut b) {
+            Ok(1) if b[0] == b'q' => served.push(c),
+            // Closed by the loop: the connection was refused.
+            Ok(0) => refused += 1,
+            Ok(n) => panic!("client {i}: unexpected read of {n}"),
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                waiting.push(c)
+            }
+            Err(e) if e.kind() == ErrorKind::ConnectionReset => refused += 1,
+            Err(e) => panic!("client {i}: read: {e}"),
+        }
+    }
+
+    assert!(
+        served.len() >= 8,
+        "some clients were served: {}",
+        served.len()
+    );
+    assert!(refused >= 1, "the descriptor limit refused nobody");
+    // The audit's finding, as an assertion: with no descriptor free, a queued
+    // connection is refused in the same turn instead of waiting for a new
+    // connection that a full queue cannot deliver. A loop that spins on
+    // `EMFILE` leaves the connection it accepted last unread, and its client
+    // sits here.
+    assert!(
+        waiting.is_empty(),
+        "{} client(s) were left waiting for a wakeup that cannot arrive: the \
+         accept arm did not drain the queue and end its turn",
+        waiting.len()
+    );
+    // Both kernels run this, and each states its own answer. The kernel facts
+    // themselves are measured by m6-platform's accept_exhaustion test, which
+    // runs on every target; this asserts what the service did with them.
+    if m6_core::platform::net::emfile_takes_queued_connection() {
+        // macOS: the `EMFILE` took the queued connection and dropped it, so the
+        // kernel refused most of these clients before the service saw them.
+        // The service counted fewer refusals than the clients that were
+        // refused, which is what "the kernel took it" looks like from here.
+        let (counted, _) = refused_totals(&srv.output_so_far());
+        assert!(
+            counted < refused as u64,
+            "the kernel takes the connection an `EMFILE` is asked about, so the \
+             service must count fewer than the {refused} refused clients, not {counted}:\n{}",
+            srv.output_so_far()
+        );
+    } else {
+        // Linux: `EMFILE` leaves each connection queued, so the drain took and
+        // closed them, counted them, and wrote the line when its turn ended.
+        // Nothing new connects between the burst and this line, so only an arm
+        // that reached its end can have written it.
+        srv.wait_for(m6_core::net::REFUSED_MESSAGE, Duration::from_secs(5));
+        assert_eq!(
+            m6_core::platform::net::accept_queue(addr).expect("the accept queue is readable"),
+            Some(0),
+            "the listener's accept queue is not empty at the end of the turn: a \
+             connection is left waiting with no wakeup that can arrive"
+        );
+    }
+    // The interval passes, and one more connection is refused: its turn ends by
+    // writing what the rate limit held back, so the burst below starts with
+    // nothing owed. When the service counted nothing for the clients above,
+    // there is nothing to write and this leaves the totals where they are.
+    std::thread::sleep(m6_core::net::REFUSED_INTERVAL + Duration::from_millis(300));
+    let before_flush = refused_totals(&srv.output_so_far()).1;
+    let mut flush = TcpStream::connect(addr).expect("flush connect");
+    flush
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("flush read timeout");
+    let _ = flush.write_all(b"flush\n");
+    let mut byte = [0u8; 1];
+    let _ = flush.read(&mut byte);
+    drop(flush);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let before = loop {
+        let totals = refused_totals(&srv.output_so_far());
+        if totals.1 > before_flush || Instant::now() >= deadline {
+            break totals;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    // A burst the service must count, with clients that send nothing.
+    //
+    // Three connections queue while the process is stopped, so one arm sees
+    // all three.
+    //
+    // **The client side cannot say which of them the service counted.** When
+    // `accept` fails for want of a descriptor, the kernel may drop a queued
+    // connection itself, and the peer reads that as end-of-file, the same read
+    // as the service's close over a connection that sent nothing. So the count
+    // is bounded below only, and the bound is one: with three connections
+    // queued in one arm, a kernel can consume at most two of them, and the
+    // reserve takes the last.
+    //
+    // The interval passes while the process is stopped, so the arm writes its
+    // line as it ends and the total can be read without another connection.
+    std::thread::sleep(m6_core::net::REFUSED_INTERVAL + Duration::from_millis(300));
+    let pid = srv.child.id().to_string();
+    let stop = std::process::Command::new("kill")
+        .args(["-STOP", &pid])
+        .status()
+        .expect("stop the echo");
+    assert!(stop.success(), "kill -STOP");
+    let mut probes: Vec<TcpStream> = (0..3)
+        .map(|_| TcpStream::connect(addr).expect("probe connect"))
+        .collect();
+    for probe in &probes {
+        probe
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("probe read timeout");
+    }
+    let cont = std::process::Command::new("kill")
+        .args(["-CONT", &pid])
+        .status()
+        .expect("continue the echo");
+    assert!(cont.success(), "kill -CONT");
+    // The reads are collected rather than asserted one at a time, so the
+    // accept-queue check below always runs and names the real fault: a drain
+    // that stopped early leaves the rest of the burst in the kernel's queue,
+    // which is what the client-side read timeout below would otherwise report.
+    let mut probe_outcomes = Vec::new();
+    for probe in &mut probes {
+        let mut byte = [0u8; 1];
+        probe_outcomes.push(probe.read(&mut byte));
+    }
+    // This burst was queued while the process was stopped, so one arm saw all
+    // three. Linux left all three queued for the drain, and the arm ended with
+    // the kernel's accept queue empty; a drain that takes one connection and
+    // ends leaves the other two here, and an edge-triggered epoll listener
+    // reports nothing for them.
+    if !m6_core::platform::net::emfile_takes_queued_connection() {
+        assert_eq!(
+            m6_core::platform::net::accept_queue(addr).expect("the accept queue is readable"),
+            Some(0),
+            "the listener's accept queue is not empty at the end of the turn: the \
+             burst was not drained and nothing can wake the listener for it"
+        );
+    }
+    for (i, outcome) in probe_outcomes.into_iter().enumerate() {
+        match outcome {
+            Ok(0) => {}
+            Err(e) if e.kind() == ErrorKind::ConnectionReset => {}
+            other => panic!(
+                "probe {i}: a connection queued while the echo was stopped was neither \
+                 closed nor reset: {other:?}"
+            ),
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let after = loop {
+        let totals = refused_totals(&srv.output_so_far());
+        if totals.1 > before.1 {
+            break totals;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the queued burst wrote no line at all:\n{}",
+            srv.output_so_far()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let counted_in_burst = after.1 - before.1;
+    assert!(
+        (1..=3).contains(&counted_in_burst),
+        "the service counted {counted_in_burst} of the three connections queued in one arm\n{}",
+        srv.output_so_far()
+    );
+    if m6_core::platform::net::emfile_takes_queued_connection() {
+        // macOS: the arm's first `EMFILE` takes one of the three with it, so
+        // the drain can count at most the other two.
+        assert!(
+            counted_in_burst <= 2,
+            "the kernel takes one connection with the `EMFILE`, so at most two of \
+             the three can be counted, not {counted_in_burst}\n{}",
+            srv.output_so_far()
+        );
+    }
+
+    // Descriptors free when the served clients close. The listener serves
+    // again, and the line said how many it refused.
+    drop(served);
+    let mut fresh = TcpStream::connect(addr).expect("connect");
+    fresh.write_all(b"new\n").expect("send");
+    assert_eq!(recv_exact(&mut fresh, 4, Duration::from_secs(10)), b"new\n");
+    drop(fresh);
+
+    let tail = srv.tail();
+    // Rate limiting delays a count and never loses one: the counts the lines
+    // carry add up to the total, and the total is what the service refused.
+    let (counted, total) = refused_totals(&tail);
+    assert_eq!(
+        counted, total,
+        "the counts in the lines add up to the total:\n{tail}"
+    );
+    // Everything the service counted before the burst is still bounded by the
+    // clients that were refused. The burst itself is tied to the arm that
+    // queued three connections in one turn.
+    assert!(
+        total - counted_in_burst <= refused as u64 + 1,
+        "the service counted {} refusals beyond the burst, but {refused} clients were refused:\n{tail}",
+        total - counted_in_burst
+    );
+}
+
+/// The listener serves again as soon as a descriptor frees, with no new
+/// connection needed.
+///
+/// Four clients fill a four-slot table and a fifth waits in the kernel's
+/// queue. Nothing new connects after that: the fifth is served because closing
+/// one held connection frees a descriptor, and the loop re-registers the
+/// listener it deregistered at the ceiling. That re-registration reaches the
+/// kernel, so a connection still queued is reported again.
+///
+/// **Break:** a listener left registered and unread, or one whose re-arm is
+/// gated on a condition that cannot be true: the fifth client's read times out.
+#[test]
+fn the_listener_serves_again_as_soon_as_descriptors_free_with_no_new_connection() {
+    let srv = Server::start(&bin("echo"), &["127.0.0.1:0"], 30_000, 4, Some(4));
+    let addr = srv.addr;
+
+    // Four connections fill the table: each answers before the next connects,
+    // so none of them is the queued one.
+    let mut held: Vec<TcpStream> = Vec::new();
+    for i in 0..4 {
+        let mut c = TcpStream::connect(addr).unwrap_or_else(|e| panic!("client {i}: {e}"));
+        c.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        c.write_all(b"a").expect("send");
+        assert_eq!(read_exact_now(&mut c, 1), b"a");
+        held.push(c);
+    }
+
+    // The fifth is queued: the table is full, so the listener is deregistered
+    // and no accept happens for it.
+    let mut queued = TcpStream::connect(addr).expect("connect");
+    queued
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .expect("read timeout");
+    queued.write_all(b"b").expect("send");
+    let mut byte = [0u8; 1];
+    assert!(
+        queued.read(&mut byte).is_err(),
+        "the fifth client was served with the table full"
+    );
+
+    // One descriptor frees, and no new connection arrives: the queued client
+    // is served.
+    drop(held.remove(0));
+    queued
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("read timeout");
+    assert_eq!(read_exact_now(&mut queued, 1), b"b");
+    drop((queued, held));
     let tail = srv.tail();
     assert_zero_allocations(&tail);
 }

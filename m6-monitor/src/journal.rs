@@ -605,6 +605,17 @@ struct Document {
     value: serde_json::Value,
 }
 
+/// The four `M6_TYPE`s the documents read asks for: the metrics and traffic
+/// documents, and the start-up and shutdown records. A service's own event
+/// lines are `M6_TYPE=event` and are read by a second reader instead, so this
+/// window is never filled with them.
+fn document_matches() -> Vec<String> {
+    ["perf", "traffic", "startup", "shutdown"]
+        .iter()
+        .map(|t| format!("M6_TYPE={t}"))
+        .collect()
+}
+
 /// The newest document of each kind the journal has carried, by node name, and
 /// the start-up records it carried.
 ///
@@ -614,6 +625,9 @@ struct Document {
 pub struct Latest {
     perf: BTreeMap<String, Document>,
     traffic: BTreeMap<String, Document>,
+    /// The configured event series' counts. Empty unless the deployment
+    /// declares one, and then every line of every read is offered to it.
+    pub events: crate::events::Counters,
     /// The start-up and shutdown records, by run id and then by node and app.
     pub startup: Startup,
     /// Lines whose `MESSAGE` had no node name, or was not one of the two
@@ -623,8 +637,19 @@ pub struct Latest {
 }
 
 impl Latest {
+    /// Empty counters. The service builds its own with [`Latest::with_events`],
+    /// so this exists for the tests that exercise the documents read alone.
+    #[cfg(test)]
     pub fn new() -> Latest {
         Latest::default()
+    }
+
+    /// The same, counting the configured event series.
+    pub fn with_events(events: crate::events::Counters) -> Latest {
+        Latest {
+            events,
+            ..Latest::default()
+        }
     }
 
     /// Read one `journalctl --output=json` line and keep what it carries.
@@ -650,6 +675,12 @@ impl Latest {
             self.malformed += 1;
             return;
         };
+        // The event series see every line, whatever its type. A line whose
+        // identifier is not configured is one failed lookup, and a line whose
+        // message is neither of a series' two is ignored there. The counters
+        // de-duplicate on the journal's time, so an entry delivered by this
+        // read and by the second reader counts once.
+        self.events.ingest(&entry, &line, at);
         if matches!(line["type"].as_str(), Some("startup") | Some("shutdown")) {
             self.startup.ingest(&line, at);
             return;
@@ -763,6 +794,11 @@ pub struct Reader {
     last_started: Option<Instant>,
     /// The `--lines` count of each read.
     window: usize,
+    /// The journal matches this read asks for, as `journalctl` field matches.
+    /// The documents reader asks for four `M6_TYPE`s. The event-series reader
+    /// asks for `SYSLOG_IDENTIFIER`s and nothing else, so the two reads select
+    /// disjoint sets of entries and cannot take each other's lines.
+    matches: Vec<String>,
     /// The one line being assembled, bounded by a named limit.
     line: Bounded<u8>,
     /// A line past the limit is dropped, and its bytes are ignored until its
@@ -784,9 +820,22 @@ impl Reader {
         limit: &Limit,
         stopped: Option<String>,
     ) -> Reader {
+        Reader::with_matches(dir, nodes, interval, limit, stopped, document_matches())
+    }
+
+    /// The same, asking for a different set of journal entries.
+    fn with_matches(
+        dir: Option<PathBuf>,
+        nodes: usize,
+        interval: Duration,
+        limit: &Limit,
+        stopped: Option<String>,
+        matches: Vec<String>,
+    ) -> Reader {
         Reader {
             dir,
             interval,
+            matches,
             child: None,
             killed: false,
             stdout: None,
@@ -822,6 +871,40 @@ impl Reader {
         reader
     }
 
+    /// A second read that asks the journal for a different set of entries.
+    ///
+    /// The event-series reader uses this: it selects by `SYSLOG_IDENTIFIER`, so
+    /// a service's own event lines arrive here and never in the documents read,
+    /// and the `--lines` window the metrics documents depend on is untouched by
+    /// them.
+    pub fn open_matching(
+        dir: &Path,
+        matches: &[String],
+        nodes: usize,
+        interval: Duration,
+        limit: &Limit,
+    ) -> Reader {
+        let matches: Vec<String> = matches
+            .iter()
+            .map(|id| format!("SYSLOG_IDENTIFIER={id}"))
+            .collect();
+        let mut reader = Reader::with_matches(
+            Some(dir.to_path_buf()),
+            nodes,
+            interval,
+            limit,
+            None,
+            matches,
+        );
+        reader.start(m6_core::platform::now());
+        reader
+    }
+
+    /// The same, one read for `--check`.
+    pub fn once_matching(dir: &Path, matches: &[String], nodes: usize, limit: &Limit) -> Reader {
+        Reader::open_matching(dir, matches, nodes, Duration::ZERO, limit)
+    }
+
     /// One run for `--check`: the same read, and [`Reader::drain`] reads the
     /// pipe to its end.
     pub fn once(dir: &Path, nodes: usize, limit: &Limit) -> Reader {
@@ -837,6 +920,11 @@ impl Reader {
     pub fn start_if_idle(&mut self, now: Instant) -> bool {
         self.settle();
         if self.dir.is_none() || self.child.is_some() || self.stdout.is_some() {
+            return false;
+        }
+        // `journalctl` with no match reads the whole journal. A reader with no
+        // filters must read nothing, not everything.
+        if self.matches.is_empty() {
             return false;
         }
         if let Some(last) = self.last_started {
@@ -1013,11 +1101,10 @@ impl Reader {
             .arg("--all")
             .arg("--output=json")
             .arg("--directory")
-            .arg(self.dir.as_deref().unwrap_or(Path::new("")))
-            .arg("M6_TYPE=perf")
-            .arg("M6_TYPE=traffic")
-            .arg("M6_TYPE=startup")
-            .arg("M6_TYPE=shutdown");
+            .arg(self.dir.as_deref().unwrap_or(Path::new("")));
+        for m in &self.matches {
+            command.arg(m);
+        }
         command
     }
 
@@ -1383,6 +1470,60 @@ mod tests {
             args.iter().filter(|a| *a == "--all").count(),
             1,
             "one --all, so long fields are not nulled"
+        );
+    }
+
+    /// **The second read selects by identifier and nothing else, and a read
+    /// with no filters selects nothing.**
+    ///
+    /// The point of the second reader is that the two cannot take each other's
+    /// lines: this one asks for `SYSLOG_IDENTIFIER` values, the documents read
+    /// asks for four `M6_TYPE`s, and an entry is in one set or the other. A
+    /// `journalctl` with no match at all reads the WHOLE journal, which is the
+    /// one thing this must never do, so an empty filter starts no read.
+    #[test]
+    fn the_event_read_selects_by_identifier_and_never_reads_the_whole_journal() {
+        let limit = Limit::builtin(&m6_core::limits::JOURNAL_LINE);
+        let reader = Reader::with_matches(
+            Some(PathBuf::from("/var/empty")),
+            3,
+            Duration::ZERO,
+            &limit,
+            None,
+            vec![
+                "SYSLOG_IDENTIFIER=example-app".to_string(),
+                "SYSLOG_IDENTIFIER=other-app".to_string(),
+            ],
+        );
+        let text: Vec<String> = reader
+            .command()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            text.iter().all(|a| !a.starts_with("M6_TYPE=")),
+            "the event read must not select a type: {text:?}"
+        );
+        assert_eq!(
+            text.iter()
+                .filter(|a| a.starts_with("SYSLOG_IDENTIFIER="))
+                .count(),
+            2,
+            "one match per configured series: {text:?}"
+        );
+        // The reader that names no match starts nothing at all, so an empty
+        // series list cannot turn into a read of the whole journal.
+        let mut none = Reader::with_matches(
+            Some(PathBuf::from("/var/empty")),
+            3,
+            Duration::ZERO,
+            &limit,
+            None,
+            Vec::new(),
+        );
+        assert!(
+            !none.start_if_idle(m6_core::platform::now()),
+            "a reader with no filters must not start"
         );
     }
 

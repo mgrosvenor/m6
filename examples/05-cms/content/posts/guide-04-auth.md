@@ -156,7 +156,7 @@ When the `session` cookie expires:
 
 If the refresh token is also expired, or absent: redirect to `/login?next=<original-path>`. API clients (non-text/html Accept) receive 401 directly throughout.
 
-## `templates/login.html`
+## `templates/login.html.tmpl`
 
 ```html
 {% extends "base.html" %}
@@ -181,7 +181,7 @@ m6-auth handles `POST /auth/login` (form-encoded) and either:
 - **Success** → sets cookies, `302` to `next`
 - **Failure** → `302` to `/login?error=invalid&next=<next>`
 
-## `templates/members.html`
+## `templates/members.html.tmpl`
 
 ```html
 {% extends "base.html" %}

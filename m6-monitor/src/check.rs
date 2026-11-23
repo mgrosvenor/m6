@@ -262,6 +262,58 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
         }
     }
 
+    // ── EVENT SERIES ─────────────────────────────────────────────────────────
+    //
+    // Each configured service's accepted and refused events, counted from the
+    // journal. A refusal whose code names the service's own configuration is a
+    // FAULT above, in the findings, and appears here with the code and the
+    // time. The distinction this section exists for: a run of refusals with no
+    // credential is traffic, which is what the service is for, and a run WITH a
+    // credential and a caller-side code is the service behaving correctly.
+    if !d.events.is_empty() {
+        let _ = writeln!(
+            o,
+            "\nEVENT SERIES  (each configured service's accepted and refused events, counted \
+             from the journal since this monitor started reading)"
+        );
+        for s in &d.events {
+            let label = if s.fault_code.is_some() {
+                "FAULT"
+            } else if !s.reads {
+                "unread"
+            } else {
+                "ok"
+            };
+            let _ = write!(
+                o,
+                "  {:<5} {:<48} {} accepted, {} refused ({} with a credential, {} without)",
+                s.identifier,
+                label,
+                s.accepted,
+                s.refused,
+                s.refused_with_token,
+                s.refused_without_token
+            );
+            if let Some(code) = &s.fault_code {
+                let _ = write!(
+                    o,
+                    "  FAULT: `{code}` at {}",
+                    s.fault_at.as_deref().unwrap_or("-")
+                );
+            } else if let Some(code) = &s.last_refused_code {
+                let _ = write!(o, "  last refused with `{code}`");
+            }
+            match &s.last_accepted_at {
+                Some(at) => {
+                    let _ = writeln!(o, "  last accepted {at}");
+                }
+                None => {
+                    let _ = writeln!(o, "  no acceptance seen");
+                }
+            }
+        }
+    }
+
     // ── STARTUP ──────────────────────────────────────────────────────────────
     //
     // The newest start-up record of each node and app. It answers the two
@@ -1438,6 +1490,62 @@ mod tests {
 
     pub(super) fn digest() -> Digest {
         crate::digest::build(&[], &crate::digest::Thresholds::default(), "now".into())
+    }
+
+    /// **The section a reader decides from, tested as it is printed.**
+    ///
+    /// A series standing on a fault says so in the findings AND here, with the
+    /// code and the time. A series whose refusals carry a caller-side code is
+    /// `ok` and still reports that code, because a run of those is the service
+    /// behaving correctly and a reader needs to tell the two apart.
+    #[test]
+    fn the_event_section_shows_the_fault_and_the_counts() {
+        let mut d = digest();
+        d.events = vec![crate::events::EventSeries {
+            identifier: "example-app".into(),
+            accepted: 3,
+            refused: 9,
+            refused_with_token: 4,
+            refused_without_token: 5,
+            fault_code: Some("invalid-credential".into()),
+            fault_at: Some("2026-11-23T01:00:01Z".into()),
+            last_accepted_at: Some("2026-11-23T00:00:00Z".into()),
+            last_refused_at: Some("2026-11-23T01:00:01Z".into()),
+            last_refused_code: Some("invalid-credential".into()),
+            reads: true,
+        }];
+        let out = render(&d, &[]);
+        assert!(out.contains("EVENT SERIES"), "{out}");
+        assert!(out.contains("example-app"), "{out}");
+        assert!(
+            out.contains("FAULT: `invalid-credential` at 2026-11-23T01:00:01Z"),
+            "{out}"
+        );
+        assert!(
+            out.contains("3 accepted, 9 refused (4 with a credential, 5 without)"),
+            "{out}"
+        );
+
+        // The same counts with a caller-side code: no fault, and the code is
+        // still named.
+        let mut d = digest();
+        d.events = vec![crate::events::EventSeries {
+            identifier: "example-app".into(),
+            accepted: 0,
+            refused: 2,
+            refused_with_token: 2,
+            refused_without_token: 0,
+            fault_code: None,
+            fault_at: None,
+            last_accepted_at: None,
+            last_refused_at: Some("2026-11-23T01:00:01Z".into()),
+            last_refused_code: Some("invalid-token".into()),
+            reads: true,
+        }];
+        let out = render(&d, &[]);
+        assert!(out.contains("invalid-token"), "{out}");
+        assert!(!out.contains("FAULT:"), "{out}");
+        assert!(out.contains("no acceptance seen"), "{out}");
     }
 
     /// The STARTUP section names each node's and app's current run, with the

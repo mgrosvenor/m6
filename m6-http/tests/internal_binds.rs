@@ -191,7 +191,7 @@ fn statuses_over_h2c(declare: bool, n: usize) -> Vec<u16> {
         };
         let client = format!("203.0.113.{}", i + 1);
         let stream_id = conn
-            .dispatch(&req, "127.0.0.1", &client, "localhost")
+            .dispatch(&req, "127.0.0.1", &client, "localhost", None)
             .expect("dispatch");
         let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
         let resp = loop {
@@ -305,7 +305,7 @@ fn an_unlisted_peer_is_refused_at_connect() {
                 headers: Vec::new(),
                 body: Vec::new(),
             };
-            match conn.dispatch(&req, "127.0.0.1", "203.0.113.1", "localhost") {
+            match conn.dispatch(&req, "127.0.0.1", "203.0.113.1", "localhost", None) {
                 Err(e) => Err(format!("dispatch: {e}")),
                 Ok(stream_id) => {
                     let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;

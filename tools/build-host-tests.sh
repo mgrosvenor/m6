@@ -307,6 +307,16 @@ grep -E '^test result:' "$T/m6-full.log" || true
 echo "### failure detail"
 sed -n '/^failures:/,$p' "$T/m6-full.log" | head -60
 
+echo "### feature-gated tests"
+# The targets `cargo test --workspace` does not build, because their
+# `required-features` are off by default. The same script CI and check.sh call,
+# so this host cannot pass a suite the runner fails. `h1_tls_miss_insert` was
+# the one that exposed three separate lists.
+with_port_lock ./tools/feature-gated-tests.sh > "$T/feature-gated.log" 2>&1
+echo "FEATURE_GATED_STATUS=$?"
+grep -E '^test result:' "$T/feature-gated.log" || true
+sed -n '/^failures:/,$p' "$T/feature-gated.log" | head -60
+
 echo "### conformance"
 # WITHOUT --allow-missing-tools, deliberately. This box has all three testers,
 # and an absent one here is a failure rather than a skip. A laptop's pre-push
@@ -594,6 +604,9 @@ read -r passed failed < <(awk '/^test result:/{p+=$4; f+=$6} END{print p+0, f+0}
 
 [[ "$rw" == "0" ]] || { echo "${RED}   $rw release warning(s) on Linux${RESET}" >&2; FAILED=1; }
 [[ "$tw" == "0" ]] || { echo "${RED}   $tw test-build warning(s) on Linux${RESET}" >&2; FAILED=1; }
+fg=$(num_after FEATURE_GATED_STATUS "$LOG"); fg="${fg:-?}"
+[[ "$fg" == "0" ]] || { echo "${RED}   feature-gated tests failed (the targets --workspace omits)${RESET}" >&2
+                        sed -n '/^### feature-gated tests/,/^### conformance/p' "$LOG" >&2; FAILED=1; }
 [[ "$cl" == "0" ]] || { echo "${RED}   clippy is not silent on Linux${RESET}" >&2
                         grep -A6 '^### clippy' "$LOG" >&2; FAILED=1; }
 [[ "$rd" == "0" ]] || { echo "${RED}   rustdoc: a broken intra-doc link (default features)${RESET}" >&2

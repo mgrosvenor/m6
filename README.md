@@ -41,7 +41,7 @@ cargo build --release --workspace
 export PATH="$PWD/target/release:$PATH"
 ```
 
-Rust 1.89 or newer.
+Rust 1.98 or newer.
 Linux is the production target (epoll).
 macOS works for development.
 
@@ -214,12 +214,12 @@ Tera template renderer for HTML routes.
 - Static params are stored as `Arc<Map>`, so a request clones a pointer and copies no Map
 - Dynamic `{stem}`-keyed params resolved and LRU-cached
 - `Accept-Encoding` negotiated by `m6_core::negotiate`, which parses the q-values, refuses `q=0` and allocates nothing
-- Minification pipeline (applied before compression): HTML (`minify-html`), CSS (in-house), JSON (`serde_json`). JavaScript is not minified, in a script file or inline in a page
+- Minification pipeline (applied before compression): HTML (`minify-html`), CSS (in-house), JSON (`serde_json`) and JavaScript (`oxc`). A module script and any non-JavaScript `<script>` type are left as written
 - Brotli and gzip compression with configurable levels per MIME type
 
 **Performance design:**
 - Minification runs once per cached response, and m6-http then serves the result compressed.
-  A `no-store` response is not minified ([`docs/m6-architecture.md`](docs/m6-architecture.md))
+  Every enabled type is minified, `Cache-Control: no-store` included ([`docs/m6-architecture.md`](docs/m6-architecture.md))
 
 ---
 

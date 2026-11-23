@@ -365,8 +365,8 @@ TOML
   # these against a live stack is that it is the live stack.
   mkdir -p "$site/templates"
   printf '<!doctype html><html><body><h1>conformance</h1></body></html>\n' \
-    > "$site/templates/index.html"
-  printf '[[route]]\npath = "/"\ntemplate = "templates/index.html"\n' \
+    > "$site/templates/index.html.tmpl"
+  printf '[[route]]\npath = "/"\ntemplate = "templates/index.html.tmpl"\n' \
     > "$site/configs/m6-html.conf"
   local hsock="$WORK/edge-m6-html-1.sock"
   rm -f "$hsock"

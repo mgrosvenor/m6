@@ -188,12 +188,12 @@ impl Stack {
         std::fs::create_dir_all(source_site.join("data")).unwrap();
         std::fs::create_dir_all(source_site.join("configs")).unwrap();
         std::fs::write(
-            source_site.join("templates/index.html"),
+            source_site.join("templates/index.html.tmpl"),
             "first: {{ title }}",
         )
         .unwrap();
         std::fs::write(
-            source_site.join("templates/other.html"),
+            source_site.join("templates/other.html.tmpl"),
             "other: {{ title }}",
         )
         .unwrap();
@@ -203,8 +203,8 @@ impl Stack {
             source_site.join("configs/m6-html.conf"),
             format!(
                 "global_params = [\"data/page.json\"]\n\n\
-                 [[route]]\npath = \"/\"\ntemplate = \"templates/index.html\"\ncache = \"{html_cache}\"\n\n\
-                 [[route]]\npath = \"/other\"\ntemplate = \"templates/other.html\"\ncache = \"{html_cache}\"\n"
+                 [[route]]\npath = \"/\"\ntemplate = \"templates/index.html.tmpl\"\ncache = \"{html_cache}\"\n\n\
+                 [[route]]\npath = \"/other\"\ntemplate = \"templates/other.html.tmpl\"\ncache = \"{html_cache}\"\n"
             ),
         )
         .unwrap();

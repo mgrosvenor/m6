@@ -415,7 +415,7 @@ A local answer such as a health check carries no stamp and is never stored.
 
 **A cache node learns the ID from its upstream.**
 Its `[genid] upstream` names a `[[backend]]` with a `url`, and its `token_file` holds a read token.
-It sends `GET /genid` at start and once `heartbeat_secs` (default 10) has passed since the last answer, and a new ID flushes its cache in one assignment.
+It sends `GET /genid` over the transport its URL backend's scheme names, at start and once `heartbeat_secs` (default 10) has passed since the last answer, and a new ID flushes its cache in one assignment.
 A node with no ID stores nothing, so a failed first heartbeat is due again after one second (`NO_ID_RETRY` in `m6-http/src/genid.rs`), which matters when `heartbeat_secs` is large.
 That is the whole invalidation: one number, one flush, no per-path map.
 
@@ -511,7 +511,7 @@ Table 8 gives the sorts of component core holds.
 | Service scaffolding | the reactor, the signal descriptor, the deadlines, the connection table, routing, the socket helper and the shutdown sequence |
 | Configuration | parsing and validation, and secrets merging |
 | Request and response | what a handler receives and returns, the layered request dictionary, cookie construction, multipart bodies |
-| Content | gzip and brotli, HTML, CSS and JSON minification, and the renderer seam with its template implementation behind it |
+| Content | gzip and brotli, HTML, CSS, JSON and JavaScript minification, and the renderer seam with its template implementation behind it |
 | Safety | path parameter validation and traversal refusal, request size caps, cryptographic token generation |
 | Observability | logging setup, the analytics record format, the health and performance endpoints, host load, memory, disk and temperature, firewall counters, newline-delimited JSON |
 | Test kit | standing a service up, claiming a socket without a race, driving it and tearing it down |
@@ -615,12 +615,19 @@ A content file that could redefine the request path could make a page misreport 
 
 ### 7.3 Why startup and shutdown belong to core
 
-**A service stops on SIGTERM by refusing new connections, removing its socket and exiting.**
-It does not wait for requests in progress: the supervisor restarts it on a deploy, and a request cut off by a restart is acceptable.
-The first signal exits 0 and the second exits immediately.
-The sequence is the service's `main`, with m6-core supplying the parts it calls: `signal::block()` first, `Lifecycle` for the lines and the signal meanings, and the socket path that `Lifecycle::complete` unlinks.
+**A service that drops work on SIGTERM turns every deploy into a handful of failed requests.**
+So the first signal refuses new connections, answers the requests the listener already accepted, up to `[server] drain_timeout_s`, and exits 0.
+The second exits immediately.
+A request cut off by a restart is the one case the drain could not finish, and the deadline is what bounds it.
+The sequence is the service's `main`, with m6-core supplying the parts it calls: `signal::block()` first, `Lifecycle` for the lines and the signal meanings, `Drain` for the accepted-work count and the deadline, and the socket path that `Lifecycle::complete` unlinks.
 A service supplies two pieces of data: the name in its lifecycle lines and the socket to unlink on every exit path.
 Core owning the lifecycle lines means a journal search for a shutdown means the same thing for every unit.
+
+**The count is taken at the accept, and that is the whole point.**
+A drain that counts a request when a turn dispatches it sees nothing in flight in the window between the listener accepting the connection and the loop reading the request, and it exits under a client that has already connected.
+Issue #338 measured that window: 57 failures in 150 loaded runs of the shutdown test before the count moved to the accept.
+The other half is the deadline.
+A request that never finishes cannot hold a deploy past `drain_timeout_s`, so the loop logs the count it left and exits anyway.
 
 **Blocking signals is the first statement of `main`, the one ordering rule in m6 that cannot be relaxed.**
 A thread inherits the signal mask as it stands when the thread is created, and a library a service links can start one.
@@ -689,8 +696,8 @@ Table 9 gives them by area.
 | processes | a connection serves at most 100 requests before closing (`MAX_REQUESTS_PER_CONN`, and `[server] max_requests_per_connection` on m6-http) | one peer cannot hold a slot indefinitely by pipelining |
 | processes | an accepted connection has a read deadline, 30 seconds by default (`DEFAULT_READ_TIMEOUT_SECS`) | a peer that connects and says nothing otherwise holds its slot until it disconnects, and enough of those fill the table while the service looks healthy |
 | processes | exit 0 clean, 1 runtime error including a configured TLS or h2c bind failure, 2 configuration or usage error including a QUIC or shared-port bind failure | a supervisor can tell a refused config from a runtime failure, which lets a deploy validate a new binary with `--dump-config` before installing it |
-| content | minification runs before compression, a `no-store` response is not minified, and each minifier returns its input unchanged when it cannot parse | ratios are better in that order, a response no cache keeps would pay the cost on every request, and a minifier that does not understand a file passes it through |
-| content | JavaScript is never minified, in a script file or inline in a page | the only engine re-emitted a string holding an apostrophe as a template literal with its escapes doubled, and a script is served as written |
+| content | minification runs before compression, every enabled type is minified including a `no-store` response, and each minifier returns its input unchanged when it cannot parse | ratios are better in that order, the owner's rule is that everything is minified, and a minifier that does not understand a file passes it through |
+| content | JavaScript is minified by `oxc_minifier`, a classic script only, and a parse failure serves the input bytes | top-level names are the page's globals, so they are kept, and the engine that corrupted strings is gone |
 | content | text types declare a charset and JSON does not | without a charset clients fall back to a legacy encoding and render UTF-8 as mojibake, and the parameter is undefined for JSON |
 | auth | access tokens are short-lived (`access_ttl` 900 seconds) with a longer refresh (`refresh_ttl` 30 days) on its own path | a stolen access token expires on its own, and the refresh path is the one thing that needs to be revocable |
 | auth | login is throttled per address | it is the one endpoint where guessing is the attack |

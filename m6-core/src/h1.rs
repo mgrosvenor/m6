@@ -1501,6 +1501,20 @@ impl ServerConn {
         }
     }
 
+    /// Requests answered on this connection so far. Zero means the connection
+    /// was accepted and has not been answered yet.
+    pub fn served(&self) -> u32 {
+        self.served
+    }
+
+    /// Whether a turn still has work: an answer owed, or bytes of a request
+    /// held in the buffer. A connection that has answered at least one request
+    /// and holds nothing is idle, which is when the shutdown drain stops
+    /// counting it.
+    pub fn pending(&self) -> bool {
+        self.out_pos < self.out_len || self.body.is_some() || self.in_len > self.consumed
+    }
+
     /// Read and parse one request. Never waits: `More` when the socket has
     /// nothing complete, `Closed` when the peer is gone.
     ///

@@ -234,7 +234,7 @@ global_params = ["data/site.json"]
 
 [[route]]
 path     = "/contact"
-template = "templates/contact.html"
+template = "templates/contact.html.tmpl"
 params   = []
 cache    = "no-store"
 
@@ -369,6 +369,8 @@ Until that restart, m6-http serves the previous certificate.
 
 An internal listener is one that `internal_binds` names.
 On an internal listener the statistics channel is labelled `internal`, the custom error path is served to the caller, and the `X-Forwarded-For` a cache node sends is believed, so each visitor behind that node keeps their own rate limit.
+The same trust keeps the `Via` entry a cache node sends, and this node appends its own after it, so the backend reads the chain in path order.
+A public listener drops a client's `Via`, because a client must not be able to name a node.
 
 Every entry must be in a local range: loopback, private (RFC 1918), link-local, shared (100.64.0.0/10) or IPv6 unique-local.
 Host names are never resolved, and a wildcard address such as `0.0.0.0` is refused.
@@ -376,7 +378,7 @@ Only the h2c listener can be internal, so an entry that equals `bind` is refused
 
 An internal listener accepts a connection only from an address in `internal_peers`, and closes any other before reading a request.
 Each entry is an IP address in a local range, without a port, and the list needs at least one address of the internal listener's IP family.
-A listed peer is also trusted for the client addresses it forwards.
+A listed peer is also trusted for the client address and the `Via` entry it forwards.
 On the TLS and QUIC listener, a request from a private, link-local, shared or unique-local address (loopback excluded) is counted as monitor traffic, so a monitor on the private network does not move the visitor counters.
 A request from a public address is monitor traffic only on `/health`, and external on every other path.
 
@@ -700,8 +702,10 @@ m6-http sizes its buffers and queues from named limits, each with a `start` and 
 The table lives in the system config, because memory is a property of the node.
 A `[limits]` table in `site.toml` stops the start with exit 2 in a two-file config, and the message names the system config.
 The keys m6-http reads are `edge_request`, `edge_response`, `h2_recv`, `h2_header_block`, `h2_stream_body`, `h2_send`, `refresh_queue`, `rate_limit_addresses`, `cache_bytes`, `connections`, `log_buffer`, `log_field` and `heap_reserve`.
+m6-file reads `cache_bytes`, `heap_reserve`, `minify_output`, `minify_parse` and `minify_nesting` for its minified-body cache and its parse budget.
 `h2_send` starts at 64 KiB. That value is how many unsent response bytes an HTTP/2 connection holds before it waits for the socket, and on Linux it is also the kernel's unsent-bytes mark for the connection. A smaller value lets a more urgent stream on the same connection overtake a large body sooner. A larger one sends large bodies in fewer writes.
-`heap_reserve` is the heap m6-http reserves from the OS at start, on huge pages where the kernel has them. Its default is `cache_bytes` max plus 64 MiB, rounded up to 2 MiB, and the cache is carved from it. A `[limits.heap_reserve] start` below `cache_bytes` max is warned at start, naming both keys.
+`heap_reserve` is the heap a service reserves from the OS at start, on huge pages where the kernel has them. Its default is `cache_bytes` max plus 64 MiB, rounded up to 2 MiB, and the cache is carved from it. A `[limits.heap_reserve] start` below `cache_bytes` max is warned at start, naming both keys.
+m6-file uses the same rule for its minified-body cache, so a default start reserves for the whole cache and an explicit start below it bounds the cache and warns once.
 [`m6-app-anatomy.md`](m6-app-anatomy.md) §4.2 gives every limit with its defaults in Table 6, the growth rule, the rounding to the page size and the error a value past its maximum gets.
 
 ```toml
@@ -739,9 +743,10 @@ The name is required.
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
-| `name` | string | yes | This node's identity, for example `edge-a`. It appears in `/health`, the metrics line, the analytics record and the start-up record's `node`, where `node_source` says `configured`. System config only |
+| `name` | string | yes | This node's identity, for example `edge-a`. It appears in `/health`, the metrics line, the analytics record, the start-up record's `node`, where `node_source` says `configured`, and the `Via` entry every forwarded request carries. One token: ASCII letters, digits, `.`, `-`, `_` and `~`. An empty name, or the retired pseudonym `m6`, stops the start with exit 2. System config only |
 
 **Table 17: the `[node]` key.**
+The name in the `Via` entry is what tells a backend and a log reader which node forwarded a request, so a name that cannot form one entry is refused at load.
 
 ### 4.17. `[security]`
 

@@ -544,10 +544,18 @@ mod bench_tests {
             let mut exited = false;
             let mut served_while_running = false;
             loop {
+                // mio reports an interrupted wait as an error. A signal is not
+                // an event and nothing has been read or lost, so wait again with
+                // the time that is left. The first sight of this as a test
+                // failure was a `poll: Os { code: 4, kind: Interrupted }` panic.
                 let left = deadline
                     .checked_duration_since(now())
                     .expect("the bench and its request finish within 10 s");
-                poll.poll(&mut events, Some(left)).expect("poll");
+                match poll.poll(&mut events, Some(left)) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => panic!("poll: {e}"),
+                }
                 for ev in &events {
                     match ev.token() {
                         PIPE => {

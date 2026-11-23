@@ -113,6 +113,9 @@ fn service(path: &Path, relay_addr: SocketAddr, stop: Arc<AtomicBool>) -> io::Re
     })?;
     let mut poll = Poll::new()?;
     let mut listener = listen_unix(path, 0o600)?;
+    // The reserve every accept loop keeps, so descriptor exhaustion refuses
+    // what is already queued instead of stalling the listener.
+    let mut spare = m6_core::platform::net::SpareDescriptor::for_unix()?;
     poll.registry()
         .register(&mut listener, LISTENER, Interest::READABLE)?;
     let mut conns = Slots::new(INITIAL, CEILING, Conn::empty);
@@ -143,6 +146,35 @@ fn service(path: &Path, relay_addr: SocketAddr, stop: Arc<AtomicBool>) -> io::Re
                                 m6_core::platform::net::Accept::SkipOne => {
                                     conns.free(taken.key);
                                     continue;
+                                }
+                                // Out of descriptors: close the reserve, take
+                                // and close every connection already queued,
+                                // open the reserve again, and end the turn.
+                                m6_core::platform::net::Accept::Exhausted => {
+                                    conns.free(taken.key);
+                                    let drained = spare.drain(|| {
+                                        let (stream, _) = listener.accept()?;
+                                        drop(stream);
+                                        Ok(())
+                                    });
+                                    if let Some(e) = &drained.stopped {
+                                        eprintln!(
+                                            "accept failed while draining the queued connections: {e}"
+                                        );
+                                    }
+                                    if let Some(e) = &drained.lost {
+                                        eprintln!(
+                                            "the reserve descriptor could not be reopened: {e}"
+                                        );
+                                    }
+                                    if drained.needs_rearm() {
+                                        poll.registry().reregister(
+                                            &mut listener,
+                                            LISTENER,
+                                            Interest::READABLE,
+                                        )?;
+                                    }
+                                    break;
                                 }
                                 m6_core::platform::net::Accept::Stop => {
                                     conns.free(taken.key);

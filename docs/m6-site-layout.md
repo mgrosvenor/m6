@@ -75,7 +75,7 @@ Each config already names paths relative to its own app's root:
 
 ```toml
 # m6-file.conf        root = "assets/"
-# m6-html.conf        template = "templates/page.html"
+# m6-html.conf        template = "templates/page.html.tmpl"
 # render-contact.conf secrets_file = "/etc/m6/relay-secrets.toml"
 ```
 

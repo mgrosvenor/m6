@@ -26,7 +26,7 @@ Sections 2 to 12 walk Examples 01 to 11 in order.
 The examples need a release build of m6, a certificate tool and the m6 checkout, which holds `examples/`.
 [`README.md`](../README.md) section 1, steps 1 to 3, gives the commands.
 Step 1 puts `target/release` on `PATH`, which makes every m6 binary available, including `m6-md`, which Example 02 uses.
-Rust 1.89 or newer provides the compiler and Cargo.
+Rust 1.98 or newer provides the compiler and Cargo.
 The renderer crates reach m6 through the relative path `../../../m6-core`, inside this repository.
 
 m6-http serves the public site over *TLS* (Transport Layer Security), so every site needs a certificate.
@@ -123,26 +123,26 @@ A `[[route_group]]` expands `assets/**/*` into one route per asset.
 ### 2.3. `configs/m6-html.conf`
 
 `configs/m6-html.conf` loads `data/site.json` into every template and gives each route a template and a params list.
-The `/` route renders `templates/home.html` with the global params.
+The `/` route renders `templates/home.html.tmpl` with the global params.
 The `/about` route adds `data/about.json`.
-The `/_errors` route renders `templates/error.html` and sets `cache = "no-store"`, so m6-http never caches the error page.
+The `/_errors` route renders `templates/error.html.tmpl` and sets `cache = "no-store"`, so m6-http never caches the error page.
 
 ```toml
 global_params = ["data/site.json"]
 
 [[route]]
 path     = "/"
-template = "templates/home.html"
+template = "templates/home.html.tmpl"
 params   = []
 
 [[route]]
 path     = "/about"
-template = "templates/page.html"
+template = "templates/page.html.tmpl"
 params   = ["data/about.json"]
 
 [[route]]
 path     = "/_errors"
-template = "templates/error.html"
+template = "templates/error.html.tmpl"
 params   = []
 cache    = "no-store"
 ```
@@ -165,7 +165,7 @@ A route that names an unknown handler stops m6-file at startup with exit code 2.
 ### 2.5. `data/site.json`
 
 `data/site.json` supplies the three global values that the layout uses: the site name, the tagline and the navigation.
-`base.html` reads `site_name` and `nav`, and `home.html` reads `site_tagline`.
+`base.html.tmpl` reads `site_name` and `nav`, and `home.html.tmpl` reads `site_tagline`.
 
 ```json
 {
@@ -180,10 +180,15 @@ A route that names an unknown handler stops m6-file at startup with exit code 2.
 
 ### 2.6. Templates
 
-`templates/base.html` is the layout for every page.
+Every template file ends `.tmpl`, and the part before `.tmpl` is the name of the output the template produces: `base.html.tmpl` produces `base.html`, and `icons/logo.svg.tmpl` produces `icons/logo.svg`.
+The Tera name is the template's path under the site directory with the suffix kept, so `{% extends "templates/base.html.tmpl" %}` names the file it extends.
+The loader walks every subdirectory of `templates/`.
+Only files ending `.tmpl` are templates.
+
+`templates/base.html.tmpl` is the layout for every page.
 It sets the title block, loads `/assets/style.css`, renders `nav` from `data/site.json`, and leaves a `content` block for the page.
-`templates/home.html` fills that block with the tagline and a link to `/about`.
-`templates/page.html` renders `title` and the HTML `body` from `data/about.json`.
+`templates/home.html.tmpl` fills that block with the tagline and a link to `/about`.
+`templates/page.html.tmpl` renders `title` and the HTML `body` from `data/about.json`.
 
 m6-html builds one params map per request.
 The map holds the global params, the route's params files, the path captures and the query parameters.
@@ -297,27 +302,27 @@ The `/` route uses `documents` for the three most recent posts on the home page.
 ```toml
 [[route]]
 path     = "/blog"
-template = "templates/post-index.html"
+template = "templates/post-index.html.tmpl"
 params   = ["data/posts.json"]
 
 [[route]]
 path     = "/blog/{stem}"
-template = "templates/post.html"
+template = "templates/post.html.tmpl"
 params   = ["data/posts.json"]
 ```
 
-### 3.6. `templates/post-index.html`
+### 3.6. `templates/post-index.html.tmpl`
 
-`templates/post-index.html` renders the list, newest first, and links each title to `/blog/{{ doc.stem }}`.
+`templates/post-index.html.tmpl` renders the list, newest first, and links each title to `/blog/{{ doc.stem }}`.
 It repeats the date descending sort that m6-md already applied, so the page keeps that order when a JSON file is edited by hand.
 
 ```html
 {% for doc in documents | sort(attribute="date") | reverse %}
 ```
 
-### 3.7. `templates/post.html`
+### 3.7. `templates/post.html.tmpl`
 
-`templates/post.html` filters `documents` by `stem`, renders the first match, and calls `not_found()` when no post matches.
+`templates/post.html.tmpl` filters `documents` by `stem`, renders the first match, and calls `not_found()` when no post matches.
 `stem` is the `{stem}` capture from the request path, which m6-html adds to the params map.
 
 ```html
@@ -445,7 +450,7 @@ fn message(global: &Global, name: &str, email: &str, text: &str) -> Result<Messa
 `load_state` runs once at startup, and the loop passes its value to the POST arm.
 The arm builds one message and calls `smtp.start(&global.relay, &msg)` on its connection's slot.
 When `start` fails, the arm answers 500 with the cause.
-When it succeeds, the arm renders `templates/contact.html` with `sent: true`, holds the page and sets the connection's state to `Sending`.
+When it succeeds, the arm renders `templates/contact.html.tmpl` with `sent: true`, holds the page and sets the connection's state to `Sending`.
 The loop then registers `smtp.fd()` with `smtp.interest()` under the slot's outgoing token and puts `smtp.deadline()` in the outgoing `Timeouts`.
 When the outgoing token fires, `smtp.drive()` returns one of three results:
 - `Ok(None)`: the delivery continues, and the loop reregisters when the interest changed.
@@ -459,7 +464,7 @@ A client that closes while `Sending` frees its slot, which closes the relay conn
 ### 4.3. `configs/render-contact.conf`
 
 `render-contact.conf` loads `data/site.json` into every template, names the secrets file and declares the one route.
-The route renders `templates/contact.html` with `cache = "no-store"`, so m6-http never caches the form or its response.
+The route renders `templates/contact.html.tmpl` with `cache = "no-store"`, so m6-http never caches the form or its response.
 `methods = ["GET"]` limits the template route to GET, because the POST is the code route in `main.rs`.
 
 ```toml
@@ -469,7 +474,7 @@ secrets_file  = "/etc/m6/render-contact.toml"
 [[route]]
 path     = "/contact"
 methods  = ["GET"]
-template = "templates/contact.html"
+template = "templates/contact.html.tmpl"
 params   = []
 cache    = "no-store"
 
@@ -491,14 +496,14 @@ In production the values move to the file named by `secrets_file`, and the `[smt
 A key set in both files is refused at startup, and a missing secrets file is ignored, so the example runs with no setup.
 In production, deliver the secrets file with `LoadCredential=secrets.toml:/etc/m6/render-contact.toml` and set `secrets_file = "/run/credentials/render-contact.service/secrets.toml"`.
 
-### 4.4. `templates/contact.html`
+### 4.4. `templates/contact.html.tmpl`
 
-`templates/contact.html` shows one of two states.
+`templates/contact.html.tmpl` shows one of two states.
 When `sent` is true it shows a thank-you message.
 Otherwise it shows the form, which posts the three fields back to `/contact`.
 
 ```html
-{% extends "templates/base.html" %}
+{% extends "templates/base.html.tmpl" %}
 {% block title %}Contact · {{ site_name }}{% endblock %}
 {% block content %}
   <div class="form-card">
@@ -524,7 +529,7 @@ Otherwise it shows the form, which posts the three fields back to `/contact`.
 ```
 
 The form's field names match the ones the POST arm reads.
-`extends` names `templates/base.html`, the layout every page shares.
+`extends` names `templates/base.html.tmpl`, the layout every page shares.
 
 ### 4.5. New in `site.toml`
 
@@ -676,13 +681,13 @@ require = "group:members"
 
 `/login` renders the login form from `m6-html`, the three `/auth/` routes reach the auth service, and the two `/members` routes are the protected pages.
 
-### 5.4. `templates/login.html`
+### 5.4. `templates/login.html.tmpl`
 
-`templates/login.html` renders the login form and the failure message.
+`templates/login.html.tmpl` renders the login form and the failure message.
 The hidden `next` field carries the page the user came from.
 
 ```html
-{% extends "templates/base.html" %}
+{% extends "templates/base.html.tmpl" %}
 {% block title %}Login · {{ site_name }}{% endblock %}
 {% block content %}
   <div class="form-card">
@@ -706,12 +711,12 @@ The hidden `next` field carries the page the user came from.
 
 The form posts to `/auth/login`, where `m6-auth` verifies the credentials and sets the session and refresh cookies.
 
-### 5.5. `templates/members.html`
+### 5.5. `templates/members.html.tmpl`
 
-`templates/members.html` is the protected page, and its only action is the logout form.
+`templates/members.html.tmpl` is the protected page, and its only action is the logout form.
 
 ```html
-{% extends "templates/base.html" %}
+{% extends "templates/base.html.tmpl" %}
 {% block title %}Members · {{ site_name }}{% endblock %}
 {% block content %}
   <h1>Members Area</h1>

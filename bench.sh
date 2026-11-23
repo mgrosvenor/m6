@@ -279,11 +279,11 @@ global_params = ["data/site.json"]
 
 [[route]]
 path     = "/"
-template = "templates/home.html"
+template = "templates/home.html.tmpl"
 
 [[route]]
 path     = "/nocache/"
-template = "templates/home.html"
+template = "templates/home.html.tmpl"
 cache    = "no-store"
 EOF
 
@@ -304,7 +304,7 @@ tail    = true
 EOF
 
 # Template (minimal — no nav loop, renders fast).
-cat > "$SITE_DIR/templates/home.html" <<'EOF'
+cat > "$SITE_DIR/templates/home.html.tmpl" <<'EOF'
 <!doctype html>
 <html><head><meta charset="utf-8"><title>bench</title></head>
 <body><h1>m6-bench</h1><p>ok</p></body>
@@ -499,7 +499,7 @@ run_handshake_suites() {
 
 run_mixed_suite() {
     echo ""
-    echo "Mixed hot hits + new full TLS handshakes: rates=${MIXED_RATES}/s  seconds=${MIXED_SECONDS}  key=${BENCH_KEY:-ec}  features=${BENCH_FEATURES:-none (ring)}  profile=$PROFILE"
+    echo "Mixed hot hits + new full TLS handshakes: rates=${MIXED_RATES}/s  seconds=${MIXED_SECONDS}  key=${BENCH_KEY:-ec}  features=${BENCH_FEATURES:-none}  profile=$PROFILE"
     stop_all
     start_backends
     start_http

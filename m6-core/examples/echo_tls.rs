@@ -81,6 +81,11 @@ fn main() -> io::Result<()> {
 
     let mut poll = Poll::new()?;
     let mut listener = listen_tcp(addr)?;
+    // The reserve the accept loop spends to refuse a connection when the
+    // process is out of descriptors. Opened here, before any pressure, and on
+    // the listener's own socket family.
+    let mut spare = m6_core::platform::net::SpareDescriptor::for_tcp(listener.local_addr()?)?;
+    let mut refusals = m6_core::net::Refusals::new();
     let mut signals = Signals::new()?;
     poll.registry()
         .register(&mut listener, LISTENER, Interest::READABLE)?;
@@ -121,6 +126,7 @@ fn main() -> io::Result<()> {
         for ev in &events {
             match ev.token() {
                 LISTENER => {
+                    let mut served = false;
                     loop {
                         let before = m6_core::testkit::alloc_count::now();
                         let old_len = slots.len();
@@ -143,11 +149,49 @@ fn main() -> io::Result<()> {
                                     slots.free(taken.key);
                                     continue;
                                 }
-                                // Any other error: say so once, give the slot back and stop
-                                // accepting for this turn.
+                                // Out of descriptors: close the reserve and take and
+                                // close every connection already queued, so the turn
+                                // ends with the queue empty and nothing waiting for a
+                                // wakeup that a full queue cannot deliver.
+                                net::Accept::Exhausted => {
+                                    slots.free(taken.key);
+                                    let drained = spare.drain(|| {
+                                        let (stream, _) = listener.accept()?;
+                                        drop(stream);
+                                        Ok(())
+                                    });
+                                    for _ in 0..drained.refused {
+                                        refusals.refused();
+                                    }
+                                    if let Some(e) = &drained.stopped {
+                                        eprintln!("accept failed while draining the queued connections: {e}");
+                                    }
+                                    if let Some(e) = &drained.lost {
+                                        eprintln!(
+                                            "the reserve descriptor could not be reopened: {e}"
+                                        );
+                                    }
+                                    if drained.needs_rearm() {
+                                        poll.registry().reregister(
+                                            &mut listener,
+                                            LISTENER,
+                                            Interest::READABLE,
+                                        )?;
+                                    }
+                                    break;
+                                }
+                                // Any other error: say so once and keep the
+                                // listener armed, so a connection still
+                                // queued is reported again rather than left
+                                // edge-triggered and unread.
                                 net::Accept::Stop => {
                                     slots.free(taken.key);
                                     eprintln!("echo: accept error: {e}");
+                                    poll.registry().reregister(
+                                        &mut listener,
+                                        LISTENER,
+                                        Interest::READABLE,
+                                    )?;
                                     break;
                                 }
                             },
@@ -160,11 +204,25 @@ fn main() -> io::Result<()> {
                         )?;
                         idle_timeouts.touch(Token(taken.key), now);
                         open += 1;
+                        served = true;
                         let c = slots.get_mut(taken.key);
                         c.tls =
                             Some(ServerConnection::new(config.clone()).map_err(io::Error::other)?);
                         (c.stream, c.start, c.end, c.eof, c.interest) =
                             (Some(stream), 0, 0, false, Interest::READABLE);
+                    }
+                    let counts = if served {
+                        refusals.flush(now)
+                    } else {
+                        refusals.due(now)
+                    };
+                    if let Some(counts) = counts {
+                        eprintln!(
+                            "echo: {} (rejected {}, total {})",
+                            m6_core::net::REFUSED_MESSAGE,
+                            counts.since_last,
+                            counts.total
+                        );
                     }
                     if slots.is_full() {
                         poll.registry().deregister(&mut listener)?;

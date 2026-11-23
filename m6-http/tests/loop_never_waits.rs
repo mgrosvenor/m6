@@ -353,7 +353,7 @@ fn h2_get(port: u16, path: &str, timeout: Duration) -> Result<(u16, String), Str
         body: vec![],
     };
     let stream_id = conn
-        .dispatch(&req, "127.0.0.1", "127.0.0.1", "127.0.0.1")
+        .dispatch(&req, "127.0.0.1", "127.0.0.1", "127.0.0.1", None)
         .map_err(|e| e.to_string())?;
     let deadline = Instant::now() + timeout;
     loop {
@@ -1667,8 +1667,14 @@ fn a_reaped_clients_stale_reply_is_not_delivered_to_a_later_connection() {
     {
         let cfg = probe::tls_config(b"h2");
         let mut a = H2sTlsClientConn::connect("127.0.0.1", port, cfg).expect("client A");
-        a.dispatch(&h2_req("/slow"), "127.0.0.1", "127.0.0.1", "127.0.0.1")
-            .expect("dispatch /slow");
+        a.dispatch(
+            &h2_req("/slow"),
+            "127.0.0.1",
+            "127.0.0.1",
+            "127.0.0.1",
+            None,
+        )
+        .expect("dispatch /slow");
         a.drive();
         let seen = await_slow_seen(
             &slow_seen_rx,
@@ -1695,7 +1701,13 @@ fn a_reaped_clients_stale_reply_is_not_delivered_to_a_later_connection() {
     let cfg = probe::tls_config(b"h2");
     let mut b = H2sTlsClientConn::connect("127.0.0.1", port, cfg).expect("client B");
     let sid = b
-        .dispatch(&h2_req("/slow2"), "127.0.0.1", "127.0.0.1", "127.0.0.1")
+        .dispatch(
+            &h2_req("/slow2"),
+            "127.0.0.1",
+            "127.0.0.1",
+            "127.0.0.1",
+            None,
+        )
         .expect("dispatch /slow2");
     b.drive();
     let seen = await_slow_seen(

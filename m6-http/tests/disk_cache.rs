@@ -184,17 +184,17 @@ impl Stack {
         std::fs::create_dir_all(source_site.join("data")).unwrap();
         std::fs::create_dir_all(source_site.join("configs")).unwrap();
         std::fs::write(
-            source_site.join("templates/index.html"),
+            source_site.join("templates/index.html.tmpl"),
             "first: {{ title }}",
         )
         .unwrap();
         std::fs::write(
-            source_site.join("templates/other.html"),
+            source_site.join("templates/other.html.tmpl"),
             "other: {{ title }}",
         )
         .unwrap();
         std::fs::write(
-            source_site.join("templates/load.html"),
+            source_site.join("templates/load.html.tmpl"),
             "x".repeat(LOAD_BODY_LEN),
         )
         .unwrap();
@@ -203,9 +203,9 @@ impl Stack {
         std::fs::write(
             source_site.join("configs/m6-html.conf"),
             "global_params = [\"data/page.json\"]\n\n\
-             [[route]]\npath = \"/\"\ntemplate = \"templates/index.html\"\ncache = \"public, max-age=60\"\n\n\
-             [[route]]\npath = \"/other\"\ntemplate = \"templates/other.html\"\ncache = \"public, max-age=60\"\n\n\
-             [[route]]\npath = \"/load\"\ntemplate = \"templates/load.html\"\ncache = \"public, max-age=60\"\n",
+             [[route]]\npath = \"/\"\ntemplate = \"templates/index.html.tmpl\"\ncache = \"public, max-age=60\"\n\n\
+             [[route]]\npath = \"/other\"\ntemplate = \"templates/other.html.tmpl\"\ncache = \"public, max-age=60\"\n\n\
+             [[route]]\npath = \"/load\"\ntemplate = \"templates/load.html.tmpl\"\ncache = \"public, max-age=60\"\n",
         )
         .unwrap();
         std::fs::write(

@@ -167,6 +167,23 @@ jobs:
           echo "test-build warnings: $n"
           [ "$n" -eq 0 ] || { echo "::error::$n test-build warning(s)"; exit 1; }
 
+      # A workspace build unifies features, so neither build above compiles
+      # m6-core with its default `templates` and `minify` off. A call to a gated
+      # module from outside its gate then compiles green here and fails for a
+      # user who depends on core with `default-features = false`. The lean
+      # build is the only one that asks that question, so it is a separate
+      # command and not part of the workspace run.
+      - name: Lean core build, zero warnings
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        run: |
+          status=0
+          cargo check -p m6-core --no-default-features > lean-core.log 2>&1 || status=$?
+          cat lean-core.log
+          [ "$status" -eq 0 ] || { echo "::error::the no-default-features build failed with status $status"; exit 1; }
+          n=$(grep -c '^warning' lean-core.log || true)
+          echo "lean-core warnings: $n"
+          [ "$n" -eq 0 ] || { echo "::error::$n lean-core warning(s)"; exit 1; }
+
       # Capture in full, then report. Grepping the pipe drops the assertion
       # message and leaves a bare `panicked at <file>:<line>`, which names the
       # place and not the reason.
@@ -191,12 +208,10 @@ jobs:
 
       # `cargo test --workspace` builds only the targets whose `required-features`
       # the workspace turns on. Any other target is omitted, not run, so the test
-      # is invisible and rots. Each line below names a target and the feature
-      # that makes it visible. The coordinator's gate runs the same four lines
-      # with `cargo nextest run`. The m6-core `testkit` targets are already in
-      # the workspace build because m6-html and m6-http ask for `testkit` in
-      # their dev-dependencies, and they are named here so that removing one of
-      # those requests cannot hide them.
+      # is invisible and rots. Those targets are named in one script, and the
+      # three jobs below, check.sh and tools/build-host-tests.sh all call it, so
+      # CI and every local gate run the same list. It was two lists until
+      # h1_tls_miss_insert failed here while the local gate reported green.
       - name: Feature-gated tests, named explicitly
         if: ${{ !cancelled() && steps.testbuild.outputs.compiled == 'true' }}
         run: |
@@ -204,14 +219,7 @@ jobs:
           # and a runner account's RLIMIT_MEMLOCK is 8 MiB. This shell is raised, and the
           # processes it starts inherit the limit, so the m6-http the tests start can pin.
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
-          # `testkit` also turns on `alloc-count`, so all five counting tests build.
-          cargo test -p m6-core --features testkit --test alloc_count_armed --test event_allocs --test limit_page_allocs --test server_conn --test site_allocs --test upstream_no_alloc
-          # `email` makes these two visible, `testkit` is the harness they use.
-          cargo test -p m6-core --features email,testkit --test email_allocs --test email_in_the_loop
-          # `count-allocations` builds the counting allocator into the binary the test reads.
-          cargo test -p m6-http --features count-allocations --test allocations
-          # `count-allocations` builds the counter into m6-monitor's binary.
-          cargo test -p m6-monitor --features count-allocations --test client_allocs
+          ./tools/feature-gated-tests.sh
 
       # Nothing in the workspace turns on some off-by-default core features
       # (`sqlite`, `email`, `multipart`), so `cargo test --workspace` never
@@ -247,7 +255,7 @@ jobs:
           [ "$n" -eq 0 ] || { cat nofeat.log; echo "::error::$n warning(s) building m6-core with no features"; exit 1; }
           for p in m6-http m6-monitor m6-auth-server m6-auth-cli; do
             tree=$(cargo tree -e normal -p "$p") || { echo "::error::cargo tree failed for $p"; exit 1; }
-            if grep -E ' (lightningcss|minify-html|tera|comrak) v' <<< "$tree"; then
+            if grep -E ' (lightningcss|minify-html|oxc|boa_engine|tera|comrak) v' <<< "$tree"; then
               echo "::error::$p links a template engine or a minifier"; exit 1
             fi
           done
@@ -336,23 +344,14 @@ jobs:
           [ "$status" -eq 0 ] || { tail -80 full.log; echo "::error::cargo test exited with status $status"; exit 1; }
       # `cargo test --workspace` builds only the targets whose `required-features`
       # the workspace turns on. Any other target is omitted, not run, so the test
-      # is invisible and rots. Each line below names a target and the feature
-      # that makes it visible. The coordinator's gate runs the same four lines
-      # with `cargo nextest run`. The m6-core `testkit` targets are already in
-      # the workspace build because m6-html and m6-http ask for `testkit` in
-      # their dev-dependencies, and they are named here so that removing one of
-      # those requests cannot hide them.
+      # is invisible and rots. Those targets are named in one script, and the
+      # three jobs below, check.sh and tools/build-host-tests.sh all call it, so
+      # CI and every local gate run the same list. It was two lists until
+      # h1_tls_miss_insert failed here while the local gate reported green.
       - name: Feature-gated tests, named explicitly
         if: ${{ !cancelled() && steps.testbuild.outputs.compiled == 'true' }}
         run: |
-          # `testkit` also turns on `alloc-count`, so all five counting tests build.
-          cargo test -p m6-core --features testkit --test alloc_count_armed --test event_allocs --test limit_page_allocs --test server_conn --test site_allocs --test upstream_no_alloc
-          # `email` makes these two visible, `testkit` is the harness they use.
-          cargo test -p m6-core --features email,testkit --test email_allocs --test email_in_the_loop
-          # `count-allocations` builds the counting allocator into the binary the test reads.
-          cargo test -p m6-http --features count-allocations --test allocations
-          # `count-allocations` builds the counter into m6-monitor's binary.
-          cargo test -p m6-monitor --features count-allocations --test client_allocs
+          ./tools/feature-gated-tests.sh
       - name: Opt-in core features, zero warnings and tests
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: |
@@ -453,12 +452,10 @@ jobs:
           [ "$status" -eq 0 ] || { tail -80 full.log; echo "::error::cargo test exited with status $status"; exit 1; }
       # `cargo test --workspace` builds only the targets whose `required-features`
       # the workspace turns on. Any other target is omitted, not run, so the test
-      # is invisible and rots. Each line below names a target and the feature
-      # that makes it visible. The coordinator's gate runs the same four lines
-      # with `cargo nextest run`. The m6-core `testkit` targets are already in
-      # the workspace build because m6-html and m6-http ask for `testkit` in
-      # their dev-dependencies, and they are named here so that removing one of
-      # those requests cannot hide them.
+      # is invisible and rots. Those targets are named in one script, and the
+      # three jobs below, check.sh and tools/build-host-tests.sh all call it, so
+      # CI and every local gate run the same list. It was two lists until
+      # h1_tls_miss_insert failed here while the local gate reported green.
       - name: Feature-gated tests, named explicitly
         if: ${{ !cancelled() && steps.testbuild.outputs.compiled == 'true' }}
         run: |
@@ -466,14 +463,7 @@ jobs:
           # and a runner account's RLIMIT_MEMLOCK is 8 MiB. This shell is raised, and the
           # processes it starts inherit the limit, so the m6-http the tests start can pin.
           sudo prlimit --pid $$ --memlock=unlimited:unlimited
-          # `testkit` also turns on `alloc-count`, so all five counting tests build.
-          cargo test -p m6-core --features testkit --test alloc_count_armed --test event_allocs --test limit_page_allocs --test server_conn --test site_allocs --test upstream_no_alloc
-          # `email` makes these two visible, `testkit` is the harness they use.
-          cargo test -p m6-core --features email,testkit --test email_allocs --test email_in_the_loop
-          # `count-allocations` builds the counting allocator into the binary the test reads.
-          cargo test -p m6-http --features count-allocations --test allocations
-          # `count-allocations` builds the counter into m6-monitor's binary.
-          cargo test -p m6-monitor --features count-allocations --test client_allocs
+          ./tools/feature-gated-tests.sh
       - name: Opt-in core features, zero warnings and tests
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: |
@@ -664,6 +654,10 @@ jobs:
   examples:
     name: the examples build and work
     runs-on: ubuntu-latest
+    # It normally finishes in about nine minutes. Without a limit a hung stack
+    # kept this job for the default six hours. A hang now fails inside the time
+    # a slow but working run takes.
+    timeout-minutes: 20
     steps:
       # The examples are examples/ in this repository, their own Cargo
       # workspace. The renderer crates depend on m6-core by relative path, so

@@ -469,25 +469,41 @@ fn auth_cli(cli: &Path, conf: &Path, args: &[&str]) -> String {
 
 // ── topology stack ────────────────────────────────────────────────────────────
 
-struct GlobalStack {
-    origin_addr: String,      // TLS endpoint
-    origin_h2c: String,       // H2C backbone (plain TCP)
-    cache_addrs: Vec<String>, // [edge-a, edge-b, edge-c, edge-d, edge-e]
-    site_dir: PathBuf,        // the copy of 07's site the origin serves
-    write_token: String,      // a token with the genid-write role
-    processes: Vec<Child>,
-    _temp_dirs: Vec<tempfile::TempDir>,
+/// The processes this stack started. Killing them on drop is what makes a
+/// half-started stack leave nothing behind, including when `start` returns
+/// `None` before it can hand the stack back: a child left alive holds its
+/// socket and its port, and the next run then fails for a reason that has
+/// nothing to do with the thing it tests.
+struct Children(Vec<Child>);
+
+impl Children {
+    fn new() -> Self {
+        Children(Vec::new())
+    }
+
+    fn push(&mut self, child: Child) {
+        self.0.push(child);
+    }
 }
 
-impl Drop for GlobalStack {
+impl Drop for Children {
     fn drop(&mut self) {
-        for c in &mut self.processes {
+        for c in &mut self.0 {
             c.kill().ok();
             c.wait().ok();
         }
     }
 }
 
+struct GlobalStack {
+    origin_addr: String,      // TLS endpoint
+    origin_h2c: String,       // H2C backbone (plain TCP)
+    cache_addrs: Vec<String>, // [edge-a, edge-b, edge-c, edge-d, edge-e]
+    site_dir: PathBuf,        // the copy of 07's site the origin serves
+    write_token: String,      // a token with the genid-write role
+    _processes: Children,
+    _temp_dirs: Vec<tempfile::TempDir>,
+}
 impl GlobalStack {
     /// Build and start the full 6-node topology.
     /// Returns None if any required binary or site setup is missing.
@@ -648,9 +664,14 @@ impl GlobalStack {
         }
 
         // Origin system config: TLS + H2C.
+        // `lock_memory = false` because this test asserts the topology and the
+        // cache protocol, not memory pinning, and pinning needs an unlimited
+        // RLIMIT_MEMLOCK that an ordinary `cargo test` shell does not have. The
+        // service still refuses to pin, with a named limit, when the key is left
+        // at its default, and m6-http's own suite covers that.
         let origin_sys_toml = origin_sock_dir.path().join("system.toml");
         std::fs::write(&origin_sys_toml, format!(
-            "[server]\nbind     = \"{origin_tls_addr}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\nh2c_bind = \"{origin_h2c_addr}\"\ninternal_binds = [\"{origin_h2c_addr}\"]\ninternal_peers = [\"127.0.0.1\"]\n\n[auth]\nbackend = \"m6-auth-check\"\n\n[genid]\nread_require  = \"role:genid-read\"\nwrite_require = \"role:genid-write\"\n\n[node]\nname = \"origin\"\n",
+            "[server]\nbind     = \"{origin_tls_addr}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\nh2c_bind = \"{origin_h2c_addr}\"\ninternal_binds = [\"{origin_h2c_addr}\"]\ninternal_peers = [\"127.0.0.1\"]\nlock_memory = false\n\n[auth]\nbackend = \"m6-auth-check\"\n\n[genid]\nread_require  = \"role:genid-read\"\nwrite_require = \"role:genid-write\"\n\n[node]\nname = \"origin\"\n",
             cert_path.display(), key_path.display(),
         )).ok()?;
 
@@ -668,7 +689,7 @@ impl GlobalStack {
         );
         std::fs::write(cache_sock_dir.path().join("site.toml"), &cache_site_toml).ok()?;
 
-        let mut processes = Vec::new();
+        let mut processes = Children::new();
         let mut temp_dirs: Vec<tempfile::TempDir> = vec![cert_dir, work];
 
         // ── Backend services ──────────────────────────────────────────────────
@@ -763,7 +784,7 @@ impl GlobalStack {
         for (i, &port) in cache_ports.iter().enumerate() {
             let sys = cache_sock_dir.path().join(format!("cache-{i}.toml"));
             std::fs::write(&sys, format!(
-                "# Cache node: {}\n[server]\nbind     = \"127.0.0.1:{port}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\n\n[node]\nname = \"cache-{i}\"\n\n[genid]\nupstream       = \"origin\"\ntoken_file     = \"{}\"\nheartbeat_secs = 2\n",
+                "# Cache node: {}\n[server]\nbind     = \"127.0.0.1:{port}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\nlock_memory = false\n\n[node]\nname = \"cache-{i}\"\n\n[genid]\nupstream       = \"origin\"\ntoken_file     = \"{}\"\nheartbeat_secs = 2\n",
                 node_names[i], cert_path.display(), key_path.display(), read_token.display(),
             )).ok()?;
 
@@ -800,7 +821,7 @@ impl GlobalStack {
                 .ok()?
                 .trim()
                 .to_string(),
-            processes,
+            _processes: processes,
             _temp_dirs: temp_dirs,
         })
     }

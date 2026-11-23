@@ -622,6 +622,12 @@ impl Site {
         self.state.config.server.read_timeout
     }
 
+    /// How long shutdown waits for accepted requests, from `[server]
+    /// drain_timeout_s`.
+    pub fn drain_timeout(&self) -> Duration {
+        self.state.config.server.drain_timeout
+    }
+
     pub fn socket_mode(&self) -> u32 {
         self.state.config.server.socket_mode
     }
@@ -965,14 +971,12 @@ impl Site {
         // Both are skipped for a `verbatim` response, which a handler has
         // already decided. A streamed body has no bytes and no flag.
         //
-        // A cache keeps what it stores, so minification is paid once per fill
-        // and its saving collected on every hit. A `no-store` response has no
-        // second hit, so the cost lands on every request, where it is about
-        // what rendering the page costs, for a few bytes saved after
-        // compression. The default ETag is skipped by the same rule in
-        // `response.rs`.
+        // Every enabled type is minified, `Cache-Control: no-store` included.
+        // Skipping a no-store body would save the work on a response no cache
+        // keeps, and it would also serve that body as written, which is the
+        // exception the owner's rule does not allow.
         let mut minified_here = false;
-        if !resp.verbatim && !crate::response::cache_control_no_store(&resp.headers) {
+        if !resp.verbatim {
             let area = self.state.page_area.borrow();
             let source = if in_area {
                 Some(area.as_bytes())
@@ -994,7 +998,9 @@ impl Site {
                         error!("{}: {refusal}", self.name);
                         resp = Response::status(500);
                         in_area = false;
-                    } else if let Some(m) = minified(mime, bytes, minification) {
+                    } else if let Some(m) =
+                        minified_response(mime, bytes, minification, &self.state.config.limits)
+                    {
                         resp.body = crate::response::Body::Bytes(m);
                         minified_here = true;
                     }
@@ -2839,11 +2845,12 @@ fn print_dump(
         crate::socket_path_from_config(config_path).display()
     );
     println!(
-        "server      read_timeout={} socket_mode={:04o}",
+        "server      read_timeout={} drain_timeout={}s socket_mode={:04o}",
         config
             .server
             .read_timeout
             .map_or("none".into(), |d| format!("{}s", d.as_secs())),
+        config.server.drain_timeout.as_secs(),
         config.server.socket_mode
     );
     for p in &config.global_params {
@@ -3002,22 +3009,73 @@ fn minified(
     mime: &str,
     bytes: &[u8],
     config: &crate::config::MinificationConfig,
+    budget: crate::minify::ParseBudget,
 ) -> Option<Vec<u8>> {
+    use crate::minify::JsKind;
     if !config.is_enabled(mime) {
         return None;
     }
     match mime {
-        "text/html" => Some(crate::minify::minify_html(bytes)),
+        "text/html" => Some(crate::minify::minify_html_with_budget(
+            bytes,
+            config.inline_js,
+            budget,
+        )),
         "text/css" => Some(crate::minify::minify_css(bytes)),
         "application/json" => Some(crate::minify::minify_json(bytes)),
+        "application/javascript" | "text/javascript" => {
+            // A rendered response has no extension to say whether it is a
+            // module. A file and an inline `type="module"` script are parsed as
+            // modules where they are read; a body a handler returns is treated
+            // as a classic script, and one that does not parse is served as
+            // written. Guessing a module from a failed script parse could
+            // change a classic script's semantics, which is the corruption the
+            // fallback exists to prevent.
+            match crate::minify::try_minify_js_with(JsKind::Script, bytes, budget) {
+                Ok(minified) => Some(minified),
+                Err(fallback) => {
+                    crate::minify::warn_unminified_render(
+                        &crate::minify::body_subject("response", bytes),
+                        &fallback,
+                    );
+                    None
+                }
+            }
+        }
         _ => None,
     }
 }
 
-/// Without the `minify` feature the config loader has already refused any
-/// config that turns minification on, so there is nothing to do.
+/// Minify a rendered body with the service's parse budget, or `None` when its
+/// type is not enabled.
+///
+/// The budget is built here so the response path never names the
+/// feature-gated module. A call to [`crate::minify`] from outside a
+/// `#[cfg(feature = "minify")]` item compiles only while some other crate in
+/// the workspace unifies the feature on, so a lean `m6-core` build would fail.
+#[cfg(feature = "minify")]
+fn minified_response(
+    mime: &str,
+    bytes: &[u8],
+    config: &crate::config::MinificationConfig,
+    limits: &crate::limits::Limits,
+) -> Option<Vec<u8>> {
+    minified(
+        mime,
+        bytes,
+        config,
+        crate::minify::ParseBudget::from_limits(limits),
+    )
+}
+
+/// Without the `minify` feature no rendered body is minified.
 #[cfg(not(feature = "minify"))]
-fn minified(_: &str, _: &[u8], _: &crate::config::MinificationConfig) -> Option<Vec<u8>> {
+fn minified_response(
+    _: &str,
+    _: &[u8],
+    _: &crate::config::MinificationConfig,
+    _: &crate::limits::Limits,
+) -> Option<Vec<u8>> {
     None
 }
 
@@ -3136,13 +3194,17 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("templates")).unwrap();
         // Written before the site is built: the renderer loads templates at
         // start, so a file written after would never be seen.
-        std::fs::write(dir.path().join("templates/index.html"), "<p>hello</p>").unwrap();
-        std::fs::write(dir.path().join("templates/login.html"), LOGIN_PAGE).unwrap();
+        std::fs::write(dir.path().join("templates/index.html.tmpl"), "<p>hello</p>").unwrap();
+        std::fs::write(dir.path().join("templates/login.html.tmpl"), LOGIN_PAGE).unwrap();
         // Prints a form field, so a test can see the dictionary a POST built.
-        std::fs::write(dir.path().join("templates/form.html"), "<p>{{ name }}</p>").unwrap();
+        std::fs::write(
+            dir.path().join("templates/form.html.tmpl"),
+            "<p>{{ name }}</p>",
+        )
+        .unwrap();
         // About 123 KB: over a 64 KiB area, under a 128 KiB one.
         std::fs::write(
-            dir.path().join("templates/big.html"),
+            dir.path().join("templates/big.html.tmpl"),
             "{% for i in range(end=3000) %}0123456789012345678901234567890123456789\n{% endfor %}",
         )
         .unwrap();
@@ -3165,7 +3227,7 @@ mod tests {
     #[test]
     fn a_template_route_reads_a_form_body_from_the_borrowed_head() {
         let (site, _dir) = site_from(
-            "[[route]]\npath = \"/\"\ntemplate = \"templates/form.html\"\n",
+            "[[route]]\npath = \"/\"\ntemplate = \"templates/form.html.tmpl\"\n",
             &[],
         );
         let request = b"POST / HTTP/1.1\r\nHost: localhost\r\n\
@@ -3202,7 +3264,7 @@ mod tests {
         }
     }
 
-    const BIG_ROUTE: &str = "[[route]]\npath = \"/big\"\ntemplate = \"templates/big.html\"\n";
+    const BIG_ROUTE: &str = "[[route]]\npath = \"/big\"\ntemplate = \"templates/big.html.tmpl\"\n";
 
     /// A page over the start grows the service's one page area by doubling and
     /// the area keeps the size, so the next page is rendered with no growth.
@@ -3238,7 +3300,7 @@ mod tests {
     #[test]
     fn a_rendered_pages_route_headers_are_borrowed_not_made_per_request() {
         let (site, _dir) = site_from(
-            "[[route]]\npath = \"/\"\ntemplate = \"templates/index.html\"\n",
+            "[[route]]\npath = \"/\"\ntemplate = \"templates/index.html.tmpl\"\n",
             &[],
         );
         let get = || {
@@ -3282,7 +3344,7 @@ mod tests {
     #[test]
     fn a_request_with_too_many_fields_is_refused_with_a_400() {
         let (site, _dir) = site_from(
-            "[[route]]\npath = \"/\"\ntemplate = \"templates/form.html\"\n",
+            "[[route]]\npath = \"/\"\ntemplate = \"templates/form.html.tmpl\"\n",
             &[],
         );
         let post = |fields: usize| {
@@ -3317,7 +3379,7 @@ mod tests {
     #[test]
     fn a_reload_frees_the_old_sites_route_header_texts() {
         let (site, _dir) = site_from(
-            "[[route]]\npath = \"/\"\ntemplate = \"templates/index.html\"\n",
+            "[[route]]\npath = \"/\"\ntemplate = \"templates/index.html.tmpl\"\n",
             &[],
         );
         let base = site.state.routes.routes()[0].clone();
@@ -3367,10 +3429,47 @@ mod tests {
         assert_eq!(get_big(&site).status, 200);
     }
 
+    /// A rendered body that differs on every request and cannot be parsed
+    /// writes one fallback line, not one per request.
+    ///
+    /// The file path keys its line on a version (path, size and mtime), so a
+    /// loop on one file writes once. A rendered body has no version, and a
+    /// handler that varies it on every request makes every body a new subject.
+    /// The render path caps new subjects in time instead.
+    #[test]
+    #[cfg(feature = "minify")]
+    fn a_varying_rendered_body_writes_one_fallback_line() {
+        use crate::minify::{unminified_lines, ParseBudget};
+
+        let mut config = crate::config::MinificationConfig::default();
+        config
+            .enabled
+            .insert("application/javascript".to_string(), true);
+        let before = unminified_lines();
+        for i in 0..20 {
+            let body = format!("function ( {{ varying rendered body {i}\n");
+            assert!(
+                minified(
+                    "application/javascript",
+                    body.as_bytes(),
+                    &config,
+                    ParseBudget::builtin(),
+                )
+                .is_none(),
+                "a body that cannot parse is served as written"
+            );
+        }
+        assert_eq!(
+            unminified_lines() - before,
+            1,
+            "20 rendered bodies wrote 20 fallback lines"
+        );
+    }
+
     #[test]
     fn a_page_defaults_to_revalidation_and_carries_an_etag() {
         let (site, _dir) = site_from(
-            "[[route]]\npath = \"/\"\ntemplate = \"templates/index.html\"\n",
+            "[[route]]\npath = \"/\"\ntemplate = \"templates/index.html.tmpl\"\n",
             &[],
         );
         let mut slots = [httparse::EMPTY_HEADER; 64];
@@ -3430,7 +3529,7 @@ mod tests {
     #[test]
     fn a_template_route_is_answered_and_finished() {
         let (site, _dir) = site_from(
-            "[[route]]\npath = \"/\"\ntemplate = \"templates/index.html\"\n",
+            "[[route]]\npath = \"/\"\ntemplate = \"templates/index.html.tmpl\"\n",
             &[],
         );
         let mut slots = [httparse::EMPTY_HEADER; 64];
@@ -3451,7 +3550,7 @@ mod tests {
     fn a_route_with_a_handler_and_a_template_goes_to_the_handler() {
         let (site, _dir) = site_from(
             "[[route]]\npath = \"/both\"\nhandler = \"files\"\n\
-             template = \"templates/index.html\"\n",
+             template = \"templates/index.html.tmpl\"\n",
             &["other", "files"],
         );
         let mut slots = [httparse::EMPTY_HEADER; 64];
@@ -3475,7 +3574,7 @@ mod tests {
     #[test]
     fn a_dictionary_error_is_finished_without_route_defaults() {
         let (site, _dir) = site_from(
-            "[[route]]\npath = \"/assets/{*relpath}\"\ntemplate = \"templates/index.html\"\n\
+            "[[route]]\npath = \"/assets/{*relpath}\"\ntemplate = \"templates/index.html.tmpl\"\n\
              cache = \"public\"\n",
             &[],
         );
@@ -3863,13 +3962,18 @@ mod tests {
                 m.insert("text/html".to_string(), true);
                 m.insert("text/css".to_string(), true);
                 m.insert("application/json".to_string(), true);
+                m.insert("application/javascript".to_string(), true);
+                m.insert("text/javascript".to_string(), true);
                 m
             },
+            inline_js: true,
         };
         assert!(cfg.is_enabled("text/html"));
         assert!(cfg.is_enabled("text/css"));
         assert!(cfg.is_enabled("application/json"));
-        assert!(!cfg.is_enabled("application/javascript"));
+        assert!(cfg.is_enabled("application/javascript"));
+        assert!(cfg.is_enabled("text/javascript"));
+        assert!(cfg.inline_js);
         assert!(!cfg.is_enabled("image/png"));
     }
 
@@ -5268,24 +5372,33 @@ mod minify_tests {
         site.handle(&head)
     }
 
-    /// A cache keeps nothing of a `no-store` page, so minifying it is paid on
-    /// every request and never repaid. The page must leave `handle` with the
-    /// bytes the template rendered, spaces and blank line intact.
+    /// A `no-store` page is minified like any other. It cost a second hit once,
+    /// and the rule is that every enabled type is minified.
     #[test]
-    fn a_no_store_page_is_sent_unminified() {
+    fn a_no_store_page_is_minified() {
         let (site, _dir) = site_from(
-            "[[route]]\npath = \"/login\"\ntemplate = \"templates/login.html\"\n\
+            "[[route]]\npath = \"/login\"\ntemplate = \"templates/login.html.tmpl\"\n\
              cache = \"no-store\"\n",
             &[],
         );
         match handle_get(&site, "/login", "identity") {
             Handled::Done(resp) => {
                 let body = resp.body.as_bytes().expect("a rendered page is buffered");
-                assert_eq!(
+                assert_ne!(
                     body,
                     LOGIN_PAGE.as_bytes(),
-                    "a no-store page must carry the template's whitespace: {:?}",
+                    "a no-store page must not carry the template's whitespace"
+                );
+                assert!(
+                    !body.windows(2).any(|pair| pair == b"  "),
+                    "a no-store page is minified, so no two spaces remain: {:?}",
                     String::from_utf8_lossy(body)
+                );
+                assert!(
+                    body.len() < LOGIN_PAGE.len(),
+                    "the minified page must be smaller: {} against {}",
+                    body.len(),
+                    LOGIN_PAGE.len()
                 );
             }
             _ => panic!("a template route comes back Done"),
@@ -5297,7 +5410,7 @@ mod minify_tests {
     #[test]
     fn a_cacheable_page_is_still_minified() {
         let (site, _dir) = site_from(
-            "[[route]]\npath = \"/login\"\ntemplate = \"templates/login.html\"\n",
+            "[[route]]\npath = \"/login\"\ntemplate = \"templates/login.html.tmpl\"\n",
             &[],
         );
         match handle_get(&site, "/login", "identity") {
@@ -5313,11 +5426,11 @@ mod minify_tests {
         }
     }
 
-    /// A config route naming a handler defaults to `no-store`, so its answer
-    /// is unminified for the same reason. JSON is a minified type by default,
-    /// and this body is deliberately spaced.
+    /// A config route naming a handler defaults to `no-store`, and its JSON is
+    /// minified too. JSON is a minified type by default, and this body is
+    /// deliberately spaced.
     #[test]
-    fn a_no_store_json_answer_is_sent_unminified() {
+    fn a_no_store_json_answer_is_minified() {
         let (site, _dir) = site_from(
             "[[route]]\npath = \"/api\"\nhandler = \"json\"\n",
             &["json"],
@@ -5335,8 +5448,8 @@ mod minify_tests {
             resp.body
                 .as_bytes()
                 .expect("a handler's JSON answer is buffered"),
-            b"{ \"a\": 1 }".as_slice(),
-            "a no-store JSON answer must not be minified"
+            b"{\"a\":1}".as_slice(),
+            "a no-store JSON answer must be minified"
         );
     }
 }

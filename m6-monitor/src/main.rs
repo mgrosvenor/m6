@@ -47,6 +47,7 @@
 
 mod check;
 mod digest;
+mod events;
 mod fleet;
 mod history;
 mod journal;
@@ -59,6 +60,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use m6_core::drain::{Drain, Step};
 use m6_core::event::{LoopTrace, Slots, Timeouts};
 use m6_core::h1::{close_conn, head_slots, Flush, Read, RequestHead, ServerConn};
 use m6_core::net::listen_unix;
@@ -83,6 +85,9 @@ const SIGNALS: Token = Token(usize::MAX - 1);
 const LOG: Token = Token(usize::MAX - 2);
 /// The journal reader's pipe: the `journalctl` child of the read in flight.
 const JOURNAL: Token = Token(usize::MAX - 3);
+/// The event series' own journal read. A second descriptor, so the two
+/// readers cannot take each other's lines.
+const EVENTS_JOURNAL: Token = Token(usize::MAX - 4);
 /// The accounting tick, and the longest the loop waits when nothing happens.
 const TICK: Duration = Duration::from_secs(1);
 const EVENTS: usize = 256;
@@ -246,19 +251,27 @@ fn run_service() -> Result<()> {
             .clone(),
         expected_file: fleet.expected_deploy_path(site.site_dir()),
         environment: fleet.environment.clone(),
+        event_series: fleet.event_series.clone(),
     });
 
     // The journal is where a node's metrics and traffic lines are read from.
     // A directory that is not there is said once and reported as a fault,
     // never a refusal to start: the monitor's own page and check still run.
     let journal_limit = site.limits().get(&m6_core::limits::JOURNAL_LINE).clone();
-    poller.journal = match fleet.journal_path(site.site_dir()) {
-        Ok(dir) => journal::Reader::open(&dir, node_count, interval, &journal_limit),
-        Err(e) => {
-            m6_core::log::error!(error = %format!("{e:#}"), "the journal cannot be read");
-            journal::Reader::unavailable(format!("{e:#}"), &journal_limit)
+    // One answer for both readers: the documents read and the event-series
+    // read are given the same directory, and the same reason when it is not
+    // there, so the page cannot report one of them working and the other not.
+    let journal_dir = fleet
+        .journal_path(site.site_dir())
+        .map_err(|e| format!("{e:#}"));
+    poller.journal = match &journal_dir {
+        Ok(dir) => journal::Reader::open(dir, node_count, interval, &journal_limit),
+        Err(reason) => {
+            m6_core::log::error!(error = %reason, "the journal cannot be read");
+            journal::Reader::unavailable(reason.clone(), &journal_limit)
         }
     };
+    poller.open_event_read(journal_dir, &journal_limit, interval);
 
     let ceiling = raise_fd_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
     if ceiling == 0 {
@@ -281,6 +294,12 @@ fn run_service() -> Result<()> {
     let mut signals = Signals::new().unwrap_or_else(|e| fail("opening the signal descriptor", e));
     let mut listener = listen_unix(site.socket_path(), site.socket_mode())
         .unwrap_or_else(|e| fail(&format!("binding {}", site.socket_path().display()), e));
+    // The reserve the accept loop spends to refuse a connection when the
+    // process is out of descriptors. Opened here, before any pressure, and on
+    // the listener's own socket family.
+    let mut spare = m6_core::platform::net::SpareDescriptor::for_unix()
+        .unwrap_or_else(|e| fail("opening the reserve descriptor", e));
+    let mut refusals = m6_core::net::Refusals::new();
     poll.registry()
         .register(&mut listener, LISTENER, Interest::READABLE)
         .unwrap_or_else(|e| fail("registering the listener", e));
@@ -297,6 +316,11 @@ fn run_service() -> Result<()> {
     let mut conns = Slots::new(initial, ceiling, move || {
         ServerConn::with_limits(&read_limit, &write_limit)
     });
+    // Accepted work and the shutdown drain, for client connections only: an
+    // outgoing node request is the monitor's own work and no client is waiting
+    // on it.
+    let drain_timeout = site.drain_timeout();
+    let mut drain = Drain::new(drain_timeout, initial);
     // A config with `read_timeout_s = 0` keeps the zero duration and never
     // touches a deadline.
     let mut deadlines = Timeouts::new(initial, read_timeout.unwrap_or(Duration::ZERO));
@@ -321,6 +345,15 @@ fn run_service() -> Result<()> {
             .unwrap_or_else(|e| fail("registering the journal", e));
         journal_fd = Some(fd);
     }
+    // The event-series read is its own child and its own pipe, so it cannot
+    // take the documents read's turn.
+    let mut events_fd = None;
+    if let Some(fd) = poller.events_journal.fd() {
+        poll.registry()
+            .register_fd(fd, EVENTS_JOURNAL, Interest::READABLE)
+            .unwrap_or_else(|e| fail("registering the event-series journal", e));
+        events_fd = Some(fd);
+    }
 
     // The first poll starts with the service, so the page and the check have a
     // reading before the first interval passes.
@@ -336,7 +369,12 @@ fn run_service() -> Result<()> {
         // ticks, and a second of lateness on the first request is the price of
         // not keeping a second clock.
         let now = m6_core::platform::now();
-        let wait = deadlines.timeout(now, TICK).min(poller.timeout(now, TICK));
+        let mut wait = deadlines.timeout(now, TICK).min(poller.timeout(now, TICK));
+        // While draining, the wait is capped at the deadline: nothing else
+        // would wake the loop to notice it.
+        if let Some(left) = drain.poll_timeout(now) {
+            wait = wait.min(left);
+        }
         match poll.poll(&mut events, Some(wait)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -351,7 +389,7 @@ fn run_service() -> Result<()> {
             Some(LISTENER) => 0,
             Some(SIGNALS) => 5,
             Some(LOG) => 6,
-            Some(JOURNAL) => 6,
+            Some(JOURNAL) | Some(EVENTS_JOURNAL) => 6,
             Some(Token(t)) if t < poll::CLIENT_BASE => 1,
             Some(Token(t)) => {
                 let slot = t - poll::CLIENT_BASE;
@@ -371,9 +409,11 @@ fn run_service() -> Result<()> {
                 // New connections: take a free slot for each, register it,
                 // start its read deadline.
                 LISTENER => {
+                    let mut served = false;
                     while let Some(taken) = conns.take() {
                         if let Some(new_len) = taken.grew_to {
                             deadlines.grow(new_len);
+                            drain.grown(new_len);
                         }
                         let mut stream = match listener.accept() {
                             Ok((stream, _)) => stream,
@@ -388,11 +428,47 @@ fn run_service() -> Result<()> {
                                     conns.free(taken.key);
                                     continue;
                                 }
-                                // Any other error: say so once, give the slot back and stop
-                                // accepting for this turn.
+                                // Out of descriptors: close the reserve and take and
+                                // close every connection already queued, so the turn
+                                // ends with the queue empty and nothing waiting for a
+                                // wakeup that a full queue cannot deliver.
+                                m6_core::platform::net::Accept::Exhausted => {
+                                    conns.free(taken.key);
+                                    let drained = spare.drain(|| {
+                                        let (stream, _) = listener.accept()?;
+                                        drop(stream);
+                                        Ok(())
+                                    });
+                                    for _ in 0..drained.refused {
+                                        refusals.refused();
+                                    }
+                                    if let Some(e) = &drained.stopped {
+                                        m6_core::log::warn!(error = %e, "accept failed while draining the queued connections");
+                                    }
+                                    if let Some(e) = &drained.lost {
+                                        m6_core::log::warn!(error = %e, "the reserve descriptor could not be reopened");
+                                    }
+                                    if drained.needs_rearm() {
+                                        poll.registry().reregister(
+                                            &mut listener,
+                                            LISTENER,
+                                            Interest::READABLE,
+                                        )?;
+                                    }
+                                    break;
+                                }
+                                // Any other error: say so once and keep the
+                                // listener armed, so a connection still
+                                // queued is reported again rather than left
+                                // edge-triggered and unread.
                                 m6_core::platform::net::Accept::Stop => {
                                     conns.free(taken.key);
-                                    eprintln!("m6-monitor: accept error: {e}");
+                                    m6_core::log::warn!(error = %e, "accept failed");
+                                    poll.registry().reregister(
+                                        &mut listener,
+                                        LISTENER,
+                                        Interest::READABLE,
+                                    )?;
                                     break;
                                 }
                             },
@@ -406,6 +482,19 @@ fn run_service() -> Result<()> {
                             deadlines.touch(Token(taken.key), now);
                         }
                         conns.get_mut(taken.key).attach(stream);
+                        // Counted here, at the accept, not when a turn reads
+                        // the request: the window between the two is what
+                        // issue #338 measured.
+                        drain.begin(taken.key);
+                        served = true;
+                    }
+                    let counts = if served {
+                        refusals.flush(now)
+                    } else {
+                        refusals.due(now)
+                    };
+                    if let Some(counts) = counts {
+                        m6_core::net::warn_refused("m6-monitor", counts);
                     }
                     if conns.is_full() {
                         // At the ceiling: stop accepting. New clients wait in
@@ -415,14 +504,19 @@ fn run_service() -> Result<()> {
                     }
                 }
                 SIGNALS => {
-                    let mut stop = false;
                     while let Some(signal) = signals.read() {
                         if lifecycle.on_signal(signal) == Action::Stop {
-                            stop = true;
+                            // Stop accepting now, then answer what was already
+                            // accepted, until the count is zero or the
+                            // deadline passes. Nothing accepted means nothing
+                            // to wait for.
+                            stop_accepting(poll.registry(), &mut listener, &mut accepting)?;
+                            // Do not leave here even when nothing is in
+                            // flight: the zero-timeout turn the drain gives
+                            // the loop is what reads a request already in a
+                            // kept-alive socket. `step` decides, after it.
+                            drain.start(now);
                         }
-                    }
-                    if stop {
-                        break 'run;
                     }
                 }
                 LOG => m6_core::log::flush(),
@@ -434,9 +528,21 @@ fn run_service() -> Result<()> {
                         poller.journal.retire();
                     }
                 }
+                EVENTS_JOURNAL => {
+                    if poller.read_events_journal() == journal::Event::Exited {
+                        if let Some(fd) = events_fd.take() {
+                            let _ = poll.registry().deregister_fd(fd);
+                        }
+                        poller.events_journal.retire();
+                    }
+                }
                 // One connection's turn: answer from the snapshot, or from
                 // the history for the two paged routes.
                 Token(k) if k < poll::CLIENT_BASE => {
+                    // A turn on the connection is accepted work. An idle
+                    // connection that sent another request is counted here,
+                    // so a request that arrives during the drain is answered.
+                    drain.begin(k);
                     #[cfg(feature = "count-allocations")]
                     let before = m6_core::testkit::alloc_count::now();
                     let conn = conns.get_mut(k);
@@ -456,8 +562,13 @@ fn run_service() -> Result<()> {
                             if read_timeout.is_some() {
                                 deadlines.touch(Token(k), now);
                             }
+                            // Answered and holding nothing: idle, so it stops
+                            // holding the drain.
+                            if conn.served() > 0 && !conn.pending() {
+                                drain.end(k);
+                            }
                         }
-                        _ => close_conn(&poll, &mut conns, &mut deadlines, k)?,
+                        _ => close(&poll, &mut conns, &mut deadlines, &mut drain, k)?,
                     }
                     #[cfg(feature = "count-allocations")]
                     {
@@ -487,10 +598,29 @@ fn run_service() -> Result<()> {
         }
         // Close every client whose read deadline passed, with no response.
         while let Some(Token(k)) = deadlines.expired(m6_core::platform::now()) {
-            close_conn(&poll, &mut conns, &mut deadlines, k)?;
+            close(&poll, &mut conns, &mut deadlines, &mut drain, k)?;
         }
-        // A slot came free while the table was full: accept again.
-        if !accepting && !conns.is_full() {
+
+        // The drain: leave the turn the last accepted request finishes, or at
+        // the deadline, and say how many were left when it was the deadline.
+        if drain.draining() {
+            match drain.step(m6_core::platform::now()) {
+                Step::Draining => {}
+                Step::Finished => break 'run,
+                Step::DeadlinePassed(unfinished) => {
+                    m6_core::log::warn!(
+                        unfinished,
+                        timeout_s = drain_timeout.as_secs(),
+                        "drain deadline passed with requests still in flight"
+                    );
+                    break 'run;
+                }
+            }
+        }
+
+        // A slot came free while the table was full: accept again. Never
+        // while draining: the listener stays closed.
+        if !accepting && !drain.draining() && !conns.is_full() {
             poll.registry()
                 .register(&mut listener, LISTENER, Interest::READABLE)?;
             accepting = true;
@@ -537,6 +667,23 @@ fn run_service() -> Result<()> {
                 journal_fd = Some(fd);
             }
         }
+        if poller.events_journal.expire(now) {
+            if let Some(fd) = events_fd.take() {
+                let _ = poll.registry().deregister_fd(fd);
+            }
+            poller.events_journal.retire();
+            m6_core::log::error!(
+                error = poller.events_journal.stopped.as_deref().unwrap_or_default(),
+                "the event-series journal read overran"
+            );
+        }
+        if poller.events_journal.start_if_idle(now) {
+            if let Some(fd) = poller.events_journal.fd() {
+                poll.registry()
+                    .register_fd(fd, EVENTS_JOURNAL, Interest::READABLE)?;
+                events_fd = Some(fd);
+            }
+        }
 
         // The accounting tick: report and clear the loop's wait and work per
         // trigger. The monitor serves no metrics page, so the report is the
@@ -561,11 +708,42 @@ fn run_service() -> Result<()> {
     // The journal's child is killed here, so no `journalctl` outlives the
     // monitor.
     poller.journal.retire();
-    // Connections still open are dropped: a SIGTERM does not wait for a
-    // request in flight. `complete` removes the socket and logs the line.
+    // Reaching here means nothing accepted is left, or the drain deadline
+    // passed and the warning already named how many were. `complete` removes
+    // the socket and logs the line.
+    //
+    // A refusal the rate limit was still holding back when the loop ended is
+    // written here. There is no later turn to carry it, so the interval does
+    // not apply: the last line reports every count the process took.
+    m6_core::net::close_refusals("m6-monitor", &mut refusals);
     lifecycle.complete();
     m6_core::log::stop()?;
     Ok(())
+}
+
+/// Stop accepting, so new clients wait in the kernel's backlog.
+fn stop_accepting(
+    registry: &m6_core::platform::Registry,
+    listener: &mut m6_core::platform::net::UnixListener,
+    accepting: &mut bool,
+) -> std::io::Result<()> {
+    if *accepting {
+        registry.deregister(listener)?;
+        *accepting = false;
+    }
+    Ok(())
+}
+
+/// Close one client connection and stop counting its accepted work.
+fn close(
+    poll: &Poll,
+    conns: &mut Slots<ServerConn>,
+    deadlines: &mut Timeouts,
+    drain: &mut Drain,
+    k: usize,
+) -> std::io::Result<()> {
+    drain.end(k);
+    close_conn(poll, conns, deadlines, k)
 }
 
 /// One connection's turn: write what is owed, read, answer and write until the
@@ -873,6 +1051,12 @@ fn publish(
     // The start-up record's checks: the deploy's expectation file and the
     // journal's own records, judged beside every other reading.
     startup::judge(&mut d, &polled.startup);
+    // The event series: the counts on the page, and a Fault for any series
+    // whose refusal names the service's own configuration.
+    d.events = polled.events;
+    for f in events::findings(&d.events) {
+        d.add_finding(f);
+    }
     let h = history.digest();
     if let Some(f) = history::finding(&h) {
         d.add_finding(f);
@@ -959,6 +1143,10 @@ fn run_check(config_path: &Path) -> Result<()> {
     let polled = poll::drive_to_end(&mut poller, &mut out, None)?;
     let mut d = digest::build(&polled.readings, &thresholds, now_iso8601());
     startup::judge(&mut d, &polled.startup);
+    d.events = polled.events;
+    for f in events::findings(&d.events) {
+        d.add_finding(f);
+    }
     // The report goes through `print!`, so stop the log first: it flushes and
     // puts stdout back to the blocking flag the process started with.
     m6_core::log::stop()?;

@@ -1391,6 +1391,20 @@ pub fn load_traced(
             "config error: {file} has no [node]. Add [node] with name = \"<this node's name>\", for example name = \"edge-a\""
         )
     })?;
+    // The name is also the `Via` entry this node adds to every request it
+    // forwards, so it must be a single visible token. An empty one would emit
+    // `1.1 ` with no node, and the retired pseudonym is read as an unknown
+    // node downstream, so both are refused here rather than shipped.
+    if let Some(why) = crate::forward::node_name_error(&node.name) {
+        let file = if one_file {
+            site_toml_path.display()
+        } else {
+            system_config_path.display()
+        };
+        return Err(anyhow::anyhow!(
+            "config error: [node].name in {file} cannot name this node: {why}. Set it to this node's own short name, for example name = \"edge-a\""
+        ));
+    }
 
     let server = ServerConfig {
         bind,
@@ -3420,6 +3434,33 @@ domain = "test.example.com"
             .unwrap_err()
             .to_string();
         assert!(err.contains("has no [node]"), "{err}");
+    }
+
+    /// The node name is the `Via` entry every forwarded request carries, so a
+    /// name that cannot be one entry is refused at load. An empty name would
+    /// send `1.1 ` with no node, and the retired pseudonym is what the
+    /// analytics writer reads as an unknown node.
+    #[test]
+    fn a_node_name_that_cannot_be_a_via_entry_is_refused() {
+        for (name, expected) in [
+            ("", "it is empty"),
+            ("edge a", "single token"),
+            ("edge-a, 1.1 edge-b", "single token"),
+            ("m6", "analytics writer reads that value"),
+        ] {
+            let dir = make_test_dir();
+            setup_minimal(dir.path());
+            write_file(
+                dir.path(),
+                "system.toml",
+                &minimal_system_toml().replace("name = \"test\"", &format!("name = \"{name}\"")),
+            );
+            let err = load(dir.path(), &dir.path().join("system.toml"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("[node].name"), "{name:?}: {err}");
+            assert!(err.contains(expected), "{name:?}: {err}");
+        }
     }
 
     #[test]

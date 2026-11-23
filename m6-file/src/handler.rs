@@ -1,5 +1,7 @@
+use std::cell::RefCell;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use m6_core::log::{debug, warn};
 use m6_core::{Request, Response, Result};
@@ -285,23 +287,68 @@ pub fn serve(req: &Request) -> Result<Response> {
         return Ok(streamed);
     }
 
-    let Ok(data) = std::fs::read(&fs_path) else {
-        debug!(path = %fs_path.display(), "file not found");
-        return Ok(Response::not_found());
-    };
-
     // Minification is applied BEFORE compression, gated by content-type and
     // config, mirroring core's pipeline so a static asset gets the same
     // treatment here as it would through the render path.
+    //
+    // It is done once per file version, not once per request. A cached entry
+    // is keyed by path, size and mtime, so a GET after the first, and every
+    // HEAD, costs a lookup; a changed file has a new key and is parsed again.
+    // A body that cannot be minified is stored as "serve the file as written"
+    // (the outer `None`), so the fallback is attempted and logged once for
+    // that version too.
+    let budget = match req.config() {
+        Some(c) => m6_core::minify::ParseBudget::from_limits(&c.limits),
+        None => m6_core::minify::ParseBudget::builtin(),
+    };
+    // The minified body has to fit the response buffer the render path uses
+    // the same limit for. A file over it is served as written; the site path
+    // has to refuse instead, because it has no file to fall back to.
+    let output_limit = match req.config() {
+        Some(c) => c.limits.get(&m6_core::limits::MINIFY_OUTPUT).clone(),
+        None => m6_core::limits::Limit::builtin(&m6_core::limits::MINIFY_OUTPUT),
+    };
+    let version = VersionKey::new(&fs_path, metadata.len(), mtime);
     let data = if minify_this {
-        match mime_base.as_str() {
-            "text/html" => m6_core::minify::minify_html(&data),
-            "text/css" => m6_core::minify::minify_css(&data),
-            "application/json" => m6_core::minify::minify_json(&data),
-            _ => data,
+        match cached_body(&version) {
+            Some(Some(body)) => body,
+            Some(None) => match read_asset(&fs_path) {
+                Some(data) => data,
+                None => return Ok(Response::not_found()),
+            },
+            None => {
+                let Some(data) = read_asset(&fs_path) else {
+                    return Ok(Response::not_found());
+                };
+                let kind = m6_core::minify::JsKind::for_path(&fs_path);
+                let inline_js = minification.is_some_and(|m| m.inline_js);
+                if data.len() > output_limit.max() {
+                    warn!(
+                        "m6-file: {}",
+                        output_limit.exceeded(data.len(), &format!("asset {}", fs_path.display()))
+                    );
+                    store_body(version, None);
+                    data
+                } else {
+                    match minify_representation(&mime_base, kind, &data, inline_js, budget) {
+                        Ok(body) => {
+                            store_body(version.clone(), Some(body.clone()));
+                            body
+                        }
+                        Err(fallback) => {
+                            m6_core::minify::warn_unminified(&version_subject(&version), &fallback);
+                            store_body(version, None);
+                            data
+                        }
+                    }
+                }
+            }
         }
     } else {
-        data
+        match read_asset(&fs_path) {
+            Some(data) => data,
+            None => return Ok(Response::not_found()),
+        }
     };
 
     // On a compression failure this used to keep the `Content-Encoding: br`
@@ -340,6 +387,187 @@ pub fn serve(req: &Request) -> Result<Response> {
         resp = resp.header("Content-Encoding", enc);
     }
     Ok(resp)
+}
+
+/// Read one asset, or `None` when it vanished between the `stat` and the read.
+fn read_asset(path: &Path) -> Option<Vec<u8>> {
+    match std::fs::read(path) {
+        Ok(data) => Some(data),
+        Err(_) => {
+            debug!(path = %path.display(), "file not found");
+            None
+        }
+    }
+}
+
+/// One file version a minified body belongs to.
+///
+/// The path is part of the key because two routes can serve the same bytes;
+/// the size and mtime are what make a changed file a new version. A same-size
+/// edit inside one filesystem timestamp tick is the one case this cannot see,
+/// which is the same weakness the weak ETag documents.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VersionKey {
+    path: PathBuf,
+    len: u64,
+    mtime: SystemTime,
+}
+
+impl VersionKey {
+    fn new(path: &Path, len: u64, mtime: SystemTime) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            len,
+            mtime,
+        }
+    }
+}
+
+/// The identifier the fallback line names, so a changed file logs again and an
+/// unchanged one does not.
+fn version_subject(key: &VersionKey) -> String {
+    let nanos = key
+        .mtime
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!("{}:{}:{}", key.path.display(), key.len, nanos)
+}
+
+/// One cached file version. `None` means the file is served as written.
+struct CachedBody {
+    key: VersionKey,
+    body: Option<Vec<u8>>,
+    used: u64,
+}
+
+/// The minified bodies one service has produced, bounded by `[limits.cache_bytes]`
+/// and by a count.
+///
+/// One loop is one thread, so this is a thread-local rather than a lock. The
+/// count is what keeps a site with thousands of small scripts from growing the
+/// table; the byte bound is what keeps a few large bundles in it.
+struct MinifyCache {
+    entries: Vec<CachedBody>,
+    bytes: usize,
+    clock: u64,
+}
+
+/// The most file versions the table holds, whatever their size.
+const MINIFIED_ENTRIES: usize = 256;
+
+static MINIFY_CACHE_LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Set the byte limit the minified-body cache follows. Start only.
+///
+/// The caller passes the smaller of `[limits.cache_bytes]` max and
+/// `[limits.heap_reserve]` start, so the cache is inside the reservation this
+/// service takes from the OS.
+pub fn set_minify_cache_limit(max_bytes: usize) {
+    let _ = MINIFY_CACHE_LIMIT.set(max_bytes);
+}
+
+fn minify_cache_limit() -> usize {
+    MINIFY_CACHE_LIMIT
+        .get()
+        .copied()
+        .unwrap_or(m6_core::limits::MINIFY_PARSE.max)
+}
+
+thread_local! {
+    static MINIFY_CACHE: RefCell<MinifyCache> = RefCell::new(MinifyCache::new());
+}
+
+impl MinifyCache {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            bytes: 0,
+            clock: 0,
+        }
+    }
+
+    /// The body for `key`, or `None` when this version has not been minified.
+    /// The outer `Option` is a hit; the inner one says whether the version is
+    /// minified (`Some`) or served as written (`None`).
+    fn get(&mut self, key: &VersionKey) -> Option<Option<Vec<u8>>> {
+        self.clock += 1;
+        let clock = self.clock;
+        let entry = self.entries.iter_mut().find(|entry| &entry.key == key)?;
+        entry.used = clock;
+        Some(entry.body.clone())
+    }
+
+    fn insert(&mut self, key: VersionKey, body: Option<Vec<u8>>) {
+        let size = body.as_ref().map_or(0, Vec::len);
+        // An entry for the same version replaces the old one rather than
+        // growing the table. This happens only if a file is rewritten with the
+        // same key, which the key exists to make impossible.
+        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
+            let old = self.entries.remove(index);
+            self.bytes = self
+                .bytes
+                .saturating_sub(old.body.as_ref().map_or(0, Vec::len));
+        }
+        if size > minify_cache_limit() {
+            return;
+        }
+        while !self.entries.is_empty()
+            && (self.entries.len() >= MINIFIED_ENTRIES || self.bytes + size > minify_cache_limit())
+        {
+            self.evict_one();
+        }
+        self.clock += 1;
+        self.bytes += size;
+        self.entries.push(CachedBody {
+            key,
+            body,
+            used: self.clock,
+        });
+    }
+
+    fn evict_one(&mut self) {
+        let Some((index, _)) = self
+            .entries
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, entry)| entry.used)
+        else {
+            return;
+        };
+        let old = self.entries.remove(index);
+        self.bytes = self
+            .bytes
+            .saturating_sub(old.body.as_ref().map_or(0, Vec::len));
+    }
+}
+
+fn cached_body(key: &VersionKey) -> Option<Option<Vec<u8>>> {
+    MINIFY_CACHE.with(|cache| cache.borrow_mut().get(key))
+}
+
+fn store_body(key: VersionKey, body: Option<Vec<u8>>) {
+    MINIFY_CACHE.with(|cache| cache.borrow_mut().insert(key, body));
+}
+
+/// Minify one representation, or say why the whole file must be served as
+/// written. Only JavaScript can fall back; the other minifiers return bytes.
+fn minify_representation(
+    mime: &str,
+    kind: m6_core::minify::JsKind,
+    data: &[u8],
+    inline_js: bool,
+    budget: m6_core::minify::ParseBudget,
+) -> std::result::Result<Vec<u8>, m6_core::minify::JsFallback> {
+    use m6_core::minify;
+    match mime {
+        "text/html" => Ok(minify::minify_html_with_budget(data, inline_js, budget)),
+        "text/css" => Ok(minify::minify_css(data)),
+        "application/json" => Ok(minify::minify_json(data)),
+        "application/javascript" | "text/javascript" => {
+            minify::try_minify_js_with(kind, data, budget)
+        }
+        _ => Ok(data.to_vec()),
+    }
 }
 
 static TAIL_LIMIT: std::sync::OnceLock<m6_core::limits::Limit> = std::sync::OnceLock::new();
@@ -748,14 +976,256 @@ mod tests {
         req
     }
 
-    /// A script is served as the bytes on disk. The JavaScript minifier m6
-    /// used to run re-emitted a string holding an apostrophe as a template
-    /// literal with its escapes doubled, so `"didn't \u2014 tab\there"` went
-    /// out as `` `didn't \\u2014 tab\\there` ``. The config is the default
-    /// one, so this is the path a site with no `[minification]` table takes.
+    /// A script is minified on the wire, and the string that used to be
+    /// corrupted keeps its characters. The old minifier re-emitted it as a
+    /// template literal with doubled escapes, so `"didn't \u2014 tab\there"`
+    /// was served as `` `didn't \\u2014 tab\\there` ``. The default config
+    /// is the path a site with no `[minification]` table takes.
     #[test]
-    fn a_script_is_served_byte_identical_under_the_default_config() {
+    fn a_script_is_minified_and_the_string_keeps_its_escape() {
         let script = "var m = \"That didn't verify \u{2014} \\u2014 tab\\there.\";\n";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("assets/app.js"), script).unwrap();
+        let mut conf = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut conf, b"").unwrap();
+        let cfg = m6_core::config::load(conf.path(), dir.path()).unwrap();
+        let req = asset_req(dir.path(), "app.js", None, &[]).with_config(std::sync::Arc::new(cfg));
+        let (status, _, body) = wire(&req);
+        assert_eq!(status, 200);
+        let served = String::from_utf8_lossy(&body);
+        assert!(
+            body.len() < script.len(),
+            "the script must shrink: {served}"
+        );
+        assert!(served.contains("didn't"), "the string changed: {served}");
+        assert!(
+            !served.contains("\\\\u2014"),
+            "the escape was doubled: {served}"
+        );
+    }
+
+    /// A JavaScript file is parsed once per file version. A second GET and a
+    /// HEAD cost a lookup, and a changed file is parsed again. The wrong
+    /// outcome is the defect: every request parses, so one client looping on a
+    /// module URL makes the loop serve nothing else.
+    #[test]
+    fn a_script_is_parsed_once_per_file_version() {
+        use m6_core::minify::parse_count;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        let path = dir.path().join("assets/app.mjs");
+        let module = "import x from \"y\";\n// a comment the minifier removes\nfunction add(a, b) {\n    return a + b;\n}\n\nexport default add(x);\n";
+        std::fs::write(&path, module).unwrap();
+        let mut conf = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut conf, b"").unwrap();
+        let cfg = std::sync::Arc::new(m6_core::config::load(conf.path(), dir.path()).unwrap());
+
+        let before = parse_count();
+        let get = asset_req(dir.path(), "app.mjs", None, &[]).with_config(cfg.clone());
+        let (status, _, first) = wire(&get);
+        assert_eq!(status, 200);
+        assert!(
+            first.len() < module.len(),
+            "a module must minify: {} against {}",
+            first.len(),
+            module.len()
+        );
+        assert_eq!(parse_count(), before + 1, "the first GET parses");
+
+        let (status, _, second) = wire(&get);
+        assert_eq!(status, 200);
+        assert_eq!(second, first, "the served bytes do not change");
+        assert_eq!(parse_count(), before + 1, "the second GET is a lookup");
+
+        let head = request(
+            "HEAD",
+            "/assets/app.mjs",
+            None,
+            &[],
+            dir.path(),
+            json!({"root": "assets/"}),
+            &[("relpath", "app.mjs")],
+        )
+        .with_config(cfg);
+        let (status, headers, body) = wire(&head);
+        assert_eq!(status, 200);
+        assert!(body.is_empty(), "a HEAD has no body");
+        assert_eq!(
+            header(&headers, "content-length").unwrap(),
+            first.len().to_string(),
+            "a HEAD reports the minified length"
+        );
+        assert_eq!(parse_count(), before + 1, "a HEAD is a lookup");
+
+        // A changed file has a new version key, so it is parsed again. The
+        // changed body is deliberately a different length, so the key moves
+        // even on a filesystem whose mtime tick is coarse.
+        let changed = "import x from \"z\";\n// another comment\nfunction twice(v) {\n    return v + v;\n}\n\nexport default twice(x);\n";
+        std::fs::write(&path, changed).unwrap();
+        let (status, _, third) = wire(&get);
+        assert_eq!(status, 200);
+        assert_ne!(
+            third, first,
+            "the changed file is served from a new version"
+        );
+        assert_eq!(parse_count(), before + 2, "a changed file is parsed again");
+    }
+
+    /// A same-length replacement with a changed mtime is a new version and is
+    /// served. The wrong outcome: the cache key ignores mtime, so a `cp -p`, a
+    /// tar extract or a reproducible build that replaces a file with one of
+    /// the same length serves the old minified bytes until the service
+    /// restarts.
+    #[test]
+    fn a_same_length_replacement_with_a_new_mtime_is_served() {
+        use m6_core::minify::parse_count;
+        use std::fs::FileTimes;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        let path = dir.path().join("assets/app.js");
+        let first_body = "var aaaa = 'one';\n";
+        let second_body = "var bbbb = 'two';\n";
+        assert_eq!(
+            first_body.len(),
+            second_body.len(),
+            "the replacement must keep the length, so only mtime can move the key"
+        );
+        std::fs::write(&path, first_body).unwrap();
+        let first_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let mut conf = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut conf, b"").unwrap();
+        let cfg = std::sync::Arc::new(m6_core::config::load(conf.path(), dir.path()).unwrap());
+
+        let before = parse_count();
+        let get = asset_req(dir.path(), "app.js", None, &[]).with_config(cfg);
+        let (status, _, first) = wire(&get);
+        assert_eq!(status, 200);
+        let first_text = String::from_utf8_lossy(&first).into_owned();
+        assert!(
+            first_text.contains("aaaa"),
+            "the first body was not minified: {first_text}"
+        );
+        assert_eq!(parse_count(), before + 1, "the first GET parses");
+
+        // Same length, different bytes, and a mtime moved forward explicitly.
+        // The length half of the key is unchanged, so only mtime can make this
+        // a new version.
+        std::fs::write(&path, second_body).unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_times(FileTimes::new().set_modified(first_mtime + Duration::from_secs(7)))
+            .unwrap();
+        drop(file);
+
+        let (status, _, second) = wire(&get);
+        assert_eq!(status, 200);
+        let second_text = String::from_utf8_lossy(&second).into_owned();
+        assert!(
+            second_text.contains("bbbb") && !second_text.contains("aaaa"),
+            "the replacement was served from the old version: {second_text}"
+        );
+        assert_eq!(
+            parse_count(),
+            before + 2,
+            "the same-length replacement is parsed again"
+        );
+    }
+
+    /// A file over `[limits.minify_output]` max is served as written, and the
+    /// parser never runs on it. The check is before the parse, so a body the
+    /// response buffer cannot hold is never handed to the parser.
+    #[test]
+    fn a_file_over_the_minify_output_limit_is_served_as_written_unparsed() {
+        use m6_core::minify::parse_count;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        let script = "var answer = 1 + 2 + 3 + 4;\n";
+        std::fs::write(dir.path().join("assets/app.js"), script).unwrap();
+        let mut conf = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(
+            &mut conf,
+            b"[limits.minify_output]\nstart = \"16B\"\nmax = \"16B\"\n",
+        )
+        .unwrap();
+        let cfg = std::sync::Arc::new(m6_core::config::load(conf.path(), dir.path()).unwrap());
+
+        let before = parse_count();
+        let get = asset_req(dir.path(), "app.js", None, &[]).with_config(cfg);
+        let (status, _, body) = wire(&get);
+        assert_eq!(status, 200);
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            script,
+            "a body over the output limit is served byte for byte"
+        );
+        assert_eq!(
+            parse_count(),
+            before,
+            "the parser was never run on a body over the output limit"
+        );
+    }
+
+    /// A script over the parse budget is served as written and attempted once
+    /// per version. The wrong outcome: the parser runs on a body the loop
+    /// cannot afford, on every request.
+    #[test]
+    fn a_script_over_the_parse_budget_is_served_as_written_once() {
+        use m6_core::minify::parse_count;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        let script = "function large() { return 1 + 2 + 3 + 4; }\n";
+        std::fs::write(dir.path().join("assets/app.js"), script).unwrap();
+        let mut conf = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(
+            &mut conf,
+            b"[limits.minify_parse]\nstart = \"16B\"\nmax = \"16B\"\n",
+        )
+        .unwrap();
+        let cfg = std::sync::Arc::new(m6_core::config::load(conf.path(), dir.path()).unwrap());
+
+        let before = parse_count();
+        let get = asset_req(dir.path(), "app.js", None, &[]).with_config(cfg);
+        let (status, _, body) = wire(&get);
+        assert_eq!(status, 200);
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            script,
+            "a body over the budget is served byte for byte"
+        );
+        assert_eq!(parse_count(), before, "the parser was never run");
+
+        let (status, _, again) = wire(&get);
+        assert_eq!(status, 200);
+        assert_eq!(again, body);
+        assert_eq!(parse_count(), before, "the fallback is cached per version");
+    }
+
+    /// A config that switches the JavaScript key off serves the file as it is,
+    /// and one that leaves it on is the default above.
+    #[test]
+    fn a_script_is_served_unminified_when_its_key_is_off() {
+        let script = "var m = \"That didn't verify \\u2014 tab\\there.\";\n";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("assets/app.js"), script).unwrap();
+        let mut conf = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut conf, b"[minification]\n\"text/javascript\" = false\n")
+            .unwrap();
+        let cfg = m6_core::config::load(conf.path(), dir.path()).unwrap();
+        let req = asset_req(dir.path(), "app.js", None, &[]).with_config(std::sync::Arc::new(cfg));
+        let (status, _, body) = wire(&req);
+        assert_eq!(status, 200);
+        assert_eq!(String::from_utf8_lossy(&body), script);
+    }
+
+    /// A script the minifier cannot parse is served as the bytes on disk, with
+    /// a warning, rather than as a corrupted or failed response.
+    #[test]
+    fn a_script_that_does_not_parse_is_served_byte_identical() {
+        let script = "function ( { this is not javascript\n";
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("assets")).unwrap();
         std::fs::write(dir.path().join("assets/app.js"), script).unwrap();
@@ -768,7 +1238,7 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(&body),
             script,
-            "the script must be served unchanged"
+            "the fallback must serve the original bytes"
         );
     }
 
