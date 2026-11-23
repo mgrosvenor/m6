@@ -460,6 +460,11 @@ struct ServerState {
     /// Reused buffer a cache lookup builds its key into, so a lookup never
     /// allocates. Capacity 512 matches the old stack buffer's bound.
     lookup_key_buf: String,
+    /// This node's `Via` entry for each protocol it can receive, formatted
+    /// once at start. A forwarded request borrows one; building it per request
+    /// cost two counted allocations per forwarded request, which the allocation
+    /// budget for `h1_tls_miss_insert` is what caught.
+    via: forward::ViaEntries,
     /// The `alt-svc` header line, formatted once at start into `ServerState`.
     alt_svc_line: std::sync::Arc<[u8]>,
     /// The `link` header line advertising the site description, when configured.
@@ -5063,42 +5068,28 @@ fn dispatch_h2(
 ) -> Result<UpstreamId, UrlDispatchError> {
     if let pool::UrlScheme::H2c = state.pool_manager.url_backend(backend_idx).scheme {
         ensure_h2c_conn(state, backend_idx, registry)?;
-        // Disjoint fields: the name is read from `config`, the authority from
-        // `pool_manager`, and only the pool is borrowed mutably.
-        let via_node = match via {
-            ViaHop::ThisNode => Some(state.config.node.name.as_str()),
+        // Disjoint fields: the prebuilt entries are read from `state`, the
+        // authority from `pool_manager`, and only the pool is borrowed mutably.
+        let via = match via {
+            ViaHop::ThisNode => Some(&state.via),
             ViaHop::None => None,
         };
         let backend = state.pool_manager.url_backend(backend_idx);
         let (conn, stream) = state
             .h2c_pool
-            .dispatch(
-                &backend.url,
-                req,
-                client_ip,
-                original_host,
-                via_node,
-                registry,
-            )
+            .dispatch(&backend.url, req, client_ip, original_host, via, registry)
             .map_err(UrlDispatchError::Failed)?;
         Ok(UpstreamId::H2c { conn, stream })
     } else {
         ensure_h2s_conn(state, backend_idx, registry)?;
-        let via_node = match via {
-            ViaHop::ThisNode => Some(state.config.node.name.as_str()),
+        let via = match via {
+            ViaHop::ThisNode => Some(&state.via),
             ViaHop::None => None,
         };
         let backend = state.pool_manager.url_backend(backend_idx);
         let (conn, stream) = state
             .h2s_pool
-            .dispatch(
-                &backend.url,
-                req,
-                client_ip,
-                original_host,
-                via_node,
-                registry,
-            )
+            .dispatch(&backend.url, req, client_ip, original_host, via, registry)
             .map_err(UrlDispatchError::Failed)?;
         Ok(UpstreamId::H2s { conn, stream })
     }
@@ -5131,7 +5122,7 @@ fn launch_url_upstream(
             &backend.host,
             client_ip,
             original_host,
-            Some(state.config.node.name.as_str()),
+            Some(&state.via),
         )
     };
     if let Err(e) = encoded {
@@ -5311,7 +5302,7 @@ fn launch_socket_upstream(
                     req,
                     client_ip,
                     original_host,
-                    Some(state.config.node.name.as_str()),
+                    Some(&state.via),
                 )
             }
             UpstreamSend::Check { credential } => {
@@ -8660,6 +8651,8 @@ fn run(args: Vec<String>) -> i32 {
     // built from it and the line is written for the life of the process.
     let stats_interval_s = config.stats.interval_s;
     let traffic_interval_s = config.stats.traffic_interval_s;
+    // Built once, here, so a forwarded request never formats one.
+    let via = forward::ViaEntries::new(&config.node.name);
     let mut state = ServerState {
         config,
         route_table,
@@ -8701,6 +8694,7 @@ fn run(args: Vec<String>) -> i32 {
         host,
         traffic: health::TrafficWindow::new(),
         lookup_key_buf: String::with_capacity(512),
+        via,
         alt_svc_line,
         describedby_line,
         genid,

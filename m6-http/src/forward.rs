@@ -284,7 +284,8 @@ fn connection_nominated(headers: &[(String, String)]) -> Vec<String> {
     out
 }
 
-/// Build the `Via` value to append for a forwarded request (RFC 9110 7.6.3).
+/// This node's `Via` entry for every protocol it can receive, built once at
+/// start (RFC 9110 7.6.3).
 ///
 /// **F017.** A proxy must announce itself, and `Via` is how a loop is detected
 /// and how a response's path is explained. m6 forwarded everything anonymously,
@@ -294,28 +295,81 @@ fn connection_nominated(headers: &[(String, String)]) -> Vec<String> {
 /// `received-protocol` is the version the request arrived on - HTTP/2 and
 /// HTTP/3 requests are reported as `2` and `3` even though they leave here as
 /// HTTP/1.1, because Via describes the hop that was received, not the one being
-/// sent. `node_name` is the identity this node reports on `/health`, from its
+/// sent. `received-by` is the identity this node reports on `/health`, from its
 /// `[node] name`, so the entry says which node of the deployment took the
 /// request.
 ///
-/// `existing` is every `Via` the request already carries, in the order the
-/// hops were visited, joined into one list. This hop's entry is appended to
-/// it, so the list stays in path order: a reader takes the first entry as the
-/// node that took the request and the last as the one nearest the backend.
-pub fn via_value(existing: &str, received_version: &str, node_name: &str) -> String {
-    let proto = match received_version {
-        v if v.eq_ignore_ascii_case("HTTP/2") || v == "2" => "2",
-        v if v.eq_ignore_ascii_case("HTTP/3") || v == "3" => "3",
-        v if v.eq_ignore_ascii_case("HTTP/1.0") => "1.0",
-        _ => "1.1",
-    };
-    let mine = format!("{proto} {node_name}");
-    let existing = existing.trim();
-    if existing.is_empty() {
-        mine
-    } else {
-        format!("{existing}, {mine}")
+/// A node can receive four versions (1.0, 1.1, 2, 3) and its name is fixed at
+/// start, so the whole set of entries is fixed at start too. This type is that
+/// set, and a forwarded request borrows its entry. The entry used to be
+/// formatted per request, which the counting test measured at two heap
+/// allocations per forwarded request: `h1_tls_miss_insert` in
+/// `m6-http/tests/allocations.rs` read 49.001 calls per request against a
+/// budget of 47.004, and 47.001 against the same budget once the set was built
+/// here. The budgets there are ceilings and are never raised, so the value is
+/// built once rather than in the forwarding path.
+#[derive(Debug)]
+pub struct ViaEntries {
+    http_1_0: String,
+    http_1_1: String,
+    http_2: String,
+    http_3: String,
+}
+
+impl ViaEntries {
+    /// Build the set from the node name that `[node] name` supplies, which
+    /// [`node_name_error`] has already validated.
+    pub fn new(node_name: &str) -> ViaEntries {
+        ViaEntries {
+            http_1_0: format!("1.0 {node_name}"),
+            http_1_1: format!("1.1 {node_name}"),
+            http_2: format!("2 {node_name}"),
+            http_3: format!("3 {node_name}"),
+        }
     }
+
+    /// This node's entry for a request received on `received_version`, which is
+    /// a parsed request's `version` field: `HTTP/1.0`, `HTTP/1.1`, `HTTP/2` or
+    /// `HTTP/3`, or the bare `2`/`3` an outbound dispatch passes.
+    pub fn for_version(&self, received_version: &str) -> &str {
+        match received_version {
+            v if v.eq_ignore_ascii_case("HTTP/2") || v == "2" => &self.http_2,
+            v if v.eq_ignore_ascii_case("HTTP/3") || v == "3" => &self.http_3,
+            v if v.eq_ignore_ascii_case("HTTP/1.0") => &self.http_1_0,
+            _ => &self.http_1_1,
+        }
+    }
+}
+
+/// Write the `Via` field for a forwarded request: every entry the request
+/// already carries, in wire order, then this node's own.
+///
+/// The list stays in path order, so a reader takes the first entry as the node
+/// that took the request and the last as the one nearest the backend. The bytes
+/// go straight into `buf`, so the field costs no heap allocation: `via` was
+/// built once at start.
+fn write_via(buf: &mut Vec<u8>, headers: &[(String, String)], version: &str, via: &ViaEntries) {
+    buf.extend_from_slice(b"Via: ");
+    let mut wrote = false;
+    for (name, value) in headers {
+        if !name.eq_ignore_ascii_case(VIA) {
+            continue;
+        }
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        if wrote {
+            buf.extend_from_slice(b", ");
+        }
+        buf.extend_from_slice(value.as_bytes());
+        wrote = true;
+    }
+    if wrote {
+        buf.extend_from_slice(b", ");
+    }
+    buf.extend_from_slice(via.for_version(version).as_bytes());
+    buf.extend_from_slice(b"\r\n");
 }
 
 /// Every `Via` value the request carries, in wire order, joined into the one
@@ -527,18 +581,18 @@ fn write_decimal(mut n: usize, buf: &mut [u8; 20]) -> &[u8] {
 /// The connection closes after one request, so the bytes ask the backend to
 /// close it.
 ///
-/// `via_node` is this node's name when the request is one m6-http forwards
-/// for a client, and `None` when m6-http originates it itself (the generation
-/// ID's refresh, for one). An originated request has no received protocol to
-/// report, so it carries no [`VIA`] entry of its own.
+/// `via` is the node's prebuilt [`ViaEntries`] when the request is one m6-http
+/// forwards for a client, and `None` when m6-http originates it itself (the
+/// generation ID's refresh, for one). An originated request has no received
+/// protocol to report, so it carries no [`VIA`] entry of its own.
 pub fn encode_request(
     buf: &mut Vec<u8>,
     req: &HttpRequest,
     client_ip: &str,
     original_host: &str,
-    via_node: Option<&str>,
+    via: Option<&ViaEntries>,
 ) -> io::Result<()> {
-    encode_forwarded(buf, req, client_ip, original_host, via_node, None, false)
+    encode_forwarded(buf, req, client_ip, original_host, via, None, false)
 }
 
 /// Build the request bytes a URL backend receives, on a connection kept open
@@ -553,17 +607,9 @@ pub fn encode_url_request(
     host: &str,
     client_ip: &str,
     original_host: &str,
-    via_node: Option<&str>,
+    via: Option<&ViaEntries>,
 ) -> io::Result<()> {
-    encode_forwarded(
-        buf,
-        req,
-        client_ip,
-        original_host,
-        via_node,
-        Some(host),
-        true,
-    )
+    encode_forwarded(buf, req, client_ip, original_host, via, Some(host), true)
 }
 
 /// The one serializer for both. `host_override` replaces the client's `Host`,
@@ -573,7 +619,7 @@ fn encode_forwarded(
     req: &HttpRequest,
     client_ip: &str,
     original_host: &str,
-    via_node: Option<&str>,
+    via: Option<&ViaEntries>,
     host_override: Option<&str>,
     keep_alive: bool,
 ) -> io::Result<()> {
@@ -611,7 +657,7 @@ fn encode_forwarded(
     // anything the client nominated in `Connection` (RFC 9110 7.6.1).
     let nominated = connection_nominated(&req.headers);
     for (name, value) in &req.headers {
-        if via_node.is_some() && name.eq_ignore_ascii_case(VIA) {
+        if via.is_some() && name.eq_ignore_ascii_case(VIA) {
             continue; // re-emitted below, joined, with our own hop appended
         }
         if skip_when_forwarding(name) || nominated.iter().any(|n| name.eq_ignore_ascii_case(n)) {
@@ -625,12 +671,8 @@ fn encode_forwarded(
         buf.extend_from_slice(value.as_bytes());
         buf.extend_from_slice(b"\r\n");
     }
-    if let Some(node) = via_node {
-        buf.extend_from_slice(b"Via: ");
-        buf.extend_from_slice(
-            via_value(&existing_via(&req.headers), &req.version, node).as_bytes(),
-        );
-        buf.extend_from_slice(b"\r\n");
+    if let Some(via) = via {
+        write_via(buf, &req.headers, &req.version, via);
     }
     if host_override.is_none() {
         write_host_if_absent(buf, req, original_host);
@@ -1055,8 +1097,14 @@ mod tests {
     fn a_forwarded_request_carries_the_proxy_headers_and_no_hop_by_hop_field() {
         let req = upstream_req();
         let mut bytes = Vec::new();
-        encode_request(&mut bytes, &req, "1.2.3.4", "original.host", Some("edge-a"))
-            .expect("encode");
+        encode_request(
+            &mut bytes,
+            &req,
+            "1.2.3.4",
+            "original.host",
+            Some(&ViaEntries::new("edge-a")),
+        )
+        .expect("encode");
         let s = std::str::from_utf8(&bytes).unwrap();
 
         assert!(s.starts_with("GET /api/test?key=value HTTP/1.1\r\n"));
@@ -1079,7 +1127,7 @@ mod tests {
             "api.example.com",
             "1.2.3.4",
             "original.host",
-            Some("edge-a"),
+            Some(&ViaEntries::new("edge-a")),
         )
         .expect("encode");
         let s = std::str::from_utf8(&bytes).unwrap();
@@ -1267,7 +1315,7 @@ mod via_and_connection_tests {
             "backend.internal",
             "1.2.3.4",
             "example.com",
-            Some(NODE),
+            Some(&ViaEntries::new(NODE)),
         )
         .expect("encode");
         String::from_utf8_lossy(&bytes).into_owned()
@@ -1391,7 +1439,7 @@ mod via_and_connection_tests {
             &req(&[("Via", "1.1 edge-a")], "HTTP/1.1"),
             "1.2.3.4",
             "example.com",
-            Some("origin"),
+            Some(&ViaEntries::new("origin")),
         )
         .expect("encode");
         let out = String::from_utf8_lossy(&bytes).into_owned();

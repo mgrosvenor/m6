@@ -132,6 +132,25 @@ else
   fail "Test suite failed — fix correctness issues before performance check"
 fi
 
+# ── 3b. The targets `cargo test --workspace` does not build ──────────────────
+# `cargo test --workspace` builds only the targets whose `required-features` the
+# workspace turns on, and omits every other one: not run, not failed, invisible.
+#
+# THAT IS THE DEFECT THAT LET TWO RED CI RUNS THROUGH. `h1_tls_miss_insert` sits
+# behind `required-features = ["count-allocations"]`, so this gate ran 2,641
+# tests, 0 failed, and never built the one CI failed on, on all three of its
+# machines. The set is now one script that CI, this gate and the build host all
+# call, so the three cannot run different suites again.
+#
+# It runs under the port lock like the suite above: these tests start real
+# services on claimed loopback ports.
+info "Running feature-gated tests (the targets the workspace suite omits)..."
+if with_port_lock ./tools/feature-gated-tests.sh 2>&1; then
+  pass "Feature-gated tests (allocation budgets included)"
+else
+  fail "Feature-gated tests failed — one of the targets the workspace suite omits"
+fi
+
 # ── 4. Conformance: HTTP/1.1, HTTP/2, HTTP/3 ─────────────────────────────────
 # A minimum score against independent testers (h1spec, h2spec, h3spec). Floors live
 # in tools/conformance-scores.txt; a score below its floor fails the push.

@@ -356,19 +356,19 @@ impl<T: Transport> H2Client<T> {
     /// Returns the stream id. The reply arrives on `drain_completions` when the
     /// stream finishes. The connection must not be dead.
     ///
-    /// `via_node` is this node's name when the request is one m6-http forwards
-    /// for a client, and `None` when m6-http originates it itself (the
-    /// generation ID's heartbeat over h2c, for one). A forwarded request gets
-    /// its `Via` here as it does on the HTTP/1.1 leg, from the same
-    /// [`crate::forward::via_value`], so the backbone hop keeps the path order
-    /// the site reads.
+    /// `via` is the node's prebuilt [`crate::forward::ViaEntries`] when the
+    /// request is one m6-http forwards for a client, and `None` when m6-http
+    /// originates it itself (the generation ID's heartbeat over h2c, for one).
+    /// A forwarded request gets its `Via` here as it does on the HTTP/1.1 leg,
+    /// from the same prebuilt entries, so the backbone hop keeps the path order
+    /// the site reads and neither leg formats an entry per request.
     pub fn dispatch(
         &mut self,
         req: &HttpRequest,
         host: &str,
         client_ip: &str,
         original_host: &str,
-        via_node: Option<&str>,
+        via: Option<&crate::forward::ViaEntries>,
     ) -> io::Result<u32> {
         if self.is_dead {
             return Err(io::Error::new(
@@ -399,7 +399,7 @@ impl<T: Transport> H2Client<T> {
                 }
                 // Re-emitted below as one joined list when this node is the
                 // proxy for this request.
-                if via_node.is_some() && name.eq_ignore_ascii_case(crate::forward::VIA) {
+                if via.is_some() && name.eq_ignore_ascii_case(crate::forward::VIA) {
                     return None;
                 }
                 // The proxy re-emits x-forwarded-* below from the real
@@ -430,15 +430,22 @@ impl<T: Transport> H2Client<T> {
         for (k, v) in &forwarded {
             hdr_list.push((k.as_slice(), v.as_slice()));
         }
-        let via = via_node.map(|node| {
-            crate::forward::via_value(
-                &crate::forward::existing_via(&req.headers),
-                &req.version,
-                node,
-            )
-        });
-        if let Some(via) = &via {
-            hdr_list.push((crate::forward::VIA.as_bytes(), via.as_bytes()));
+        // This node's entry was built at start. The common case -- a public
+        // listener, where an arriving `Via` is stripped -- appends it with no
+        // allocation at all. Only a backbone hop that carries a peer's entry
+        // joins the two, and that is a cache-to-origin leg, not the hot path.
+        let joined_via: String;
+        if let Some(via) = via {
+            let mine = via.for_version(&req.version);
+            let mut existing = crate::forward::existing_via(&req.headers);
+            if existing.is_empty() {
+                hdr_list.push((crate::forward::VIA.as_bytes(), mine.as_bytes()));
+            } else {
+                existing.push_str(", ");
+                existing.push_str(mine);
+                joined_via = existing;
+                hdr_list.push((crate::forward::VIA.as_bytes(), joined_via.as_bytes()));
+            }
         }
 
         let header_block = self.hpack_enc.encode(hdr_list);
@@ -1111,13 +1118,13 @@ impl<T: Transport> Pool<T> {
         req: &HttpRequest,
         client_ip: &str,
         original_host: &str,
-        via_node: Option<&str>,
+        via: Option<&crate::forward::ViaEntries>,
         registry: &Registry,
     ) -> io::Result<(Token, u32)> {
         let (host, _) = parse_host_port(base_url, T::prefix(), T::default_port())?;
         let (token, stream_id) = {
             let conn = self.connections.get_mut(base_url).unwrap();
-            let stream_id = conn.dispatch(req, &host, client_ip, original_host, via_node)?;
+            let stream_id = conn.dispatch(req, &host, client_ip, original_host, via)?;
             Self::register_interest(conn, registry);
             (conn.token(), stream_id)
         };

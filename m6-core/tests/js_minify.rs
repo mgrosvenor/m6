@@ -26,6 +26,38 @@ fn run(script: &str) -> String {
         .to_std_string_escaped()
 }
 
+/// Run `body` on a thread with an explicit stack, and carry a panic back to
+/// the test harness so a failure is still a failure.
+///
+/// Boa's parser is recursive descent: it walks the whole expression precedence
+/// chain once per bracket level, and its frames are large in a debug build.
+/// This fixture's deepest expression nests 13 bracket levels by the nesting
+/// guard's own scan. Under the address sanitiser those levels cost the parser
+/// more than the 2 MiB a test thread is born with, so the parser overflows and
+/// the test binary dies with a stack-overflow report that names Boa's frames.
+///
+/// Boa is a dev-dependency: it never ships. The production minifier (oxc) has
+/// already parsed the same bytes earlier in this test, and it is oxc the
+/// request path runs. So the stack this needs is the harness's to supply, and
+/// the test does not touch `[limits.minify_nesting]` for it.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "test code: one thread for the whole test, to give Boa's parser a stack; the event-loop rule is about the shipping loop"
+)]
+fn on_a_boa_stack(body: impl FnOnce() + Send + 'static) {
+    // Eight times the 4 MiB measured to pass on aarch64 debug + ASan (2 MiB,
+    // the test thread's own stack, overflows). A thread stack is reserved
+    // rather than committed, so the size costs address space and nothing else.
+    const STACK: usize = 32 * 1024 * 1024;
+    std::thread::Builder::new()
+        .name("js_minify-boa".to_string())
+        .stack_size(STACK)
+        .spawn(body)
+        .expect("spawn the thread Boa parses on")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
 fn minified(script: &str) -> (String, Vec<u8>) {
     let bytes = m6_core::minify::minify_js(script.as_bytes());
     let text = String::from_utf8(bytes.clone()).expect("the minifier emits UTF-8");
@@ -210,24 +242,27 @@ fn a_script_in_an_attribute_is_not_an_element() {
 }
 
 /// A third-party-sized classic script round-trips with the same behaviour on
-/// a small harness, and shrinks.
+/// a small harness, and shrinks. Boa runs it on its own stack: see
+/// [`on_a_boa_stack`].
 #[test]
 fn a_third_party_sized_script_round_trips() {
-    let harness = r#"globalThis.__result = JSON.stringify([d3.range(10).join(','), d3.max([1,5,2]), d3.min([1,5,2]), d3.mean([1,2,3]), d3.format('.2f')(1.234), d3.csvParse('a,b\n1,2\n3,4').length, d3.scaleLinear().domain([0,10]).range([0,100])(5), d3.sum([1,2,3]), d3.quantileSorted([1,2,3,4],0.5), d3.utcFormat('%Y-%m-%d')(new Date(Date.UTC(2020,0,2)))]);"#;
-    let (min_text, min_bytes) = minified(D3);
-    assert!(
-        min_bytes.len() < D3.len() * 7 / 10,
-        "the fixture only fell from {} to {} bytes",
-        D3.len(),
-        min_bytes.len()
-    );
-    assert!(
-        !min_text.contains("</script"),
-        "the output holds a close tag"
-    );
-    let original = format!("{D3}\n{harness}");
-    let minified_script = format!("{min_text}\n{harness}");
-    assert_eq!(run(&original), run(&minified_script));
+    on_a_boa_stack(|| {
+        let harness = r#"globalThis.__result = JSON.stringify([d3.range(10).join(','), d3.max([1,5,2]), d3.min([1,5,2]), d3.mean([1,2,3]), d3.format('.2f')(1.234), d3.csvParse('a,b\n1,2\n3,4').length, d3.scaleLinear().domain([0,10]).range([0,100])(5), d3.sum([1,2,3]), d3.quantileSorted([1,2,3,4],0.5), d3.utcFormat('%Y-%m-%d')(new Date(Date.UTC(2020,0,2)))]);"#;
+        let (min_text, min_bytes) = minified(D3);
+        assert!(
+            min_bytes.len() < D3.len() * 7 / 10,
+            "the fixture only fell from {} to {} bytes",
+            D3.len(),
+            min_bytes.len()
+        );
+        assert!(
+            !min_text.contains("</script"),
+            "the output holds a close tag"
+        );
+        let original = format!("{D3}\n{harness}");
+        let minified_script = format!("{min_text}\n{harness}");
+        assert_eq!(run(&original), run(&minified_script));
+    });
 }
 
 /// Every example's JavaScript file parses, and every classic inline script in
