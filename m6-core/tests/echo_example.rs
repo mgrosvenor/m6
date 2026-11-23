@@ -613,14 +613,16 @@ fn the_loop_never_waits() {
 /// never writes a refusal line. macOS answers `WouldBlock` for an empty queue,
 /// so the same loop ends its turn there and the test passed on macOS only.
 ///
-/// **What only a Linux run can prove**, and this test now asserts: every client
-/// reaches an outcome with no new connection arriving; the refusal line is
-/// written, which only happens when the arm ends its turn; the accept queue the
-/// platform layer reads is empty afterwards; and the listener serves again,
-/// which it can only do if the arm returned to `poll`. macOS has no accept
-/// queue reading, so those checks are skipped there, and it needs none of them:
-/// its kernel drops the connection that `accept` refused for want of a
-/// descriptor.
+/// **The test runs on both kernels and each asserts its own answer.** Linux:
+/// every queued client reaches an outcome with no new connection arriving; the
+/// refusal line is written, which only happens when the arm ends its turn; the
+/// accept queue the platform layer reads is empty afterwards; and the listener
+/// serves again, which it can only do if the arm returned to `poll`. macOS:
+/// the service counts fewer refusals than the clients the kernel refused,
+/// because an `EMFILE` there takes and drops the queued connection, and the
+/// stopped burst counts at most two of its three. The two kernel facts behind
+/// the split are measured on the running kernel by `m6-platform`'s
+/// `accept_exhaustion` test, which also runs on every target.
 ///
 /// **Break:** an accept loop that returns from the arm on `EMFILE` (the queued
 /// clients then sit in the queue: this test's read times out), one that takes
@@ -680,18 +682,29 @@ fn queued_clients_are_refused_with_no_new_connection_arriving() {
          accept arm did not drain the queue and end its turn",
         waiting.len()
     );
-    // Linux, where the kernel reports the accept queue, so this is a check only
-    // a Linux run can fail. The turn ended and wrote the refusals above:
-    // nothing new connects between the burst and this line, so only an arm that
-    // reached its end can have written it, and a loop that spins on `EMFILE`
-    // never does. The queue it left is empty. macOS has no such report and
-    // needs neither check: its kernel drops the connection that `accept`
-    // refused for want of a descriptor.
-    let queued = m6_core::platform::net::accept_queue(addr).expect("the accept queue is readable");
-    if queued.is_some() {
+    // Both kernels run this, and each states its own answer. The kernel facts
+    // themselves are measured by m6-platform's accept_exhaustion test, which
+    // runs on every target; this asserts what the service did with them.
+    if m6_core::platform::net::emfile_takes_queued_connection() {
+        // macOS: the `EMFILE` took the queued connection and dropped it, so the
+        // kernel refused most of these clients before the service saw them.
+        // The service counted fewer refusals than the clients that were
+        // refused, which is what "the kernel took it" looks like from here.
+        let (counted, _) = refused_totals(&srv.output_so_far());
+        assert!(
+            counted < refused as u64,
+            "the kernel takes the connection an `EMFILE` is asked about, so the \
+             service must count fewer than the {refused} refused clients, not {counted}:\n{}",
+            srv.output_so_far()
+        );
+    } else {
+        // Linux: `EMFILE` leaves each connection queued, so the drain took and
+        // closed them, counted them, and wrote the line when its turn ended.
+        // Nothing new connects between the burst and this line, so only an arm
+        // that reached its end can have written it.
         srv.wait_for(m6_core::net::REFUSED_MESSAGE, Duration::from_secs(5));
         assert_eq!(
-            queued,
+            m6_core::platform::net::accept_queue(addr).expect("the accept queue is readable"),
             Some(0),
             "the listener's accept queue is not empty at the end of the turn: a \
              connection is left waiting with no wakeup that can arrive"
@@ -764,16 +777,15 @@ fn queued_clients_are_refused_with_no_new_connection_arriving() {
         let mut byte = [0u8; 1];
         probe_outcomes.push(probe.read(&mut byte));
     }
-    // Linux: this burst was queued while the process was stopped, so one arm
-    // saw all three, and that arm ended with the kernel's accept queue empty.
-    // A drain that takes one connection and ends the turn leaves the other two
-    // here, and an edge-triggered epoll listener reports nothing for them: the
-    // no-wakeup stall this whole test exists for.
-    if let Some(queued) =
-        m6_core::platform::net::accept_queue(addr).expect("the accept queue is readable")
-    {
+    // This burst was queued while the process was stopped, so one arm saw all
+    // three. Linux left all three queued for the drain, and the arm ended with
+    // the kernel's accept queue empty; a drain that takes one connection and
+    // ends leaves the other two here, and an edge-triggered epoll listener
+    // reports nothing for them.
+    if !m6_core::platform::net::emfile_takes_queued_connection() {
         assert_eq!(
-            queued, 0,
+            m6_core::platform::net::accept_queue(addr).expect("the accept queue is readable"),
+            Some(0),
             "the listener's accept queue is not empty at the end of the turn: the \
              burst was not drained and nothing can wake the listener for it"
         );
@@ -807,6 +819,16 @@ fn queued_clients_are_refused_with_no_new_connection_arriving() {
         "the service counted {counted_in_burst} of the three connections queued in one arm\n{}",
         srv.output_so_far()
     );
+    if m6_core::platform::net::emfile_takes_queued_connection() {
+        // macOS: the arm's first `EMFILE` takes one of the three with it, so
+        // the drain can count at most the other two.
+        assert!(
+            counted_in_burst <= 2,
+            "the kernel takes one connection with the `EMFILE`, so at most two of \
+             the three can be counted, not {counted_in_burst}\n{}",
+            srv.output_so_far()
+        );
+    }
 
     // Descriptors free when the served clients close. The listener serves
     // again, and the line said how many it refused.

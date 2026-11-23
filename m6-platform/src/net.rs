@@ -406,6 +406,94 @@ impl SpareDescriptor {
     }
 }
 
+/// What this target's `accept` does when the process has no descriptor to give
+/// a new connection.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AcceptExhaustion {
+    /// The connection that was queued when `accept` failed with `EMFILE` was
+    /// still queued afterwards, so a later `accept` with one descriptor free
+    /// took it. False on macOS, where the `EMFILE` takes and drops it.
+    pub queued_survives_emfile: bool,
+    /// With the descriptor table full and the listen queue empty, `accept`
+    /// answered `WouldBlock`. True on macOS, whose kernel consults the queue
+    /// first; false on Linux, which consults the table first and answers
+    /// `EMFILE`.
+    pub empty_queue_is_would_block: bool,
+}
+
+/// Whether this target's `EMFILE` takes the queued connection with it.
+///
+/// The accept loops' shape depends on this: a kernel that leaves the
+/// connection queued needs the drain to take it, and a kernel that drops it
+/// needs the refusal not to be counted twice. It is a compile-time fact here
+/// and a measured one in [`accept_exhaustion`]; `tests/accept_exhaustion.rs`
+/// holds the two equal on the kernel it runs on.
+pub const fn emfile_takes_queued_connection() -> bool {
+    os::EMFILE_TAKES_QUEUED
+}
+
+/// Measure [`AcceptExhaustion`] on this kernel.
+///
+/// The probe fills this process's descriptor table, so it lowers the process's
+/// open-file limit and must run in a process of its own. `tests/accept_exhaustion.rs`
+/// runs it in a child, and that test is the only caller. It is measured rather
+/// than assumed because the acceptance tests and both kernels' behaviour turn
+/// on the two answers.
+pub fn accept_exhaustion() -> io::Result<AcceptExhaustion> {
+    use nix::errno::Errno;
+    use nix::sys::resource::{getrlimit, setrlimit, Resource};
+
+    // A table small enough to fill, and never above the hard limit.
+    let (_, hard) = getrlimit(Resource::RLIMIT_NOFILE)?;
+    let soft = hard.min(256);
+    setrlimit(Resource::RLIMIT_NOFILE, soft, hard)?;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    // A plain connect to a listening socket is what puts one connection in the
+    // queue. It is not the loop's connect: this probe is a kernel measurement,
+    // and `socket2` is the layer's socket, so the event-loop rule does not
+    // apply to it.
+    let client = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
+    client.connect(&socket2::SockAddr::from(listener.local_addr()?))?;
+    let mut filled: Vec<std::fs::File> = Vec::new();
+    loop {
+        match std::fs::File::open("/dev/null") {
+            Ok(file) => filled.push(file),
+            Err(e) if e.raw_os_error() == Some(Errno::EMFILE as i32) => break,
+            Err(e) => return Err(e),
+        }
+    }
+    let full = |e: &io::Error| e.raw_os_error() == Some(Errno::EMFILE as i32);
+    let first = listener.accept();
+    if !matches!(&first, Err(e) if full(e)) {
+        return Err(io::Error::other(format!(
+            "accept with a full table and one connection queued: {first:?}"
+        )));
+    }
+    // The table is still full. With the queue empty this is `WouldBlock` on a
+    // kernel that consults the queue first, and `EMFILE` on one that consults
+    // the table: the connection the `EMFILE` was asked about is gone there.
+    let second = listener.accept();
+    let empty_queue_is_would_block =
+        matches!(&second, Err(e) if e.kind() == io::ErrorKind::WouldBlock);
+    // One descriptor free: the connection is taken here if it survived the
+    // `EMFILE`.
+    drop(filled.pop());
+    let third = listener.accept();
+    let queued_survives_emfile = third.is_ok();
+    if !queued_survives_emfile && !matches!(&third, Err(e) if e.kind() == io::ErrorKind::WouldBlock)
+    {
+        return Err(io::Error::other(format!(
+            "accept after one descriptor was freed: {third:?}"
+        )));
+    }
+    Ok(AcceptExhaustion {
+        queued_survives_emfile,
+        empty_queue_is_would_block,
+    })
+}
+
 /// The connections waiting in a TCP listener's accept queue, where the kernel
 /// reports it.
 ///

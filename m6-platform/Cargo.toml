@@ -64,5 +64,9 @@ libtest-mimic = "0.8"
 # The signal contract. Its own `main` so the signals are blocked before any
 # thread exists.
 [[test]]
+name    = "accept_exhaustion"
+harness = false
+
+[[test]]
 name    = "platform_signals"
 harness = false

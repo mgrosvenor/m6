@@ -102,6 +102,11 @@ pub(super) fn prepare_socket(_sock: &socket2::Socket) -> io::Result<()> {
     Ok(())
 }
 
+/// Linux consults the process's descriptor table before the listen queue, so
+/// `EMFILE` leaves the queued connection queued and an empty queue answers
+/// `EMFILE` too.
+pub(super) const EMFILE_TAKES_QUEUED: bool = false;
+
 /// The connections waiting in a TCP listener's accept queue, read from
 /// `/proc/net/tcp` and `/proc/net/tcp6`.
 ///
