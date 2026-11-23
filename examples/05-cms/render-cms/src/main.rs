@@ -606,13 +606,13 @@ fn route(index: usize, req: &Request) -> Result<Answer> {
 }
 
 fn handle_contact_get(req: &Request) -> Result<Response> {
-    Response::render("templates/contact.html", req)
+    Response::render("templates/contact.html.tmpl", req)
 }
 
 fn handle_contact_post(req: &Request) -> Result<Response> {
     let name = req.field("name")?;
     Response::render_with(
-        "templates/contact.html",
+        "templates/contact.html.tmpl",
         req,
         json!({
             "sent": true,
@@ -633,7 +633,7 @@ fn handle_dashboard(req: &Request) -> Result<Response> {
         .unwrap_or_else(|_| json!({"documents": []}));
     let published = index["documents"].as_array().cloned().unwrap_or_default();
     Response::render_with(
-        "templates/cms/dashboard.html",
+        "templates/cms/dashboard.html.tmpl",
         req,
         json!({
             "drafts":    drafts,
@@ -644,7 +644,7 @@ fn handle_dashboard(req: &Request) -> Result<Response> {
 }
 
 fn handle_new(req: &Request) -> Result<Response> {
-    Response::render_with("templates/cms/editor.html", req, json!({"new": true}))
+    Response::render_with("templates/cms/editor.html.tmpl", req, json!({"new": true}))
 }
 
 fn handle_edit(req: &Request) -> Result<Response> {
@@ -697,7 +697,7 @@ fn handle_edit(req: &Request) -> Result<Response> {
     post["body_b64"] = json!(body_b64);
     post["tags_b64"] = json!(tags_b64);
 
-    Response::render_with("templates/cms/editor.html", req, post)
+    Response::render_with("templates/cms/editor.html.tmpl", req, post)
 }
 
 fn handle_create_draft(req: &Request) -> Result<Response> {

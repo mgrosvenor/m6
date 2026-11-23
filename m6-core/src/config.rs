@@ -1106,7 +1106,7 @@ site_name = "Test"
 
 [[route]]
 path = "/"
-template = "templates/home.html"
+template = "templates/home.html.tmpl"
 "#
         )
         .unwrap();

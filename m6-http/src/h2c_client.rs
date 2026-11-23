@@ -158,10 +158,11 @@ impl H2cClientPool {
         req: &HttpRequest,
         client_ip: &str,
         original_host: &str,
+        via_node: Option<&str>,
         registry: &Registry,
     ) -> io::Result<(Token, u32)> {
         self.0
-            .dispatch(base_url, req, client_ip, original_host, registry)
+            .dispatch(base_url, req, client_ip, original_host, via_node, registry)
     }
 
     /// Store who waits for an outbound stream's reply.
@@ -235,7 +236,7 @@ mod tests {
             body: vec![b'x'; 65_536],
         };
         let _rx = conn
-            .dispatch(&req, "127.0.0.1", "127.0.0.1", "127.0.0.1")
+            .dispatch(&req, "127.0.0.1", "127.0.0.1", "127.0.0.1", None)
             .unwrap();
 
         // First drive flushes HEADERS + the first connection window of DATA,

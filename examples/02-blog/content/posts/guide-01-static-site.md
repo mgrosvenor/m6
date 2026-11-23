@@ -119,17 +119,17 @@ global_params = ["data/site.json"]
 
 [[route]]
 path     = "/"
-template = "templates/home.html"
+template = "templates/home.html.tmpl"
 params   = []
 
 [[route]]
 path     = "/about"
-template = "templates/page.html"
+template = "templates/page.html.tmpl"
 params   = ["data/about.json"]
 
 [[route]]
 path     = "/_errors"
-template = "templates/error.html"
+template = "templates/error.html.tmpl"
 params   = []
 cache    = "no-store"
 ```
@@ -163,7 +163,7 @@ All file responses are `Cache-Control: public` — m6-http caches them as pre-co
 
 This file is the `global_params` source — merged into every template's context. Add any site-wide variables here: `site_name`, analytics IDs, feature flags, whatever every page needs.
 
-## `templates/base.html`
+## `templates/base.html.tmpl`
 
 ```html
 <!doctype html>
@@ -184,9 +184,9 @@ This file is the `global_params` source — merged into every template's context
 </html>
 ```
 
-Tera template inheritance: `{% extends "templates/base.html" %}` in child templates, `{% block content %}` to fill the slot. Works like Jinja2 with one important difference: `{% set %}` at the top level of a child template is silently discarded — you must set variables inside the block where they're used.
+Tera template inheritance: `{% extends "templates/base.html.tmpl" %}` in child templates, `{% block content %}` to fill the slot. Works like Jinja2 with one important difference: `{% set %}` at the top level of a child template is silently discarded — you must set variables inside the block where they're used.
 
-## `templates/error.html`
+## `templates/error.html.tmpl`
 
 ```html
 {% extends "base.html" %}

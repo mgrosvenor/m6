@@ -115,11 +115,11 @@ global_params = ["data/site.json"]
 
 [[route]]
 path     = "/"
-template = "templates/home.html"
+template = "templates/home.html.tmpl"
 
 [[route]]
 path     = "/render"
-template = "templates/home.html"
+template = "templates/home.html.tmpl"
 cache    = "no-store"
 TOML
   cat > "$SITE/configs/m6-file.conf" <<TOML
@@ -128,7 +128,7 @@ path    = "/assets/{relpath}"
 handler = "files"
 root    = "assets/"
 TOML
-  cat > "$SITE/templates/home.html" <<'HTML'
+  cat > "$SITE/templates/home.html.tmpl" <<'HTML'
 <!doctype html>
 <html><head><meta charset="utf-8"><title>memcalls</title></head><body><h1>memcalls</h1><p>ok</p></body></html>
 HTML

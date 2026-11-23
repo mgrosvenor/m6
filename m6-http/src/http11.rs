@@ -1998,7 +1998,16 @@ fn drive_h1<S, FH, FO, FR>(
                                 ParseResult::Complete(mut req) => {
                                     // Strip proxy-owned headers before anything
                                     // reads them. See the note on the parser.
-                                    crate::forward::strip_untrusted_inbound(&mut req.headers);
+                                    //
+                                    // This listener is public: it binds
+                                    // `[server] bind`, and the only internal
+                                    // listener is the h2c one, so a `Via` that
+                                    // reaches here is the client's claim and is
+                                    // dropped.
+                                    crate::forward::strip_untrusted_inbound(
+                                        &mut req.headers,
+                                        crate::forward::ForwardedTrust::Never,
+                                    );
                                     h1.keep_alive =
                                         wants_keep_alive(&req) && h1.served + 1 < h1.max_requests;
                                     match on_owned(state, RequestRef::Owned(&req), client_ip) {

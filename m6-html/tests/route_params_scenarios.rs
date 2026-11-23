@@ -257,11 +257,11 @@ fn global_params_change_picked_up_after_restart() {
     std::fs::write(site.path().join("site.toml"), "").unwrap();
     std::fs::write(
         &config,
-        "global_params = [\"data/site.json\"]\n\n[[route]]\npath = \"/brand-global\"\ntemplate = \"templates/params.html\"\nparams = []\n",
+        "global_params = [\"data/site.json\"]\n\n[[route]]\npath = \"/brand-global\"\ntemplate = \"templates/params.html.tmpl\"\nparams = []\n",
     )
     .expect("write config");
     std::fs::write(
-        site.path().join("templates").join("params.html"),
+        site.path().join("templates").join("params.html.tmpl"),
         "{{ brand }}",
     )
     .expect("write template");

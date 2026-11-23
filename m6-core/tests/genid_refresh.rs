@@ -55,7 +55,7 @@ fn page_site() -> (Site, tempfile::TempDir) {
     std::fs::create_dir_all(dir.path().join("templates")).expect("templates");
     std::fs::create_dir_all(dir.path().join("data")).expect("data");
     std::fs::write(
-        dir.path().join("templates/index.html"),
+        dir.path().join("templates/index.html.tmpl"),
         "first: {{ title }}",
     )
     .expect("template");
@@ -67,7 +67,7 @@ fn page_site() -> (Site, tempfile::TempDir) {
     .expect("site.toml");
     std::fs::write(
         dir.path().join("m6-site.toml"),
-        "[[route]]\npath = \"/\"\ntemplate = \"templates/index.html\"\n\
+        "[[route]]\npath = \"/\"\ntemplate = \"templates/index.html.tmpl\"\n\
          params = [\"data/page.json\"]\n",
     )
     .expect("config");
@@ -253,7 +253,8 @@ fn header<'a>(response: &'a Response, name: &str) -> Option<&'a str> {
 }
 
 fn rewrite(dir: &Path) {
-    std::fs::write(dir.join("templates/index.html"), "second: {{ title }}").expect("new template");
+    std::fs::write(dir.join("templates/index.html.tmpl"), "second: {{ title }}")
+        .expect("new template");
     std::fs::write(dir.join("data/page.json"), "{\"title\": \"two\"}").expect("new params");
 }
 
@@ -344,7 +345,8 @@ fn a_failed_load_keeps_the_old_site_serving_and_is_reported() {
     let first = exchange(&site, &mut p, GET);
     assert_eq!(body_of(&first), b"first: one");
 
-    std::fs::write(dir.path().join("templates/index.html"), "{% if %}").expect("broken template");
+    std::fs::write(dir.path().join("templates/index.html.tmpl"), "{% if %}")
+        .expect("broken template");
 
     let error = match site.reload(&[], &[], &TeraFactory) {
         Ok(_) => panic!("a template that does not parse fails the load"),
@@ -443,7 +445,7 @@ fn a_route_on_genid_is_refused_at_start() {
 
     let dir = tempfile::TempDir::new().expect("a temp site");
     std::fs::create_dir_all(dir.path().join("templates")).expect("templates");
-    std::fs::write(dir.path().join("templates/index.html"), "reserved").expect("template");
+    std::fs::write(dir.path().join("templates/index.html.tmpl"), "reserved").expect("template");
     std::fs::write(
         dir.path().join("site.toml"),
         "[[backend]]\nname = \"m6-site\"\ncompresses = true\n",
@@ -451,7 +453,7 @@ fn a_route_on_genid_is_refused_at_start() {
     .expect("site.toml");
     std::fs::write(
         dir.path().join("m6-site.toml"),
-        "[[route]]\npath = \"/genid\"\ntemplate = \"templates/index.html\"\n",
+        "[[route]]\npath = \"/genid\"\ntemplate = \"templates/index.html.tmpl\"\n",
     )
     .expect("config");
 

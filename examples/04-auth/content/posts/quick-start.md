@@ -92,7 +92,7 @@ Add a route to `configs/m6-html.conf`:
 ```toml
 [[route]]
 path     = "/contact"
-template = "templates/page.html"
+template = "templates/page.html.tmpl"
 params   = ["data/contact.json"]
 ```
 

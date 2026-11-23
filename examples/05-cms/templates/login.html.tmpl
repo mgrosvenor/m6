@@ -1,0 +1,52 @@
+{% extends "templates/base.html.tmpl" %}
+{% block title %}Login · {{ site_name }}{% endblock %}
+
+{% block head %}
+<style>
+  .form-card .field       { display: flex; flex-direction: column; gap: 0.3rem; }
+  .form-card .field label { font-size: 0.9rem; font-weight: 500; color: var(--text); }
+  .form-card .field input {
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    -webkit-appearance: none;
+    -moz-appearance: none;
+    appearance: none;
+    padding: 0.55rem 0.85rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font: inherit;
+    font-size: 0.95rem;
+    line-height: 1.4;
+    color: var(--text);
+    background: var(--bg);
+    outline: none;
+  }
+  .form-card .field input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(37,99,235,0.12);
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+  <div class="form-card">
+    <h1>Login</h1>
+    {% if query.error is defined and query.error %}
+      <p class="error">Invalid username or password.</p>
+    {% endif %}
+    <form method="post" action="/auth/login">
+      <input type="hidden" name="next" value="{{ query.next | default(value='') }}">
+      <div class="field">
+        <label for="username">Username</label>
+        <input type="text" id="username" name="username" autocomplete="username" required>
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" autocomplete="current-password" required>
+      </div>
+      <button type="submit">Login</button>
+    </form>
+  </div>
+  <script>document.getElementById('username').focus();</script>
+{% endblock %}

@@ -3194,13 +3194,17 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("templates")).unwrap();
         // Written before the site is built: the renderer loads templates at
         // start, so a file written after would never be seen.
-        std::fs::write(dir.path().join("templates/index.html"), "<p>hello</p>").unwrap();
-        std::fs::write(dir.path().join("templates/login.html"), LOGIN_PAGE).unwrap();
+        std::fs::write(dir.path().join("templates/index.html.tmpl"), "<p>hello</p>").unwrap();
+        std::fs::write(dir.path().join("templates/login.html.tmpl"), LOGIN_PAGE).unwrap();
         // Prints a form field, so a test can see the dictionary a POST built.
-        std::fs::write(dir.path().join("templates/form.html"), "<p>{{ name }}</p>").unwrap();
+        std::fs::write(
+            dir.path().join("templates/form.html.tmpl"),
+            "<p>{{ name }}</p>",
+        )
+        .unwrap();
         // About 123 KB: over a 64 KiB area, under a 128 KiB one.
         std::fs::write(
-            dir.path().join("templates/big.html"),
+            dir.path().join("templates/big.html.tmpl"),
             "{% for i in range(end=3000) %}0123456789012345678901234567890123456789\n{% endfor %}",
         )
         .unwrap();
@@ -3223,7 +3227,7 @@ mod tests {
     #[test]
     fn a_template_route_reads_a_form_body_from_the_borrowed_head() {
         let (site, _dir) = site_from(
-            "[[route]]\npath = \"/\"\ntemplate = \"templates/form.html\"\n",
+            "[[route]]\npath = \"/\"\ntemplate = \"templates/form.html.tmpl\"\n",
             &[],
         );
         let request = b"POST / HTTP/1.1\r\nHost: localhost\r\n\
@@ -3260,7 +3264,7 @@ mod tests {
         }
     }
 
-    const BIG_ROUTE: &str = "[[route]]\npath = \"/big\"\ntemplate = \"templates/big.html\"\n";
+    const BIG_ROUTE: &str = "[[route]]\npath = \"/big\"\ntemplate = \"templates/big.html.tmpl\"\n";
 
     /// A page over the start grows the service's one page area by doubling and
     /// the area keeps the size, so the next page is rendered with no growth.
@@ -3296,7 +3300,7 @@ mod tests {
     #[test]
     fn a_rendered_pages_route_headers_are_borrowed_not_made_per_request() {
         let (site, _dir) = site_from(
-            "[[route]]\npath = \"/\"\ntemplate = \"templates/index.html\"\n",
+            "[[route]]\npath = \"/\"\ntemplate = \"templates/index.html.tmpl\"\n",
             &[],
         );
         let get = || {
@@ -3340,7 +3344,7 @@ mod tests {
     #[test]
     fn a_request_with_too_many_fields_is_refused_with_a_400() {
         let (site, _dir) = site_from(
-            "[[route]]\npath = \"/\"\ntemplate = \"templates/form.html\"\n",
+            "[[route]]\npath = \"/\"\ntemplate = \"templates/form.html.tmpl\"\n",
             &[],
         );
         let post = |fields: usize| {
@@ -3375,7 +3379,7 @@ mod tests {
     #[test]
     fn a_reload_frees_the_old_sites_route_header_texts() {
         let (site, _dir) = site_from(
-            "[[route]]\npath = \"/\"\ntemplate = \"templates/index.html\"\n",
+            "[[route]]\npath = \"/\"\ntemplate = \"templates/index.html.tmpl\"\n",
             &[],
         );
         let base = site.state.routes.routes()[0].clone();
@@ -3465,7 +3469,7 @@ mod tests {
     #[test]
     fn a_page_defaults_to_revalidation_and_carries_an_etag() {
         let (site, _dir) = site_from(
-            "[[route]]\npath = \"/\"\ntemplate = \"templates/index.html\"\n",
+            "[[route]]\npath = \"/\"\ntemplate = \"templates/index.html.tmpl\"\n",
             &[],
         );
         let mut slots = [httparse::EMPTY_HEADER; 64];
@@ -3525,7 +3529,7 @@ mod tests {
     #[test]
     fn a_template_route_is_answered_and_finished() {
         let (site, _dir) = site_from(
-            "[[route]]\npath = \"/\"\ntemplate = \"templates/index.html\"\n",
+            "[[route]]\npath = \"/\"\ntemplate = \"templates/index.html.tmpl\"\n",
             &[],
         );
         let mut slots = [httparse::EMPTY_HEADER; 64];
@@ -3546,7 +3550,7 @@ mod tests {
     fn a_route_with_a_handler_and_a_template_goes_to_the_handler() {
         let (site, _dir) = site_from(
             "[[route]]\npath = \"/both\"\nhandler = \"files\"\n\
-             template = \"templates/index.html\"\n",
+             template = \"templates/index.html.tmpl\"\n",
             &["other", "files"],
         );
         let mut slots = [httparse::EMPTY_HEADER; 64];
@@ -3570,7 +3574,7 @@ mod tests {
     #[test]
     fn a_dictionary_error_is_finished_without_route_defaults() {
         let (site, _dir) = site_from(
-            "[[route]]\npath = \"/assets/{*relpath}\"\ntemplate = \"templates/index.html\"\n\
+            "[[route]]\npath = \"/assets/{*relpath}\"\ntemplate = \"templates/index.html.tmpl\"\n\
              cache = \"public\"\n",
             &[],
         );
@@ -5373,7 +5377,7 @@ mod minify_tests {
     #[test]
     fn a_no_store_page_is_minified() {
         let (site, _dir) = site_from(
-            "[[route]]\npath = \"/login\"\ntemplate = \"templates/login.html\"\n\
+            "[[route]]\npath = \"/login\"\ntemplate = \"templates/login.html.tmpl\"\n\
              cache = \"no-store\"\n",
             &[],
         );
@@ -5406,7 +5410,7 @@ mod minify_tests {
     #[test]
     fn a_cacheable_page_is_still_minified() {
         let (site, _dir) = site_from(
-            "[[route]]\npath = \"/login\"\ntemplate = \"templates/login.html\"\n",
+            "[[route]]\npath = \"/login\"\ntemplate = \"templates/login.html.tmpl\"\n",
             &[],
         );
         match handle_get(&site, "/login", "identity") {

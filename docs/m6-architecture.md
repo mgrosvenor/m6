@@ -415,7 +415,7 @@ A local answer such as a health check carries no stamp and is never stored.
 
 **A cache node learns the ID from its upstream.**
 Its `[genid] upstream` names a `[[backend]]` with a `url`, and its `token_file` holds a read token.
-It sends `GET /genid` at start and once `heartbeat_secs` (default 10) has passed since the last answer, and a new ID flushes its cache in one assignment.
+It sends `GET /genid` over the transport its URL backend's scheme names, at start and once `heartbeat_secs` (default 10) has passed since the last answer, and a new ID flushes its cache in one assignment.
 A node with no ID stores nothing, so a failed first heartbeat is due again after one second (`NO_ID_RETRY` in `m6-http/src/genid.rs`), which matters when `heartbeat_secs` is large.
 That is the whole invalidation: one number, one flush, no per-path map.
 

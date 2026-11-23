@@ -89,16 +89,14 @@ own_track "$CMS_PID"
 
 trap 'echo ""; info "Stopping..."; own_stop_records; own_forget; wait 2>/dev/null' EXIT
 
-# Wait for backend sockets
-echo -n "Waiting for backend sockets"
-for _ in $(seq 1 30); do
-    if [[ -S /tmp/m6/m6-html.sock && -S /tmp/m6/m6-file.sock && -S /tmp/m6/m6-auth.sock && -S /tmp/m6/check-m6-auth.sock && -S /tmp/m6/render-cms.sock ]]; then
-        echo " ready."
-        break
-    fi
-    echo -n "."
-    sleep 0.25
-done
+# Wait for backend sockets. A backend that exits stops the stack here, before
+# m6-http starts on a half-built one.
+echo "Waiting for backend sockets..."
+own_wait_sockets "example 05" \
+    /tmp/m6/m6-html.sock /tmp/m6/m6-file.sock \
+    /tmp/m6/m6-auth.sock /tmp/m6/check-m6-auth.sock \
+    /tmp/m6/render-cms.sock || exit 1
+info "Backend sockets ready."
 
 info "Starting m6-http..."
 mkdir -p $M6_DEV_HOME/05-cms/state

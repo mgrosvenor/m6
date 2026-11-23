@@ -292,8 +292,13 @@ struct H2Field {
 /// and the list it needs straight out of the read buffer.
 pub struct H2Headers<'a> {
     fields: &'a [H2Field],
-    buf: &'a [u8],
+    buf: &'a str,
     authority: Option<&'a str>,
+    /// The same trust that decides whether a forwarded client address is
+    /// believed, and the one that decides whether an arriving `Via` is the
+    /// client's claim or a cache node's entry. See
+    /// [`crate::forward::is_untrusted_inbound`].
+    trust: crate::forward::ForwardedTrust,
 }
 
 /// One request decoded on an HTTP/2 connection.
@@ -317,7 +322,11 @@ pub enum RequestRef<'a> {
 }
 
 impl<'a> H2Headers<'a> {
-    fn new(fields: &'a [H2Field], buf: &'a [u8]) -> H2Headers<'a> {
+    fn new(
+        fields: &'a [H2Field],
+        buf: &'a str,
+        trust: crate::forward::ForwardedTrust,
+    ) -> H2Headers<'a> {
         let authority = fields
             .iter()
             .find(|f| field_name(buf, f) == ":authority")
@@ -326,13 +335,15 @@ impl<'a> H2Headers<'a> {
             fields,
             buf,
             authority,
+            trust,
         }
     }
 
     /// Every field that may be forwarded, in wire order.
     fn forwarded(&self) -> impl Iterator<Item = (&'a str, &'a str)> + '_ {
-        fields(self.fields, self.buf)
-            .filter(|(k, _)| !k.starts_with(':') && !crate::forward::is_untrusted_inbound(k))
+        fields(self.fields, self.buf).filter(|(k, _)| {
+            !k.starts_with(':') && !crate::forward::is_untrusted_inbound(k, self.trust)
+        })
     }
 
     fn has_explicit_host(&self) -> bool {
@@ -373,7 +384,12 @@ impl m6_core::http::HeaderSource for H2Headers<'_> {
 }
 
 impl<'a> H2Request<'a> {
-    fn new(list: &'a [H2Field], buf: &'a [u8], body: Vec<u8>) -> H2Request<'a> {
+    fn new(
+        list: &'a [H2Field],
+        buf: &'a str,
+        body: Vec<u8>,
+        trust: crate::forward::ForwardedTrust,
+    ) -> H2Request<'a> {
         let mut method = "";
         let mut path = "";
         let mut query = None;
@@ -394,7 +410,7 @@ impl<'a> H2Request<'a> {
             method,
             path,
             query,
-            headers: H2Headers::new(list, buf),
+            headers: H2Headers::new(list, buf, trust),
             body,
         }
     }
@@ -541,7 +557,11 @@ pub struct Http2Conn {
     /// callback hands over name and value bytes. Every `H2Field` in a stream
     /// is a range into this buffer. It is cleared only when no stream holds a
     /// range, so the bytes are reused across streams on one connection.
-    decode_buf: Vec<u8>,
+    /// Decoded header names and values, as one UTF-8 buffer. A field view is a
+    /// range into it and needs no validation, because the only writer
+    /// (`push_field_bytes`) validates each part as it appends and replaces an
+    /// invalid one with U+FFFD.
+    decode_buf: String,
     /// Lowercased header names and merged `Vary` values for response
     /// encoding, reused across responses. One field's bytes are appended,
     /// then borrowed as a slice, so a response costs no `String` per field.
@@ -658,7 +678,7 @@ impl Http2Conn {
                 buf.set_what("an HTTP/2 response");
                 buf
             },
-            decode_buf: Vec::with_capacity(MAX_REQUEST_HEAD.min(16 * 1024)),
+            decode_buf: String::with_capacity(MAX_REQUEST_HEAD.min(16 * 1024)),
             hdr_scratch: Vec::with_capacity(8 * 1024),
             streams: BTreeMap::new(),
             free_streams: Vec::new(),
@@ -2229,7 +2249,7 @@ impl Http2Conn {
         let client_ip =
             crate::forward::attributed_client_ip(forwarded_for, peer_ip, self.forwarded_trust);
 
-        let req = H2Request::new(&headers, &self.decode_buf, body);
+        let req = H2Request::new(&headers, &self.decode_buf, body, self.forwarded_trust);
         match on_request(state, RequestRef::H2(req), client_ip) {
             RequestOutcome::Ready(status, resp_headers, resp_body, _, genid) => {
                 self.dispatch_h2_response(
@@ -3209,7 +3229,7 @@ fn link_is_describedby(value: &str) -> bool {
 fn decode_hpack(
     dec: &mut hpack::Decoder<'_>,
     block: &[u8],
-    buf: &mut Vec<u8>,
+    buf: &mut String,
     out: &mut Vec<H2Field>,
 ) -> Result<usize, &'static str> {
     // Counted as each field is decoded, and a field is kept only while the
@@ -3237,31 +3257,36 @@ fn decode_hpack(
 /// before, so a later `&str` view of the bytes says the same thing the old
 /// owned `String` said. A valid part, which is every part a conforming peer
 /// sends, is a plain copy.
-fn push_field_bytes(buf: &mut Vec<u8>, bytes: &[u8]) -> Range<u32> {
+fn push_field_bytes(buf: &mut String, bytes: &[u8]) -> Range<u32> {
     let start = buf.len() as u32;
+    // The one validation of a decoded field part. Its result is what makes
+    // every later field view a `str` range with no check of its own.
     match std::str::from_utf8(bytes) {
-        Ok(_) => buf.extend_from_slice(bytes),
-        Err(_) => buf.extend_from_slice(String::from_utf8_lossy(bytes).as_bytes()),
+        Ok(text) => buf.push_str(text),
+        Err(_) => buf.push_str(&String::from_utf8_lossy(bytes)),
     }
     start..buf.len() as u32
 }
 
 /// The bytes of one field part, re-borrowed from the connection's buffer.
-fn field_bytes<'a>(buf: &'a [u8], range: &Range<u32>) -> &'a [u8] {
-    buf.get(range.start as usize..range.end as usize)
+fn field_bytes<'a>(buf: &'a str, range: &Range<u32>) -> &'a [u8] {
+    buf.as_bytes()
+        .get(range.start as usize..range.end as usize)
         .unwrap_or(&[])
 }
 
-fn field_name<'a>(buf: &'a [u8], field: &H2Field) -> &'a str {
-    std::str::from_utf8(field_bytes(buf, &field.name)).unwrap_or("")
+fn field_name<'a>(buf: &'a str, field: &H2Field) -> &'a str {
+    buf.get(field.name.start as usize..field.name.end as usize)
+        .unwrap_or("")
 }
 
-fn field_value<'a>(buf: &'a [u8], field: &H2Field) -> &'a str {
-    std::str::from_utf8(field_bytes(buf, &field.value)).unwrap_or("")
+fn field_value<'a>(buf: &'a str, field: &H2Field) -> &'a str {
+    buf.get(field.value.start as usize..field.value.end as usize)
+        .unwrap_or("")
 }
 
 /// Every field in `list` as a borrowed name and value.
-fn fields<'a>(list: &'a [H2Field], buf: &'a [u8]) -> impl Iterator<Item = (&'a str, &'a str)> + 'a {
+fn fields<'a>(list: &'a [H2Field], buf: &'a str) -> impl Iterator<Item = (&'a str, &'a str)> + 'a {
     list.iter()
         .map(move |f| (field_name(buf, f), field_value(buf, f)))
 }
@@ -3269,13 +3294,13 @@ fn fields<'a>(list: &'a [H2Field], buf: &'a [u8]) -> impl Iterator<Item = (&'a s
 /// Every field in `list` as raw bytes, for the validators that work on bytes.
 fn field_byte_pairs<'a>(
     list: &'a [H2Field],
-    buf: &'a [u8],
+    buf: &'a str,
 ) -> impl Iterator<Item = (&'a [u8], &'a [u8])> + 'a {
     list.iter()
         .map(move |f| (field_bytes(buf, &f.name), field_bytes(buf, &f.value)))
 }
 
-fn is_headersonly(headers: &[H2Field], buf: &[u8]) -> bool {
+fn is_headersonly(headers: &[H2Field], buf: &str) -> bool {
     for (k, v) in fields(headers, buf) {
         if k == ":method" {
             return matches!(v, "GET" | "HEAD" | "DELETE" | "OPTIONS" | "CONNECT");
@@ -3290,7 +3315,7 @@ fn is_headersonly(headers: &[H2Field], buf: &[u8]) -> bool {
 /// the value (5.6.3). HTTP/2 previously used `v.trim().parse::<usize>()`, which
 /// read `+5` as 5 and silently ignored a value that failed to parse, serving a
 /// request whose framing the peer never declared.
-fn declared_content_length(headers: &[H2Field], buf: &[u8]) -> Result<Option<usize>, ()> {
+fn declared_content_length(headers: &[H2Field], buf: &str) -> Result<Option<usize>, ()> {
     let Some((_, value)) = fields(headers, buf).find(|(k, _)| *k == "content-length") else {
         return Ok(None);
     };
@@ -3307,14 +3332,20 @@ mod authority_tests {
     /// Materialize the borrowed request exactly as the miss path does, so these
     /// tests cover the one conversion a request makes on its way to a backend.
     fn build(pairs: &[(&str, &str)]) -> crate::forward::HttpRequest {
-        let mut buf = Vec::new();
+        let mut buf = String::new();
         let mut fields = Vec::new();
         for (k, v) in pairs {
             let name = super::push_field_bytes(&mut buf, k.as_bytes());
             let value = super::push_field_bytes(&mut buf, v.as_bytes());
             fields.push(super::H2Field { name, value });
         }
-        super::H2Request::new(&fields, &buf, Vec::new()).into_owned()
+        super::H2Request::new(
+            &fields,
+            &buf,
+            Vec::new(),
+            crate::forward::ForwardedTrust::Never,
+        )
+        .into_owned()
     }
     fn host_of(req: &crate::forward::HttpRequest) -> Option<&str> {
         req.headers
@@ -4789,7 +4820,7 @@ mod hpack_robustness {
             // through, not to make it safe.
             let panicked = std::panic::catch_unwind(|| {
                 let mut dec = hpack::Decoder::new();
-                let mut buf = Vec::new();
+                let mut buf = String::new();
                 let mut out = Vec::new();
                 let _ = decode_hpack(&mut dec, &block, &mut buf, &mut out);
             })
@@ -4818,7 +4849,7 @@ mod hpack_robustness {
             let block = part.to_vec();
             let ok = std::panic::catch_unwind(|| {
                 let mut dec = hpack::Decoder::new();
-                let mut buf = Vec::new();
+                let mut buf = String::new();
                 let mut out = Vec::new();
                 let _ = decode_hpack(&mut dec, &block, &mut buf, &mut out);
             })
@@ -5267,7 +5298,7 @@ mod header_list_size_tests {
     fn an_amplified_block_never_holds_more_than_the_limit_in_memory() {
         let block = amplified_block(2_000);
         let mut dec = hpack::Decoder::new();
-        let mut buf = Vec::new();
+        let mut buf = String::new();
         let mut out = Vec::new();
         let size = decode_hpack(&mut dec, &block, &mut buf, &mut out).expect("a valid block");
         assert!(

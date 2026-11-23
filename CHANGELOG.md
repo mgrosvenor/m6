@@ -39,6 +39,39 @@ The released versions, newest first:
 
 ---
 
+## 1.17.0-rc.1, 2026-11-23
+
+**Templates are named for what they produce, and the loader reads only `.tmpl` files.**
+A template file is `page.html.tmpl`, `icon.svg.tmpl` or `robots.txt.tmpl`, and the part before `.tmpl` is the output it produces.
+The loader walks every subdirectory of `templates/`, so an icon can live in `templates/icons/`.
+The Tera name is the full path with the suffix kept, so an include names the file it includes: `{% include "templates/icons/logo.svg.tmpl" %}`.
+This is a breaking change: a file that does not end `.tmpl` is no longer a template, and there is no compatibility shim.
+The version is `1.17.0-rc.1`, a develop build: `main` is still 1.15.0 and there is no `v1.16.0` tag.
+Every example and test fixture in this repository is renamed in the same commit.
+
+### Migration
+
+Rename every template file by appending `.tmpl` to its name: `templates/page.html` becomes `templates/page.html.tmpl`, and `templates/icon.svg` becomes `templates/icon.svg.tmpl`.
+Update every `template` value in every route config, every `{% extends %}` and `{% include %}` name, and every `Response::render` and `Response::render_with` call to the new name.
+A file that keeps its old name is never loaded, so a route that still names it fails at the first render with `template not found`.
+Templates in subdirectories are found by the updated loader, so a renamed icon can move to `templates/icons/` in the same change.
+
+### Changed
+
+**Both template builders load only `.tmpl` files, recursively.**
+`build_tera` walks every subdirectory of `templates/`.
+`build_tera_from_paths` walks the whole template root as well, because an include may cross folders, and then loads any named template outside the root.
+Tera chooses autoescaping from the template name, and the name now ends `.tmpl`, so the builders set the suffixes explicitly: `.html.tmpl`, `.htm.tmpl` and `.xml.tmpl` escape, and `.svg.tmpl`, `.txt.tmpl` and `.json.tmpl` do not.
+A page therefore renders the same bytes under its new name as it did under its old `.html` name.
+
+### Verified
+
+- `a_template_in_a_subfolder_is_found`, `a_file_without_the_tmpl_suffix_is_not_a_template` and `an_include_across_folders_renders` in `m6-core/src/template.rs`.
+- `build_tera_from_paths_loads_the_whole_root_and_only_tmpl_files` and `autoescaping_follows_the_output_part_of_the_name`, which fails if the autoescape suffixes are left at Tera's defaults.
+- The full workspace suite, with every example and fixture template renamed.
+
+---
+
 ## 1.16.0-rc.1, 2026-11-18
 
 **m6 keeps one log stream, and the monitoring endpoints and their credentials are gone.**
@@ -64,6 +97,23 @@ Every enabled type is minified now, HTML and JSON included.
 Verified by `a_no_store_page_is_minified` and `a_no_store_json_answer_is_minified` in `m6-core/src/site.rs`, which assert the minified bytes and that the page is smaller.
 The cost is measured. A rendered `no-store` page of 2 KiB costs 21.5 microseconds more per response at p50, and a 1 KiB JSON answer costs 2.6 microseconds. A script served from the file path costs 8.1 microseconds against 36.2 milliseconds when the same script is parsed on every request, which is what the per-version cache buys. The rendered cost is accepted as the price of the rule that every enabled type is minified. It is recorded here so the price stays visible beside the rule.
 
+**The `Via` entry on every forwarded request names the node, so a backend and a log reader can tell which node took the request, and per-node analytics have a value to read.**
+1.16.0-rc.1 sent the fixed pseudonym `m6`, unchanged since 1.14.0, so every node's requests looked identical downstream and a site splitting its analytics by node had one bucket.
+The entry is now this node's `[node] name`, the same identity `/health` reports, for example `1.1 edge-a` instead of `1.1 m6`, and it is the standard `Via` of RFC 9110 7.6.3.
+A request the node received over HTTP/2 or HTTP/3 reports the protocol it arrived on, `2` or `3`, so the entry describes the hop that was received.
+A cache node's entry crosses the backbone and the origin appends its own after it, one comma-separated list in path order, which reads `1.1 edge-a, 2 origin` at the backend.
+The site reads the first entry as the node that took the request, so the order is the contract and the tests assert the string.
+The trust is the one that already decides whether a forwarded client address is believed.
+A `Via` arriving on a public listener is dropped at ingress on every protocol, because a client must not be able to name a node, and the node then writes its own entry.
+A `Via` arriving on an `h2c_bind` listener from an address in `internal_peers` is kept and appended to.
+A config whose `[node].name` is empty, holds a character a `Via` entry cannot, or is the retired pseudonym `m6` stops at start with exit 2, because an empty entry is malformed and `m6` is the value downstream reads as an unknown node.
+No operator change is needed: `[node] name` was already required, and every deployment sets it.
+Verified by six tests in `m6-http/tests/via.rs` against a backend that captures the request bytes.
+A client's `Via: 1.1 edge-b` is stripped on the public listener at h1, h2 and h3, and the backend reads `1.1 edge-a`, `2 edge-a` and `3 edge-a` in turn.
+A cache node's entry survives to the origin and the backend reads `1.1 edge-a, 2 origin`.
+An internal listener keeps and appends a peer's entry, and the same h2c listener declared public strips it.
+Each direction is a caught revert: ignoring the listener's trust fails five of the six, sending the fixed pseudonym fails all six, and putting this node's entry first fails the two that carry a chain.
+
 **Socket paths in tests no longer depend on `TMPDIR`.** `m6_platform::socket_scratch_root` names the shortest writable temporary root, and every test that binds a unix socket creates its scratch directory there, so a long `TMPDIR` can no longer spend the 104-byte `sun_path` before the file name. The reported intermittent `m6-auth-server` failure ("103 limit") was this: the test measured the host's temporary directory rather than the behaviour it asserts. The platform still refuses a path that cannot fit, naming its length and the limit. That refusal is tested, not worked around. Verified by the workspace suite with `TMPDIR` set to a 93-character path, where the named test failed before the change and passes after it.
 
 **Every m6 binary reports the build it is running, from constants fixed at compile time.**
@@ -78,7 +128,60 @@ Three gaps remain, and the Not measured section lists each.
 
 **HTTP/3 no longer visits every idle QUIC connection on every loop turn.** The loop fired the timer, retried parked responses and tried to send on every QUIC connection each turn, at about half a microsecond per connection. A client that leaves connections behind (each stays for its 30 s idle timeout) made the sweep longer than the work: with about a thousand idle connections, throughput at two concurrent clients fell below the previous release. The loop now drives only the connections whose timer has passed. A connection that received a packet is already driven in the turn it arrives, and that turn now also resumes a response that was waiting for flow-control credit. Tests: `a_connection_whose_timer_is_due_is_driven` and `idle_connections_whose_timer_is_not_due_are_not_touched` in `m6-http/src/main.rs`, and `a_parked_h3_response_completes_when_credit_arrives` in `m6-http/tests/loop_never_waits.rs`.
 
-**The HTTP/2 send queue starts at 64 KiB, not 16 KiB.** At 16 KiB a 484 KB response took 30 writes and 30 TLS records, and bandwidth on large bodies at four connections fell 8 to 16 percent below the previous release. `[limits.h2_send] start` is now 64 KiB. On Linux it is also the kernel's unsent-bytes mark, so a more urgent stream on the same connection waits behind at most 64 KiB. A site that serves large bodies and cares more about bandwidth than that ordering can raise it in the system config.
+**The HTTP/2 send queue starts at 64 KiB, not 16 KiB.** At 16 KiB a 484 KB response took 30 writes and 30 TLS records, and requests per second on large bodies at four connections fell 8 to 16 percent below the previous release. `[limits.h2_send] start` is now 64 KiB. On Linux it is also the kernel's unsent-bytes mark, so a more urgent stream on the same connection waits behind at most 64 KiB. A site that serves large bodies and cares more about large-body throughput than that ordering can raise it in the system config.
+
+**The HTTP/3 server reads its socket's local address once per socket, not once per received datagram.**
+Every received datagram needs the local address the connection answered on, and the receive loop asked the kernel for it again for each one.
+A bound socket's local address cannot change, so the call returned the same value every time.
+The server now reads it when the socket is created, carries it beside the socket, and uses the stored value for every `RecvInfo`.
+A server that receives a burst therefore pays one lookup for the socket rather than one for each datagram it takes in.
+Interface classification is unchanged, because it is chosen from the peer address the receive reports.
+The test `local_addr_is_read_once` counts the reads and shows that a stored read does not go back to the kernel.
+
+**The HTTP/3 benchmark client reads its per-socket facts once per connection, and closes a connection before replacing it.**
+The client set its read timeout and asked the kernel for the peer and local addresses once per received datagram, and all three are facts about a connected socket that cannot change during the connection.
+The read timeout is the turn's wait rather than a deadline per datagram.
+The timeout and the connection's `RecvInfo` are now taken once at connect, and each request reuses them.
+The client also reconnects after a fixed number of requests.
+It used to drop the old connection and its socket without a QUIC close, so the server kept every replaced connection until its idle timeout and carried them all on every loop turn.
+Each reconnect now sends CONNECTION_CLOSE and flushes it before the socket is dropped.
+A run therefore measures the server's HTTP/3 path rather than the client's own per-datagram calls, and leaves no growing set of idle connections behind.
+This changes the benchmark client only, and the server is untouched.
+The test `close_and_flush_sends_the_close` has a real quiche peer receive the close and report the connection closed.
+
+**The platform layer gains a UDP batch, so one call sends a packed buffer as many datagrams and one call takes in many datagrams.**
+`net::UdpBatch` is the API, and it states a batch in a service's terms.
+`for_socket` probes a socket once at setup, `send` sends a buffer packed as segments of one size, and `recv` takes up to `MAX_BATCH` datagrams into one contiguous buffer, one per slot, with the length and source of each in a `RecvMeta`.
+On Linux the send is one `sendmsg` carrying a `UDP_SEGMENT` control message, so the kernel cuts the packed buffer into the datagrams the caller described, and the receive is one `recvmmsg`.
+The macOS arm takes the same calls as a loop of one `sendto` and one `recvfrom` per datagram.
+The fallback is the same code path rather than a second implementation, so a batch puts the same bytes on the wire in the same order wherever it runs.
+The probe sets the option and reads it back, because a bare read reports zero on every kernel, and it clears the option afterwards so an ordinary send on that socket stays one datagram per call.
+`without_gso` runs the fallback on a socket that has segmentation, so the contract suite compares the segmented path against the fallback over loopback on one machine.
+Four `platform_contract` tests run unchanged on every target: four segments with a short last one, the fallback against the path a socket takes by default, a batch of one datagram, and a malformed batch refused before any system call.
+The Linux-only behaviour is the one segmented send and the one receive call.
+The API and its contract are the same on every supported target.
+
+**The HTTP/3 server packs a flush into one buffer and sends it in one call, and one readiness event drains up to sixteen datagrams.**
+While quiche's packets have one destination and every packet but the last is one size, the loop packs them into its own buffer.
+It stops at 64 KiB, 64 segments or the connection's send quantum, then sends the buffer as one batch.
+On Linux that is one `sendmsg` with `UDP_SEGMENT`, and the kernel does the split.
+The one-system-call send and the one-system-call receive are Linux-only.
+Where the socket cannot segment, the platform layer sends one datagram per call, with the same bytes in the same order, so a flush is one code path on every platform.
+The receive side takes up to sixteen datagrams per readiness event and feeds each one to the connection with its own `RecvInfo`, and the socket's local address is read once at setup.
+The batch buffer belongs to the loop and is allocated once, so a flush allocates nothing.
+The receive slots are a slice of the buffer the loop already has, so a readiness event allocates nothing either.
+A server therefore spends fewer system calls per response and per burst of received datagrams.
+The `h3_transfer` test sends a body whose last segment is short through a real m6-http over HTTP/3 and compares every byte, so a batch that drops or mis-sizes its last segment fails.
+
+**A test that executes a copied file takes the copy from a directory the build owns rather than the temporary directory, because a host may mount its temporary directory `noexec`.**
+`the_first_tick_reads_no_executable` copies the `m6-http` binary and runs the copy, and the copy lived in a temporary directory that follows `TMPDIR`.
+On a build host whose temporary directory is mounted `noexec` the spawn fails with "Permission denied", so the release-build proof failed for a reason about where the file lived rather than about what the test asserts.
+The directory now comes from `env!("CARGO_TARGET_TMPDIR")`, which cargo creates under the build's own target directory before the test runs, on the same filesystem as the test binary, so exec permission there follows from the test having run at all.
+The copy, the removal and every assertion are unchanged.
+One more test had the same hazard and it failed silently.
+`the_hook_runs_no_content_checks` writes a `cargo` stub into a temporary directory, puts that directory first on `PATH`, and asserts the stub was never run, so on a `noexec` mount the refused exec left the marker absent and the test passed for the wrong reason.
+It now takes the same directory.
+A sweep of the workspace found every other place that writes or copies a binary into a temporary directory and executes it, and each one already runs from an executable directory.
 
 ### Migration
 
@@ -745,11 +848,15 @@ A live multi-host journal is not measured here.
 **The monitor reads whole journal fields, so a metrics document is no longer null.** Its one `journalctl` command asked for JSON output without `--all`, and JSON output prints a field null when its name and value reach 4096 bytes together, which for `MESSAGE` is 4088 bytes of value. A metrics document is about 6.4 KB, so every one of them reached the monitor with no message, was counted as malformed and dropped, and the digest reported that no metrics line existed for any node. The command now passes `--all`.
 Verified on a monitor reading its node directory with the command's own options: the metrics document arrived as a null field in 87 of 87 entries, and as a string in 87 of 87 after the change.
 
+**The QUIC receive-batch test read the client sockets before loopback had delivered the datagrams.** `a_receive_batch_flushes_each_connection_once` read each client socket once, straight after the server's sends, and asserted it had every datagram. A loopback UDP send is not delivered synchronously with the read, so on macOS arm64 the read found 0 of the 14 datagrams the sends carried in that run and the test failed, while the same commit passed on Linux and on later macOS runs. The test now reads both clients until every datagram the sends carried has arrived, or 5 s pass, then asserts the count and the bodies as before: two sends, more than 10 datagrams, and both bodies byte for byte. Verified: the fixed test passes 300 of 300 runs.
+
 **A cache node whose `[genid] upstream` is an `h2c://` or `h2s://` backend asked it over HTTP/1.1.** The heartbeat was one raw `GET /genid` sent on an HTTP/1.1 upstream slot whatever the backend's URL scheme, so an h2c-only listener logged "http2 error: bad connection preface" once a heartbeat, the node never learned an ID, and it reported `id` null, `upstream_down` true and a degraded `/health` for ever, while client requests forwarded to the same backend worked.
 The heartbeat now takes the transport the URL scheme names, the same split every other request to that backend makes: an h2 stream for h2c and h2s, an upstream slot for http and https.
-Verified by a test that starts a source with an internal h2c listener and a cache node whose genid upstream is `h2c://127.0.0.1:<port>`, and waits for the cache's metrics line to report the source's ID with its upstream up. It fails on the old code with the preface error in the source's log and passes with the fix.
+Verified by a test that starts a source with an internal h2c listener and a cache node whose genid upstream is an `h2c://` address, and waits for the cache's metrics line to report the source's ID with its upstream up. It fails on the old code with the preface error in the source's log and passes with the fix.
 
-**m6-core's TLS client reads a response of any size.** It read every waiting TLS record before draining any plaintext, so a response larger than rustls's plaintext buffer failed with "received plaintext buffer full" instead of growing the read buffer. m6-monitor could not fetch a page over about 20 KB. The reader now drains after each record, and when the slot's buffer is full it returns so the caller grows the buffer, within its limit. Test: `a_tls_response_larger_than_the_read_buffer_grows_it_and_arrives_whole` (256 KiB body, 4 KiB start), which fails with the old reader.
+**m6-core's TLS client reads a response of any size.** It read every waiting TLS record before draining any plaintext, so a response larger than rustls's plaintext buffer failed with "received plaintext buffer full" instead of growing the read buffer. m6-monitor could not fetch a page over about 20 KB. The reader now drains after each record, and when the slot's buffer is full it returns so the caller grows the buffer, within `[limits.upstream_read] max`. Test: `a_tls_response_larger_than_the_read_buffer_grows_it_and_arrives_whole` (256 KiB body, 4 KiB start), which fails with the old reader.
+
+**The SMTP reader grows its reply buffer and reads again, within `[limits.smtp_reply] max`.** `Smtp::read_in` called the TLS reader once, so a reply longer than the free buffer left plaintext inside rustls with no new socket readiness to wake for it, and the delivery stalled until the relay timeout. It now loops, growing within the limit, until the reader stops making progress, as `Upstream` already did. The STARTTLS test answers the second EHLO with about 11 KB against a 512-byte start, which hangs without the fix.
 
 **m6-auth-cli reads a check-only config.** A config whose `[keys]` table names only `public_key`, as a check-only process's does, was refused while parsing with "error: parsing config file", although user and group commands never read the keys. `[keys] private_key` is now optional, and a config without it gives a tool that can manage users but cannot mint tokens. Test: `a_user_command_reads_a_config_whose_keys_name_only_the_public_key` in `m6-auth-cli/tests/integration.rs`, which fails without the fix.
 
@@ -826,7 +933,7 @@ The rule is: allocate `start`, grow by doubling only when a write does not fit, 
 Twenty-six limits now exist (`docs/m6-app-anatomy.md` §4.2, Table 6), read from `[limits.<name>]` in a service's config and in m6-http's system config.
 - m6-core: the HTTP/1.1 slot's read buffer (`request_body`) and write buffer (`response_buffer`) no longer shrink after a large request, a request past the maximum is 413 and a response past it is 500.
   The upstream client's read buffer (`upstream_read`) and request buffer (`upstream_request`, which had no bound) refuse past their maximums.
-  The compressor's and minifier's input (`compress_output`, `minify_output`) and the SMTP reply buffer (`smtp_reply`, a fixed buffer that failed when full) follow limits, and so do the connection table (`connections`) and the ndjson page (`ndjson_page`).
+  The compressor's and minifier's input (`compress_output`, `minify_output`) and the SMTP reply buffer (`smtp_reply`, which starts at 512 B and grows to its maximum) follow limits, and so do the connection table (`connections`) and the ndjson page (`ndjson_page`).
 - m6-http: `edge_request`, `edge_response` (which had no bound), `h2_recv` (no bound), `h2_header_block`, `h2_stream_body`, `refresh_queue`, `rate_limit_addresses`, `cache_bytes` and `connections`.
 - m6-log: `log_buffer` grows from 16 KiB to 1 MiB where it was fixed and dropped lines, and `log_field` replaces the 1024-byte cut.
 - m6-monitor: `history_queue`, and its node requests follow `upstream_read` and `upstream_request`.
@@ -834,7 +941,7 @@ Twenty-six limits now exist (`docs/m6-app-anatomy.md` §4.2, Table 6), read from
 Left without a key on purpose: the HTTP/1.1 head limits (431), the HTTP/2 reset memory, which is now twice the concurrency cap (200 where it was 128) so it stays above the cap whatever the cap is, and the idle URL connection pool, which closes a spare connection and loses no work.
 Verified by a test per limit that fills it past its maximum and reads the refusal: `m6-core/tests/server_conn.rs`, `m6-core/src/limits.rs`, `m6-core/src/client.rs`, `m6-core/src/email.rs`, `m6-core/src/site.rs`, `m6-log/tests/limits_refuse.rs`, `m6-log/tests/escaping.rs`, `m6-http/src/http11.rs`, `m6-http/src/http2.rs`, `m6-http/src/rate_limit.rs`, `m6-monitor/src/history.rs` and `m6-file/src/handler.rs`.
 The hot cache hit still allocates nothing (`m6-http --features count-allocations --test allocations`), and the page-path budgets in `site_allocs` and `request_allocs` are unchanged.
-m6-http conformance (h1spec, h2spec, h3spec) was not run on macOS and must be run on Linux.
+m6-http conformance (h1spec, h2spec, h3spec) is not run on macOS, so the Linux gate runs it.
 
 **A monitor poll on any path is counted as monitor traffic, not as a visitor (#107).** The channel table had two interfaces, so a header check on `/capabilities`, a `/health` poll, or any other monitoring request arrived in `http/*/external` and moved the visitor hit rate while no visitor had moved. The metrics line now reports `http/*/monitor` beside `http/*/external` and `http/*/internal`. `/health` is identified by its backend name, and every other path by the peer's address class. A monitor runs on the private network, so its poll arrives from a private address, while a real visitor's address is public after NAT. The class comes from the listener socket and the peer address the connection proved, so it reads no header and needs no configuration key. Three tests pin the three populations. `a_monitor_poll_on_another_path_is_not_external_traffic` fails as external traffic when the private-peer class is removed, `a_real_external_request_stays_external` fails as monitor when the class is over-broad, and `an_internal_backbone_request_stays_internal` fails as external when the internal socket is classified by its forwarded peer address instead.
 
@@ -1146,7 +1253,7 @@ Verified with `a_symlinked_directory_inside_the_site_is_refused`, which returns 
 
 ### Not measured
 
-- **Linux on the development host.** Every platform and cgroup run above is macOS arm64. On that host the Linux arms of `host_facts()`, the cgroup walk and every `/proc` parse are formatted and parsed but not type-checked, because it has only the `aarch64-apple-darwin` standard library and no rustup. The first Linux CI job that runs `cargo check --workspace --all-targets`, `platform_gate` and `platform_contract` is the proof.
+- **Linux.** The release is measured on Linux: the release-build suite passes there, and the conformance suites score h2spec 146/146 and h3spec 47/49. The development host is macOS arm64, so the Linux arms of `host_facts()`, the cgroup walk and every `/proc` parse are exercised by that build rather than by a run on that host.
 - **The deploy-side writer of `[monitor] expected_deploy_file`.** The monitor reads the file and reports it as waiting. m6 ships no writer of the file, so until a deployment writes one no version or config sha256 is compared.
 ### Known issues
 

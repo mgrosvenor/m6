@@ -61,15 +61,14 @@ own_track "$RENDER_PID"
 
 trap 'own_stop_records; own_forget; wait 2>/dev/null' EXIT
 
-# Wait for backend sockets
-for _ in $(seq 1 30); do
-    [ -S /tmp/m6/m6-html.sock ] && \
-    [ -S /tmp/m6/m6-file.sock ] && \
-    [ -S /tmp/m6/m6-auth.sock ] && \
-    [ -S /tmp/m6/check-m6-auth.sock ] && \
-    [ -S /tmp/m6/render-cms-prod.sock ] && break
-    sleep 0.2
-done
+# Wait for backend sockets. A backend that exits stops the stack here, before
+# m6-http starts on a half-built one.
+echo "Waiting for backend sockets..."
+own_wait_sockets "example 07" \
+    /tmp/m6/m6-html.sock /tmp/m6/m6-file.sock \
+    /tmp/m6/m6-auth.sock /tmp/m6/check-m6-auth.sock \
+    /tmp/m6/render-cms-prod.sock || exit 1
+echo "Backend sockets ready."
 
 mkdir -p $M6_DEV_HOME/07-dev-to-production/state
 STATE_DIRECTORY=$M6_DEV_HOME/07-dev-to-production/state \

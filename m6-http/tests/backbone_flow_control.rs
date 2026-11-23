@@ -277,7 +277,7 @@ fn a_backbone_body_respects_the_peers_send_window() {
         body: sent.clone(),
     };
     let stream_id = conn
-        .dispatch(&req, "127.0.0.1", "203.0.113.9", "example.test")
+        .dispatch(&req, "127.0.0.1", "203.0.113.9", "example.test", None)
         .expect("dispatch");
 
     // Drive the non-blocking client until the response lands. The whole point

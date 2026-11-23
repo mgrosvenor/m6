@@ -95,7 +95,7 @@ fn handle_post(req: &Request, global: &Global, smtp: &mut Smtp) -> Result<Respon
     let msg = message(global, &name, &email, &text)?;
     smtp.start(&global.relay, &msg).map_err(|e| Error::Other(e.into()))?;
 
-    Response::render_with("templates/contact.html", req, json!({"sent": true, "name": name}))
+    Response::render_with("templates/contact.html.tmpl", req, json!({"sent": true, "name": name}))
 }
 ```
 
@@ -119,7 +119,7 @@ secrets_file  = "/etc/m6/render-contact.toml"
 [[route]]
 path     = "/contact"
 methods  = ["GET"]
-template = "templates/contact.html"
+template = "templates/contact.html.tmpl"
 params   = []
 cache    = "no-store"
 
@@ -150,7 +150,7 @@ username = "user@example.com"
 password = "live-smtp-password"
 ```
 
-## `templates/contact.html`
+## `templates/contact.html.tmpl`
 
 ```html
 {% extends "base.html" %}

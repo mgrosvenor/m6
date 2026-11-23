@@ -144,6 +144,19 @@ const JS_D3: &str = include_str!("../tests/fixtures/d3.v7.9.0.js");
 /// Minimal Tera template — one variable substitution.
 const MINIMAL_TEMPLATE: &str = "<!doctype html><html><body><h1>{{ title }}</h1></body></html>";
 
+/// A Tera instance carrying production's autoescaping, for the render benches.
+///
+/// `m6_core::template::new_tera` (`m6-core/src/template.rs:140-142`) is private
+/// to its crate, so the suffixes are repeated here. They must match that list:
+/// without them a template named `page.html.tmpl` does not end in a suffix Tera
+/// knows, renders unescaped, and the bench measures a path production never
+/// runs. Change the two lists together.
+fn production_tera() -> tera::Tera {
+    let mut tera = tera::Tera::default();
+    tera.autoescape_on(vec![".html.tmpl", ".htm.tmpl", ".xml.tmpl"]);
+    tera
+}
+
 fn make_routes() -> RouteTable {
     let patterns = &[
         ("/", RouteMethod::Any),
@@ -311,11 +324,11 @@ fn bench_template_render(c: &mut Criterion) {
         .prefix("m6b-")
         .tempdir_in(m6_core::platform::socket_scratch_root())
         .unwrap();
-    let tmpl_path = dir.path().join("page.html");
+    let tmpl_path = dir.path().join("page.html.tmpl");
     std::fs::write(&tmpl_path, MINIMAL_TEMPLATE).unwrap();
 
-    let mut tera = tera::Tera::default();
-    tera.add_template_file(&tmpl_path, Some("page.html"))
+    let mut tera = production_tera();
+    tera.add_template_file(&tmpl_path, Some("page.html.tmpl"))
         .unwrap();
 
     let mut ctx = tera::Context::new();
@@ -326,7 +339,7 @@ fn bench_template_render(c: &mut Criterion) {
     group.bench_function("template_render", |b| {
         b.iter(|| {
             black_box(
-                tera.render(black_box("page.html"), black_box(&ctx))
+                tera.render(black_box("page.html.tmpl"), black_box(&ctx))
                     .unwrap(),
             )
         })
@@ -383,13 +396,13 @@ fn bench_socket_round_trip(c: &mut Criterion) {
     // Write template.
     let tmpl_dir = dir.path().join("templates");
     std::fs::create_dir_all(&tmpl_dir).unwrap();
-    std::fs::write(tmpl_dir.join("page.html"), MINIMAL_TEMPLATE).unwrap();
+    std::fs::write(tmpl_dir.join("page.html.tmpl"), MINIMAL_TEMPLATE).unwrap();
 
     // Write minimal config.
     let cfg_text = r#"
 [[route]]
 path     = "/blog/{stem}"
-template = "templates/page.html"
+template = "templates/page.html.tmpl"
 
 [params_cache]
 size = 64
@@ -412,10 +425,10 @@ size = 64
 
         let config = m6_core::config::load(&cfg_path2, &site_dir).unwrap();
 
-        // Build Tera directly.
-        let tmpl_path = site_dir.join("templates/page.html");
-        let mut tera = tera::Tera::default();
-        tera.add_template_file(&tmpl_path, Some("templates/page.html"))
+        // Build Tera with production's autoescaping.
+        let tmpl_path = site_dir.join("templates/page.html.tmpl");
+        let mut tera = production_tera();
+        tera.add_template_file(&tmpl_path, Some("templates/page.html.tmpl"))
             .unwrap();
 
         let routes = RouteTable::new(
@@ -694,16 +707,16 @@ fn main() {
             .prefix("m6b-")
             .tempdir_in(m6_core::platform::socket_scratch_root())
             .unwrap();
-        let tmpl_path = dir.path().join("page.html");
+        let tmpl_path = dir.path().join("page.html.tmpl");
         std::fs::write(&tmpl_path, MINIMAL_TEMPLATE).unwrap();
-        let mut tera = tera::Tera::default();
-        tera.add_template_file(&tmpl_path, Some("page.html"))
+        let mut tera = production_tera();
+        tera.add_template_file(&tmpl_path, Some("page.html.tmpl"))
             .unwrap();
         let mut ctx = tera::Context::new();
         ctx.insert("title", "Hello, World!");
         report_percentiles("template_render", N, || {
             black_box(
-                tera.render(black_box("page.html"), black_box(&ctx))
+                tera.render(black_box("page.html.tmpl"), black_box(&ctx))
                     .unwrap(),
             );
         });
@@ -733,12 +746,12 @@ fn main() {
             .unwrap();
         let tmpl_dir2 = dir2.path().join("templates");
         std::fs::create_dir_all(&tmpl_dir2).unwrap();
-        std::fs::write(tmpl_dir2.join("page.html"), MINIMAL_TEMPLATE).unwrap();
+        std::fs::write(tmpl_dir2.join("page.html.tmpl"), MINIMAL_TEMPLATE).unwrap();
 
         let cfg_text2 = r#"
 [[route]]
 path     = "/blog/{stem}"
-template = "templates/page.html"
+template = "templates/page.html.tmpl"
 
 [params_cache]
 size = 64
@@ -753,9 +766,9 @@ size = 64
         std::thread::spawn(move || {
             let listener = std::os::unix::net::UnixListener::bind(&sock_path2).unwrap();
             let config = m6_core::config::load(&cfg_path2, &site_dir2).unwrap();
-            let tmpl_path = site_dir2.join("templates/page.html");
-            let mut tera = tera::Tera::default();
-            tera.add_template_file(&tmpl_path, Some("templates/page.html"))
+            let tmpl_path = site_dir2.join("templates/page.html.tmpl");
+            let mut tera = production_tera();
+            tera.add_template_file(&tmpl_path, Some("templates/page.html.tmpl"))
                 .unwrap();
             let routes2 = RouteTable::new(
                 config

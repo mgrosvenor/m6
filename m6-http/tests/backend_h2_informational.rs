@@ -127,7 +127,7 @@ fn fetch_h2c(informational: usize) -> std::io::Result<HttpResponse> {
     });
     let mut conn = H2cClientConn::connect("127.0.0.1", port).unwrap();
     let stream_id = conn
-        .dispatch(&get(), "127.0.0.1", "203.0.113.9", "example.test")
+        .dispatch(&get(), "127.0.0.1", "203.0.113.9", "example.test", None)
         .unwrap();
     let r = await_response(|| {
         conn.drive();
@@ -169,7 +169,7 @@ fn fetch_h2s(informational: usize) -> std::io::Result<HttpResponse> {
     });
     let mut conn = H2sTlsClientConn::connect("localhost", port, Arc::new(client)).unwrap();
     let stream_id = conn
-        .dispatch(&get(), "localhost", "203.0.113.9", "example.test")
+        .dispatch(&get(), "localhost", "203.0.113.9", "example.test", None)
         .unwrap();
     let r = await_response(|| {
         conn.drive();
