@@ -380,6 +380,7 @@ Neither blocks, and neither starts a thread.
 `Relay::new` refuses plain SMTP (no `starttls`) to any host but `127.0.0.1`, `::1` or `localhost`, resolves the host once with `net::resolve`, and reads the EHLO name.
 A host that does not resolve is an error, so the service stops at start, and a relay whose address changes needs a restart.
 `Smtp::new(read_cap, write_cap)` makes one slot per outgoing table entry, with its buffers.
+The reply buffer grows within `[limits.smtp_reply] max`. A reply longer than the free buffer grows it and reads again, so a long EHLO reply arrives without waiting for a new socket edge.
 `Smtp::start` keeps the bytes from `Message::formatted()` and begins a non-blocking connect.
 `fd()` is `None` while the slot has no connection.
 The service registers `fd()` with `interest()`, keeps the deadline from `deadline()` in its outgoing `Timeouts`, and calls `drive()` when the token fires.
@@ -390,6 +391,7 @@ The connection's state is one `enum` of steps inside the slot, so the service's 
 
 **client::Endpoint.** `Endpoint::new(url, tls)` runs at start: it parses an `http` or `https` URL, resolves the host once, and keeps the `Host` header, path and query.
 `post_form(&mut up, fields, deadline)` encodes `application/x-www-form-urlencoded` straight into the `Upstream`'s request buffer and starts it, and the service drives the `Upstream` as it drives an `Smtp`.
+The `Upstream` drains each TLS record as it arrives and grows its read buffer within `[limits.upstream_read] max`, so a response larger than the first buffer arrives whole.
 Each call opens one connection and sends `Connection: close`.
 `m6_core::rustls` re-exports the TLS library, so a service names `m6_core::rustls::ClientConfig` and takes no `rustls` dependency of its own.
 
