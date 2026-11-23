@@ -60,7 +60,7 @@ resolver = "2"
 # plain version is a release. The build identity adds the commit and dirty flag
 # as SemVer build metadata at compile time, which is why this line stays a plain
 # Cargo version with no `+`.
-version      = "1.17.0-rc.1"
+version      = "1.17.0-rc.2"
 edition      = "2021"
 # The oldest toolchain we test. Declared because declaring one and not testing
 # it is a claim rather than a fact: CI builds the whole workspace with exactly

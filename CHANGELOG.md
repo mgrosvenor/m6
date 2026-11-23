@@ -13,6 +13,7 @@ The heading is the version, and a number would break the pattern `tag.sh` and CI
 
 The released versions, newest first:
 
+- [1.17.0-rc.2, 2026-11-24](#1170-rc2-2026-11-24)
 - [1.17.0-rc.1, 2026-11-23](#1170-rc1-2026-11-23)
 - [1.16.0-rc.1, 2026-11-18](#1160-rc1-2026-11-18)
 - [1.15.0, 2026-10-29](#1150-2026-10-29)
@@ -38,7 +39,7 @@ The released versions, newest first:
 - [1.0.0, 2026-09-14](#100-2026-09-14)
 - [0.2.0 and earlier, 2026-03-15 and before](#020-and-earlier-2026-03-15-and-before)
 
-## Unreleased
+## 1.17.0-rc.2, 2026-11-24
 
 **JavaScript minification drops comments and line breaks.**
 The code generator now runs with comments disabled instead of keeping normal, JSDoc and annotation comments. Legal comments (`//!`, `/*!`, `@license` and `@preserve`) stay inline, because a licence notice is a requirement on a served file.
