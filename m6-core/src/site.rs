@@ -622,6 +622,12 @@ impl Site {
         self.state.config.server.read_timeout
     }
 
+    /// How long shutdown waits for accepted requests, from `[server]
+    /// drain_timeout_s`.
+    pub fn drain_timeout(&self) -> Duration {
+        self.state.config.server.drain_timeout
+    }
+
     pub fn socket_mode(&self) -> u32 {
         self.state.config.server.socket_mode
     }

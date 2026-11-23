@@ -92,6 +92,14 @@ pub struct ServerConfig {
     /// holds its connection slot until it disconnects. Configure
     /// `read_timeout_s = 0` to ask for that deliberately.
     pub read_timeout: Option<std::time::Duration>,
+    /// How long shutdown waits for accepted requests to finish, from
+    /// `drain_timeout_s`.
+    ///
+    /// When it passes, the service warns with how many requests were still
+    /// running and exits anyway, so a deploy finishes inside the supervisor's
+    /// own stop timeout instead of being killed mid-response. Zero waits for
+    /// nothing.
+    pub drain_timeout: std::time::Duration,
     /// Mode applied to the unix socket after bind, from `socket_mode`.
     ///
     /// Written the way systemd writes it, as an octal string:
@@ -645,7 +653,11 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
         );
     }
     check_keys(&tv, "params_cache", &["size"])?;
-    check_keys(&tv, "server", &["read_timeout_s", "socket_mode"])?;
+    check_keys(
+        &tv,
+        "server",
+        &["read_timeout_s", "drain_timeout_s", "socket_mode"],
+    )?;
     // The one `[log]` parse, kept here so a bad log table is refused before the
     // rest of the file is read.
     let log = LogConfig::from_toml(tv.get("log"))?;
@@ -695,6 +707,10 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
             0 => None,
             secs => Some(std::time::Duration::from_secs(secs)),
         };
+    let drain_timeout = std::time::Duration::from_secs(server_secs(
+        "drain_timeout_s",
+        crate::server::DEFAULT_DRAIN_TIMEOUT_SECS,
+    )?);
 
     // An octal string, as systemd writes it. See `ServerConfig::socket_mode`
     // for why this is not an integer.
@@ -790,6 +806,7 @@ fn parse_config(tv: toml::Value, _site_dir: &Path) -> anyhow::Result<RendererCon
         params_cache: ParamsCacheConfig { size: pc_size },
         server: ServerConfig {
             read_timeout,
+            drain_timeout,
             socket_mode,
         },
         compression,
@@ -1188,14 +1205,28 @@ template = "templates/home.html"
             cfg.server.read_timeout,
             Some(std::time::Duration::from_secs(30))
         );
+        assert_eq!(cfg.server.drain_timeout, std::time::Duration::from_secs(30));
         assert_eq!(cfg.server.socket_mode, 0o660);
     }
 
     #[test]
     fn server_keys_are_read() {
-        let s = server_cfg("read_timeout_s = 5\nsocket_mode = \"0600\"").unwrap();
+        let s =
+            server_cfg("read_timeout_s = 5\ndrain_timeout_s = 7\nsocket_mode = \"0600\"").unwrap();
         assert_eq!(s.read_timeout, Some(std::time::Duration::from_secs(5)));
+        assert_eq!(s.drain_timeout, std::time::Duration::from_secs(7));
         assert_eq!(s.socket_mode, 0o600);
+    }
+
+    /// `drain_timeout_s = 0` waits for nothing, which is how a service asks
+    /// for the stop-at-once behaviour that every service had while the drain
+    /// was removed.
+    #[test]
+    fn a_zero_drain_timeout_waits_for_nothing() {
+        assert_eq!(
+            server_cfg("drain_timeout_s = 0").unwrap().drain_timeout,
+            std::time::Duration::ZERO
+        );
     }
 
     /// Zero is the documented way to ask for the old no-timeout behaviour, so
@@ -1232,6 +1263,8 @@ template = "templates/home.html"
         for body in [
             "read_timeout_s = -1",
             "read_timeout_s = \"30\"",
+            "drain_timeout_s = -1",
+            "drain_timeout_s = \"30\"",
             "socket_mode = 660",
             "socket_mode = \"rw-rw----\"",
             "socket_mode = \"0999\"",

@@ -8,6 +8,9 @@ pub mod config;
 pub mod cookie;
 pub mod dict;
 pub mod dns;
+/// Accepted work, and the shutdown that waits for it. See `[server]
+/// drain_timeout_s`.
+pub mod drain;
 pub mod error;
 pub mod event;
 pub mod firewall;

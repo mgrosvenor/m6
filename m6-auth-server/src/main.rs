@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use m6_core::drain::{Drain, Step};
 use m6_core::event::{LoopTrace, Slots, Timeouts};
 use m6_core::h1::{head_slots, Flush, Read, ServerConn};
 use m6_core::net::listen_unix;
@@ -392,6 +393,11 @@ fn main() -> Result<()> {
     let mut conns = Slots::new(initial, ceiling, move || {
         ServerConn::with_limits(&read_limit, &write_limit)
     });
+    // Accepted work and the shutdown drain. The count is taken at the accept,
+    // so a request the listener took and no turn has read yet still holds
+    // shutdown open.
+    let drain_timeout = site.drain_timeout();
+    let mut drain = Drain::new(drain_timeout, initial);
     // A config with `read_timeout_s = 0` keeps the zero duration and never
     // touches a deadline.
     let mut deadlines = Timeouts::new(initial, read_timeout.unwrap_or(Duration::ZERO));
@@ -412,9 +418,14 @@ fn main() -> Result<()> {
         // The nearer of the read deadlines, a deferred request's retry and the
         // tick. An interrupted wait is not an error: wait again. mio passes
         // EINTR up rather than retrying.
-        let wait = deadlines
+        let mut wait = deadlines
             .timeout(m6_core::platform::now(), TICK)
             .min(busy_timeouts.timeout(m6_core::platform::now(), TICK));
+        // While draining, the wait is capped at the deadline: nothing else
+        // would wake the loop to notice it.
+        if let Some(left) = drain.poll_timeout(m6_core::platform::now()) {
+            wait = wait.min(left);
+        }
         match poll.poll(&mut events, Some(wait)) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -454,6 +465,7 @@ fn main() -> Result<()> {
                             busy_timeouts.grow(new_len);
                             retries.resize_with(new_len, || None);
                             conn_sides.resize_with(new_len, || Side::Login);
+                            drain.grown(new_len);
                         }
                         let mut stream = match listener.accept() {
                             Ok((stream, _)) => stream,
@@ -487,6 +499,10 @@ fn main() -> Result<()> {
                             deadlines.touch(Token(taken.key), now);
                         }
                         conns.get_mut(taken.key).attach(stream);
+                        // Counted here, at the accept, not when a turn reads
+                        // the request: the window between the two is what
+                        // issue #338 measured.
+                        drain.begin(taken.key);
                     }
                     if conns.is_full() {
                         // At the ceiling: stop accepting on both listeners. New
@@ -507,14 +523,29 @@ fn main() -> Result<()> {
                     }
                 }
                 SIGNALS => {
-                    let mut stop = false;
                     while let Some(signal) = signals.read() {
                         if lifecycle.on_signal(signal) == Action::Stop {
-                            stop = true;
+                            // Stop accepting on both listeners now, then answer
+                            // what was already accepted, until the count is
+                            // zero or the deadline passes. Nothing accepted
+                            // means nothing to wait for.
+                            for side in Side::BOTH {
+                                if !accepting[side.index()] {
+                                    continue;
+                                }
+                                let listener = match side {
+                                    Side::Login => login_listener.as_mut(),
+                                    Side::Check => check_listener.as_mut(),
+                                };
+                                if let Some(listener) = listener {
+                                    poll.registry().deregister(listener)?;
+                                }
+                                accepting[side.index()] = false;
+                            }
+                            if drain.start(now) {
+                                break 'run;
+                            }
                         }
-                    }
-                    if stop {
-                        break 'run;
                     }
                 }
                 LOG => m6_core::log::flush(),
@@ -523,6 +554,10 @@ fn main() -> Result<()> {
                 // deferred request is not read: its client is waiting for that
                 // answer.
                 Token(k) => {
+                    // A turn on the connection is accepted work. An idle
+                    // connection that sent another request is counted here,
+                    // so a request that arrives during the drain is answered.
+                    drain.begin(k);
                     if retries[k].is_some() {
                         continue;
                     }
@@ -540,6 +575,12 @@ fn main() -> Result<()> {
                                 was,
                                 now,
                             )?;
+                            // Answered and holding nothing, with no deferred
+                            // request: idle, so it stops holding the drain.
+                            let conn = conns.get(k);
+                            if conn.served() > 0 && !conn.pending() && retries[k].is_none() {
+                                drain.end(k);
+                            }
                         }
                         _ => close(
                             &poll,
@@ -547,6 +588,7 @@ fn main() -> Result<()> {
                             &mut deadlines,
                             &mut busy_timeouts,
                             &mut retries,
+                            &mut drain,
                             k,
                         )?,
                     }
@@ -605,6 +647,10 @@ fn main() -> Result<()> {
                 Ok(true) => {
                     touch_retry(&mut busy_timeouts, &retries, k);
                     after_turn(&poll, &mut conns, &mut deadlines, read_timeout, k, was, now)?;
+                    let conn = conns.get(k);
+                    if conn.served() > 0 && !conn.pending() && retries[k].is_none() {
+                        drain.end(k);
+                    }
                 }
                 _ => close(
                     &poll,
@@ -612,6 +658,7 @@ fn main() -> Result<()> {
                     &mut deadlines,
                     &mut busy_timeouts,
                     &mut retries,
+                    &mut drain,
                     k,
                 )?,
             }
@@ -626,12 +673,31 @@ fn main() -> Result<()> {
                 &mut deadlines,
                 &mut busy_timeouts,
                 &mut retries,
+                &mut drain,
                 k,
             )?;
         }
+
+        // The drain: leave the turn the last accepted request finishes, or at
+        // the deadline, and say how many were left when it was the deadline.
+        if drain.draining() {
+            match drain.step(m6_core::platform::now()) {
+                Step::Draining => {}
+                Step::Finished => break 'run,
+                Step::DeadlinePassed(unfinished) => {
+                    m6_core::log::warn!(
+                        unfinished,
+                        timeout_s = drain_timeout.as_secs(),
+                        "drain deadline passed with requests still in flight"
+                    );
+                    break 'run;
+                }
+            }
+        }
+
         // A slot came free while the table was full: accept again on every
-        // listener that was deregistered.
-        if !conns.is_full() {
+        // listener that was deregistered. Never while draining.
+        if !drain.draining() && !conns.is_full() {
             for side in Side::BOTH {
                 if accepting[side.index()] {
                     continue;
@@ -663,10 +729,11 @@ fn main() -> Result<()> {
     }
 
     // ── stop: blocking and allocation are fine ───────────────────────────
-    // Connections still open are dropped: a SIGTERM does not wait for a
-    // request in flight. `complete` removes the socket it was given and logs
-    // the line. The check socket is removed here when the primary was that
-    // socket, which is the case in both-listener and login-listener modes.
+    // Reaching here means nothing accepted is left, or the drain deadline
+    // passed and the warning already named how many were. `complete` removes
+    // the socket it was given and logs the line. The check socket is removed
+    // here when the primary was that socket, which is the case in
+    // both-listener and login-listener modes.
     lifecycle.complete();
     if bind.check {
         let _ = std::fs::remove_file(&check_socket);
@@ -852,16 +919,18 @@ fn touch_retry(busy_timeouts: &mut Timeouts, retries: &[Option<Retry>], k: usize
     }
 }
 
-/// Close a connection: forget any deferred request and its retry deadline, then
-/// detach and free the slot.
+/// Close a connection: stop counting its accepted work, forget any deferred
+/// request and its retry deadline, then detach and free the slot.
 fn close(
     poll: &Poll,
     conns: &mut Slots<ServerConn>,
     deadlines: &mut Timeouts,
     busy_timeouts: &mut Timeouts,
     retries: &mut [Option<Retry>],
+    drain: &mut Drain,
     k: usize,
 ) -> io::Result<()> {
+    drain.end(k);
     busy_timeouts.clear(Token(k));
     retries[k] = None;
     m6_core::h1::close_conn(poll, conns, deadlines, k)

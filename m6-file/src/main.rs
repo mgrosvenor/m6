@@ -15,6 +15,9 @@
 //! event. Each connection slot keeps its own buffers, made at start. A file
 //! larger than a slot's output buffer is streamed: one `read(2)` of the file
 //! per writable turn, so a slow client holds its own connection and no other.
+//!
+//! A stop closes the listener and answers what was already accepted, up to
+//! `[server] drain_timeout_s`, then exits. See [`m6_core::drain`].
 
 #![deny(unsafe_code)]
 
@@ -26,6 +29,7 @@ use std::io;
 use std::time::Duration;
 
 use anyhow::Result;
+use m6_core::drain::{Drain, Step};
 use m6_core::event::{LoopTrace, Slots, Timeouts};
 use m6_core::h1::{head_slots, Flush, Read, ServerConn};
 use m6_core::net::listen_unix;
@@ -143,6 +147,11 @@ fn main() -> Result<()> {
     let mut conns = Slots::new(initial, ceiling, move || {
         ServerConn::with_limits(&read_limit, &write_limit)
     });
+    // Accepted work and the shutdown drain. The count is taken at the accept,
+    // so a request the listener took and no turn has read yet still holds
+    // shutdown open.
+    let drain_timeout = site.drain_timeout();
+    let mut drain = Drain::new(drain_timeout, initial);
     // A config with `read_timeout_s = 0` keeps the zero duration and never
     // touches a deadline.
     let mut deadlines = Timeouts::new(initial, read_timeout.unwrap_or(Duration::ZERO));
@@ -154,12 +163,15 @@ fn main() -> Result<()> {
 
     // ── run: nothing blocks ──────────────────────────────────────────────
     'run: loop {
+        // While draining, the wait is capped at the deadline: nothing else
+        // would wake the loop to notice it.
+        let mut wait = deadlines.timeout(m6_core::platform::now(), TICK);
+        if let Some(left) = drain.poll_timeout(m6_core::platform::now()) {
+            wait = wait.min(left);
+        }
         // An interrupted wait is not an error: wait again. mio passes EINTR
         // up rather than retrying.
-        match poll.poll(
-            &mut events,
-            Some(deadlines.timeout(m6_core::platform::now(), TICK)),
-        ) {
+        match poll.poll(&mut events, Some(wait)) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e.into()),
@@ -184,6 +196,7 @@ fn main() -> Result<()> {
                     while let Some(taken) = conns.take() {
                         if let Some(new_len) = taken.grew_to {
                             deadlines.grow(new_len);
+                            drain.grown(new_len);
                         }
                         let mut stream = match listener.accept() {
                             Ok((stream, _)) => stream,
@@ -216,6 +229,10 @@ fn main() -> Result<()> {
                             deadlines.touch(Token(taken.key), now);
                         }
                         conns.get_mut(taken.key).attach(stream);
+                        // Counted here, at the accept, not when a turn reads
+                        // the request: the window between the two is what
+                        // issue #338 measured.
+                        drain.begin(taken.key);
                     }
                     if conns.is_full() {
                         // At the ceiling: stop accepting. New clients wait in
@@ -225,20 +242,27 @@ fn main() -> Result<()> {
                     }
                 }
                 SIGNALS => {
-                    let mut stop = false;
                     while let Some(signal) = signals.read() {
                         if lifecycle.on_signal(signal) == Action::Stop {
-                            stop = true;
+                            // Stop accepting now, then answer what was already
+                            // accepted, until the count is zero or the
+                            // deadline passes. Nothing accepted means nothing
+                            // to wait for.
+                            stop_accepting(poll.registry(), &mut listener, &mut accepting)?;
+                            if drain.start(now) {
+                                break 'run;
+                            }
                         }
-                    }
-                    if stop {
-                        break 'run;
                     }
                 }
                 LOG => m6_core::log::flush(),
                 // One connection's turn, then wait for what it still needs,
                 // touch its deadline, or close it.
                 Token(k) => {
+                    // A turn on the connection is accepted work. An idle
+                    // connection that sent another request is counted here,
+                    // so a request that arrives during the drain is answered.
+                    drain.begin(k);
                     let conn = conns.get_mut(k);
                     let was = conn.interest();
                     match turn(conn, &mut site) {
@@ -256,8 +280,13 @@ fn main() -> Result<()> {
                             if read_timeout.is_some() {
                                 deadlines.touch(Token(k), now);
                             }
+                            // Answered and holding nothing: idle, so it stops
+                            // holding the drain.
+                            if conn.served() > 0 && !conn.pending() {
+                                drain.end(k);
+                            }
                         }
-                        _ => m6_core::h1::close_conn(&poll, &mut conns, &mut deadlines, k)?,
+                        _ => close(&poll, &mut conns, &mut deadlines, &mut drain, k)?,
                     }
                 }
             }
@@ -272,10 +301,29 @@ fn main() -> Result<()> {
         // Close every connection whose read deadline passed, with no
         // response: it did not send a request in time.
         while let Some(Token(k)) = deadlines.expired(m6_core::platform::now()) {
-            m6_core::h1::close_conn(&poll, &mut conns, &mut deadlines, k)?;
+            close(&poll, &mut conns, &mut deadlines, &mut drain, k)?;
         }
-        // A slot came free while the table was full: accept again.
-        if !accepting && !conns.is_full() {
+
+        // The drain: leave the turn the last accepted request finishes, or at
+        // the deadline, and say how many were left when it was the deadline.
+        if drain.draining() {
+            match drain.step(m6_core::platform::now()) {
+                Step::Draining => {}
+                Step::Finished => break 'run,
+                Step::DeadlinePassed(unfinished) => {
+                    m6_core::log::warn!(
+                        unfinished,
+                        timeout_s = drain_timeout.as_secs(),
+                        "drain deadline passed with requests still in flight"
+                    );
+                    break 'run;
+                }
+            }
+        }
+
+        // A slot came free while the table was full: accept again. Never
+        // while draining: the listener stays closed.
+        if !accepting && !drain.draining() && !conns.is_full() {
             poll.registry()
                 .register(&mut listener, LISTENER, Interest::READABLE)?;
             accepting = true;
@@ -296,11 +344,37 @@ fn main() -> Result<()> {
     }
 
     // ── stop: blocking and allocation are fine ───────────────────────────
-    // Connections still open are dropped: a SIGTERM does not wait for a
-    // request in flight. `complete` removes the socket and logs the line.
+    // Reaching here means nothing accepted is left, or the drain deadline
+    // passed and the warning already named how many were. `complete` removes
+    // the socket and logs the line.
     lifecycle.complete();
     m6_core::log::stop()?;
     Ok(())
+}
+
+/// Stop accepting, so new clients wait in the kernel's backlog.
+fn stop_accepting(
+    registry: &m6_core::platform::Registry,
+    listener: &mut m6_core::platform::net::UnixListener,
+    accepting: &mut bool,
+) -> io::Result<()> {
+    if *accepting {
+        registry.deregister(listener)?;
+        *accepting = false;
+    }
+    Ok(())
+}
+
+/// Close one connection and stop counting its accepted work.
+fn close(
+    poll: &Poll,
+    conns: &mut Slots<ServerConn>,
+    deadlines: &mut Timeouts,
+    drain: &mut Drain,
+    k: usize,
+) -> io::Result<()> {
+    drain.end(k);
+    m6_core::h1::close_conn(poll, conns, deadlines, k)
 }
 
 /// One connection's turn: read, answer and write until the socket would
