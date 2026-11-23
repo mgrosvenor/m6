@@ -39,6 +39,39 @@ The released versions, newest first:
 
 ---
 
+## 1.17.0-rc.1, 2026-11-23
+
+**Templates are named for what they produce, and the loader reads only `.tmpl` files.**
+A template file is `page.html.tmpl`, `icon.svg.tmpl` or `robots.txt.tmpl`, and the part before `.tmpl` is the output it produces.
+The loader walks every subdirectory of `templates/`, so an icon can live in `templates/icons/`.
+The Tera name is the full path with the suffix kept, so an include names the file it includes: `{% include "templates/icons/logo.svg.tmpl" %}`.
+This is a breaking change: a file that does not end `.tmpl` is no longer a template, and there is no compatibility shim.
+The version is `1.17.0-rc.1`, a develop build: `main` is still 1.15.0 and there is no `v1.16.0` tag.
+Every example and test fixture in this repository is renamed in the same commit.
+
+### Migration
+
+Rename every template file by appending `.tmpl` to its name: `templates/page.html` becomes `templates/page.html.tmpl`, and `templates/icon.svg` becomes `templates/icon.svg.tmpl`.
+Update every `template` value in every route config, every `{% extends %}` and `{% include %}` name, and every `Response::render` and `Response::render_with` call to the new name.
+A file that keeps its old name is never loaded, so a route that still names it fails at the first render with `template not found`.
+Templates in subdirectories are found by the updated loader, so a renamed icon can move to `templates/icons/` in the same change.
+
+### Changed
+
+**Both template builders load only `.tmpl` files, recursively.**
+`build_tera` walks every subdirectory of `templates/`.
+`build_tera_from_paths` walks the whole template root as well, because an include may cross folders, and then loads any named template outside the root.
+Tera chooses autoescaping from the template name, and the name now ends `.tmpl`, so the builders set the suffixes explicitly: `.html.tmpl`, `.htm.tmpl` and `.xml.tmpl` escape, and `.svg.tmpl`, `.txt.tmpl` and `.json.tmpl` do not.
+A page therefore renders the same bytes under its new name as it did under its old `.html` name.
+
+### Verified
+
+- `a_template_in_a_subfolder_is_found`, `a_file_without_the_tmpl_suffix_is_not_a_template` and `an_include_across_folders_renders` in `m6-core/src/template.rs`.
+- `build_tera_from_paths_loads_the_whole_root_and_only_tmpl_files` and `autoescaping_follows_the_output_part_of_the_name`, which fails if the autoescape suffixes are left at Tera's defaults.
+- The full workspace suite, with every example and fixture template renamed.
+
+---
+
 ## 1.16.0-rc.1, 2026-11-18
 
 **m6 keeps one log stream, and the monitoring endpoints and their credentials are gone.**

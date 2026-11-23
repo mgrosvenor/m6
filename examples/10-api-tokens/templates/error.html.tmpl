@@ -1,0 +1,9 @@
+{% extends "templates/base.html.tmpl" %}
+{% block title %}{{ query.status }} · {{ site_name }}{% endblock %}
+{% block content %}
+  <h1>{{ query.status }}</h1>
+  {% if query.from is defined %}
+    <p>Path: <code>{{ query.from }}</code></p>
+  {% endif %}
+  <a href="/">Return home</a>
+{% endblock %}

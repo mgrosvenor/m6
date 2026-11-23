@@ -20,8 +20,12 @@ use serde_json::Value;
 use tera::Tera;
 
 /// Initialise Tera with all templates under `site_dir/templates/` and register custom filters.
-/// Templates are registered under paths relative to `site_dir` so that
-/// `Response::render_with("templates/foo.html", …)` resolves correctly.
+///
+/// Only files ending `.tmpl` are templates, and every subdirectory is walked.
+/// The part before the suffix names the output (`page.html.tmpl` renders
+/// `page.html`), and the template is registered under its full path relative to
+/// `site_dir`, suffix kept, so `Response::render_with("templates/page.html.tmpl", …)`
+/// resolves and an include names the file it includes.
 pub fn build_tera(site_dir: &Path) -> anyhow::Result<Tera> {
     let mut contents: Vec<(String, String)> = Vec::new();
     let templates_dir = site_dir.join("templates");
@@ -29,7 +33,7 @@ pub fn build_tera(site_dir: &Path) -> anyhow::Result<Tera> {
         collect_templates(site_dir, &templates_dir, &mut contents)?;
     }
 
-    let mut tera = Tera::default();
+    let mut tera = new_tera();
     let pairs: Vec<(&str, &str)> = contents
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -40,7 +44,13 @@ pub fn build_tera(site_dir: &Path) -> anyhow::Result<Tera> {
     Ok(tera)
 }
 
-/// Recursively collect all template files under `dir`, keyed by path relative to `site_dir`.
+/// A file is a template when its name ends in `.tmpl`.
+fn is_template(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("tmpl")
+}
+
+/// Recursively collect every `.tmpl` file under `dir`, keyed by path relative to
+/// `site_dir`, the suffix included.
 fn collect_templates(
     site_dir: &Path,
     dir: &Path,
@@ -52,14 +62,12 @@ fn collect_templates(
         let path = entry.path();
         if path.is_dir() {
             collect_templates(site_dir, &path, out)?;
-        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if matches!(ext, "html" | "txt" | "xml" | "json") {
-                if let Ok(rel) = path.strip_prefix(site_dir) {
-                    if let Some(name) = rel.to_str() {
-                        let content = std::fs::read_to_string(&path)
-                            .with_context(|| format!("reading template {}", path.display()))?;
-                        out.push((name.to_string(), content));
-                    }
+        } else if is_template(&path) {
+            if let Ok(rel) = path.strip_prefix(site_dir) {
+                if let Some(name) = rel.to_str() {
+                    let content = std::fs::read_to_string(&path)
+                        .with_context(|| format!("reading template {}", path.display()))?;
+                    out.push((name.to_string(), content));
                 }
             }
         }
@@ -68,52 +76,42 @@ fn collect_templates(
 }
 
 /// Build a Tera instance from explicit template paths (relative to site_dir).
-/// Also loads all *.html/*.txt/*.xml/*.json siblings in each referenced template's
-/// directory so that `{% extends %}` and `{% include %}` work correctly.
+///
+/// The whole template root (`site_dir/templates`) is loaded, recursively,
+/// because an include crosses directories: `templates/_head.html.tmpl` includes
+/// `templates/icons/logo.svg.tmpl`. A named template that sits outside the root
+/// is loaded as well. Only `.tmpl` files are templates.
 pub fn build_tera_from_paths(site_dir: &Path, template_paths: &[String]) -> anyhow::Result<Tera> {
     use std::collections::HashSet;
 
-    // Collect unique directories that contain route-referenced templates.
-    let mut dirs: HashSet<std::path::PathBuf> = HashSet::new();
-    for rel_path in template_paths {
-        let abs = site_dir.join(rel_path);
-        if let Some(parent) = abs.parent() {
-            dirs.insert(parent.to_path_buf());
-        }
-    }
-
-    // Walk each directory and collect all template files.
-    let mut all_paths: Vec<String> = Vec::new();
-    for dir in &dirs {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                        if matches!(ext, "html" | "txt" | "xml" | "json") {
-                            if let Ok(rel) = path.strip_prefix(site_dir) {
-                                if let Some(s) = rel.to_str() {
-                                    all_paths.push(s.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Collect all (name, content) pairs and add as a batch so Tera can resolve
-    // `extends`/`include` chains regardless of insertion order.
+    // An include may reach into any subdirectory of the root, so one walk of
+    // the root covers more than the directories the named templates sit in.
     let mut contents: Vec<(String, String)> = Vec::new();
-    for rel_path in &all_paths {
+    let root = site_dir.join("templates");
+    if root.is_dir() {
+        collect_templates(site_dir, &root, &mut contents)?;
+    }
+
+    // A route may name a template outside the template root. Load one the walk
+    // did not already reach.
+    let mut seen: HashSet<String> = contents.iter().map(|(name, _)| name.clone()).collect();
+    for rel_path in template_paths {
+        if seen.contains(rel_path) {
+            continue;
+        }
         let abs = site_dir.join(rel_path);
+        if !abs.is_file() || !is_template(&abs) {
+            continue;
+        }
         let content = std::fs::read_to_string(&abs)
             .with_context(|| format!("reading template {}", abs.display()))?;
+        seen.insert(rel_path.clone());
         contents.push((rel_path.clone(), content));
     }
 
-    let mut tera = Tera::default();
+    // Add as a batch so Tera can resolve `extends`/`include` chains regardless
+    // of insertion order.
+    let mut tera = new_tera();
     let pairs: Vec<(&str, &str)> = contents
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -122,6 +120,27 @@ pub fn build_tera_from_paths(site_dir: &Path, template_paths: &[String]) -> anyh
         .context("compiling templates")?;
     register_filters(&mut tera, site_dir);
     Ok(tera)
+}
+
+/// A Tera instance that escapes the same output kinds it did before the rename.
+///
+/// Tera chooses autoescaping from the template name's suffix, and every name now
+/// ends `.tmpl`, which it does not know. The explicit list restores what the old
+/// names got by suffix: `.html.tmpl`, `.htm.tmpl` and `.xml.tmpl` escape as
+/// `.html`, `.htm` and `.xml` did, and `.txt.tmpl` and `.json.tmpl` stay
+/// unescaped as they were.
+///
+/// Two kinds changed class. An icon was `*.svg.html` and the stylesheet was
+/// `_style.css.html`, so both ended `.html` and were escaped; `*.svg.tmpl` and
+/// `*.css.tmpl` are not. Nothing observable changes, because neither is ever
+/// rendered as a root: they are included from an `.html.tmpl` page, and Tera
+/// renders an include with the root's escaping flag, so a value in an icon or
+/// the stylesheet is escaped exactly as before. Rendered as a root instead, the
+/// same file would now emit its substitutions raw.
+fn new_tera() -> Tera {
+    let mut tera = Tera::default();
+    tera.autoescape_on(vec![".html.tmpl", ".htm.tmpl", ".xml.tmpl"]);
+    tera
 }
 
 /// Map of asset path (relative to `assets/`) to a short content hash.
@@ -521,6 +540,165 @@ mod tests {
         ctx.insert("content", "one two three four five");
         let out = tera.render("t", &ctx).unwrap();
         assert!(out.starts_with("one two three"));
+    }
+}
+
+#[cfg(test)]
+mod template_loader_tests {
+    use super::{build_tera, build_tera_from_paths};
+    use std::path::Path;
+
+    fn write(root: &Path, rel: &str, body: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn names(tera: &tera::Tera) -> Vec<String> {
+        tera.get_template_names().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn a_template_in_a_subfolder_is_found() {
+        let site = tempfile::tempdir().unwrap();
+        write(
+            site.path(),
+            "templates/icons/logo.svg.tmpl",
+            r#"<svg viewBox="0 0 1 1"><path d="M0 0"/></svg>"#,
+        );
+
+        let tera = build_tera(site.path()).unwrap();
+        assert!(
+            names(&tera).contains(&"templates/icons/logo.svg.tmpl".to_string()),
+            "subfolder template is not registered: {:?}",
+            names(&tera)
+        );
+        let out = tera
+            .render("templates/icons/logo.svg.tmpl", &tera::Context::new())
+            .unwrap();
+        assert_eq!(out, r#"<svg viewBox="0 0 1 1"><path d="M0 0"/></svg>"#);
+    }
+
+    #[test]
+    fn a_file_without_the_tmpl_suffix_is_not_a_template() {
+        let site = tempfile::tempdir().unwrap();
+        write(site.path(), "templates/page.html", "the old name");
+        write(site.path(), "templates/page.html.tmpl", "the new name");
+
+        let tera = build_tera(site.path()).unwrap();
+        let registered = names(&tera);
+        assert!(
+            registered.contains(&"templates/page.html.tmpl".to_string()),
+            "{registered:?}"
+        );
+        assert!(
+            !registered.contains(&"templates/page.html".to_string()),
+            "a .html file was loaded as a template: {registered:?}"
+        );
+        assert!(tera
+            .render("templates/page.html", &tera::Context::new())
+            .is_err());
+        assert_eq!(
+            tera.render("templates/page.html.tmpl", &tera::Context::new())
+                .unwrap(),
+            "the new name"
+        );
+    }
+
+    #[test]
+    fn an_include_across_folders_renders() {
+        let site = tempfile::tempdir().unwrap();
+        write(
+            site.path(),
+            "templates/icons/logo.svg.tmpl",
+            "<svg>logo</svg>",
+        );
+        write(
+            site.path(),
+            "templates/_head.html.tmpl",
+            r#"{% include "templates/icons/logo.svg.tmpl" %}"#,
+        );
+
+        let named = vec!["templates/_head.html.tmpl".to_string()];
+        let tera = build_tera_from_paths(site.path(), &named).unwrap();
+        let out = tera
+            .render("templates/_head.html.tmpl", &tera::Context::new())
+            .unwrap();
+        assert_eq!(out, "<svg>logo</svg>");
+    }
+
+    /// `build_tera_from_paths` used to load only the named templates' own
+    /// directories. It now loads the template root, so a renderer can reach an
+    /// include in any subfolder and cannot see a file that is not a template.
+    #[test]
+    fn build_tera_from_paths_loads_the_whole_root_and_only_tmpl_files() {
+        let site = tempfile::tempdir().unwrap();
+        write(site.path(), "templates/page.html.tmpl", "page");
+        write(site.path(), "templates/icons/logo.svg.tmpl", "logo");
+        write(site.path(), "templates/page.html", "ignored");
+
+        let named = vec!["templates/page.html.tmpl".to_string()];
+        let tera = build_tera_from_paths(site.path(), &named).unwrap();
+        let registered = names(&tera);
+        assert!(
+            registered.contains(&"templates/icons/logo.svg.tmpl".to_string()),
+            "{registered:?}"
+        );
+        assert!(
+            !registered.contains(&"templates/page.html".to_string()),
+            "{registered:?}"
+        );
+    }
+
+    /// Tera escapes by suffix, and the suffix is now `.tmpl`. Without the
+    /// explicit list every HTML template would stop escaping, which changes the
+    /// bytes of every page that renders a value.
+    ///
+    /// The suffix decides escaping for a *root* render. An include is rendered
+    /// by the root's processor and inherits the root's flag, so an icon included
+    /// from an `.html.tmpl` page is escaped even though an `.svg.tmpl` root is
+    /// not. Both halves are asserted here: production's icons are includes, so
+    /// the root-only assertion teaches the opposite of what they do.
+    #[test]
+    fn autoescaping_follows_the_output_part_of_the_name() {
+        let site = tempfile::tempdir().unwrap();
+        write(site.path(), "templates/page.html.tmpl", "{{ value }}");
+        write(site.path(), "templates/feed.xml.tmpl", "{{ value }}");
+        write(site.path(), "templates/robots.txt.tmpl", "{{ value }}");
+        write(site.path(), "templates/icon.svg.tmpl", "{{ value }}");
+        write(
+            site.path(),
+            "templates/icon-page.html.tmpl",
+            r#"<div>{% include "templates/icon.svg.tmpl" %}</div>"#,
+        );
+
+        let tera = build_tera(site.path()).unwrap();
+        let mut ctx = tera::Context::new();
+        ctx.insert("value", "<a & b>");
+
+        assert_eq!(
+            tera.render("templates/page.html.tmpl", &ctx).unwrap(),
+            "&lt;a &amp; b&gt;"
+        );
+        assert_eq!(
+            tera.render("templates/feed.xml.tmpl", &ctx).unwrap(),
+            "&lt;a &amp; b&gt;"
+        );
+        assert_eq!(
+            tera.render("templates/robots.txt.tmpl", &ctx).unwrap(),
+            "<a & b>"
+        );
+        // Root render of an icon: `.svg.tmpl` is not in the escape list.
+        assert_eq!(
+            tera.render("templates/icon.svg.tmpl", &ctx).unwrap(),
+            "<a & b>"
+        );
+        // The same icon as production uses it, included from an HTML page: the
+        // root escapes, so the icon's substitution is escaped too.
+        assert_eq!(
+            tera.render("templates/icon-page.html.tmpl", &ctx).unwrap(),
+            "<div>&lt;a &amp; b&gt;</div>"
+        );
     }
 }
 

@@ -33,7 +33,7 @@ fn socket_mode_for(id: &str, server_section: &str) -> u32 {
              {server_section}\n\
              [[route]]\n\
              path = \"/\"\n\
-             template = \"templates/home.html\"\n\
+             template = \"templates/home.html.tmpl\"\n\
              params = [\"content/pages/index.json\"]\n"
         ),
     )
