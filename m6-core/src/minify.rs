@@ -41,7 +41,7 @@
 //! rather than one a request.
 
 use oxc::allocator::Allocator;
-use oxc::codegen::{Codegen, CodegenOptions};
+use oxc::codegen::{Codegen, CodegenOptions, LegalComment};
 use oxc::minifier::{
     CompressOptions, CompressOptionsUnused, MangleOptions, Minifier, MinifierOptions,
 };
@@ -374,11 +374,14 @@ pub fn try_minify_js_with(
         }),
     };
     let minified = Minifier::new(options).minify(&allocator, &mut program);
+    // The output is the script a browser runs. Normal, JSDoc and annotation
+    // comments do not change behaviour and are dropped. oxc separates legal
+    // comments (`//!`, `/*!`, `@license` and `@preserve`), and those stay inline
+    // because a licence notice is the one comment a served file must keep.
+    let mut codegen_options = CodegenOptions::minify();
+    codegen_options.comments.legal = LegalComment::Inline;
     let code = Codegen::new()
-        .with_options(CodegenOptions {
-            minify: true,
-            ..CodegenOptions::default()
-        })
+        .with_options(codegen_options)
         .with_scoping(minified.scoping)
         .with_private_member_mappings(minified.class_private_mappings)
         .build(&program)

@@ -125,6 +125,54 @@ fn top_level_names_survive() {
     }
 }
 
+/// The output is the script a browser runs. Normal, JSDoc and annotation
+/// comments do not change behaviour, so they are dropped, and oxc puts the
+/// remaining statements on the fewest lines it needs. A legal comment is the
+/// one kind kept: a licence notice is a requirement on the served file, and
+/// oxc separates `/*! ... */`, `//! ...`, `@license` and `@preserve` from the
+/// rest for exactly that reason.
+#[test]
+fn comments_are_dropped_and_only_a_legal_notice_stays() {
+    let script = r#"// leading
+var a = 1; // trailing
+/* block
+   on two lines */
+/** jsdoc */
+function f() {
+  // inner
+  return a + /* inline */ 2;
+}
+globalThis.__result = String(f());
+"#;
+    let (min_text, _) = minified(script);
+    assert_same_behaviour(script);
+    assert!(
+        !min_text.contains("//"),
+        "a line comment survived: {min_text}"
+    );
+    assert!(
+        !min_text.contains("/*"),
+        "a block comment survived: {min_text}"
+    );
+    assert_eq!(
+        min_text.lines().count(),
+        1,
+        "oxc emits this script on one line: {min_text}"
+    );
+
+    let licensed = "/*! MIT License */\n// dropped\nvar b = 2; globalThis.__result = String(b);\n";
+    let (min_text, _) = minified(licensed);
+    assert_same_behaviour(licensed);
+    assert!(
+        min_text.contains("MIT License"),
+        "the legal notice was dropped: {min_text}"
+    );
+    assert!(
+        !min_text.contains("dropped"),
+        "a normal comment survived: {min_text}"
+    );
+}
+
 /// A script the parser cannot read is served as written. That is the fallback
 /// between a minifier bug and a broken or failed response.
 #[test]
