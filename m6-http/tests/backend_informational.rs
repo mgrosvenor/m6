@@ -51,7 +51,7 @@ fn drive_upstream(
     use m6_core::platform::{Events, Poll, Token};
 
     let mut up = m6_core::client::Upstream::new(64 * 1024, 16 * 1024);
-    forward::encode_request(up.request_buf(), req, client_ip, original_host)?;
+    forward::encode_request(up.request_buf(), req, client_ip, original_host, None)?;
     let deadline = std::time::Instant::now() + m6_core::testkit::STARTUP_BOUND;
     up.start(
         &m6_core::client::Addr::Unix(sock.to_path_buf()),

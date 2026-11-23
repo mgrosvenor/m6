@@ -648,7 +648,8 @@ The unit's `LoadCredential` lines deliver the two files, as `m6-user-guide.md` s
 
 The H2C listener speaks HTTP/2 framing over plain TCP, and routes and handles each request as it does a TLS request.
 
-The listener is internal, and trusts the `X-Forwarded-For` a cache node sends, only when `[server] internal_binds` names it.
+The listener is internal, and trusts the `X-Forwarded-For` and the `Via` a cache node sends, only when `[server] internal_binds` names it.
+On the public listener a client's `Via` is dropped at ingress, and every forwarded request carries this node's `[node] name` instead.
 m6-http refuses to start with `h2c_bind` set and `internal_binds` absent.
 `internal_binds = []` declares the listener public.
 An internal listener closes a connection from any address not in `[server] internal_peers`, and m6-http refuses to start with `internal_binds` set and `internal_peers` absent.

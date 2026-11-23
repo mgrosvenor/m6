@@ -88,7 +88,7 @@ fn drive_and_capture(sock: &Path, req: &HttpRequest, client_ip: &str) {
     use m6_core::platform::{Events, Poll, Token};
 
     let mut up = m6_core::client::Upstream::new(64 * 1024, 16 * 1024);
-    forward::encode_request(up.request_buf(), req, client_ip, "example.com").expect("encode");
+    forward::encode_request(up.request_buf(), req, client_ip, "example.com", None).expect("encode");
     let deadline = std::time::Instant::now() + m6_core::testkit::STARTUP_BOUND;
     up.start(
         &m6_core::client::Addr::Unix(sock.to_path_buf()),
@@ -173,7 +173,10 @@ fn finding_2_forged_x_auth_claims_must_not_survive_ingress() {
         http11::ParseResult::Complete(r) => r,
         _ => panic!("expected a complete parse of:\n{raw}"),
     };
-    m6_http_lib::forward::strip_untrusted_inbound(&mut req.headers);
+    m6_http_lib::forward::strip_untrusted_inbound(
+        &mut req.headers,
+        m6_http_lib::forward::ForwardedTrust::Never,
+    );
 
     assert!(
         !req.headers
@@ -205,7 +208,10 @@ fn finding_2b_all_proxy_owned_headers_stripped_at_ingress() {
         http11::ParseResult::Complete(r) => r,
         _ => panic!("expected a complete parse"),
     };
-    m6_http_lib::forward::strip_untrusted_inbound(&mut req.headers);
+    m6_http_lib::forward::strip_untrusted_inbound(
+        &mut req.headers,
+        m6_http_lib::forward::ForwardedTrust::Never,
+    );
 
     for banned in forward::UNTRUSTED_INBOUND {
         assert!(

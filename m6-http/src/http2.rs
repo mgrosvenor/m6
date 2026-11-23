@@ -294,6 +294,11 @@ pub struct H2Headers<'a> {
     fields: &'a [H2Field],
     buf: &'a [u8],
     authority: Option<&'a str>,
+    /// The same trust that decides whether a forwarded client address is
+    /// believed, and the one that decides whether an arriving `Via` is the
+    /// client's claim or a cache node's entry. See
+    /// [`crate::forward::is_untrusted_inbound`].
+    trust: crate::forward::ForwardedTrust,
 }
 
 /// One request decoded on an HTTP/2 connection.
@@ -317,7 +322,11 @@ pub enum RequestRef<'a> {
 }
 
 impl<'a> H2Headers<'a> {
-    fn new(fields: &'a [H2Field], buf: &'a [u8]) -> H2Headers<'a> {
+    fn new(
+        fields: &'a [H2Field],
+        buf: &'a [u8],
+        trust: crate::forward::ForwardedTrust,
+    ) -> H2Headers<'a> {
         let authority = fields
             .iter()
             .find(|f| field_name(buf, f) == ":authority")
@@ -326,13 +335,15 @@ impl<'a> H2Headers<'a> {
             fields,
             buf,
             authority,
+            trust,
         }
     }
 
     /// Every field that may be forwarded, in wire order.
     fn forwarded(&self) -> impl Iterator<Item = (&'a str, &'a str)> + '_ {
-        fields(self.fields, self.buf)
-            .filter(|(k, _)| !k.starts_with(':') && !crate::forward::is_untrusted_inbound(k))
+        fields(self.fields, self.buf).filter(|(k, _)| {
+            !k.starts_with(':') && !crate::forward::is_untrusted_inbound(k, self.trust)
+        })
     }
 
     fn has_explicit_host(&self) -> bool {
@@ -373,7 +384,12 @@ impl m6_core::http::HeaderSource for H2Headers<'_> {
 }
 
 impl<'a> H2Request<'a> {
-    fn new(list: &'a [H2Field], buf: &'a [u8], body: Vec<u8>) -> H2Request<'a> {
+    fn new(
+        list: &'a [H2Field],
+        buf: &'a [u8],
+        body: Vec<u8>,
+        trust: crate::forward::ForwardedTrust,
+    ) -> H2Request<'a> {
         let mut method = "";
         let mut path = "";
         let mut query = None;
@@ -394,7 +410,7 @@ impl<'a> H2Request<'a> {
             method,
             path,
             query,
-            headers: H2Headers::new(list, buf),
+            headers: H2Headers::new(list, buf, trust),
             body,
         }
     }
@@ -2229,7 +2245,7 @@ impl Http2Conn {
         let client_ip =
             crate::forward::attributed_client_ip(forwarded_for, peer_ip, self.forwarded_trust);
 
-        let req = H2Request::new(&headers, &self.decode_buf, body);
+        let req = H2Request::new(&headers, &self.decode_buf, body, self.forwarded_trust);
         match on_request(state, RequestRef::H2(req), client_ip) {
             RequestOutcome::Ready(status, resp_headers, resp_body, _, genid) => {
                 self.dispatch_h2_response(
@@ -3314,7 +3330,13 @@ mod authority_tests {
             let value = super::push_field_bytes(&mut buf, v.as_bytes());
             fields.push(super::H2Field { name, value });
         }
-        super::H2Request::new(&fields, &buf, Vec::new()).into_owned()
+        super::H2Request::new(
+            &fields,
+            &buf,
+            Vec::new(),
+            crate::forward::ForwardedTrust::Never,
+        )
+        .into_owned()
     }
     fn host_of(req: &crate::forward::HttpRequest) -> Option<&str> {
         req.headers

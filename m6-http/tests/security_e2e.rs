@@ -242,7 +242,7 @@ fn h2_get(
         body: vec![],
     };
     let stream_id = conn
-        .dispatch(&request, "127.0.0.1", "127.0.0.1", "127.0.0.1")
+        .dispatch(&request, "127.0.0.1", "127.0.0.1", "127.0.0.1", None)
         .map_err(|e| e.to_string())?;
 
     let mut poll = Poll::new().map_err(|e| e.to_string())?;

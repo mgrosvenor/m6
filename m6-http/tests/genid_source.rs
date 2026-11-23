@@ -362,7 +362,7 @@ impl Fixture {
             headers,
             body: Vec::new(),
         };
-        let stream_id = match conn.dispatch(&req, "localhost", client_ip, "localhost") {
+        let stream_id = match conn.dispatch(&req, "localhost", client_ip, "localhost", None) {
             Ok(id) => id,
             Err(e) => return no_response(format!("h2 dispatch: {e}")),
         };
@@ -401,7 +401,7 @@ impl Fixture {
             headers,
             body: Vec::new(),
         };
-        let stream_id = match conn.dispatch(&req, "127.0.0.1", client_ip, "localhost") {
+        let stream_id = match conn.dispatch(&req, "127.0.0.1", client_ip, "localhost", None) {
             Ok(id) => id,
             Err(e) => return no_response(format!("h2c dispatch: {e}")),
         };

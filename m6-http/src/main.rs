@@ -1211,8 +1211,9 @@ fn on_request_head(
                 _ => unreachable!("bodyless head materializes"),
             };
             // Strip proxy-owned headers before forwarding, exactly as the owned
-            // h1 and h2 paths do.
-            forward::strip_untrusted_inbound(&mut req.headers);
+            // h1 and h2 paths do. The QUIC listener is public, so a `Via` here
+            // is the client's claim.
+            forward::strip_untrusted_inbound(&mut req.headers, forward::ForwardedTrust::Never);
             let enc = m6_core::headers::get(&req.headers[..], "accept-encoding").unwrap_or("");
             let outcome = handle_request(&req, client_ip, enc, state, false, false, registry, None);
             finish_miss(state, outcome, start, version, iface, quic_port)
@@ -2172,7 +2173,7 @@ fn launch_genid_member(
     };
     let encoded = {
         let entry = state.upstreams.get_mut(owner.key);
-        forward::encode_request(entry.upstream.request_buf(), &req, "127.0.0.1", host)
+        forward::encode_request(entry.upstream.request_buf(), &req, "127.0.0.1", host, None)
     };
     if encoded.is_err() {
         state.upstreams.free(owner.key);
@@ -2441,7 +2442,7 @@ fn launch_heartbeat(
                 return Err(UrlDispatchError::NoSlot);
             };
             let host = state.pool_manager.url_backend(backend_idx).host.clone();
-            let id = dispatch_h2(state, registry, backend_idx, &req, "", &host);
+            let id = dispatch_h2(state, registry, backend_idx, &req, "", &host, ViaHop::None);
             state.heartbeat_h2_request = Some(req);
             id?
         }
@@ -4453,8 +4454,12 @@ fn handle_h3_request(
         }
         if let (Ok(k), Ok(v)) = (std::str::from_utf8(name), std::str::from_utf8(h.value())) {
             // Strip proxy-owned headers on ingress — see
-            // `forward::UNTRUSTED_INBOUND`.
-            if m6_http_lib::forward::is_untrusted_inbound(k) {
+            // `forward::UNTRUSTED_INBOUND`. The QUIC listener is public, so a
+            // `Via` here is the client's claim and is dropped.
+            if m6_http_lib::forward::is_untrusted_inbound(
+                k,
+                m6_http_lib::forward::ForwardedTrust::Never,
+            ) {
                 continue;
             }
             fwd_headers.push((k.to_string(), v.to_string()));
@@ -4877,12 +4882,34 @@ fn dispatch_url_backend(
     match state.pool_manager.url_backend(backend_idx).scheme {
         pool::UrlScheme::H2c | pool::UrlScheme::H2s => {
             let original_host = origin_host(req, &state.config).to_string();
-            dispatch_h2(state, registry, backend_idx, req, client_ip, &original_host)
+            dispatch_h2(
+                state,
+                registry,
+                backend_idx,
+                req,
+                client_ip,
+                &original_host,
+                ViaHop::ThisNode,
+            )
         }
         pool::UrlScheme::Http | pool::UrlScheme::Https => {
             launch_url_upstream(state, registry, req, client_ip, backend_idx).map(UpstreamId::Slot)
         }
     }
+}
+
+/// Whether a request heading for a URL backend is one m6-http forwards for a
+/// client, or one it originates itself.
+///
+/// A forwarded request announces this node in `Via` (RFC 9110 7.6.3). A
+/// request m6-http originates, such as the generation ID's heartbeat, has no
+/// received protocol to report and carries no entry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViaHop {
+    /// A forwarded request: this node's name is appended to `Via`.
+    ThisNode,
+    /// A request m6-http originates itself: no `Via` entry.
+    None,
 }
 
 /// Start one request to an h2c or h2s URL backend on its connection pool,
@@ -4894,21 +4921,46 @@ fn dispatch_h2(
     req: &forward::HttpRequest,
     client_ip: &str,
     original_host: &str,
+    via: ViaHop,
 ) -> Result<UpstreamId, UrlDispatchError> {
     if let pool::UrlScheme::H2c = state.pool_manager.url_backend(backend_idx).scheme {
         ensure_h2c_conn(state, backend_idx, registry)?;
+        // Disjoint fields: the name is read from `config`, the authority from
+        // `pool_manager`, and only the pool is borrowed mutably.
+        let via_node = match via {
+            ViaHop::ThisNode => Some(state.config.node.name.as_str()),
+            ViaHop::None => None,
+        };
         let backend = state.pool_manager.url_backend(backend_idx);
         let (conn, stream) = state
             .h2c_pool
-            .dispatch(&backend.url, req, client_ip, original_host, registry)
+            .dispatch(
+                &backend.url,
+                req,
+                client_ip,
+                original_host,
+                via_node,
+                registry,
+            )
             .map_err(UrlDispatchError::Failed)?;
         Ok(UpstreamId::H2c { conn, stream })
     } else {
         ensure_h2s_conn(state, backend_idx, registry)?;
+        let via_node = match via {
+            ViaHop::ThisNode => Some(state.config.node.name.as_str()),
+            ViaHop::None => None,
+        };
         let backend = state.pool_manager.url_backend(backend_idx);
         let (conn, stream) = state
             .h2s_pool
-            .dispatch(&backend.url, req, client_ip, original_host, registry)
+            .dispatch(
+                &backend.url,
+                req,
+                client_ip,
+                original_host,
+                via_node,
+                registry,
+            )
             .map_err(UrlDispatchError::Failed)?;
         Ok(UpstreamId::H2s { conn, stream })
     }
@@ -4941,6 +4993,7 @@ fn launch_url_upstream(
             &backend.host,
             client_ip,
             original_host,
+            Some(state.config.node.name.as_str()),
         )
     };
     if let Err(e) = encoded {
@@ -5115,7 +5168,13 @@ fn launch_socket_upstream(
         match send {
             UpstreamSend::Forward(req) => {
                 let original_host = origin_host(req, &state.config);
-                forward::encode_request(entry.upstream.request_buf(), req, client_ip, original_host)
+                forward::encode_request(
+                    entry.upstream.request_buf(),
+                    req,
+                    client_ip,
+                    original_host,
+                    Some(state.config.node.name.as_str()),
+                )
             }
             UpstreamSend::Check { credential } => {
                 auth::encode_check_request(entry.upstream.request_buf(), Some(credential));
