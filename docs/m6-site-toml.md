@@ -369,6 +369,8 @@ Until that restart, m6-http serves the previous certificate.
 
 An internal listener is one that `internal_binds` names.
 On an internal listener the statistics channel is labelled `internal`, the custom error path is served to the caller, and the `X-Forwarded-For` a cache node sends is believed, so each visitor behind that node keeps their own rate limit.
+The same trust keeps the `Via` entry a cache node sends, and this node appends its own after it, so the backend reads the chain in path order.
+A public listener drops a client's `Via`, because a client must not be able to name a node.
 
 Every entry must be in a local range: loopback, private (RFC 1918), link-local, shared (100.64.0.0/10) or IPv6 unique-local.
 Host names are never resolved, and a wildcard address such as `0.0.0.0` is refused.
@@ -376,7 +378,7 @@ Only the h2c listener can be internal, so an entry that equals `bind` is refused
 
 An internal listener accepts a connection only from an address in `internal_peers`, and closes any other before reading a request.
 Each entry is an IP address in a local range, without a port, and the list needs at least one address of the internal listener's IP family.
-A listed peer is also trusted for the client addresses it forwards.
+A listed peer is also trusted for the client address and the `Via` entry it forwards.
 On the TLS and QUIC listener, a request from a private, link-local, shared or unique-local address (loopback excluded) is counted as monitor traffic, so a monitor on the private network does not move the visitor counters.
 A request from a public address is monitor traffic only on `/health`, and external on every other path.
 
@@ -739,9 +741,10 @@ The name is required.
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
-| `name` | string | yes | This node's identity, for example `edge-a`. It appears in `/health`, the metrics line, the analytics record and the start-up record's `node`, where `node_source` says `configured`. System config only |
+| `name` | string | yes | This node's identity, for example `edge-a`. It appears in `/health`, the metrics line, the analytics record, the start-up record's `node`, where `node_source` says `configured`, and the `Via` entry every forwarded request carries. One token: ASCII letters, digits, `.`, `-`, `_` and `~`. An empty name, or the retired pseudonym `m6`, stops the start with exit 2. System config only |
 
 **Table 17: the `[node]` key.**
+The name in the `Via` entry is what tells a backend and a log reader which node forwarded a request, so a name that cannot form one entry is refused at load.
 
 ### 4.17. `[security]`
 

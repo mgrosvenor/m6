@@ -674,7 +674,7 @@ fn h2_get(conn: &mut H2sTlsClientConn, path: &str, port: u16) -> std::io::Result
         headers: vec![("host".to_string(), format!("localhost:{port}"))],
         body: Vec::new(),
     };
-    let stream_id = conn.dispatch(&request, "localhost", "127.0.0.1", "localhost")?;
+    let stream_id = conn.dispatch(&request, "localhost", "127.0.0.1", "localhost", None)?;
     let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     loop {
         conn.drive();

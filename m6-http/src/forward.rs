@@ -40,6 +40,51 @@ pub const UNTRUSTED_INBOUND: &[&str] = &[
     "x-real-ip",
 ];
 
+/// The field this node names itself in on a request it forwards (RFC 9110
+/// 7.6.3).
+///
+/// [`VIA`] is in the ingress strip only on a listener that may not believe a
+/// peer: a client that sends `Via: 1.1 edge-b` on the public listener would
+/// otherwise name itself a node, and every visit it made would be counted
+/// against `edge-b`. A cache node on the backbone is a peer this deployment
+/// runs, and its entry is what says which node took the request, so that one
+/// is kept and this node's entry is appended after it.
+pub const VIA: &str = "via";
+
+/// The pseudonym every m6 build before this one sent, and the literal the
+/// site's analytics writer reads as "unknown".
+///
+/// A node named this would have its visits counted as unknown, so `load`
+/// refuses it. The name a node sends is its `[node] name`.
+pub const RETIRED_VIA_PSEUDONYM: &str = "m6";
+
+/// Why `name` cannot be the `received-by` of this node's [`VIA`] entry, if it
+/// cannot.
+///
+/// A `Via` entry is `<protocol> SP <received-by>`, and the entries form a
+/// comma-separated list. A name holding a comma, a space or a control
+/// character would split one entry into two or forge a second hop, and an
+/// empty name would emit `1.1 ` with no node in it at all. Both are refused
+/// at load, because a `Via` that names no node is the defect this header
+/// exists to fix.
+pub fn node_name_error(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("it is empty");
+    }
+    if name.eq_ignore_ascii_case(RETIRED_VIA_PSEUDONYM) {
+        return Some("it is the pseudonym every build before 1.16 sent, and the analytics writer reads that value as an unknown node");
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
+    {
+        return Some(
+            "a Via entry is a single token, so it may hold only ASCII letters, digits, '.', '-' and '_'",
+        );
+    }
+    None
+}
+
 /// Whether a listener is allowed to believe a forwarded client IP.
 ///
 /// The address a request is attributed to decides two things that matter: the
@@ -114,9 +159,18 @@ pub fn attributed_client_ip<'a>(
     forwarded.and_then(sole_forwarded_ip).unwrap_or(peer_ip)
 }
 
-/// True if `name` is a header a client is never allowed to supply.
+/// True if `name` is a header the proxy owns on this hop, and a client is
+/// therefore never allowed to supply it.
+///
+/// One entry depends on `trust`: [`VIA`]. A public listener drops the client's
+/// copy because a node's name is a claim only this deployment may make, and a
+/// backbone listener keeps it because the peer that sent it is one of this
+/// deployment's own nodes.
 #[inline]
-pub fn is_untrusted_inbound(name: &str) -> bool {
+pub fn is_untrusted_inbound(name: &str, trust: ForwardedTrust) -> bool {
+    if trust == ForwardedTrust::Never && name.eq_ignore_ascii_case(VIA) {
+        return true;
+    }
     UNTRUSTED_INBOUND
         .iter()
         .any(|&h| name.eq_ignore_ascii_case(h))
@@ -154,9 +208,12 @@ fn write_host_if_absent(buf: &mut Vec<u8>, req: &HttpRequest, original_host: &st
 /// Drop every client-supplied copy of a proxy-owned header.
 ///
 /// Call on ingress for each protocol, immediately after parsing and before
-/// anything reads the header set.
-pub fn strip_untrusted_inbound(headers: &mut Vec<(String, String)>) {
-    headers.retain(|(name, _)| !is_untrusted_inbound(name));
+/// anything reads the header set. `trust` is the same value that decides
+/// whether a forwarded client address is believed, and it decides the same
+/// thing here: on a public listener the [`VIA`] a client sent is dropped, and
+/// on the backbone it is kept so this node's own entry can follow it.
+pub fn strip_untrusted_inbound(headers: &mut Vec<(String, String)>, trust: ForwardedTrust) {
+    headers.retain(|(name, _)| !is_untrusted_inbound(name, trust));
 }
 
 /// True if the proxy — not the client — owns this header on a forwarded
@@ -190,14 +247,6 @@ fn proxy_owned_request_header(name: &str) -> bool {
 fn skip_when_forwarding(name: &str) -> bool {
     HOP_BY_HOP.iter().any(|&h| name.eq_ignore_ascii_case(h)) || proxy_owned_request_header(name)
 }
-
-/// The pseudonym this proxy identifies itself by in `Via`.
-///
-/// Deliberately a fixed token rather than the node's hostname. RFC 9110 7.6.3
-/// allows a pseudonym precisely so an intermediary need not disclose its
-/// internal naming, and "origin"/"edge-a"/"edge-b" would hand every client a map of the
-/// topology for no benefit.
-const VIA_PSEUDONYM: &str = "m6";
 
 /// Field names nominated by a `Connection` header, which must be removed
 /// before forwarding (RFC 9110 7.6.1).
@@ -242,22 +291,56 @@ fn connection_nominated(headers: &[(String, String)]) -> Vec<String> {
 /// so a request that came back round to this proxy was indistinguishable from a
 /// fresh one.
 ///
-/// `received-protocol` is the version the request arrived on -- HTTP/2 and
+/// `received-protocol` is the version the request arrived on - HTTP/2 and
 /// HTTP/3 requests are reported as `2` and `3` even though they leave here as
 /// HTTP/1.1, because Via describes the hop that was received, not the one being
-/// sent. Any existing Via is preserved and this appends to it.
-fn via_value(existing: Option<&str>, received_version: &str) -> String {
+/// sent. `node_name` is the identity this node reports on `/health`, from its
+/// `[node] name`, so the entry says which node of the deployment took the
+/// request.
+///
+/// `existing` is every `Via` the request already carries, in the order the
+/// hops were visited, joined into one list. This hop's entry is appended to
+/// it, so the list stays in path order: a reader takes the first entry as the
+/// node that took the request and the last as the one nearest the backend.
+pub fn via_value(existing: &str, received_version: &str, node_name: &str) -> String {
     let proto = match received_version {
         v if v.eq_ignore_ascii_case("HTTP/2") || v == "2" => "2",
         v if v.eq_ignore_ascii_case("HTTP/3") || v == "3" => "3",
         v if v.eq_ignore_ascii_case("HTTP/1.0") => "1.0",
         _ => "1.1",
     };
-    let mine = format!("{proto} {VIA_PSEUDONYM}");
-    match existing {
-        Some(prev) if !prev.trim().is_empty() => format!("{}, {}", prev.trim(), mine),
-        _ => mine,
+    let mine = format!("{proto} {node_name}");
+    let existing = existing.trim();
+    if existing.is_empty() {
+        mine
+    } else {
+        format!("{existing}, {mine}")
     }
+}
+
+/// Every `Via` value the request carries, in wire order, joined into the one
+/// list a recipient reads.
+///
+/// RFC 9110 7.6.3 defines `Via` as a list and lets a sender spread it over
+/// several fields, so a request from a chain of proxies can arrive as two
+/// `Via` lines. Concatenating them in order keeps the path order that the
+/// first entry's meaning depends on.
+pub fn existing_via(headers: &[(String, String)]) -> String {
+    let mut out = String::new();
+    for (name, value) in headers {
+        if !name.eq_ignore_ascii_case(VIA) {
+            continue;
+        }
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str(", ");
+        }
+        out.push_str(value);
+    }
+    out
 }
 
 /// The request type is `m6_core::http::RawRequest`, parsed by the one parser
@@ -443,13 +526,19 @@ fn write_decimal(mut n: usize, buf: &mut [u8; 20]) -> &[u8] {
 ///
 /// The connection closes after one request, so the bytes ask the backend to
 /// close it.
+///
+/// `via_node` is this node's name when the request is one m6-http forwards
+/// for a client, and `None` when m6-http originates it itself (the generation
+/// ID's refresh, for one). An originated request has no received protocol to
+/// report, so it carries no [`VIA`] entry of its own.
 pub fn encode_request(
     buf: &mut Vec<u8>,
     req: &HttpRequest,
     client_ip: &str,
     original_host: &str,
+    via_node: Option<&str>,
 ) -> io::Result<()> {
-    encode_forwarded(buf, req, client_ip, original_host, None, false)
+    encode_forwarded(buf, req, client_ip, original_host, via_node, None, false)
 }
 
 /// Build the request bytes a URL backend receives, on a connection kept open
@@ -464,8 +553,17 @@ pub fn encode_url_request(
     host: &str,
     client_ip: &str,
     original_host: &str,
+    via_node: Option<&str>,
 ) -> io::Result<()> {
-    encode_forwarded(buf, req, client_ip, original_host, Some(host), true)
+    encode_forwarded(
+        buf,
+        req,
+        client_ip,
+        original_host,
+        via_node,
+        Some(host),
+        true,
+    )
 }
 
 /// The one serializer for both. `host_override` replaces the client's `Host`,
@@ -475,6 +573,7 @@ fn encode_forwarded(
     req: &HttpRequest,
     client_ip: &str,
     original_host: &str,
+    via_node: Option<&str>,
     host_override: Option<&str>,
     keep_alive: bool,
 ) -> io::Result<()> {
@@ -511,11 +610,9 @@ fn encode_forwarded(
     // Forward headers, excluding hop-by-hop, anything the proxy owns, and
     // anything the client nominated in `Connection` (RFC 9110 7.6.1).
     let nominated = connection_nominated(&req.headers);
-    let mut existing_via: Option<&str> = None;
     for (name, value) in &req.headers {
-        if name.eq_ignore_ascii_case("via") {
-            existing_via = Some(value.as_str());
-            continue; // re-emitted below with our own hop appended
+        if via_node.is_some() && name.eq_ignore_ascii_case(VIA) {
+            continue; // re-emitted below, joined, with our own hop appended
         }
         if skip_when_forwarding(name) || nominated.iter().any(|n| name.eq_ignore_ascii_case(n)) {
             continue;
@@ -528,9 +625,13 @@ fn encode_forwarded(
         buf.extend_from_slice(value.as_bytes());
         buf.extend_from_slice(b"\r\n");
     }
-    buf.extend_from_slice(b"Via: ");
-    buf.extend_from_slice(via_value(existing_via, &req.version).as_bytes());
-    buf.extend_from_slice(b"\r\n");
+    if let Some(node) = via_node {
+        buf.extend_from_slice(b"Via: ");
+        buf.extend_from_slice(
+            via_value(&existing_via(&req.headers), &req.version, node).as_bytes(),
+        );
+        buf.extend_from_slice(b"\r\n");
+    }
     if host_override.is_none() {
         write_host_if_absent(buf, req, original_host);
     }
@@ -954,7 +1055,8 @@ mod tests {
     fn a_forwarded_request_carries_the_proxy_headers_and_no_hop_by_hop_field() {
         let req = upstream_req();
         let mut bytes = Vec::new();
-        encode_request(&mut bytes, &req, "1.2.3.4", "original.host").expect("encode");
+        encode_request(&mut bytes, &req, "1.2.3.4", "original.host", Some("edge-a"))
+            .expect("encode");
         let s = std::str::from_utf8(&bytes).unwrap();
 
         assert!(s.starts_with("GET /api/test?key=value HTTP/1.1\r\n"));
@@ -977,6 +1079,7 @@ mod tests {
             "api.example.com",
             "1.2.3.4",
             "original.host",
+            Some("edge-a"),
         )
         .expect("encode");
         let s = std::str::from_utf8(&bytes).unwrap();
@@ -1137,6 +1240,11 @@ mod smuggling_tests {
 mod via_and_connection_tests {
     use super::*;
 
+    /// The node name every assertion here expects, as `[node] name` would set
+    /// it. A name a deployment would use, so a reader can see it is the
+    /// configured identity and not the host.
+    const NODE: &str = "edge-a";
+
     fn req(headers: &[(&str, &str)], version: &str) -> HttpRequest {
         HttpRequest {
             method: "GET".to_string(),
@@ -1153,8 +1261,15 @@ mod via_and_connection_tests {
 
     fn serialised(r: &HttpRequest) -> String {
         let mut bytes = Vec::new();
-        encode_url_request(&mut bytes, r, "backend.internal", "1.2.3.4", "example.com")
-            .expect("encode");
+        encode_url_request(
+            &mut bytes,
+            r,
+            "backend.internal",
+            "1.2.3.4",
+            "example.com",
+            Some(NODE),
+        )
+        .expect("encode");
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
@@ -1214,11 +1329,12 @@ mod via_and_connection_tests {
         assert_eq!(header_values(&out, "x-keep"), vec!["v"]);
     }
 
-    /// F017. A proxy must announce itself so a loop is detectable.
+    /// F017. A proxy must announce itself so a loop is detectable, and the
+    /// name it announces is the node identity `/health` reports.
     #[test]
-    fn via_is_appended() {
+    fn via_names_the_configured_node() {
         let out = serialised(&req(&[], "HTTP/1.1"));
-        assert_eq!(header_values(&out, "via"), vec!["1.1 m6"], "\n{out}");
+        assert_eq!(header_values(&out, "via"), vec!["1.1 edge-a"], "\n{out}");
     }
 
     /// Via describes the protocol the request was RECEIVED on, not the one it
@@ -1227,26 +1343,77 @@ mod via_and_connection_tests {
     fn via_reports_the_received_protocol() {
         assert_eq!(
             header_values(&serialised(&req(&[], "HTTP/2")), "via"),
-            vec!["2 m6"]
+            vec!["2 edge-a"]
         );
         assert_eq!(
             header_values(&serialised(&req(&[], "HTTP/3")), "via"),
-            vec!["3 m6"]
+            vec!["3 edge-a"]
         );
         assert_eq!(
             header_values(&serialised(&req(&[], "HTTP/1.0")), "via"),
-            vec!["1.0 m6"]
+            vec!["1.0 edge-a"]
         );
     }
 
     /// An upstream proxy's Via must be preserved and appended to, not replaced
-    /// -- the whole point is the chain.
+    /// -- the whole point is the chain, and the ORDER is the path order. The
+    /// site reads the first entry as the edge that took the request, so a
+    /// reversed list would attribute every visit to the origin and still look
+    /// plausible.
     #[test]
-    fn existing_via_is_extended_not_replaced() {
+    fn existing_via_is_extended_not_replaced_and_stays_in_path_order() {
         let out = serialised(&req(&[("Via", "1.1 upstream-cache")], "HTTP/1.1"));
         assert_eq!(
             header_values(&out, "via"),
-            vec!["1.1 upstream-cache, 1.1 m6"],
+            vec!["1.1 upstream-cache, 1.1 edge-a"],
+            "\n{out}"
+        );
+
+        // The two-hop shape the deployment produces: the cache's entry first,
+        // this node's after it.
+        let out = serialised(&req(&[("Via", "1.1 edge-b")], "HTTP/2"));
+        assert_eq!(
+            header_values(&out, "via"),
+            vec!["1.1 edge-b, 2 edge-a"],
+            "\n{out}"
+        );
+    }
+
+    /// The shape a cache node's forwarded request takes when the backbone leg
+    /// is HTTP/1.1: the cache's entry first, the origin's after it, one string.
+    /// The site reads the first entry as the edge that took the request, so
+    /// this exact string is the contract.
+    #[test]
+    fn cache_then_origin_reads_in_path_order() {
+        let mut bytes = Vec::new();
+        encode_request(
+            &mut bytes,
+            &req(&[("Via", "1.1 edge-a")], "HTTP/1.1"),
+            "1.2.3.4",
+            "example.com",
+            Some("origin"),
+        )
+        .expect("encode");
+        let out = String::from_utf8_lossy(&bytes).into_owned();
+        assert_eq!(
+            header_values(&out, "via"),
+            vec!["1.1 edge-a, 1.1 origin"],
+            "\n{out}"
+        );
+    }
+
+    /// RFC 9110 7.6.3 lets a sender spread the list over several fields. The
+    /// entries are joined in wire order before this hop is appended, so a
+    /// request that carries two `Via` fields keeps its path order.
+    #[test]
+    fn two_via_fields_are_joined_in_wire_order() {
+        let out = serialised(&req(
+            &[("Via", "1.1 edge-b"), ("Via", "2 edge-c")],
+            "HTTP/1.1",
+        ));
+        assert_eq!(
+            header_values(&out, "via"),
+            vec!["1.1 edge-b, 2 edge-c, 1.1 edge-a"],
             "\n{out}"
         );
     }
@@ -1259,13 +1426,37 @@ mod via_and_connection_tests {
         assert_eq!(header_values(&out, "via").len(), 1);
     }
 
-    /// The pseudonym must not leak the node's real hostname.
+    /// The entry names this node and nothing else about the path: no
+    /// hostname, no backend authority, no client address.
     #[test]
-    fn via_does_not_disclose_internal_topology() {
+    fn via_discloses_only_the_node_name() {
         let out = serialised(&req(&[], "HTTP/1.1"));
         let via = header_values(&out, "via").join(" ");
-        for leak in ["node-a", "node-b", "node-c", "example", "backend.internal"] {
+        for leak in ["node-a", "node-b", "example", "backend.internal", "1.2.3.4"] {
             assert!(!via.contains(leak), "Via leaks {leak:?}: {via}");
+        }
+    }
+
+    /// A node name with a comma, a space or a control character would split
+    /// one entry into two or forge a hop, and an empty one would emit `1.1 `
+    /// with no node. `[node] name` refuses each at load.
+    #[test]
+    fn a_node_name_must_be_a_single_visible_token() {
+        for good in ["edge-a", "origin", "monitor", "10.0.0.1", "edge_a", "a~b"] {
+            assert_eq!(node_name_error(good), None, "{good:?} should be accepted");
+        }
+        for bad in [
+            "",
+            "edge a",
+            "edge-a, 1.1 edge-b",
+            "edge-a\r\n",
+            "edge:a",
+            "edge/a",
+            "\u{2014}",
+            "m6",
+            "M6",
+        ] {
+            assert!(node_name_error(bad).is_some(), "{bad:?} should be refused");
         }
     }
 }
@@ -1363,13 +1554,64 @@ mod forwarded_trust_tests {
     /// believed, never whether the header survives.
     #[test]
     fn the_header_itself_is_still_untrusted_inbound() {
-        assert!(is_untrusted_inbound("x-forwarded-for"));
-        assert!(is_untrusted_inbound("X-Forwarded-For"));
+        assert!(is_untrusted_inbound(
+            "x-forwarded-for",
+            ForwardedTrust::Never
+        ));
+        assert!(is_untrusted_inbound(
+            "X-Forwarded-For",
+            ForwardedTrust::Never
+        ));
         let mut headers = vec![
             ("X-Forwarded-For".to_string(), "203.0.113.9".to_string()),
             ("Accept".to_string(), "*/*".to_string()),
         ];
-        strip_untrusted_inbound(&mut headers);
+        strip_untrusted_inbound(&mut headers, ForwardedTrust::Never);
         assert_eq!(headers, vec![("Accept".to_string(), "*/*".to_string())]);
+    }
+
+    /// `Via` is the one proxy-owned field whose trust is the listener's. A
+    /// client on the public listener must not be able to name itself a node,
+    /// and a cache node on the backbone must have its entry survive so the
+    /// origin can append its own after it.
+    #[test]
+    fn via_is_stripped_from_a_public_listener_and_kept_from_the_backbone() {
+        assert!(is_untrusted_inbound("via", ForwardedTrust::Never));
+        assert!(is_untrusted_inbound("Via", ForwardedTrust::Never));
+        assert!(!is_untrusted_inbound("via", ForwardedTrust::Backbone));
+
+        let headers = || {
+            vec![
+                ("Via".to_string(), "1.1 edge-b".to_string()),
+                ("Accept".to_string(), "*/*".to_string()),
+            ]
+        };
+        let mut public = headers();
+        strip_untrusted_inbound(&mut public, ForwardedTrust::Never);
+        assert_eq!(
+            public,
+            vec![("Accept".to_string(), "*/*".to_string())],
+            "a client named itself a node on a public listener"
+        );
+
+        let mut backbone = headers();
+        strip_untrusted_inbound(&mut backbone, ForwardedTrust::Backbone);
+        assert_eq!(
+            backbone,
+            headers(),
+            "a cache node's Via was dropped on the backbone"
+        );
+    }
+
+    /// Every other proxy-owned field is stripped whatever the trust: a peer on
+    /// the backbone may assert a Via entry, never an identity or an address.
+    #[test]
+    fn the_backbone_trust_covers_via_only() {
+        for name in UNTRUSTED_INBOUND {
+            assert!(
+                is_untrusted_inbound(name, ForwardedTrust::Backbone),
+                "{name} survived on the backbone"
+            );
+        }
     }
 }

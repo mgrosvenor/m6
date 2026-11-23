@@ -64,6 +64,23 @@ Every enabled type is minified now, HTML and JSON included.
 Verified by `a_no_store_page_is_minified` and `a_no_store_json_answer_is_minified` in `m6-core/src/site.rs`, which assert the minified bytes and that the page is smaller.
 The cost is measured. A rendered `no-store` page of 2 KiB costs 21.5 microseconds more per response at p50, and a 1 KiB JSON answer costs 2.6 microseconds. A script served from the file path costs 8.1 microseconds against 36.2 milliseconds when the same script is parsed on every request, which is what the per-version cache buys. The rendered cost is accepted as the price of the rule that every enabled type is minified. It is recorded here so the price stays visible beside the rule.
 
+**The `Via` entry on every forwarded request names the node, so a backend and a log reader can tell which node took the request, and per-node analytics have a value to read.**
+1.16.0-rc.1 sent the fixed pseudonym `m6`, unchanged since 1.14.0, so every node's requests looked identical downstream and a site splitting its analytics by node had one bucket.
+The entry is now this node's `[node] name`, the same identity `/health` reports, for example `1.1 edge-a` instead of `1.1 m6`, and it is the standard `Via` of RFC 9110 7.6.3.
+A request the node received over HTTP/2 or HTTP/3 reports the protocol it arrived on, `2` or `3`, so the entry describes the hop that was received.
+A cache node's entry crosses the backbone and the origin appends its own after it, one comma-separated list in path order, which reads `1.1 edge-a, 2 origin` at the backend.
+The site reads the first entry as the node that took the request, so the order is the contract and the tests assert the string.
+The trust is the one that already decides whether a forwarded client address is believed.
+A `Via` arriving on a public listener is dropped at ingress on every protocol, because a client must not be able to name a node, and the node then writes its own entry.
+A `Via` arriving on an `h2c_bind` listener from an address in `internal_peers` is kept and appended to.
+A config whose `[node].name` is empty, holds a character a `Via` entry cannot, or is the retired pseudonym `m6` stops at start with exit 2, because an empty entry is malformed and `m6` is the value downstream reads as an unknown node.
+No operator change is needed: `[node] name` was already required, and every deployment sets it.
+Verified by six tests in `m6-http/tests/via.rs` against a backend that captures the request bytes.
+A client's `Via: 1.1 edge-b` is stripped on the public listener at h1, h2 and h3, and the backend reads `1.1 edge-a`, `2 edge-a` and `3 edge-a` in turn.
+A cache node's entry survives to the origin and the backend reads `1.1 edge-a, 2 origin`.
+An internal listener keeps and appends a peer's entry, and the same h2c listener declared public strips it.
+Each direction is a caught revert: ignoring the listener's trust fails five of the six, sending the fixed pseudonym fails all six, and putting this node's entry first fails the two that carry a chain.
+
 **Socket paths in tests no longer depend on `TMPDIR`.** `m6_platform::socket_scratch_root` names the shortest writable temporary root, and every test that binds a unix socket creates its scratch directory there, so a long `TMPDIR` can no longer spend the 104-byte `sun_path` before the file name. The reported intermittent `m6-auth-server` failure ("103 limit") was this: the test measured the host's temporary directory rather than the behaviour it asserts. The platform still refuses a path that cannot fit, naming its length and the limit. That refusal is tested, not worked around. Verified by the workspace suite with `TMPDIR` set to a 93-character path, where the named test failed before the change and passes after it.
 
 **Every m6 binary reports the build it is running, from constants fixed at compile time.**

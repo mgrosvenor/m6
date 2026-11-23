@@ -253,7 +253,7 @@ fn h2_send(
         body: Vec::new(),
     };
     let stream_id = conn
-        .dispatch(&req, "127.0.0.1", "127.0.0.1", "127.0.0.1")
+        .dispatch(&req, "127.0.0.1", "127.0.0.1", "127.0.0.1", None)
         .map_err(|e| e.to_string())?;
     let deadline = Instant::now() + timeout;
     loop {

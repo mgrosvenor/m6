@@ -113,7 +113,7 @@ Take from it that `Host` is the client's value, forwarded unchanged when the cli
 | Field | Value |
 |---|---|
 | `Host` | The public host the client used: its own `Host` field, its `:authority`, or the configured site domain when it sent neither |
-| `Via` | The protocol version the request arrived on, then the pseudonym `m6`, for example `1.1 m6`. An existing `Via` is kept and the proxy's hop is appended (RFC 9110 §7.6.3) |
+| `Via` | The protocol version the request arrived on, then this node's `[node] name`, for example `1.1 edge-a`. An entry a trusted cache node sent on the backbone is kept in front of it, and the list stays in path order (RFC 9110 §7.6.3) |
 | `X-Forwarded-For` | The client's *IP* (Internet Protocol) address, as the proxy attributes it |
 | `X-Forwarded-Proto` | `https` on every request |
 | `X-Forwarded-Host` | The public host the client used |
@@ -164,6 +164,11 @@ content-length   x-auth-claims   x-forwarded-for   x-forwarded-proto   x-forward
 
 The proxy re-emits `Content-Length` from the body it sends, `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Forwarded-Host` on every request, and `X-Auth-Claims` on a `require` route.
 It drops `X-Real-IP` and never re-adds it.
+
+`Via` is the one proxy-owned field whose strip depends on the listener.
+A public listener drops the client's copy, because a client must not be able to name a node, and then writes this node's own entry.
+An h2c listener named in `[server] internal_binds` keeps the entry a peer in `[server] internal_peers` sends and appends this node's entry after it.
+The trust is the one that decides whether a forwarded client address is believed, so a listener that refuses a peer's `X-Forwarded-For` refuses its `Via` too.
 
 The proxy forwards the client's `Host` unchanged (§2.2), so a backend MUST treat `Host` as attacker-controlled.
 
