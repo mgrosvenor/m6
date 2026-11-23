@@ -61,6 +61,14 @@ pub fn socket_path_from_config(config_path: &Path) -> PathBuf {
 /// path, so 30 is the value already in service.
 pub const DEFAULT_READ_TIMEOUT_SECS: u64 = 30;
 
+/// How long shutdown waits for accepted requests, in seconds.
+///
+/// Well inside the 90 s systemd allows a stop by default, and as long as one
+/// read deadline, so a client that is mid-request meets the drain's deadline
+/// before the read's. Zero waits for nothing, which is the behaviour every
+/// service had from 6310c3a9 until the drain returned.
+pub const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 30;
+
 /// Default mode for a service's unix socket.
 ///
 /// `0o660`, not the `0o666` that `m6-file` and `m6-auth-server` each set by
