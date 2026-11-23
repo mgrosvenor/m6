@@ -605,6 +605,16 @@ Table 8 gives what each signal does to m6-http.
 **Table 8: the signals m6-http handles.**
 A second termination signal exits at once.
 
+**m6-http does not drain before it stops, by design.**
+A drain on the edge would hold a restart open for requests that already recover without one:
+
+- A client retries an idempotent request (`GET`, `HEAD`) when the connection it reused closes, so a page or asset request cut by the stop is sent again.
+- A request that arrives while the process restarts fails whether or not the old process drained, because no listener is bound in that gap.
+- A non-idempotent request such as a `POST` cut mid-flight ends in a connection error, and the client can send it again.
+
+An edge restarts only at a deploy, so a stop costs at most the requests in flight at that moment.
+The backends behind it do drain, up to `[server] drain_timeout_s`, because a backend restart can cut work a client cannot see or repeat.
+
 A clean exit writes one `type=shutdown` line with the run's `run_id`, its uptime and reason `signal`, and a forced exit on the second signal writes reason `forced` ([`m6-log.md`](m6-log.md) §9).
 
 ---
