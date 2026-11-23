@@ -3,33 +3,40 @@ use ahash::AHashMap;
 use m6_core::http::HeaderSource;
 use std::borrow::Borrow;
 
-/// A response's header names and values in one byte arena, with each field a
-/// pair of `u32` ranges into it.
+/// A response's header names and values, with each field a pair of `u32`
+/// ranges into one text buffer.
 ///
 /// This is the cache entry's stored shape. Storing a backend reply used to
-/// allocate a `String` for every name and every value — twelve calls per
-/// inserted response on the miss row — because the entry outlives the reply
-/// and the reply's slices cannot be borrowed from it. The bytes still have to
-/// be copied once, because the entry owns them, but they are copied into one
-/// arena: the entry then holds ranges, and every reader borrows `&str` from
-/// the arena rather than cloning.
+/// allocate a `String` for every name and every value, twelve calls per
+/// inserted response on the miss row, because the entry outlives the reply and
+/// the reply's slices cannot be borrowed from it. The bytes are copied once,
+/// because the entry owns them, into one text buffer that every reader borrows
+/// from rather than cloning.
 ///
-/// The tape is `bytes::Bytes`, so a clone is a refcount bump and a cache hit
-/// still shares the entry's header bytes. The layout is
+/// The slots are `bytes::Bytes` and the text is `Arc<str>`, so a clone is two
+/// refcount bumps and a cache hit still shares the entry's header bytes. The
+/// slots are
 ///
 /// ```text
-/// [u32 count][u32 slot_capacity][(noff, nlen, voff, vlen) * capacity][bytes...]
+/// [u32 count][u32 slot_capacity][(noff, nlen, voff, vlen) * capacity]
 /// ```
 ///
-/// with absolute `u32` offsets. The slot area is fixed at construction (with
-/// spare slots for the headers a response gains on its way out), so appending
-/// a field only extends the text and bumps the count. A field whose name is
-/// `Set-Cookie` or `M6-Genid` is marked not-storable and is dropped when the
-/// block is stored; that is the only per-field metadata, packed into the top
-/// bit of the name length.
+/// with absolute `u32` offsets into the text. The slot area is fixed at
+/// construction (with spare slots for the headers a response gains on its way
+/// out), so appending a field only extends the text and bumps the count. A
+/// field whose name is `Set-Cookie` or `M6-Genid` is marked not-storable and is
+/// dropped when the block is stored, and that is the only per-field metadata,
+/// packed into the top bit of the name length.
+///
+/// The text buffer is built only from `&str`, so it is valid UTF-8 by
+/// construction. A field view is a `str` range, which checks two character
+/// boundaries and never re-validates the bytes. The tape used to store one
+/// buffer and hand every field to `str::from_utf8`, which was 6.2% of the
+/// server's HTTP/2 cycles in the profile that prompted this shape.
 #[derive(Clone, PartialEq, Eq)]
 pub struct HeaderBlock {
-    tape: bytes::Bytes,
+    slots: bytes::Bytes,
+    text: std::sync::Arc<str>,
 }
 
 /// Bit 31 of a field's name length: the field must not be stored.
@@ -58,7 +65,10 @@ impl HeaderBlock {
     }
 
     fn view(&self) -> TapeView<'_> {
-        TapeView { buf: &self.tape }
+        TapeView {
+            slots: &self.slots,
+            text: &self.text,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -106,11 +116,11 @@ impl HeaderBlock {
 
     /// The number of bytes this block holds, for the cache's capacity bound.
     ///
-    /// Counts the reserved spare text, so the bound stays conservative: the
-    /// allocation is the tape's capacity, and the tape's length understates it
-    /// by exactly the slack a response writes into on its way out.
+    /// Counts the reserved spare text, so the bound stays conservative. The
+    /// buffers' lengths understate their capacity by the slack a response
+    /// writes into on its way out.
     pub fn footprint(&self) -> usize {
-        self.tape.len() + SPARE_TEXT
+        self.slots.len() + self.text.len() + SPARE_TEXT
     }
 
     /// The storable subset, as a block.
@@ -200,21 +210,26 @@ impl From<Vec<(&str, &str)>> for HeaderBlock {
 }
 
 /// Build a [`HeaderBlock`] in place, reserving the slots and the text it will
-/// need up front so the ordinary case is exactly one allocation.
+/// need up front so the ordinary case is one allocation per buffer.
 pub struct HeaderBuilder {
-    buf: Vec<u8>,
+    slots: Vec<u8>,
+    text: String,
     cap: u32,
     count: u32,
 }
 
 impl HeaderBuilder {
-    /// `slots` fields are expected; `text_bytes` is their names and values.
+    /// `slots` fields are expected, and `text_bytes` is their names and values.
     pub fn with_capacity(slots: usize, text_bytes: usize) -> Self {
         let cap = (slots + SPARE_SLOTS) as u32;
-        let mut buf = Vec::with_capacity(8 + 16 * cap as usize + text_bytes + SPARE_TEXT);
-        buf.resize(8 + 16 * cap as usize, 0);
-        buf[4..8].copy_from_slice(&cap.to_le_bytes());
-        HeaderBuilder { buf, cap, count: 0 }
+        let mut slots = vec![0u8; 8 + 16 * cap as usize];
+        slots[4..8].copy_from_slice(&cap.to_le_bytes());
+        HeaderBuilder {
+            slots,
+            text: String::with_capacity(text_bytes + SPARE_TEXT),
+            cap,
+            count: 0,
+        }
     }
 
     pub fn from_pairs(pairs: &[(String, String)]) -> Self {
@@ -244,7 +259,10 @@ impl HeaderBuilder {
     }
 
     fn view(&self) -> TapeView<'_> {
-        TapeView { buf: &self.buf }
+        TapeView {
+            slots: &self.slots,
+            text: &self.text,
+        }
     }
 
     pub fn find(&self, name: &str) -> Option<&str> {
@@ -288,87 +306,49 @@ impl HeaderBuilder {
 
     fn push_marked(&mut self, name: &str, value: &str, stored: bool) {
         self.reserve(1, name.len() + value.len());
-        let noff = self.buf.len() as u32;
-        self.buf.extend_from_slice(name.as_bytes());
-        let voff = self.buf.len() as u32;
-        self.buf.extend_from_slice(value.as_bytes());
+        let noff = self.text.len() as u32;
+        self.text.push_str(name);
+        let voff = self.text.len() as u32;
+        self.text.push_str(value);
         let nlen = name.len() as u32 | if stored { 0 } else { NOT_STORED };
         self.set_span(self.count as usize, noff, nlen, voff, value.len() as u32);
         self.count += 1;
-        self.buf[0..4].copy_from_slice(&self.count.to_le_bytes());
-    }
-
-    /// Append a field whose value is written by `f` straight into the arena.
-    /// No intermediate `String`: `Date` is formatted here rather than into an
-    /// allocation that is then copied.
-    pub fn push_with(&mut self, name: &str, f: impl FnOnce(&mut Vec<u8>)) {
-        self.reserve(1, name.len() + SPARE_TEXT);
-        let start = self.buf.len();
-        f(&mut self.buf);
-        let vlen = (self.buf.len() - start) as u32;
-        let noff = self.buf.len() as u32;
-        self.buf.extend_from_slice(name.as_bytes());
-        self.set_span(
-            self.count as usize,
-            noff,
-            name.len() as u32,
-            start as u32,
-            vlen,
-        );
-        self.count += 1;
-        self.buf[0..4].copy_from_slice(&self.count.to_le_bytes());
+        self.slots[0..4].copy_from_slice(&self.count.to_le_bytes());
     }
 
     fn set_span(&mut self, i: usize, noff: u32, nlen: u32, voff: u32, vlen: u32) {
         let o = 8 + 16 * i;
-        self.buf[o..o + 4].copy_from_slice(&noff.to_le_bytes());
-        self.buf[o + 4..o + 8].copy_from_slice(&nlen.to_le_bytes());
-        self.buf[o + 8..o + 12].copy_from_slice(&voff.to_le_bytes());
-        self.buf[o + 12..o + 16].copy_from_slice(&vlen.to_le_bytes());
+        self.slots[o..o + 4].copy_from_slice(&noff.to_le_bytes());
+        self.slots[o + 4..o + 8].copy_from_slice(&nlen.to_le_bytes());
+        self.slots[o + 8..o + 12].copy_from_slice(&voff.to_le_bytes());
+        self.slots[o + 12..o + 16].copy_from_slice(&vlen.to_le_bytes());
     }
 
     fn reserve(&mut self, slots: usize, text: usize) {
         let have_slots = self.cap.saturating_sub(self.count) as usize;
-        if have_slots >= slots && self.buf.capacity() - self.buf.len() >= text {
+        if have_slots >= slots && self.text.capacity() - self.text.len() >= text {
             return;
         }
         let new_cap = (self.cap as usize + slots + SPARE_SLOTS).max(16);
-        let mut buf = Vec::with_capacity(8 + 16 * new_cap + self.buf.len() + text);
-        buf.resize(8 + 16 * new_cap, 0);
-        buf[4..8].copy_from_slice(&(new_cap as u32).to_le_bytes());
-        let old_text_start = 8 + 16 * self.cap as usize;
+        let mut grown = vec![0u8; 8 + 16 * new_cap];
+        grown[4..8].copy_from_slice(&(new_cap as u32).to_le_bytes());
         let used_spans = 8 + 16 * self.count as usize;
-        buf[8..used_spans].copy_from_slice(&self.buf[8..used_spans]);
-        let text = &self.buf[old_text_start..];
-        let at = 8 + 16 * new_cap;
-        // `at` is already `buf.len()` (the slot area was resized to it), so the
-        // text is appended rather than written through an index past the end.
-        buf.extend_from_slice(text);
-        // Spans are absolute offsets, so moving the text area shifts every one
-        // of them. Forgetting this read the wrong bytes: a header value that
-        // landed past the old end panicked on a range past the tape.
-        let delta = at as i64 - old_text_start as i64;
-        if delta != 0 {
-            for i in 0..self.count as usize {
-                let o = 8 + 16 * i;
-                for (a, b) in [(o, o + 4), (o + 8, o + 12)] {
-                    let off = u32::from_le_bytes(buf[a..b].try_into().unwrap());
-                    let shifted = (off as i64 + delta) as u32;
-                    buf[a..b].copy_from_slice(&shifted.to_le_bytes());
-                }
-            }
-        }
-        self.buf = buf;
+        grown[8..used_spans].copy_from_slice(&self.slots[8..used_spans]);
+        self.slots = grown;
         self.cap = new_cap as u32;
+        // The spans are offsets into `text`, which has not moved, so growing
+        // the slot area leaves every offset valid.
+        self.text.reserve(text);
     }
 
-    /// Freeze into the shared immutable form. `Bytes::from(Vec)` takes the
-    /// buffer's allocation, so this adds no allocation.
+    /// Freeze into the shared immutable form. `Bytes::from(Vec)` takes the slot
+    /// allocation. Building the `Arc<str>` copies the text once.
     pub fn freeze(mut self) -> HeaderBlock {
-        self.buf[0..4].copy_from_slice(&self.count.to_le_bytes());
-        self.buf[4..8].copy_from_slice(&self.cap.to_le_bytes());
+        self.slots[0..4].copy_from_slice(&self.count.to_le_bytes());
+        self.slots[4..8].copy_from_slice(&self.cap.to_le_bytes());
         HeaderBlock {
-            tape: bytes::Bytes::from(self.buf),
+            slots: bytes::Bytes::from(self.slots),
+            text: std::sync::Arc::from(self.text),
         }
     }
 }
@@ -394,48 +374,58 @@ impl m6_core::http::HeaderSource for HeaderBuilder {
     }
 }
 
-/// A borrowed view of a header tape.
+/// A borrowed view of a header block: the field slots and the text they point
+/// into.
 struct TapeView<'a> {
-    buf: &'a [u8],
+    slots: &'a [u8],
+    text: &'a str,
 }
 
 impl<'a> TapeView<'a> {
     fn count(&self) -> usize {
-        u32::from_le_bytes(self.buf[0..4].try_into().unwrap()) as usize
-    }
-
-    fn cap(&self) -> usize {
-        u32::from_le_bytes(self.buf[4..8].try_into().unwrap()) as usize
+        u32::from_le_bytes(self.slots[0..4].try_into().unwrap()) as usize
     }
 
     fn text_len(&self) -> usize {
-        self.buf.len().saturating_sub(8 + 16 * self.cap())
+        self.text.len()
     }
 
     fn span(&self, i: usize) -> (u32, u32, u32, u32) {
         let o = 8 + 16 * i;
         (
-            u32::from_le_bytes(self.buf[o..o + 4].try_into().unwrap()),
-            u32::from_le_bytes(self.buf[o + 4..o + 8].try_into().unwrap()),
-            u32::from_le_bytes(self.buf[o + 8..o + 12].try_into().unwrap()),
-            u32::from_le_bytes(self.buf[o + 12..o + 16].try_into().unwrap()),
+            u32::from_le_bytes(self.slots[o..o + 4].try_into().unwrap()),
+            u32::from_le_bytes(self.slots[o + 4..o + 8].try_into().unwrap()),
+            u32::from_le_bytes(self.slots[o + 8..o + 12].try_into().unwrap()),
+            u32::from_le_bytes(self.slots[o + 12..o + 16].try_into().unwrap()),
         )
     }
 
+    /// One field, as `str` ranges of the text buffer.
+    ///
+    /// `str::get` checks the two character boundaries and does no UTF-8
+    /// validation. The text is built only from `&str`, so every span this
+    /// reads is already valid.
     fn field(&self, i: usize) -> (&'a str, &'a str, bool) {
         let (noff, nlen, voff, vlen) = self.span(i);
         let stored = nlen & NOT_STORED == 0;
         let nlen = (nlen & !NOT_STORED) as usize;
-        let name =
-            std::str::from_utf8(&self.buf[noff as usize..noff as usize + nlen]).unwrap_or_default();
-        let value = std::str::from_utf8(&self.buf[voff as usize..voff as usize + vlen as usize])
+        let name = self
+            .text
+            .get(noff as usize..noff as usize + nlen)
+            .unwrap_or_default();
+        let value = self
+            .text
+            .get(voff as usize..voff as usize + vlen as usize)
             .unwrap_or_default();
         (name, value, stored)
     }
 
     fn iter(&self, storable_only: bool) -> TapeIter<'a> {
         TapeIter {
-            view: TapeView { buf: self.buf },
+            view: TapeView {
+                slots: self.slots,
+                text: self.text,
+            },
             i: 0,
             storable_only,
         }
