@@ -128,7 +128,60 @@ Three gaps remain, and the Not measured section lists each.
 
 **HTTP/3 no longer visits every idle QUIC connection on every loop turn.** The loop fired the timer, retried parked responses and tried to send on every QUIC connection each turn, at about half a microsecond per connection. A client that leaves connections behind (each stays for its 30 s idle timeout) made the sweep longer than the work: with about a thousand idle connections, throughput at two concurrent clients fell below the previous release. The loop now drives only the connections whose timer has passed. A connection that received a packet is already driven in the turn it arrives, and that turn now also resumes a response that was waiting for flow-control credit. Tests: `a_connection_whose_timer_is_due_is_driven` and `idle_connections_whose_timer_is_not_due_are_not_touched` in `m6-http/src/main.rs`, and `a_parked_h3_response_completes_when_credit_arrives` in `m6-http/tests/loop_never_waits.rs`.
 
-**The HTTP/2 send queue starts at 64 KiB, not 16 KiB.** At 16 KiB a 484 KB response took 30 writes and 30 TLS records, and bandwidth on large bodies at four connections fell 8 to 16 percent below the previous release. `[limits.h2_send] start` is now 64 KiB. On Linux it is also the kernel's unsent-bytes mark, so a more urgent stream on the same connection waits behind at most 64 KiB. A site that serves large bodies and cares more about bandwidth than that ordering can raise it in the system config.
+**The HTTP/2 send queue starts at 64 KiB, not 16 KiB.** At 16 KiB a 484 KB response took 30 writes and 30 TLS records, and requests per second on large bodies at four connections fell 8 to 16 percent below the previous release. `[limits.h2_send] start` is now 64 KiB. On Linux it is also the kernel's unsent-bytes mark, so a more urgent stream on the same connection waits behind at most 64 KiB. A site that serves large bodies and cares more about large-body throughput than that ordering can raise it in the system config.
+
+**The HTTP/3 server reads its socket's local address once per socket, not once per received datagram.**
+Every received datagram needs the local address the connection answered on, and the receive loop asked the kernel for it again for each one.
+A bound socket's local address cannot change, so the call returned the same value every time.
+The server now reads it when the socket is created, carries it beside the socket, and uses the stored value for every `RecvInfo`.
+A server that receives a burst therefore pays one lookup for the socket rather than one for each datagram it takes in.
+Interface classification is unchanged, because it is chosen from the peer address the receive reports.
+The test `local_addr_is_read_once` counts the reads and shows that a stored read does not go back to the kernel.
+
+**The HTTP/3 benchmark client reads its per-socket facts once per connection, and closes a connection before replacing it.**
+The client set its read timeout and asked the kernel for the peer and local addresses once per received datagram, and all three are facts about a connected socket that cannot change during the connection.
+The read timeout is the turn's wait rather than a deadline per datagram.
+The timeout and the connection's `RecvInfo` are now taken once at connect, and each request reuses them.
+The client also reconnects after a fixed number of requests.
+It used to drop the old connection and its socket without a QUIC close, so the server kept every replaced connection until its idle timeout and carried them all on every loop turn.
+Each reconnect now sends CONNECTION_CLOSE and flushes it before the socket is dropped.
+A run therefore measures the server's HTTP/3 path rather than the client's own per-datagram calls, and leaves no growing set of idle connections behind.
+This changes the benchmark client only, and the server is untouched.
+The test `close_and_flush_sends_the_close` has a real quiche peer receive the close and report the connection closed.
+
+**The platform layer gains a UDP batch, so one call sends a packed buffer as many datagrams and one call takes in many datagrams.**
+`net::UdpBatch` is the API, and it states a batch in a service's terms.
+`for_socket` probes a socket once at setup, `send` sends a buffer packed as segments of one size, and `recv` takes up to `MAX_BATCH` datagrams into one contiguous buffer, one per slot, with the length and source of each in a `RecvMeta`.
+On Linux the send is one `sendmsg` carrying a `UDP_SEGMENT` control message, so the kernel cuts the packed buffer into the datagrams the caller described, and the receive is one `recvmmsg`.
+The macOS arm takes the same calls as a loop of one `sendto` and one `recvfrom` per datagram.
+The fallback is the same code path rather than a second implementation, so a batch puts the same bytes on the wire in the same order wherever it runs.
+The probe sets the option and reads it back, because a bare read reports zero on every kernel, and it clears the option afterwards so an ordinary send on that socket stays one datagram per call.
+`without_gso` runs the fallback on a socket that has segmentation, so the contract suite compares the segmented path against the fallback over loopback on one machine.
+Four `platform_contract` tests run unchanged on every target: four segments with a short last one, the fallback against the path a socket takes by default, a batch of one datagram, and a malformed batch refused before any system call.
+The Linux-only behaviour is the one segmented send and the one receive call.
+The API and its contract are the same on every supported target.
+
+**The HTTP/3 server packs a flush into one buffer and sends it in one call, and one readiness event drains up to sixteen datagrams.**
+While quiche's packets have one destination and every packet but the last is one size, the loop packs them into its own buffer.
+It stops at 64 KiB, 64 segments or the connection's send quantum, then sends the buffer as one batch.
+On Linux that is one `sendmsg` with `UDP_SEGMENT`, and the kernel does the split.
+The one-system-call send and the one-system-call receive are Linux-only.
+Where the socket cannot segment, the platform layer sends one datagram per call, with the same bytes in the same order, so a flush is one code path on every platform.
+The receive side takes up to sixteen datagrams per readiness event and feeds each one to the connection with its own `RecvInfo`, and the socket's local address is read once at setup.
+The batch buffer belongs to the loop and is allocated once, so a flush allocates nothing.
+The receive slots are a slice of the buffer the loop already has, so a readiness event allocates nothing either.
+A server therefore spends fewer system calls per response and per burst of received datagrams.
+The `h3_transfer` test sends a body whose last segment is short through a real m6-http over HTTP/3 and compares every byte, so a batch that drops or mis-sizes its last segment fails.
+
+**A test that executes a copied file takes the copy from a directory the build owns rather than the temporary directory, because a host may mount its temporary directory `noexec`.**
+`the_first_tick_reads_no_executable` copies the `m6-http` binary and runs the copy, and the copy lived in a temporary directory that follows `TMPDIR`.
+On a build host whose temporary directory is mounted `noexec` the spawn fails with "Permission denied", so the release-build proof failed for a reason about where the file lived rather than about what the test asserts.
+The directory now comes from `env!("CARGO_TARGET_TMPDIR")`, which cargo creates under the build's own target directory before the test runs, on the same filesystem as the test binary, so exec permission there follows from the test having run at all.
+The copy, the removal and every assertion are unchanged.
+One more test had the same hazard and it failed silently.
+`the_hook_runs_no_content_checks` writes a `cargo` stub into a temporary directory, puts that directory first on `PATH`, and asserts the stub was never run, so on a `noexec` mount the refused exec left the marker absent and the test passed for the wrong reason.
+It now takes the same directory.
+A sweep of the workspace found every other place that writes or copies a binary into a temporary directory and executes it, and each one already runs from an executable directory.
 
 ### Migration
 
@@ -888,7 +941,7 @@ Twenty-six limits now exist (`docs/m6-app-anatomy.md` §4.2, Table 6), read from
 Left without a key on purpose: the HTTP/1.1 head limits (431), the HTTP/2 reset memory, which is now twice the concurrency cap (200 where it was 128) so it stays above the cap whatever the cap is, and the idle URL connection pool, which closes a spare connection and loses no work.
 Verified by a test per limit that fills it past its maximum and reads the refusal: `m6-core/tests/server_conn.rs`, `m6-core/src/limits.rs`, `m6-core/src/client.rs`, `m6-core/src/email.rs`, `m6-core/src/site.rs`, `m6-log/tests/limits_refuse.rs`, `m6-log/tests/escaping.rs`, `m6-http/src/http11.rs`, `m6-http/src/http2.rs`, `m6-http/src/rate_limit.rs`, `m6-monitor/src/history.rs` and `m6-file/src/handler.rs`.
 The hot cache hit still allocates nothing (`m6-http --features count-allocations --test allocations`), and the page-path budgets in `site_allocs` and `request_allocs` are unchanged.
-m6-http conformance (h1spec, h2spec, h3spec) was not run on macOS and must be run on Linux.
+m6-http conformance (h1spec, h2spec, h3spec) is not run on macOS, so the Linux gate runs it.
 
 **A monitor poll on any path is counted as monitor traffic, not as a visitor (#107).** The channel table had two interfaces, so a header check on `/capabilities`, a `/health` poll, or any other monitoring request arrived in `http/*/external` and moved the visitor hit rate while no visitor had moved. The metrics line now reports `http/*/monitor` beside `http/*/external` and `http/*/internal`. `/health` is identified by its backend name, and every other path by the peer's address class. A monitor runs on the private network, so its poll arrives from a private address, while a real visitor's address is public after NAT. The class comes from the listener socket and the peer address the connection proved, so it reads no header and needs no configuration key. Three tests pin the three populations. `a_monitor_poll_on_another_path_is_not_external_traffic` fails as external traffic when the private-peer class is removed, `a_real_external_request_stays_external` fails as monitor when the class is over-broad, and `an_internal_backbone_request_stays_internal` fails as external when the internal socket is classified by its forwarded peer address instead.
 
@@ -1200,7 +1253,7 @@ Verified with `a_symlinked_directory_inside_the_site_is_refused`, which returns 
 
 ### Not measured
 
-- **Linux on the development host.** Every platform and cgroup run above is macOS arm64. On that host the Linux arms of `host_facts()`, the cgroup walk and every `/proc` parse are formatted and parsed but not type-checked, because it has only the `aarch64-apple-darwin` standard library and no rustup. The first Linux CI job that runs `cargo check --workspace --all-targets`, `platform_gate` and `platform_contract` is the proof.
+- **Linux.** The release is measured on Linux: the release-build suite passes there, and the conformance suites score h2spec 146/146 and h3spec 47/49. The development host is macOS arm64, so the Linux arms of `host_facts()`, the cgroup walk and every `/proc` parse are exercised by that build rather than by a run on that host.
 - **The deploy-side writer of `[monitor] expected_deploy_file`.** The monitor reads the file and reports it as waiting. m6 ships no writer of the file, so until a deployment writes one no version or config sha256 is compared.
 ### Known issues
 
