@@ -488,51 +488,34 @@ fn main() -> Result<()> {
                                     conns.free(taken.key);
                                     continue;
                                 }
-                                // Out of descriptors: refuse the connection
-                                // that is already queued by spending the
-                                // reserve, so it is not left waiting for a
+                                // Out of descriptors: close the reserve and take and
+                                // close every connection already queued, so the turn
+                                // ends with the queue empty and nothing waiting for a
                                 // wakeup that a full queue cannot deliver.
-                                // Then keep draining.
                                 m6_core::platform::net::Accept::Exhausted => {
                                     conns.free(taken.key);
-                                    match spare.reject_one(|| {
+                                    let drained = spare.drain(|| {
                                         let (stream, _) = listener.accept()?;
                                         drop(stream);
                                         Ok(())
-                                    }) {
-                                        Ok(m6_core::platform::net::RejectOutcome::Refused) => {
-                                            refusals.refused();
-                                            continue;
-                                        }
-                                        Ok(m6_core::platform::net::RejectOutcome::Nothing) => {
-                                            continue
-                                        }
-                                        Ok(m6_core::platform::net::RejectOutcome::Failed(e)) => {
-                                            m6_core::log::warn!(error = %e, "accept failed while refusing a queued connection");
-                                            poll.registry().reregister(
-                                                listener,
-                                                token,
-                                                Interest::READABLE,
-                                            )?;
-                                            break;
-                                        }
-                                        Err(e) => {
-                                            // The reserve is gone, so the next
-                                            // shortage cannot be handled.
-                                            // Arm the listener and stop
-                                            // draining rather than spinning.
-                                            m6_core::log::warn!(
-                                                error = %e,
-                                                "the reserve descriptor could not be reopened"
-                                            );
-                                            poll.registry().reregister(
-                                                listener,
-                                                token,
-                                                Interest::READABLE,
-                                            )?;
-                                            break;
-                                        }
+                                    });
+                                    for _ in 0..drained.refused {
+                                        refusals.refused();
                                     }
+                                    if let Some(e) = &drained.stopped {
+                                        m6_core::log::warn!(error = %e, "accept failed while draining the queued connections");
+                                    }
+                                    if let Some(e) = &drained.lost {
+                                        m6_core::log::warn!(error = %e, "the reserve descriptor could not be reopened");
+                                    }
+                                    if drained.needs_rearm() {
+                                        poll.registry().reregister(
+                                            listener,
+                                            token,
+                                            Interest::READABLE,
+                                        )?;
+                                    }
+                                    break;
                                 }
                                 // Any other error: say so once and keep the
                                 // listener armed, so a connection still

@@ -575,52 +575,30 @@ fn main() -> io::Result<()> {
                                 match m6_core::platform::net::accept_error(&e) {
                                     m6_core::platform::net::Accept::Drained => break,
                                     m6_core::platform::net::Accept::SkipOne => continue,
-                                    // Out of descriptors: refuse the
-                                    // connection that is already queued by
-                                    // spending the reserve, so it is not left
-                                    // waiting for a wakeup that a full queue
-                                    // cannot deliver. Then keep draining.
+                                                                        // Out of descriptors: close the reserve and take and
+                                    // close every connection already queued, so the turn
+                                    // ends with the queue empty and nothing waiting for a
+                                    // wakeup that a full queue cannot deliver.
+
                                     m6_core::platform::net::Accept::Exhausted => {
-                                        match spare.reject_one(|| {
+                                        let drained = spare.drain(|| {
                                             let (stream, _) = listener.accept()?;
                                             drop(stream);
                                             Ok(())
-                                        }) {
-                                            Ok(m6_core::platform::net::RejectOutcome::Refused) => {
-                                                refusals.refused();
-                                                continue;
-                                            }
-                                            Ok(m6_core::platform::net::RejectOutcome::Nothing) => {
-                                                continue
-                                            }
-                                            Ok(m6_core::platform::net::RejectOutcome::Failed(
-                                                e,
-                                            )) => {
-                                                m6_core::log::warn!(error = %e, "accept failed while refusing a queued connection");
-                                                poll.registry().reregister(
-                                                    &mut listener,
-                                                    LISTENER,
-                                                    Interest::READABLE,
-                                                )?;
-                                                break;
-                                            }
-                                            Err(e) => {
-                                                // The reserve is gone, so the
-                                                // next shortage cannot be
-                                                // handled. Arm the listener and
-                                                // stop draining.
-                                                m6_core::log::warn!(
-                                                    error = %e,
-                                                    "the reserve descriptor could not be reopened"
-                                                );
-                                                poll.registry().reregister(
-                                                    &mut listener,
-                                                    LISTENER,
-                                                    Interest::READABLE,
-                                                )?;
-                                                break;
-                                            }
+                                        });
+                                        for _ in 0..drained.refused {
+                                            refusals.refused();
                                         }
+                                        if let Some(e) = &drained.stopped {
+                                            m6_core::log::warn!(error = %e, "accept failed while draining the queued connections");
+                                        }
+                                        if let Some(e) = &drained.lost {
+                                            m6_core::log::warn!(error = %e, "the reserve descriptor could not be reopened");
+                                        }
+                                        if drained.needs_rearm() {
+                                            poll.registry().reregister(&mut listener, LISTENER, Interest::READABLE)?;
+                                        }
+                                        break;
                                     }
                                     // Any other error: say so once and keep
                                     // the listener armed, so a connection

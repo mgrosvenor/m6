@@ -246,12 +246,12 @@ fn connect_in_progress(e: &io::Error) -> bool {
 /// What an `accept` error means for an edge-triggered accept loop.
 ///
 /// The loop drains the listener to [`Accept::Drained`]. [`Accept::SkipOne`]
-/// is a connection that went away before it was accepted (`ECONNABORTED`) or
-/// an interrupted call: keep draining. [`Accept::Exhausted`] is `EMFILE` or
-/// `ENFILE`: take the queued connection with the reserve descriptor
-/// ([`SpareDescriptor`]), refuse it, and keep draining. [`Accept::Stop`] is
-/// any other failure: log it once, leave the listener armed and stop
-/// draining.
+/// is a connection that went away before it was accepted (`ECONNABORTED`,
+/// `ECONNRESET`) or an interrupted call: keep draining. [`Accept::Exhausted`] is `EMFILE` or
+/// `ENFILE`: close the reserve descriptor ([`SpareDescriptor::drain`]), take
+/// and close every queued connection until `WouldBlock`, open the reserve
+/// again, and end the turn. [`Accept::Stop`] is any other failure: log it
+/// once, leave the listener armed and stop draining.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Accept {
     /// `WouldBlock`: the queue is empty.
@@ -270,7 +270,9 @@ pub fn accept_error(e: &io::Error) -> Accept {
     use nix::errno::Errno;
     match e.kind() {
         io::ErrorKind::WouldBlock => Accept::Drained,
-        io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted => Accept::SkipOne,
+        io::ErrorKind::Interrupted
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::ConnectionReset => Accept::SkipOne,
         _ if e.raw_os_error() == Some(Errno::ECONNABORTED as i32) => Accept::SkipOne,
         _ if matches!(
             e.raw_os_error(),
@@ -283,37 +285,49 @@ pub fn accept_error(e: &io::Error) -> Accept {
     }
 }
 
-/// What one [`SpareDescriptor::reject_one`] call did with the queued
-/// connection.
-#[derive(Debug)]
-pub enum RejectOutcome {
-    /// The connection was taken and closed: the service refused it, and it is
-    /// counted.
-    Refused,
-    /// Nothing was taken: the queue was already empty, or the kernel reset the
-    /// connection before `accept` could take it. Nothing was refused.
-    Nothing,
-    /// `accept` failed for a reason that is not a refusal. The reserve is held
-    /// again, and the caller must log this rather than count it.
-    Failed(io::Error),
+/// What one [`SpareDescriptor::drain`] call did with the queued connections.
+///
+/// The caller counts [`Drained::refused`], logs either error, and re-arms the
+/// listener when [`Drained::needs_rearm`] says a connection may still be
+/// queued. It then ends the turn: after a drain the queue is empty, and there
+/// is nothing left to accept.
+#[derive(Debug, Default)]
+pub struct Drained {
+    /// The connections taken and closed by the drain. Each one is a refusal.
+    pub refused: usize,
+    /// The accept error that ended the drain before the queue was empty, if
+    /// any. A connection may still be queued, so the listener needs re-arming.
+    pub stopped: Option<io::Error>,
+    /// The reserve could not be opened again after the drain. The queue is
+    /// empty, but the next shortage cannot be refused.
+    pub lost: Option<io::Error>,
+}
+
+impl Drained {
+    /// Whether a connection may still be queued: the drain did not end at
+    /// `WouldBlock`, so the listener must be re-armed to report it again.
+    pub fn needs_rearm(&self) -> bool {
+        self.stopped.is_some()
+    }
 }
 
 /// The descriptor an accept loop keeps in reserve, so that running out of
-/// descriptors refuses the queued connection instead of stalling the listener.
+/// descriptors refuses the connections that are queued instead of stalling the
+/// listener.
 ///
 /// It is opened at start, before any pressure, and it is of the same socket
 /// family as the listener it serves, so the descriptor the kernel hands back
 /// is one this process can always make again.
 ///
-/// On `EMFILE` or `ENFILE` the loop closes the reserve, takes the queued
-/// connection in the descriptor that frees, closes that connection at once,
-/// and opens the reserve again. That is `libuv`'s `uv__emfile_trick`, and it
-/// is what keeps the listener draining. An edge-triggered listener has already
-/// consumed the readiness that woke it, so the only thing that can wake it
-/// again is another connection, and a full queue lets no other connection
-/// complete: a loop that stops accepting there waits for the life of the
-/// process. Taking and refusing the queued connection empties the queue, so
-/// the turn ends with nothing unread and no re-arm to get wrong.
+/// On `EMFILE` or `ENFILE` the loop closes the reserve with [`Self::drain`],
+/// which takes and closes every queued connection until the kernel answers
+/// `WouldBlock`, and then opens the reserve again. That is `libuv`'s
+/// `uv__emfile_trick`, and it is what keeps the listener draining. An
+/// edge-triggered listener has already consumed the readiness that woke it, so
+/// the only thing that can wake it again is another connection, and a full
+/// queue lets no other connection complete: a loop that stops accepting there
+/// waits for the life of the process. Draining to `WouldBlock` empties the
+/// queue, so the turn ends with nothing unread and no re-arm to get wrong.
 #[derive(Debug)]
 pub struct SpareDescriptor {
     domain: socket2::Domain,
@@ -338,46 +352,51 @@ impl SpareDescriptor {
         Self::new(socket2::Domain::UNIX)
     }
 
-    /// Take and close the connection the kernel has queued, using the reserve.
+    /// Close the reserve, take and close every connection the listener has
+    /// queued, then open the reserve again.
     ///
-    /// The reserve is closed first, then `accept` runs (it must take one
-    /// connection and close it), then the reserve is opened again. `accept`
-    /// therefore runs while the reserve's descriptor is free, which is the
-    /// descriptor the queued connection is taken in.
+    /// `accept` must accept one connection and close it at once: the
+    /// descriptor the reserve freed is the one the connection is taken in, and
+    /// closing it returns that descriptor for the next call. The loop ends
+    /// when `accept` answers `WouldBlock`, and no other answer ends it as
+    /// "empty": a connection that vanished (`ECONNABORTED`/`ECONNRESET`) or an
+    /// interrupted call is passed over, and any other failure stops the drain
+    /// and is reported in [`Drained::stopped`].
     ///
-    /// The reserve is held again on every return except the one error it can
-    /// report, the reserve failing to reopen. That error is the caller's to
-    /// handle, because the next shortage cannot be.
+    /// `WouldBlock`, not `EMFILE`, is the empty-queue answer. Linux consults
+    /// the process's descriptor table before the listen queue, so with the
+    /// table full an `accept` on an empty queue is `EMFILE` and not
+    /// `WouldBlock`; a loop that treats that `EMFILE` as "try again" spins.
+    /// With the reserve closed during the drain the table is one descriptor
+    /// short of full, and the final `accept` really does answer `WouldBlock`.
     ///
-    /// The accept's own outcome is returned rather than discarded. An accept
-    /// loop writes a line per refusal and the count must be exact, so
-    /// [`RejectOutcome::Refused`] is the only outcome a caller may count:
-    /// an emptied queue (`EAGAIN`) or a connection the kernel reset before
-    /// `accept` could take it (`ECONNABORTED`/`ECONNRESET`) is
-    /// [`RejectOutcome::Nothing`], and any other error is
-    /// [`RejectOutcome::Failed`] and must reach the log instead of being
-    /// counted as a refusal.
-    pub fn reject_one(
-        &mut self,
-        accept: impl FnOnce() -> io::Result<()>,
-    ) -> io::Result<RejectOutcome> {
-        // Dropping the reserve closes it: the queued connection needs the
-        // descriptor number it held.
+    /// The reserve is held again on every return. [`Drained::lost`] reports
+    /// the one failure that leaves it unheld, which the caller must log: the
+    /// next shortage cannot be refused.
+    pub fn drain(&mut self, mut accept: impl FnMut() -> io::Result<()>) -> Drained {
+        // Dropping the reserve closes it. Keeping exactly this one descriptor
+        // free is what lets the drain see `WouldBlock` instead of `EMFILE`,
+        // and the queued connection is taken in it.
         self.fd = None;
-        let taken = accept();
-        let fd = self.open()?;
-        self.fd = Some(fd);
-        Ok(match taken {
-            Ok(()) => RejectOutcome::Refused,
-            Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock
-                    || e.kind() == io::ErrorKind::ConnectionAborted
-                    || e.kind() == io::ErrorKind::ConnectionReset =>
-            {
-                RejectOutcome::Nothing
+        let mut drained = Drained::default();
+        loop {
+            match accept() {
+                Ok(()) => drained.refused += 1,
+                Err(e) => match accept_error(&e) {
+                    Accept::Drained => break,
+                    Accept::SkipOne => continue,
+                    Accept::Exhausted | Accept::Stop => {
+                        drained.stopped = Some(e);
+                        break;
+                    }
+                },
             }
-            Err(e) => RejectOutcome::Failed(e),
-        })
+        }
+        match self.open() {
+            Ok(fd) => self.fd = Some(fd),
+            Err(e) => drained.lost = Some(e),
+        }
+        drained
     }
 
     fn open(&self) -> io::Result<OwnedFd> {
@@ -385,6 +404,22 @@ impl SpareDescriptor {
         os::prepare_socket(&sock)?;
         Ok(OwnedFd::from(sock))
     }
+}
+
+/// The connections waiting in a TCP listener's accept queue, where the kernel
+/// reports it.
+///
+/// `Ok(None)` where there is no such report: macOS has no `/proc`, and kqueue
+/// says a listener is readable but not how many connections are behind it.
+/// Nothing in a running service asks this; a test does, to assert that an
+/// accept arm ended with the queue empty, which a client's own outcome cannot
+/// state directly.
+///
+/// Linux reads `/proc/net/tcp` and `/proc/net/tcp6`. A listening socket's row
+/// prints `tx_queue:rx_queue`, and the second number is the completed
+/// connections this process has not accepted.
+pub fn accept_queue(local: SocketAddr) -> io::Result<Option<usize>> {
+    os::accept_queue(local)
 }
 
 /// Set the send and receive buffer sizes, in bytes. The kernel may round them
@@ -768,13 +803,17 @@ mod tests {
             Accept::SkipOne
         );
         assert_eq!(
+            accept_error(&io::Error::from(io::ErrorKind::ConnectionReset)),
+            Accept::SkipOne
+        );
+        assert_eq!(
             accept_error(&io::Error::from_raw_os_error(Errno::EBADF as i32)),
             Accept::Stop
         );
     }
 
     /// The reserve is a stream socket of the listener's own family, held from
-    /// start, and spending it takes a queued connection and holds it again.
+    /// start, and draining spends it and holds it again.
     ///
     /// Break: a reserve opened as a file rather than a socket of the same
     /// family, or one that is not reopened after it is spent (the next
@@ -805,60 +844,68 @@ mod tests {
              one an accepted connection needs"
         );
 
-        // Spending it runs the caller's accept with the reserve's descriptor
+        // Draining runs the caller's accept with the reserve's descriptor
         // free, and holds the reserve again afterwards.
-        let mut ran = false;
-        let outcome = unix.reject_one(|| {
-            ran = true;
+        let mut runs = 0;
+        let drained = unix.drain(|| {
+            runs += 1;
             Err(io::Error::from(io::ErrorKind::WouldBlock))
         });
-        assert!(ran, "the caller's accept ran with the reserve free");
-        assert!(
-            matches!(outcome, Ok(RejectOutcome::Nothing)),
-            "an emptied queue refused nothing, and the reserve was taken back"
-        );
+        assert_eq!(runs, 1, "the caller's accept ran with the reserve free");
+        assert_eq!(drained.refused, 0, "an emptied queue refused nothing");
+        assert!(!drained.needs_rearm());
         assert!(unix.fd.is_some(), "held again after it was spent");
     }
 
-    /// The reserve reports what the accept did: a taken connection is a
-    /// refusal and is counted; an emptied queue or a connection the kernel
-    /// reset before it could be taken is not; any other failure is carried to
-    /// the caller's log.
+    /// The drain takes every connection the queue holds, one after another,
+    /// counting each, and stops at `WouldBlock`. A real accept error stops it
+    /// and is carried to the caller's log instead of being counted.
     ///
-    /// Break: `Ok(())` for every outcome, which counts a refusal that never
-    /// happened and swallows a real accept error.
+    /// Break: one accept per call. On an edge-triggered listener the readiness
+    /// that woke the loop is consumed, and the connections that were left
+    /// queued wait for a wakeup that a full queue cannot deliver.
     #[test]
-    fn reject_one_reports_the_accept_outcome() {
+    fn the_drain_takes_every_queued_connection() {
         let mut spare = SpareDescriptor::for_unix().expect("a unix reserve");
 
-        let refused = spare.reject_one(|| Ok(())).expect("the reserve reopens");
-        assert!(matches!(refused, RejectOutcome::Refused));
+        // Three queued connections, then the queue is empty.
+        let mut left = 3;
+        let drained = spare.drain(|| {
+            if left > 0 {
+                left -= 1;
+                Ok(())
+            } else {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+        });
+        assert_eq!(drained.refused, 3, "every queued connection was taken");
+        assert!(drained.stopped.is_none(), "the queue emptied");
+        assert!(!drained.needs_rearm());
         assert!(spare.fd.is_some(), "the reserve is held again");
 
-        for gone in [
-            io::ErrorKind::WouldBlock,
-            io::ErrorKind::ConnectionAborted,
-            io::ErrorKind::ConnectionReset,
-        ] {
-            let outcome = spare
-                .reject_one(|| Err(io::Error::from(gone)))
-                .expect("the reserve reopens");
-            assert!(
-                matches!(outcome, RejectOutcome::Nothing),
-                "{gone:?} refused nothing"
-            );
-            assert!(spare.fd.is_some(), "the reserve is held again");
-        }
-
-        let failed = spare
-            .reject_one(|| Err(io::Error::from(io::ErrorKind::PermissionDenied)))
-            .expect("the reserve reopens");
-        match failed {
-            RejectOutcome::Failed(e) => {
-                assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        // A connection the kernel reset before it could be taken is passed
+        // over, and the drain carries on to the next one.
+        let mut step = 0;
+        let drained = spare.drain(|| {
+            step += 1;
+            match step {
+                1 => Err(io::Error::from(io::ErrorKind::ConnectionReset)),
+                2 => Ok(()),
+                _ => Err(io::Error::from(io::ErrorKind::WouldBlock)),
             }
-            other => panic!("a real accept error must reach the caller: {other:?}"),
-        }
+        });
+        assert_eq!(drained.refused, 1, "the reset connection is not a refusal");
+        assert!(!drained.needs_rearm());
+
+        // Any other failure stops the drain and reaches the caller.
+        let drained = spare.drain(|| Err(io::Error::from(io::ErrorKind::PermissionDenied)));
+        assert_eq!(drained.refused, 0);
+        assert_eq!(
+            drained.stopped.as_ref().map(io::Error::kind),
+            Some(io::ErrorKind::PermissionDenied),
+            "a real accept error must reach the caller"
+        );
+        assert!(drained.needs_rearm(), "a connection may still be queued");
         assert!(spare.fd.is_some(), "the reserve is held again");
     }
 

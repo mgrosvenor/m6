@@ -145,53 +145,36 @@ fn main() -> io::Result<()> {
                                     slots.free(taken.key);
                                     continue;
                                 }
-                                // Out of descriptors: refuse the connection
-                                // that is already queued by spending the
-                                // reserve, so it is not left waiting for a
+                                // Out of descriptors: close the reserve and take and
+                                // close every connection already queued, so the turn
+                                // ends with the queue empty and nothing waiting for a
                                 // wakeup that a full queue cannot deliver.
-                                // Then keep draining.
                                 net::Accept::Exhausted => {
                                     slots.free(taken.key);
-                                    match spare.reject_one(|| {
+                                    let drained = spare.drain(|| {
                                         let (stream, _) = listener.accept()?;
                                         drop(stream);
                                         Ok(())
-                                    }) {
-                                        Ok(m6_core::platform::net::RejectOutcome::Refused) => {
-                                            refusals.refused();
-                                            continue;
-                                        }
-                                        Ok(m6_core::platform::net::RejectOutcome::Nothing) => {
-                                            continue
-                                        }
-                                        Ok(m6_core::platform::net::RejectOutcome::Failed(e)) => {
-                                            // This example has no log sink; the
-                                            // refusal path writes to stderr too.
-                                            eprintln!(
-                                                "accept failed while refusing a queued connection: {e}"
-                                            );
-                                            poll.registry().reregister(
-                                                &mut listener,
-                                                LISTENER,
-                                                Interest::READABLE,
-                                            )?;
-                                            break;
-                                        }
-                                        Err(e) => {
-                                            // The reserve is gone, so the next
-                                            // shortage cannot be handled. Arm
-                                            // the listener and stop draining.
-                                            eprintln!(
-                                                "the reserve descriptor could not be reopened: {e}"
-                                            );
-                                            poll.registry().reregister(
-                                                &mut listener,
-                                                LISTENER,
-                                                Interest::READABLE,
-                                            )?;
-                                            break;
-                                        }
+                                    });
+                                    for _ in 0..drained.refused {
+                                        refusals.refused();
                                     }
+                                    if let Some(e) = &drained.stopped {
+                                        eprintln!("accept failed while draining the queued connections: {e}");
+                                    }
+                                    if let Some(e) = &drained.lost {
+                                        eprintln!(
+                                            "the reserve descriptor could not be reopened: {e}"
+                                        );
+                                    }
+                                    if drained.needs_rearm() {
+                                        poll.registry().reregister(
+                                            &mut listener,
+                                            LISTENER,
+                                            Interest::READABLE,
+                                        )?;
+                                    }
+                                    break;
                                 }
                                 // Any other error: say so once and keep the
                                 // listener armed, so a connection still

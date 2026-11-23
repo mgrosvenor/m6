@@ -603,9 +603,30 @@ fn the_loop_never_waits() {
 /// it was another connection, which a full queue cannot deliver. The queued
 /// client therefore waited for the life of the process.
 ///
+/// **The Linux defect this pins.** `EMFILE` is not the empty-queue answer.
+/// Linux consults the process's descriptor table before the listen queue, so
+/// with every descriptor in use `accept` answers `EMFILE` even when nothing is
+/// queued, and it leaves a queued connection queued. A loop that closes the
+/// reserve, takes one connection, opens the reserve again and retries `EMFILE`
+/// therefore never reaches `WouldBlock` on Linux: it spins in the accept arm,
+/// never returns to `poll`, never reads the connection it accepted last, and
+/// never writes a refusal line. macOS answers `WouldBlock` for an empty queue,
+/// so the same loop ends its turn there and the test passed on macOS only.
+///
+/// **What only a Linux run can prove**, and this test now asserts: every client
+/// reaches an outcome with no new connection arriving; the refusal line is
+/// written, which only happens when the arm ends its turn; the accept queue the
+/// platform layer reads is empty afterwards; and the listener serves again,
+/// which it can only do if the arm returned to `poll`. macOS has no accept
+/// queue reading, so those checks are skipped there, and it needs none of them:
+/// its kernel drops the connection that `accept` refused for want of a
+/// descriptor.
+///
 /// **Break:** an accept loop that returns from the arm on `EMFILE` (the queued
-/// clients then sit in the queue: this test's read times out), one that logs
-/// the refusal and stops draining, or an echo that returns the error and exits.
+/// clients then sit in the queue: this test's read times out), one that takes
+/// one connection per `EMFILE` and retries (it spins on Linux, leaving the
+/// client it accepted unread and the refusal uncounted), one that logs the
+/// refusal and stops draining, or an echo that returns the error and exits.
 #[test]
 fn queued_clients_are_refused_with_no_new_connection_arriving() {
     let cmd = m6_core::testkit::lowered_fd_limit_command(40, 0, bin("echo"));
@@ -650,13 +671,32 @@ fn queued_clients_are_refused_with_no_new_connection_arriving() {
     assert!(refused >= 1, "the descriptor limit refused nobody");
     // The audit's finding, as an assertion: with no descriptor free, a queued
     // connection is refused in the same turn instead of waiting for a new
-    // connection that a full queue cannot deliver.
+    // connection that a full queue cannot deliver. A loop that spins on
+    // `EMFILE` leaves the connection it accepted last unread, and its client
+    // sits here.
     assert!(
         waiting.is_empty(),
         "{} client(s) were left waiting for a wakeup that cannot arrive: the \
-         listener consumed the readiness and never drained",
+         accept arm did not drain the queue and end its turn",
         waiting.len()
     );
+    // Linux, where the kernel reports the accept queue, so this is a check only
+    // a Linux run can fail. The turn ended and wrote the refusals above:
+    // nothing new connects between the burst and this line, so only an arm that
+    // reached its end can have written it, and a loop that spins on `EMFILE`
+    // never does. The queue it left is empty. macOS has no such report and
+    // needs neither check: its kernel drops the connection that `accept`
+    // refused for want of a descriptor.
+    let queued = m6_core::platform::net::accept_queue(addr).expect("the accept queue is readable");
+    if queued.is_some() {
+        srv.wait_for(m6_core::net::REFUSED_MESSAGE, Duration::from_secs(5));
+        assert_eq!(
+            queued,
+            Some(0),
+            "the listener's accept queue is not empty at the end of the turn: a \
+             connection is left waiting with no wakeup that can arrive"
+        );
+    }
     // The interval passes, and one more connection is refused: its turn ends by
     // writing what the rate limit held back, so the burst below starts with
     // nothing owed. When the service counted nothing for the clients above,
@@ -715,14 +755,36 @@ fn queued_clients_are_refused_with_no_new_connection_arriving() {
         .status()
         .expect("continue the echo");
     assert!(cont.success(), "kill -CONT");
+    // The reads are collected rather than asserted one at a time, so the
+    // accept-queue check below always runs and names the real fault: a drain
+    // that stopped early leaves the rest of the burst in the kernel's queue,
+    // which is what the client-side read timeout below would otherwise report.
+    let mut probe_outcomes = Vec::new();
     for probe in &mut probes {
         let mut byte = [0u8; 1];
-        match probe.read(&mut byte) {
+        probe_outcomes.push(probe.read(&mut byte));
+    }
+    // Linux: this burst was queued while the process was stopped, so one arm
+    // saw all three, and that arm ended with the kernel's accept queue empty.
+    // A drain that takes one connection and ends the turn leaves the other two
+    // here, and an edge-triggered epoll listener reports nothing for them: the
+    // no-wakeup stall this whole test exists for.
+    if let Some(queued) =
+        m6_core::platform::net::accept_queue(addr).expect("the accept queue is readable")
+    {
+        assert_eq!(
+            queued, 0,
+            "the listener's accept queue is not empty at the end of the turn: the \
+             burst was not drained and nothing can wake the listener for it"
+        );
+    }
+    for (i, outcome) in probe_outcomes.into_iter().enumerate() {
+        match outcome {
             Ok(0) => {}
             Err(e) if e.kind() == ErrorKind::ConnectionReset => {}
             other => panic!(
-                "a connection queued while the echo was stopped was neither closed nor reset: \
-                 {other:?}"
+                "probe {i}: a connection queued while the echo was stopped was neither \
+                 closed nor reset: {other:?}"
             ),
         }
     }

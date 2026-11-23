@@ -102,6 +102,42 @@ pub(super) fn prepare_socket(_sock: &socket2::Socket) -> io::Result<()> {
     Ok(())
 }
 
+/// The connections waiting in a TCP listener's accept queue, read from
+/// `/proc/net/tcp` and `/proc/net/tcp6`.
+///
+/// A listening socket's row prints `tx_queue:rx_queue`, and the second number
+/// is the completed connections this process has not accepted. The port alone
+/// names the listener: it is bound while the question is asked, so no other
+/// row can carry it. A listener that is not in either file is an error rather
+/// than "no queue": silently answering zero would let a test that asks this
+/// pass without checking anything.
+pub(super) fn accept_queue(local: SocketAddr) -> io::Result<Option<usize>> {
+    let port = format!(":{:04X}", local.port());
+    let mut queued: Option<usize> = None;
+    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for line in text.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 5 || !fields[1].ends_with(&port) || fields[3] != "0A" {
+                continue;
+            }
+            let Some((_, rx)) = fields[4].split_once(':') else {
+                continue;
+            };
+            let n = usize::from_str_radix(rx, 16).unwrap_or(0);
+            queued = Some(queued.map_or(n, |q| q.max(n)));
+        }
+    }
+    queued.map(Some).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no listening socket for {local} in /proc/net/tcp"),
+        )
+    })
+}
+
 /// Ask the kernel to report the socket writable only while its send queue holds
 /// fewer than `bytes`, so one response's body is not all handed to the kernel
 /// at once and the order m6 frames it in is the order it leaves.

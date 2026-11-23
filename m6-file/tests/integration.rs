@@ -929,12 +929,14 @@ fn count_field(line: &str, key: &str) -> u64 {
 /// fails with `EMFILE`. A loop that stops accepting on that error leaves the
 /// listener edge-triggered with a connection queued and no wakeup left: with a
 /// full queue no new connection can complete, so the client waits for the life
-/// of the process. The loop must refuse the queued connection instead, with the
-/// reserve descriptor, and keep draining.
+/// of the process. The loop must close the reserve descriptor, take and close
+/// every queued connection until `WouldBlock`, open the reserve again, and end
+/// the turn. `WouldBlock` and not `EMFILE` is the empty answer: Linux consults
+/// the descriptor table before the queue, so a loop that retries `EMFILE` spins.
 ///
 /// The burst is made deterministic by stopping the process: three connections
 /// are queued while it is stopped, so the arm that runs on resume sees all
-/// three. A loop that refuses one and stops leaves the other two in the queue,
+/// three. A loop that takes one and stops leaves the other two in the queue,
 /// and nothing can wake it for them.
 ///
 /// Break: a loop that returns from the accept arm on `EMFILE`, one that refuses

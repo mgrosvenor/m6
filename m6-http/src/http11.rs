@@ -598,40 +598,36 @@ impl Http11Listener {
                         return None;
                     }
                     m6_core::platform::net::Accept::SkipOne => continue,
-                    // Out of descriptors: refuse the connection already
-                    // queued by spending the reserve, so it is not left
-                    // waiting for a wakeup that a full queue cannot deliver.
-                    // Then keep draining.
+                    // Out of descriptors: close the reserve and take and
+                    // close every connection already queued, so the turn
+                    // ends with the queue empty and nothing waiting for a
+                    // wakeup that a full queue cannot deliver.
                     m6_core::platform::net::Accept::Exhausted => {
-                        match spare.reject_one(|| {
+                        let drained = spare.drain(|| {
                             let (stream, _) = listener.accept()?;
                             drop(stream);
                             Ok(())
-                        }) {
-                            Ok(m6_core::platform::net::RejectOutcome::Refused) => {
-                                self.refusals.refused();
-                                continue;
-                            }
-                            Ok(m6_core::platform::net::RejectOutcome::Nothing) => continue,
-                            Ok(m6_core::platform::net::RejectOutcome::Failed(e)) => {
-                                warn!(
-                                    error = %e,
-                                    "accept failed while refusing a queued connection"
-                                );
-                                self.note_rearm(status);
-                                report_refusals(&mut self.refusals, false);
-                                return None;
-                            }
-                            Err(e) => {
-                                // The reserve is gone, so the next shortage
-                                // cannot be handled. The loop re-registers
-                                // the listener and stops draining.
-                                warn!(error = %e, "the reserve descriptor could not be reopened");
-                                self.note_rearm(status);
-                                report_refusals(&mut self.refusals, false);
-                                return None;
-                            }
+                        });
+                        for _ in 0..drained.refused {
+                            self.refusals.refused();
                         }
+                        if let Some(e) = &drained.stopped {
+                            warn!(
+                                error = %e,
+                                "accept failed while draining the queued connections"
+                            );
+                        }
+                        if let Some(e) = &drained.lost {
+                            // The reserve is gone, so the next shortage
+                            // cannot be handled.
+                            warn!(error = %e, "the reserve descriptor could not be reopened");
+                        }
+                        if drained.needs_rearm() {
+                            self.note_rearm(status);
+                        }
+                        report_refusals(&mut self.refusals, false);
+                        // The queue is empty, so the turn is done.
+                        return None;
                     }
                     // Any other error: say so once and have the loop
                     // re-register the listener, so a connection still queued
@@ -1253,33 +1249,30 @@ impl H2cListener {
                 // while its budget lasts.
                 m6_core::platform::net::Accept::Exhausted => {
                     let listener = &self.listener;
-                    match self.spare.reject_one(|| {
+                    let drained = self.spare.drain(|| {
                         let (stream, _) = listener.accept()?;
                         drop(stream);
                         Ok(())
-                    }) {
-                        Ok(m6_core::platform::net::RejectOutcome::Refused) => {
-                            self.fd_refusals.refused();
-                            H2cAccept::Refused
-                        }
-                        Ok(m6_core::platform::net::RejectOutcome::Nothing) => H2cAccept::Refused,
-                        Ok(m6_core::platform::net::RejectOutcome::Failed(e)) => {
-                            warn!(
-                                error = %e,
-                                "accept failed while refusing a queued connection"
-                            );
-                            self.rearm = true;
-                            H2cAccept::WouldBlock
-                        }
-                        Err(e) => {
-                            // The reserve is gone, so the next shortage cannot
-                            // be handled. The loop re-registers the listener
-                            // and stops draining.
-                            warn!(error = %e, "the reserve descriptor could not be reopened");
-                            self.rearm = true;
-                            H2cAccept::WouldBlock
-                        }
+                    });
+                    for _ in 0..drained.refused {
+                        self.fd_refusals.refused();
                     }
+                    if let Some(e) = &drained.stopped {
+                        warn!(
+                            error = %e,
+                            "accept failed while draining the queued connections"
+                        );
+                    }
+                    if let Some(e) = &drained.lost {
+                        // The reserve is gone, so the next shortage cannot be
+                        // handled.
+                        warn!(error = %e, "the reserve descriptor could not be reopened");
+                    }
+                    if drained.needs_rearm() {
+                        self.rearm = true;
+                    }
+                    // The queue is empty, so the accept pass is done.
+                    H2cAccept::WouldBlock
                 }
                 // Any other error: say so once and have the loop re-register
                 // the listener, so a connection still queued is reported again
