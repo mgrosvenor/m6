@@ -367,7 +367,7 @@ Table 5 is the reserved set, and a key in it never reaches a template.
 | `[params_cache]` | core | `size`, default 256 entries |
 | `[server]` | core | `read_timeout_s`, default 30, `0` disables. `socket_mode`, an octal string as systemd writes it, default `"0660"` |
 | `[compression]` | core | brotli and gzip levels per MIME type |
-| `[minification]` | core | on or off per MIME type. JavaScript is never minified. A build without the `minify` feature refuses a config that turns it on. The `no-store` exception is in Table 9 of `m6-architecture.md` |
+| `[minification]` | core | on or off per MIME type, plus `inline_js` for classic inline scripts. A module script and a non-JavaScript `<script>` type keep their bytes. A `no-store` response is minified like any other. A build without the `minify` feature refuses a config that turns it on |
 | `[log]` | core | `level`, default `info` |
 | `[limits.<name>]` | core | `start` and `max` of a named buffer or queue, §4.2 and Table 6 |
 | `[[route]]` | core | the configuration route table, §5 |
@@ -749,7 +749,7 @@ This section lists it.
 - `listen_unix`, which binds a non-blocking socket with the mode set.
 - Content-coding negotiation with real q-values, so `br;q=0` is honoured, `*` supplies the quality for anything unnamed, and an explicitly named coding beats `*` in either direction.
 - Conditional requests: `If-Match`, `If-None-Match`, `If-Modified-Since` and `If-Unmodified-Since`, with weak comparison where the specification requires it.
-- brotli and gzip, and HTML, CSS and JSON minification, both configurable per MIME type, with minification before compression.
+- brotli and gzip, and HTML, CSS, JSON and JavaScript minification, both configurable per MIME type, with minification before compression.
 - Configuration, templates and params files read at start and again on `POST /genid` (§5.1). The log level is fixed for the life of the process.
 - Structured logging as JSON lines, flushed by the loop that writes them.
 - A request dictionary layered over a shared base, assembled from twelve sources in a fixed order.

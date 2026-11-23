@@ -26,7 +26,7 @@ Sections 2 to 12 walk Examples 01 to 11 in order.
 The examples need a release build of m6, a certificate tool and the m6 checkout, which holds `examples/`.
 [`README.md`](../README.md) section 1, steps 1 to 3, gives the commands.
 Step 1 puts `target/release` on `PATH`, which makes every m6 binary available, including `m6-md`, which Example 02 uses.
-Rust 1.89 or newer provides the compiler and Cargo.
+Rust 1.98 or newer provides the compiler and Cargo.
 The renderer crates reach m6 through the relative path `../../../m6-core`, inside this repository.
 
 m6-http serves the public site over *TLS* (Transport Layer Security), so every site needs a certificate.

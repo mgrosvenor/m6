@@ -277,9 +277,13 @@ impl RendererConfig {
         );
 
         // The minification table is flat in the file: `[minification]` holds
-        // one `<mime> = true` key per type, so the record and the rebuilt
-        // file use the same shape.
+        // `inline_js` plus one `<mime> = true` key per type, so the record and
+        // the rebuilt file use the same shape.
         let mut minification = Map::new();
+        minification.insert(
+            "inline_js".to_string(),
+            Value::Bool(self.minification.inline_js),
+        );
         for (mime, on) in &self.minification.enabled {
             minification.insert(mime.clone(), Value::Bool(*on));
         }
@@ -391,6 +395,11 @@ fn json_option(value: &Option<String>) -> Value {
 pub struct MinificationConfig {
     /// Which MIME types have minification enabled.
     pub enabled: std::collections::HashMap<String, bool>,
+    /// Whether to minify classic inline `<script>` bodies inside HTML.
+    ///
+    /// Module scripts and non-JavaScript script types are left as written.
+    /// Set in config with `[minification] inline_js`.
+    pub inline_js: bool,
 }
 
 impl MinificationConfig {
@@ -405,7 +414,12 @@ fn default_minification() -> MinificationConfig {
     m.insert("text/html".to_string(), true);
     m.insert("text/css".to_string(), true);
     m.insert("application/json".to_string(), true);
-    MinificationConfig { enabled: m }
+    m.insert("application/javascript".to_string(), true);
+    m.insert("text/javascript".to_string(), true);
+    MinificationConfig {
+        enabled: m,
+        inline_js: true,
+    }
 }
 
 /// Framework-consumed top-level keys that must not appear in the request dict.
@@ -818,10 +832,14 @@ fn parse_minification(
             let on = val.as_bool().ok_or_else(|| {
                 anyhow::anyhow!("[minification] {key} must be true or false, got {val}")
             })?;
-            minification.enabled.insert(key.clone(), on);
+            if key == "inline_js" {
+                minification.inline_js = on;
+            } else {
+                minification.enabled.insert(key.clone(), on);
+            }
         }
     }
-    let asked = minification.enabled.values().any(|&on| on);
+    let asked = minification.inline_js || minification.enabled.values().any(|&on| on);
     if asked && !minifiers_linked {
         anyhow::bail!(
             "[minification] turns minification on, but this build of m6-core has no minifiers: \
@@ -987,12 +1005,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     /// Compressed by default and deliberately not minified.
-    const NOT_MINIFIED: &[&str] = &[
-        "image/svg+xml",
-        "text/plain",
-        "application/javascript",
-        "text/javascript",
-    ];
+    const NOT_MINIFIED: &[&str] = &["image/svg+xml", "text/plain"];
 
     #[test]
     fn every_minified_type_is_also_compressed_by_default() {
@@ -1042,9 +1055,24 @@ mod tests {
 
     #[test]
     fn a_build_with_the_minify_feature_minifies_by_default() {
-        assert!(parse_minification(None, true)
-            .unwrap()
-            .is_enabled("text/html"));
+        let minification = parse_minification(None, true).unwrap();
+        assert!(minification.is_enabled("text/html"));
+        assert!(minification.is_enabled("application/javascript"));
+        assert!(minification.is_enabled("text/javascript"));
+        assert!(minification.inline_js);
+    }
+
+    #[test]
+    fn the_javascript_keys_and_inline_js_can_be_turned_off() {
+        let table: toml::Value = toml::from_str(
+            "[minification]\n\"application/javascript\" = false\n\"text/javascript\" = false\ninline_js = false\n",
+        )
+        .unwrap();
+        let minification = parse_minification(table.get("minification"), true).unwrap();
+        assert!(!minification.is_enabled("application/javascript"));
+        assert!(!minification.is_enabled("text/javascript"));
+        assert!(minification.is_enabled("text/html"));
+        assert!(!minification.inline_js);
     }
 
     #[test]

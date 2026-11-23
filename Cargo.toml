@@ -67,9 +67,9 @@ edition      = "2021"
 # this version, and that is how this number was found rather than guessed. The
 # guess was 1.85, on the basis that `is_none_or` (1.82) is the newest standard
 # library call we make. CI answered with the real constraint, which is the
-# dependencies: globset and the icu_* crates require 1.88, and rusqlite 0.41
-# requires 1.89.
-rust-version = "1.89"
+# dependencies: globset and the icu_* crates require 1.88, rusqlite 0.41
+# requires 1.89, and oxc 0.159 (the JavaScript minifier) requires 1.98.
+rust-version = "1.98"
 license      = "BSD-3-Clause"
 authors      = ["Matthew P. Grosvenor"]
 repository   = "https://github.com/mgrosvenor/m6"

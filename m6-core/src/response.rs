@@ -568,8 +568,8 @@ fn content_hash(body: &[u8]) -> u64 {
 /// cache parser does, so a quoted value such as `no-cache="a,no-store,b"` stays
 /// one directive and does not read as `no-store`. `no-store` is a bare
 /// directive name, matched exactly and case-insensitively across every field
-/// line. It is also the rule for minification in `site.rs`.
-pub(crate) fn cache_control_no_store(headers: &[crate::headers::Header]) -> bool {
+/// line.
+fn cache_control_no_store(headers: &[crate::headers::Header]) -> bool {
     crate::headers::get_all(headers, "cache-control").any(|value| {
         let mut in_quotes = false;
         let mut escaped = false;
