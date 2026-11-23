@@ -59,14 +59,13 @@ own_track "$FILE_PID"
 trap 'own_stop_records; own_forget; wait 2>/dev/null' EXIT
 
 # ── Wait for backend sockets ──────────────────────────────────────────────────
-printf "waiting for backends"
-for _ in $(seq 1 50); do
-    [ -S /tmp/m6/m6-auth-admin.sock ] && \
-    [ -S /tmp/m6/check-m6-auth-admin.sock ] && \
-    [ -S /tmp/m6/render-admin.sock  ] && \
-    [ -S /tmp/m6/m6-file-admin.sock ] && { echo " ready."; break; }
-    printf "."; sleep 0.2
-done
+# A backend that exits stops the stack here, before m6-http starts on a
+# half-built one.
+echo "waiting for backends"
+own_wait_sockets "example 11" \
+    /tmp/m6/m6-auth-admin.sock /tmp/m6/check-m6-auth-admin.sock \
+    /tmp/m6/render-admin.sock /tmp/m6/m6-file-admin.sock || exit 1
+echo "ready."
 
 # ── m6-http ───────────────────────────────────────────────────────────────────
 # Truncate the log file so render-admin always reads current-session data.
