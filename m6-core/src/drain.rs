@@ -177,7 +177,7 @@ mod tests {
         drain.begin(1);
         assert_eq!(drain.in_flight(), 2);
 
-        let now = Instant::now();
+        let now = crate::platform::now();
         assert!(
             !drain.start(now),
             "two accepted connections must hold the drain open"
@@ -198,7 +198,7 @@ mod tests {
     fn drain_returns_when_the_last_request_finishes() {
         let mut drain = Drain::new(DRAIN_LONG, 1);
         drain.begin(0);
-        let now = Instant::now();
+        let now = crate::platform::now();
         assert!(!drain.start(now));
         assert_eq!(drain.step(now + Duration::from_secs(1)), Step::Draining);
 
@@ -218,7 +218,7 @@ mod tests {
         let mut drain = Drain::new(Duration::from_millis(20), 2);
         drain.begin(0);
         drain.begin(1);
-        let now = Instant::now();
+        let now = crate::platform::now();
         assert!(!drain.start(now));
         assert_eq!(
             drain.step(now + Duration::from_millis(20)),
@@ -231,7 +231,7 @@ mod tests {
     #[test]
     fn nothing_in_flight_stops_at_once() {
         let mut drain = Drain::new(DRAIN_LONG, 1);
-        let now = Instant::now();
+        let now = crate::platform::now();
         assert!(drain.start(now));
         assert_eq!(drain.step(now), Step::Finished);
     }
@@ -244,7 +244,7 @@ mod tests {
     fn a_request_on_a_kept_alive_connection_is_counted_again() {
         let mut drain = Drain::new(DRAIN_LONG, 1);
         drain.begin(0);
-        let now = Instant::now();
+        let now = crate::platform::now();
         assert!(!drain.start(now));
         drain.end(0);
         assert_eq!(drain.step(now), Step::Finished);
