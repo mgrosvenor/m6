@@ -27,6 +27,10 @@ use std::path::Path;
 pub enum RenderError {
     /// The template asked for a 404.
     NotFound,
+    /// The page outgrew the page area's maximum. The size is the least the
+    /// page needed when the area refused it, and the caller names the page and
+    /// the limit.
+    TooLarge(usize),
     /// Anything else: a syntax error, a missing include, a filter that failed.
     Failed(anyhow::Error),
 }
@@ -35,6 +39,7 @@ impl std::fmt::Display for RenderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound => write!(f, "template signalled not found"),
+            Self::TooLarge(n) => write!(f, "page needs at least {n} bytes"),
             Self::Failed(e) => write!(f, "{e:#}"),
         }
     }
@@ -43,16 +48,22 @@ impl std::fmt::Display for RenderError {
 /// Turns a template name and a context into a rendered body.
 ///
 /// One virtual call per templated response, on a path that is already doing
-/// file I/O and compression.
+/// file I/O and compression. The page is written into `out`, the service's one
+/// reusable page area, which the caller empties before the call. A renderer
+/// that finds `out` full past its maximum stops and returns
+/// [`RenderError::TooLarge`] with [`crate::limits::Bounded::overflow`].
 pub trait Renderer: Send + Sync + 'static {
-    fn render(&self, template: &str, ctx: &crate::dict::Dict) -> Result<String, RenderError>;
+    fn render(
+        &self,
+        template: &str,
+        ctx: &crate::dict::Dict,
+        out: &mut crate::limits::Bounded<u8>,
+    ) -> Result<(), RenderError>;
 }
 
 /// Builds a `Renderer` for a site.
 ///
-/// A trait rather than a value because the service loop rebuilds one on every
-/// config reload, and a reload has to be able to pick up an edited template
-/// without restarting the process.
+/// A trait rather than a value so a service can name its own engine.
 pub trait RendererFactory: Send + Sync + 'static {
     /// `template_paths` is the set of templates named by config routes,
     /// relative to `site_dir`. Empty means "discover them", which is what a
@@ -73,7 +84,12 @@ pub trait RendererFactory: Send + Sync + 'static {
 pub struct NoTemplates;
 
 impl Renderer for NoTemplates {
-    fn render(&self, template: &str, _ctx: &crate::dict::Dict) -> Result<String, RenderError> {
+    fn render(
+        &self,
+        template: &str,
+        _ctx: &crate::dict::Dict,
+        _out: &mut crate::limits::Bounded<u8>,
+    ) -> Result<(), RenderError> {
         Err(RenderError::Failed(anyhow::anyhow!(
             "route asked for template `{template}`, but this binary links no template engine"
         )))

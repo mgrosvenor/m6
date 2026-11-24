@@ -35,10 +35,10 @@
 //! - one `health` row per node: reachability, the node's own verdict level,
 //!   build, uptime, request, cache and backend error counters, hit and miss
 //!   percentiles with their sample counts, the host figures, the tunnel
-//!   figures and the log reopen state;
+//!   figures;
 //! - `health_channel` rows (one per channel with traffic) and `health_net`
 //!   rows (one per network interface);
-//! - once per node per `/traffic` window, one `crawl_window` row with the
+//! - once per node per traffic window, one `crawl_window` row with the
 //!   window's total, its response status counts (`crawl_status`) and its
 //!   crawler sightings (`crawl_sighting`).
 //!
@@ -59,12 +59,12 @@
 //!
 //! ## Crawler cadence
 //!
-//! `/traffic` is a rolling summary over `window_minutes`, polled every
-//! `poll_interval_s`. Storing every poll would repeat each sighting about 120
-//! times. A node's window is stored when it has none yet, or when at least
-//! `window_minutes` have passed since its last stored one, so the stored
-//! windows tile time without overlap. A restart resumes the tiling from the
-//! file.
+//! The traffic document is a rolling summary over `window_minutes`, read from
+//! the journal at every `poll_interval_s`. Storing every poll would repeat each
+//! sighting about 120 times. A node's window is stored when it has none yet, or
+//! when at least `window_minutes` have passed since its last stored one, so the
+//! stored windows tile time without overlap. A restart resumes the tiling from
+//! the file.
 //!
 //! # The cap
 //!
@@ -75,17 +75,21 @@
 //! vacuumed. The first row of a poll goes first, even if the clock has moved
 //! back, because `poll.id` only increases.
 //!
-//! # Writing never slows polling
+//! # Writing is the poll's own work
 //!
-//! The poller builds a batch and hands it to a writer thread through a queue
-//! of 8 polls. A full queue drops the poll and counts it, so the poller never
-//! waits. A write that fails drops the connection, and the next poll opens it
-//! again. The state `behind` lasts until a write succeeds after a drop.
+//! The poll builds a batch once per interval and hands it to the loop's own
+//! [`History`] value, which writes every held batch oldest first, each in one
+//! short transaction. A transaction that meets a locked file returns
+//! `SQLITE_BUSY` at once and leaves its batch, and the ones behind it, for the
+//! next poll, so the loop never waits on the file. A hold of more than 8 polls
+//! drops the oldest and counts it. A write that fails for any other reason
+//! drops its batch, closes the connection and reports `failing`, and the next
+//! poll opens it again.
 //!
 //! A prune that fails, or that deletes every earlier poll and is still over the
 //! cap, does not lose the poll just written. The states are `prune_failed` and
 //! `over_cap`, each with its own Warn, and the next write that prunes cleanly
-//! clears them.
+//! clears them. The state `behind` means a batch is held for a locked file.
 //!
 //! # Reading it
 //!
@@ -126,12 +130,12 @@
 //!
 //! ```text
 //! id, at, at_unix_ms, node, level, poll_level, reachable, status, detail,
-//! traffic_error, rtt_ms, binary, version, hash, uptime_s, host_uptime_s,
-//! requests_total, monitor_requests, cache_hits, cache_misses, hit_rate,
-//! backend_errors, hit_samples, hit_p50_ns, hit_p99_ns, miss_samples,
+//! traffic_error, rtt_ms, binary, release, commit, dirty, uptime_s,
+//! host_uptime_s, requests_total, monitor_requests, cache_hits, cache_misses,
+//! hit_rate, backend_errors, hit_samples, hit_p50_ns, hit_p99_ns, miss_samples,
 //! miss_p50_ns, miss_p99_ns, load_one, cpus, memory_used, memory_total_bytes,
 //! disk_used, disk_total_bytes, thermal_max_c, cert_not_after_unix,
-//! cert_expires_in_s, tunnel, log_reopen, net, channels, findings,
+//! cert_expires_in_s, tunnel, net, channels, findings,
 //! other_findings
 //! ```
 //!
@@ -143,20 +147,39 @@
 //! `crawlers`, each crawler being `user_agent`, `requests`, `client_ips` and
 //! `paths`, and `sightings_dropped`.
 //!
+//! # The build a node was running
+//!
+//! `binary`, `release`, `commit` and `dirty` are the four columns that
+//! identify one build. `release` is the SemVer release without its build
+//! metadata, `commit` is that metadata's commit, and `dirty` is 1 when the
+//! tree the binary was built from had uncommitted changes. A reader answers
+//! "which build was this node running" from the columns. The drift check
+//! compares `release` for version drift and the `(commit, dirty)` pair for
+//! build drift, through [`crate::digest::release`] and
+//! [`crate::digest::commit_and_dirty`], which parse the version with the
+//! `semver` crate.
+//!
+//! A file written before schema 3 loses its build rows when it is opened. Their
+//! `hash` was the md5 of an executable that no longer exists, and their
+//! `version` carried no build metadata, so neither value is comparable with a
+//! build these columns can name. The table is recreated empty. A `health` row
+//! that named a discarded build keeps every figure and loses `build_id`. One
+//! `type=event` line at the migration says both facts.
+//!
 //! The reader opens its own read-only connection and reads a whole page inside
 //! one read transaction, so a prune that commits meanwhile cannot leave a row
 //! without its channels, interfaces or findings. It reads 256 rows at a time,
 //! each with its children, and writes them into the page until the page is
 //! full or the range ends. A page of 4 MiB usually fills after 1,500 to 4,000
 //! rows, so the rest of the range is not read. The file uses a rollback
-//! journal, so the writer waits for the transaction to end, up to its busy
-//! timeout of 5 seconds. A write that waits longer fails and that poll is not
-//! stored.
+//! journal, so a write that meets a page read fails `SQLITE_BUSY` at once and
+//! its poll is held for the next one rather than lost.
 //!
 //! # Caveats
 //!
-//! Channel counters include the monitor's own polls and header checks (issue
-//! #107). `monitor_requests` on each node row says how many.
+//! Channel counters separate the monitor's own polls and header checks (issue
+//! #107) into `http/<version>/monitor`. `monitor_requests` on each node row
+//! says how many.
 //!
 //! The node's own periodic stats log is not the history. It lives in the
 //! node's journal, which is capped, it is a 10 second series with no channels,
@@ -164,14 +187,11 @@
 //! when a node is down, which is when a history is wanted.
 //!
 //! To start fresh, stop the service, delete the file and start it again.
-//! Migration 1 is permanent: a later release adds columns in migration 2.
+//! Migrations 1, 2 and 3 are permanent, and a later change adds migration 4.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use m6_core::monitoring::CrawlerReport;
@@ -189,7 +209,6 @@ use crate::poll::NodeReading;
 
 pub const DEFAULT_MAX_MB: u64 = 256;
 pub const MAX_MB: u64 = 1_048_576;
-const QUEUE_POLLS: usize = 8;
 const PRUNE_BATCH: u32 = 256;
 
 const SCHEMA_V1: &str = "
@@ -222,9 +241,7 @@ CREATE TABLE health (
   load_one REAL, cpus INTEGER, memory_used REAL, memory_total_bytes INTEGER,
   disk_used REAL, disk_total_bytes INTEGER, thermal_max_c REAL, cert_not_after_unix INTEGER,
   tunnel_rtt_ms REAL, tunnel_rtt_n INTEGER, tunnel_probe TEXT, tunnel_probe_error TEXT,
-  tunnel_handshake TEXT, tunnel_handshake_age_s INTEGER, tunnel_handshake_detail TEXT,
-  reopen_state TEXT, reopen_age_s INTEGER, reopen_last_unix INTEGER, reopen_reopens INTEGER,
-  reopen_failures INTEGER, reopen_last_failure_age_s INTEGER, reopen_detail TEXT) STRICT;
+  tunnel_handshake TEXT, tunnel_handshake_age_s INTEGER, tunnel_handshake_detail TEXT) STRICT;
 CREATE INDEX health_poll ON health (poll_id);
 CREATE INDEX health_at ON health (at_ms);
 CREATE INDEX health_node_at ON health (node_id, at_ms);
@@ -262,10 +279,83 @@ CREATE TABLE crawl_status (
   PRIMARY KEY (window_id, code)) STRICT, WITHOUT ROWID;
 ";
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: SCHEMA_V1,
-}];
+/// The index the last-200 read answers from. Migration 2 adds it to a file
+/// made by release 1, and it holds only the rows that count as a 200, so the
+/// read touches one row per node however long the history is.
+const SCHEMA_V2: &str = "
+CREATE INDEX IF NOT EXISTS health_ok_node_at ON health (node_id, at_ms)
+  WHERE reachable = 1 AND status = 'ok';
+";
+
+/// Migration 3: the `build` table as the four columns that identify a build,
+/// recreated empty.
+///
+/// The table before this held `(binary, version, hash)`. `hash` was the md5 of
+/// the node's executable, a mechanism this release deletes, and `version` was a
+/// bare release such as `1.15.0` with no build metadata. Neither column carries
+/// a fact that names a build in the new shape, so no old row can be carried
+/// across: a row saying `(m6-http, 1.15.0, <md5>)` and a row saying
+/// `(m6-http, 1.16.0-rc.1, abc123def456, 0)` would look like two comparable
+/// builds while sharing no fact at all. The table is dropped and created empty,
+/// and the one line [`BUILD_RESET`] says why.
+///
+/// `health` keeps every observation. A row that named a discarded build has
+/// `build_id` set to NULL and keeps every other figure, so the poll survives
+/// and the build attribution goes. The nulling is one statement inside the
+/// migration's transaction, so the foreign-key check
+/// [`m6_core::sqlite::migrate`] runs finds no dangling reference when the
+/// migration ends.
+///
+/// The version stays 3 because `1.16.0-rc.1` has not shipped: no released file
+/// is at 3, and the only files at 3 were written by this same unreleased code.
+/// Replacing the migration is right for those files. Editing a migration that
+/// has shipped is what this avoids.
+const SCHEMA_V3: &str = r#"
+DROP TRIGGER IF EXISTS build_append_only_update;
+DROP TRIGGER IF EXISTS build_append_only_delete;
+DROP TABLE build;
+CREATE TABLE build (id INTEGER PRIMARY KEY, binary TEXT NOT NULL, "release" TEXT NOT NULL,
+                    "commit" TEXT NOT NULL, dirty INTEGER NOT NULL CHECK (dirty IN (0,1)),
+                    UNIQUE (binary, "release", "commit", dirty)) STRICT;
+UPDATE health SET build_id = NULL WHERE build_id IS NOT NULL;
+"#;
+
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: SCHEMA_V1,
+    },
+    Migration {
+        version: 2,
+        sql: SCHEMA_V2,
+    },
+    Migration {
+        version: 3,
+        sql: SCHEMA_V3,
+    },
+];
+
+/// The one line a file that predates schema 3 writes when it is opened.
+///
+/// The build rows are gone and nothing can bring them back, so the file says
+/// so at the moment it happens. A history that restarts silently reads as a
+/// history that was lost, and an operator who sees build ids go empty would
+/// otherwise have to guess whether the file or the code dropped them.
+const BUILD_RESET: &str = concat!(
+    "the history file was migrated to schema 3: its build table was rebuilt to hold ",
+    "the binary, release, commit and dirty flag, and the previous build rows are ",
+    "not comparable with that shape, so they were dropped and health rows that ",
+    "named one keep their figures with no build"
+);
+
+/// Whether opening a file at `version` must say the build table was rebuilt.
+///
+/// Migration 1 and 2 files held build rows in the old shape and lose them. A
+/// fresh file (version 0) had none to lose and says nothing, and a file already
+/// at 3 is opened without a migration.
+fn announces_build_reset(version: u32) -> bool {
+    (1..3).contains(&version)
+}
 
 /// Lookup tables that are never pruned. `agent` is not here: a user agent is
 /// text a visitor chooses, so its rows go when no sighting names them.
@@ -358,17 +448,6 @@ pub struct TunnelRow {
     pub handshake_detail: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct ReopenRow {
-    pub state: String,
-    pub age_s: Option<i64>,
-    pub last_unix: Option<i64>,
-    pub reopens: Option<i64>,
-    pub failures: Option<i64>,
-    pub last_failure_age_s: Option<i64>,
-    pub detail: Option<String>,
-}
-
 #[derive(Debug, Clone)]
 pub struct ChannelRow {
     pub channel: String,
@@ -405,6 +484,41 @@ pub struct CrawlSnapshot {
     pub crawlers: Vec<CrawlerReport>,
 }
 
+/// The build one node was running, as the four columns that name it.
+///
+/// The release and the commit are apart so a reader answers "which build was
+/// this node running" from the row. `release` is the SemVer release without its
+/// build metadata, `commit` is that metadata's commit, and `dirty` is true when
+/// the tree had uncommitted changes. A build with no metadata it can parse has
+/// the release the node reported, the commit `unknown`, and `dirty` false.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BuildRef {
+    pub binary: String,
+    pub release: String,
+    pub commit: String,
+    pub dirty: bool,
+}
+
+/// The build a node's digest names, in the four facts the history stores.
+///
+/// The version is parsed once, by [`crate::digest::release`] and
+/// [`crate::digest::commit_and_dirty`], so the row carries four facts and no
+/// version string to parse again.
+fn build_ref(n: &NodeDigest) -> Option<BuildRef> {
+    if n.binary.is_none() && n.version.is_none() {
+        return None;
+    }
+    let version = n.version.as_deref().unwrap_or_default();
+    let (commit, dirty) =
+        crate::digest::commit_and_dirty(version).unwrap_or_else(|| ("unknown".to_string(), false));
+    Some(BuildRef {
+        binary: n.binary.clone().unwrap_or_default(),
+        release: crate::digest::release(version),
+        commit,
+        dirty,
+    })
+}
+
 /// One node's row in a poll.
 #[derive(Debug, Clone, Default)]
 pub struct Row {
@@ -415,7 +529,8 @@ pub struct Row {
     pub detail: Option<String>,
     pub traffic_error: Option<String>,
     pub rtt_ms: Option<f64>,
-    pub build: Option<(String, String, String)>,
+    /// The build the node was running, as the four facts that name it.
+    pub build: Option<BuildRef>,
     pub uptime_s: Option<i64>,
     pub host_uptime_s: Option<i64>,
     pub requests_total: Option<i64>,
@@ -438,7 +553,6 @@ pub struct Row {
     pub thermal_max_c: Option<f64>,
     pub cert_not_after_unix: Option<i64>,
     pub tunnel: Option<TunnelRow>,
-    pub reopen: ReopenRow,
     pub channels: Vec<ChannelRow>,
     pub net: Vec<NetRow>,
     pub crawl: Option<CrawlSnapshot>,
@@ -464,9 +578,7 @@ fn row(r: &NodeReading, n: &NodeDigest, d: &Digest) -> Row {
         .map(|f| f.level)
         .max()
         .unwrap_or(Level::Ok);
-    let present = |s: &Option<String>| s.clone().unwrap_or_default();
-    let build = (n.binary.is_some() || n.version.is_some() || n.hash.is_some())
-        .then(|| (present(&n.binary), present(&n.version), present(&n.hash)));
+    let build = build_ref(n);
     let mut out = Row {
         node: n.name.clone(),
         level: level_i(level),
@@ -489,7 +601,7 @@ fn row(r: &NodeReading, n: &NodeDigest, d: &Digest) -> Row {
         memory_total_bytes: n.memory_total_bytes.map(i),
         disk_used: n.disk_used,
         disk_total_bytes: n.disk_total_bytes.map(i),
-        thermal_max_c: n.thermal_max_c.and_then(|t| t.to_string().parse().ok()),
+        thermal_max_c: n.thermal_max_c.map(|t| t as f64),
         cert_not_after_unix: n.cert_not_after_unix,
         tunnel: n.tunnel.as_ref().map(|t| TunnelRow {
             rtt_ms: t.rtt_ms,
@@ -500,15 +612,6 @@ fn row(r: &NodeReading, n: &NodeDigest, d: &Digest) -> Row {
             handshake_age_s: t.handshake_age_s.map(i),
             handshake_detail: t.handshake_detail.clone(),
         }),
-        reopen: ReopenRow {
-            state: n.log_reopen.state.to_string(),
-            age_s: n.log_reopen.age_s.map(i),
-            last_unix: n.log_reopen.last_unix.map(i),
-            reopens: n.log_reopen.reopens.map(i),
-            failures: n.log_reopen.failures.map(i),
-            last_failure_age_s: n.log_reopen.last_failure_age_s.map(i),
-            detail: n.log_reopen.detail.clone(),
-        },
         ..Row::default()
     };
     if let Some(p) = &r.perf {
@@ -639,8 +742,51 @@ struct Store {
     channels: Interner,
     ifaces: Interner,
     agents: Interner,
-    builds: Interner,
+    builds: Builds,
     last_crawl_at: HashMap<i64, i64>,
+}
+
+/// The ids of the build rows the file holds, keyed by the four facts.
+///
+/// A build's key carries text and the `dirty` integer, so it keeps its own
+/// small cache.
+#[derive(Default)]
+struct Builds {
+    ids: HashMap<String, i64>,
+}
+
+impl Builds {
+    /// The id of a build row, inserted when the file has not seen that build.
+    ///
+    /// The four facts are the table's uniqueness constraint, so one build
+    /// reported by every node on every poll is one row.
+    fn id(&mut self, tx: &Transaction, b: &BuildRef) -> rusqlite::Result<i64> {
+        let key = format!(
+            "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+            b.binary,
+            b.release,
+            b.commit,
+            u8::from(b.dirty)
+        );
+        if let Some(id) = self.ids.get(&key) {
+            return Ok(*id);
+        }
+        tx.prepare_cached(
+            r#"INSERT INTO build (binary, "release", "commit", dirty) VALUES (?1, ?2, ?3, ?4)
+               ON CONFLICT DO NOTHING"#,
+        )?
+        .execute(params![b.binary, b.release, b.commit, b.dirty])?;
+        let id = tx
+            .prepare_cached(
+                r#"SELECT id FROM build WHERE binary = ?1 AND "release" = ?2 AND "commit" = ?3
+                   AND dirty = ?4"#,
+            )?
+            .query_row(params![b.binary, b.release, b.commit, b.dirty], |r| {
+                r.get(0)
+            })?;
+        self.ids.insert(key, id);
+        Ok(id)
+    }
 }
 
 /// What one write did, for the status.
@@ -661,30 +807,10 @@ struct Written {
 
 /// Create the directory (mode 0700 when new) and the empty file (mode 0600)
 /// before SQLite does, and tighten a file left by an earlier start. SQLite
-/// gives its journal the mode of the database file. Mode bits do not exist off
-/// Unix, so there the files take the platform default.
+/// gives its journal the mode of the database file.
 fn make_private(file: &Path) -> anyhow::Result<()> {
-    if let Some(dir) = file.parent().filter(|p| !p.as_os_str().is_empty()) {
-        let mut b = std::fs::DirBuilder::new();
-        b.recursive(true);
-        #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
-        b.create(dir)
-            .map_err(|e| anyhow::anyhow!("creating {}: {e}", dir.display()))?;
-    }
-    let mut o = std::fs::OpenOptions::new();
-    o.write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
-    o.open(file)
-        .map_err(|e| anyhow::anyhow!("creating {}: {e}", file.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| anyhow::anyhow!("securing {}: {e}", file.display()))?;
-    }
-    Ok(())
+    m6_core::platform::create_private(file)
+        .map_err(|e| anyhow::anyhow!("creating {}: {e}", file.display()))
 }
 
 /// True when the error means the process must not go on: a file from a newer
@@ -700,7 +826,13 @@ impl Store {
     fn open(cfg: &Config) -> anyhow::Result<Self> {
         make_private(&cfg.file)?;
         let mut conn = sqlite::open(&cfg.file)?;
+        // Read before the migrations, because a file that predates schema 3 is
+        // the only one that loses rows, and only that open says so.
+        let was = sqlite::schema_version(&conn)?;
         sqlite::migrate(&mut conn, MIGRATIONS)?;
+        if announces_build_reset(was) {
+            m6_core::log::info!("{BUILD_RESET}");
+        }
         for t in LOOKUP_TABLES {
             sqlite::append_only(&conn, t)?;
         }
@@ -708,6 +840,10 @@ impl Store {
             "DROP TRIGGER IF EXISTS agent_append_only_update; \
              DROP TRIGGER IF EXISTS agent_append_only_delete;",
         )?;
+        // After the open a write never waits: a statement that meets another
+        // connection returns SQLITE_BUSY at once and its poll stays held for
+        // the next one. The open and its migrations keep the ordinary wait.
+        conn.busy_timeout(std::time::Duration::ZERO)?;
         let mut last_crawl_at = HashMap::new();
         {
             let mut stmt =
@@ -738,10 +874,7 @@ impl Store {
                 "INSERT INTO agent (user_agent) VALUES (?1) ON CONFLICT DO NOTHING",
                 "SELECT id FROM agent WHERE user_agent = ?1",
             ),
-            builds: Interner::new(
-                "INSERT INTO build (binary, version, hash) VALUES (?1, ?2, ?3) ON CONFLICT DO NOTHING",
-                "SELECT id FROM build WHERE binary = ?1 AND version = ?2 AND hash = ?3",
-            ),
+            builds: Builds::default(),
             last_crawl_at,
         })
     }
@@ -752,10 +885,25 @@ impl Store {
             &mut self.channels,
             &mut self.ifaces,
             &mut self.agents,
-            &mut self.builds,
         ] {
             c.ids.clear();
         }
+        self.builds.ids.clear();
+    }
+
+    /// When each node last answered `/health` with 200, by node name.
+    ///
+    /// One row per node, read from the partial index `health_ok_node_at`:
+    /// each node's newest row is the first entry of its range, so the cost is
+    /// the number of nodes and not the length of the history. It runs when the
+    /// digest is built, so the age the check prints is the age in the file
+    /// rather than a number kept in memory and able to drift from it.
+    fn last_ok_at(&self) -> rusqlite::Result<HashMap<String, i64>> {
+        let mut stmt = self.conn.prepare(LAST_OK_SQL)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect();
+        rows
     }
 
     /// Write one poll in one transaction, then prune. On error the caller drops
@@ -798,7 +946,7 @@ impl Store {
         for r in &b.rows {
             let node_id = self.nodes.id(&tx, &[&r.node])?;
             let build_id = match &r.build {
-                Some((bin, ver, hash)) => Some(self.builds.id(&tx, &[bin, ver, hash])?),
+                Some(build) => Some(self.builds.id(&tx, build)?),
                 None => None,
             };
             let t = r.tunnel.as_ref();
@@ -822,11 +970,6 @@ impl Store {
                 ":tunnel_handshake": t.map(|t| t.handshake.as_str()),
                 ":tunnel_handshake_age_s": t.and_then(|t| t.handshake_age_s),
                 ":tunnel_handshake_detail": t.and_then(|t| t.handshake_detail.as_deref()),
-                ":reopen_state": r.reopen.state, ":reopen_age_s": r.reopen.age_s,
-                ":reopen_last_unix": r.reopen.last_unix, ":reopen_reopens": r.reopen.reopens,
-                ":reopen_failures": r.reopen.failures,
-                ":reopen_last_failure_age_s": r.reopen.last_failure_age_s,
-                ":reopen_detail": r.reopen.detail,
             })?;
             let health_id = tx.last_insert_rowid();
             for c in &r.channels {
@@ -1045,16 +1188,14 @@ detail, traffic_error, rtt_ms, build_id, uptime_s, host_uptime_s, requests_total
 cache_hits, cache_misses, backend_errors, hit_samples, hit_p50_ns, hit_p99_ns, miss_samples, \
 miss_p50_ns, miss_p99_ns, load_one, cpus, memory_used, memory_total_bytes, disk_used, \
 disk_total_bytes, thermal_max_c, cert_not_after_unix, tunnel_rtt_ms, tunnel_rtt_n, tunnel_probe, \
-tunnel_probe_error, tunnel_handshake, tunnel_handshake_age_s, tunnel_handshake_detail, \
-reopen_state, reopen_age_s, reopen_last_unix, reopen_reopens, reopen_failures, \
-reopen_last_failure_age_s, reopen_detail) VALUES (:poll_id, :at_ms, :node_id, :level, :reachable, \
+tunnel_probe_error, tunnel_handshake, tunnel_handshake_age_s, tunnel_handshake_detail) \
+VALUES (:poll_id, :at_ms, :node_id, :level, :reachable, \
 :status, :detail, :traffic_error, :rtt_ms, :build_id, :uptime_s, :host_uptime_s, :requests_total, \
 :monitor_requests, :cache_hits, :cache_misses, :backend_errors, :hit_samples, :hit_p50_ns, \
 :hit_p99_ns, :miss_samples, :miss_p50_ns, :miss_p99_ns, :load_one, :cpus, :memory_used, \
 :memory_total_bytes, :disk_used, :disk_total_bytes, :thermal_max_c, :cert_not_after_unix, \
 :tunnel_rtt_ms, :tunnel_rtt_n, :tunnel_probe, :tunnel_probe_error, :tunnel_handshake, \
-:tunnel_handshake_age_s, :tunnel_handshake_detail, :reopen_state, :reopen_age_s, :reopen_last_unix, \
-:reopen_reopens, :reopen_failures, :reopen_last_failure_age_s, :reopen_detail)";
+:tunnel_handshake_age_s, :tunnel_handshake_detail)";
 
 // ── status ───────────────────────────────────────────────────────────────────
 
@@ -1068,7 +1209,6 @@ struct Status {
     crawl_windows: u64,
     failures: u64,
     pruned: u64,
-    dropped_acked: u64,
     last_write: Option<Instant>,
     used_bytes: Option<u64>,
     file_bytes: Option<u64>,
@@ -1076,25 +1216,38 @@ struct Status {
     newest_ms: Option<i64>,
 }
 
-struct Shared {
-    cfg: Option<Config>,
-    status: Mutex<Status>,
-    dropped: AtomicU64,
-    stopped: AtomicBool,
+/// The age of one node's last `/health` answer of 200, from the history.
+///
+/// A node missing from the list has never answered 200 in the history that is
+/// being kept, which the check reports as an absence rather than as an age.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LastOk {
+    pub node: String,
+    pub age_s: u64,
 }
 
-impl Shared {
-    fn status(&self) -> std::sync::MutexGuard<'_, Status> {
-        self.status.lock().unwrap_or_else(|e| e.into_inner())
-    }
+/// Each node's newest 200 row. The `WHERE` repeats the index's own, which is
+/// what lets the planner use the partial index.
+const LAST_OK_SQL: &str = "SELECT n.name, \
+    (SELECT h.at_ms FROM health h WHERE h.node_id = n.id AND h.reachable = 1 \
+       AND h.status = 'ok' ORDER BY h.at_ms DESC LIMIT 1) AS at_ms \
+    FROM node n WHERE at_ms IS NOT NULL";
+
+/// The wall clock in milliseconds. The one clock helper in the crate: the
+/// digest's ages, the poll's stamp and the tests all read it.
+pub(crate) fn now_ms() -> i64 {
+    m6_core::platform::wall()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// The history as the digest reports it.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct HistoryDigest {
-    /// `off`, `ok`, `not_open`, `failing`, `prune_failed`, `over_cap`, `behind`
-    /// or `stopped`. In `failing` a poll was not written. In `prune_failed` and
-    /// `over_cap` it was, and the file may pass its cap.
+    /// `off`, `ok`, `not_open`, `failing`, `prune_failed`, `over_cap` or
+    /// `behind`. In `failing` a poll was not written. In `prune_failed` and
+    /// `over_cap` it was, and the file may pass its cap. In `behind` a poll
+    /// met a locked file and is held for the next one.
     pub state: &'static str,
     pub file: Option<String>,
     pub max_bytes: Option<u64>,
@@ -1109,24 +1262,40 @@ pub struct HistoryDigest {
     pub dropped: u64,
     pub pruned: u64,
     pub last_error: Option<String>,
+    /// The age of each node's last 200. `None` when history is off or the
+    /// file could not be read, and `Some` with no entries when no node has
+    /// answered 200 in the history yet.
+    pub last_ok: Option<Vec<LastOk>>,
 }
 
-/// Read side of the status, and the path for the endpoints.
-#[derive(Clone)]
-pub struct HistoryHandle(Arc<Shared>);
+/// The history store, owned by the loop that writes it.
+///
+/// One poll adds one batch and writes every held batch that will go. A
+/// transaction that meets another connection leaves its batch, and the ones
+/// behind it, for the next poll, so the loop never waits on the file. `record`
+/// is the only write path and it runs once per poll interval.
+pub struct History {
+    cfg: Option<Config>,
+    store: Option<Store>,
+    status: Status,
+    /// Batches held for a locked file, oldest first, under the
+    /// `history_queue` limit.
+    queue: m6_core::limits::Bounded<Batch>,
+    /// Polls refused because the hold was past its maximum.
+    dropped: u64,
+}
 
-impl HistoryHandle {
+impl History {
+    /// The file the two endpoints read, or `None` when history is off.
     pub fn file(&self) -> Option<&Path> {
-        self.0.cfg.as_ref().map(|c| c.file.as_path())
+        self.cfg.as_ref().map(|c| c.file.as_path())
     }
 
+    /// The history as the digest and the check report it.
     pub fn digest(&self) -> HistoryDigest {
-        let s = self.0.status();
-        let dropped = self.0.dropped.load(Ordering::Relaxed);
-        let state = if self.0.cfg.is_none() {
+        let s = &self.status;
+        let state = if self.cfg.is_none() {
             "off"
-        } else if self.0.stopped.load(Ordering::Relaxed) {
-            "stopped"
         } else if s.open_error.is_some() {
             "not_open"
         } else if s.last_error.is_some() {
@@ -1135,7 +1304,7 @@ impl HistoryHandle {
             "prune_failed"
         } else if s.over_cap {
             "over_cap"
-        } else if dropped > s.dropped_acked {
+        } else if !self.queue.is_empty() {
             "behind"
         } else {
             "ok"
@@ -1143,8 +1312,8 @@ impl HistoryHandle {
         let at = |ms: Option<i64>| ms.map(|m| rfc3339_utc_ms(m).to_string());
         HistoryDigest {
             state,
-            file: self.0.cfg.as_ref().map(|c| c.file.display().to_string()),
-            max_bytes: self.0.cfg.as_ref().map(|c| c.max_bytes),
+            file: self.cfg.as_ref().map(|c| c.file.display().to_string()),
+            max_bytes: self.cfg.as_ref().map(|c| c.max_bytes),
             file_bytes: s.file_bytes,
             used_bytes: s.used_bytes,
             oldest_at: at(s.oldest_ms),
@@ -1153,7 +1322,7 @@ impl HistoryHandle {
             writes: s.writes,
             crawl_windows: s.crawl_windows,
             failures: s.failures,
-            dropped,
+            dropped: self.dropped,
             pruned: s.pruned,
             last_error: s
                 .open_error
@@ -1161,7 +1330,126 @@ impl HistoryHandle {
                 .or_else(|| s.last_error.clone())
                 .or_else(|| s.prune_error.clone())
                 .or_else(|| s.over_cap.then(|| OVER_CAP.to_string())),
+            last_ok: self.last_ok(),
         }
+    }
+
+    /// The age of each node's last 200, read from the store.
+    ///
+    /// The history is the record of what the nodes answered, so the age comes
+    /// from the rows rather than from a counter the writer keeps: a row that
+    /// was pruned stops being a last 200, and the absence is then reported.
+    fn last_ok(&self) -> Option<Vec<LastOk>> {
+        let at = self.store.as_ref()?.last_ok_at().ok()?;
+        let now = now_ms();
+        let mut out: Vec<LastOk> = at
+            .into_iter()
+            .map(|(node, at_ms)| LastOk {
+                node,
+                age_s: u64::try_from(now.saturating_sub(at_ms)).unwrap_or(0) / 1000,
+            })
+            .collect();
+        out.sort_by(|a, b| a.node.cmp(&b.node));
+        Some(out)
+    }
+
+    /// Add one poll and write every held batch that will go.
+    ///
+    /// The hold grows by doubling while the file stays locked. Past the
+    /// `history_queue` maximum the new poll is refused with an error that names
+    /// the key, and counted, so what is held stays whole and in order.
+    pub fn record(&mut self, b: Batch) {
+        if self.cfg.is_none() {
+            return;
+        }
+        if let Err((_, refusal)) = self.queue.push_back(b, "a poll") {
+            self.dropped += 1;
+            m6_core::log::error!("{refusal}");
+        }
+        self.write_held();
+    }
+
+    /// Stop: one last attempt at what is held, then say what is left.
+    pub fn flush(&mut self) {
+        self.write_held();
+        if !self.queue.is_empty() {
+            m6_core::log::warn!(
+                held = self.queue.len(),
+                "history batches were still held when the monitor stopped"
+            );
+        }
+    }
+
+    /// Write the held batches front to back until one meets a lock or fails.
+    fn write_held(&mut self) {
+        while !self.queue.is_empty() {
+            if self.store.is_none() {
+                let Some(cfg) = self.cfg.clone() else {
+                    self.queue.clear();
+                    return;
+                };
+                match Store::open(&cfg) {
+                    Ok(s) => {
+                        self.store = Some(s);
+                        if self.status.open_error.take().is_some() {
+                            m6_core::log::info!(file = %cfg.file.display(), "history file opened");
+                        }
+                    }
+                    Err(e) => {
+                        self.queue.pop_front();
+                        self.fail(format!("{e:#}"), true);
+                        return;
+                    }
+                }
+            }
+            let b = self.queue.front().expect("the queue is not empty");
+            let result = self.store.as_mut().expect("opened above").write(b);
+            let w = match result {
+                Ok(w) => w,
+                Err(e) if is_busy(&e) => return,
+                Err(e) => {
+                    self.queue.pop_front();
+                    self.store = None;
+                    self.fail(format!("{e:#}"), false);
+                    return;
+                }
+            };
+            self.queue.pop_front();
+            let st = &mut self.status;
+            if st.last_error.take().is_some() {
+                m6_core::log::info!("history writes recovered");
+            }
+            st.writes += 1;
+            st.crawl_windows += w.crawl_windows;
+            st.pruned += w.pruned;
+            st.last_write = Some(m6_core::platform::now());
+            st.used_bytes = Some(w.used_bytes);
+            st.file_bytes = Some(w.file_bytes);
+            st.oldest_ms = w.oldest_ms;
+            st.newest_ms = w.newest_ms;
+            if w.prune_error.is_some() && w.prune_error != st.prune_error {
+                m6_core::log::error!(error = ?w.prune_error, "history could not prune");
+            }
+            if w.cap_unmet && !st.over_cap {
+                m6_core::log::error!("{OVER_CAP}");
+            }
+            st.prune_error = w.prune_error;
+            st.over_cap = w.cap_unmet;
+        }
+    }
+
+    fn fail(&mut self, msg: String, open: bool) {
+        let st = &mut self.status;
+        st.failures += 1;
+        let slot = if open {
+            &mut st.open_error
+        } else {
+            &mut st.last_error
+        };
+        if slot.as_deref() != Some(msg.as_str()) {
+            m6_core::log::error!(error = %msg, "history is not being written");
+        }
+        *slot = Some(msg);
     }
 }
 
@@ -1188,11 +1476,10 @@ pub fn finding(h: &HistoryDigest) -> Option<Finding> {
             h.max_bytes.unwrap_or(0) >> 20
         ),
         "behind" => format!(
-            "the history writer is behind and has dropped {} poll(s) since start: \
+            "the history is behind and has dropped {} poll(s) since start: \
              is the disk slow or the file locked?",
             h.dropped
         ),
-        "stopped" => "the history writer has stopped, so no history is being kept".to_string(),
         _ => return None,
     };
     Some(Finding {
@@ -1202,175 +1489,52 @@ pub fn finding(h: &HistoryDigest) -> Option<Finding> {
     })
 }
 
-/// The poller's side. `record` never blocks.
-pub struct Recorder {
-    tx: Option<SyncSender<Batch>>,
-    shared: Arc<Shared>,
+/// Whether a write failed because another connection holds the file.
+///
+/// This is the one failure that is not an error: it means try again next poll.
+/// `SQLITE_BUSY` is a lock and `SQLITE_LOCKED` a table lock in this connection's
+/// own file, and both leave the transaction uncommitted.
+fn is_busy(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|cause| match cause.downcast_ref::<rusqlite::Error>() {
+            Some(rusqlite::Error::SqliteFailure(f, _)) => matches!(
+                f.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ),
+            _ => false,
+        })
 }
 
-impl Recorder {
-    pub fn record(&self, b: Batch) {
-        let Some(tx) = &self.tx else { return };
-        match tx.try_send(b) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                self.shared.dropped.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                self.shared.stopped.store(true, Ordering::Relaxed);
-            }
-        }
-    }
-}
-
-/// Applies batches to the store and keeps the status.
-struct Writer {
-    store: Option<Store>,
-    cfg: Config,
-    shared: Arc<Shared>,
-}
-
-impl Writer {
-    fn handle(&mut self, b: &Batch) {
-        if self.store.is_none() {
-            match Store::open(&self.cfg) {
-                Ok(s) => {
-                    self.store = Some(s);
-                    let mut st = self.shared.status();
-                    if st.open_error.take().is_some() {
-                        tracing::info!(file = %self.cfg.file.display(), "history file opened");
-                    }
-                }
-                Err(e) => {
-                    self.fail(format!("{e:#}"), true);
-                    return;
-                }
-            }
-        }
-        let Some(store) = self.store.as_mut() else {
-            return;
-        };
-        match store.write(b) {
-            Ok(w) => {
-                let mut st = self.shared.status();
-                if st.last_error.take().is_some() {
-                    tracing::info!("history writes recovered");
-                }
-                st.writes += 1;
-                st.crawl_windows += w.crawl_windows;
-                st.pruned += w.pruned;
-                st.last_write = Some(Instant::now());
-                st.used_bytes = Some(w.used_bytes);
-                st.file_bytes = Some(w.file_bytes);
-                st.oldest_ms = w.oldest_ms;
-                st.newest_ms = w.newest_ms;
-                st.dropped_acked = self.shared.dropped.load(Ordering::Relaxed);
-                if w.prune_error.is_some() && w.prune_error != st.prune_error {
-                    tracing::error!(error = ?w.prune_error, "history could not prune");
-                }
-                if w.cap_unmet && !st.over_cap {
-                    tracing::error!("{OVER_CAP}");
-                }
-                st.prune_error = w.prune_error;
-                st.over_cap = w.cap_unmet;
-            }
-            Err(e) => {
-                self.store = None;
-                self.fail(format!("{e:#}"), false);
-            }
-        }
-    }
-
-    fn fail(&self, msg: String, open: bool) {
-        let mut st = self.shared.status();
-        st.failures += 1;
-        let slot = if open {
-            &mut st.open_error
-        } else {
-            &mut st.last_error
-        };
-        if slot.as_deref() != Some(msg.as_str()) {
-            tracing::error!(error = %msg, "history is not being written");
-        }
-        *slot = Some(msg);
-    }
-}
-
-/// Marks the history stopped when the writer thread ends for any reason.
-struct StopGuard(Arc<Shared>);
-
-impl Drop for StopGuard {
-    fn drop(&mut self) {
-        self.0.stopped.store(true, Ordering::Relaxed);
-    }
-}
-
-fn new_shared(cfg: Option<Config>) -> Arc<Shared> {
-    Arc::new(Shared {
-        cfg,
-        status: Mutex::new(Status::default()),
-        dropped: AtomicU64::new(0),
-        stopped: AtomicBool::new(false),
-    })
-}
-
-/// Open the file and start the writer thread.
+/// Open the file as the loop's own store.
 ///
 /// A fatal error (a file from a newer release, a bad migration list) is `Err`
-/// and the service exits 2. Any other failure starts the writer with no file
-/// and state `not_open`, and the next poll tries again.
-pub fn start(cfg: Option<Config>) -> anyhow::Result<(Recorder, HistoryHandle)> {
-    let shared = new_shared(cfg.clone());
-    let Some(cfg) = cfg else {
-        return Ok((
-            Recorder {
-                tx: None,
-                shared: Arc::clone(&shared),
-            },
-            HistoryHandle(shared),
-        ));
+/// and the service exits 2. Any other failure leaves the store closed and state
+/// `not_open`, and the next poll tries again. The connection's busy timeout is
+/// set to zero after the open, so a write that meets a lock returns at once and
+/// its batch stays held.
+pub fn start(cfg: Option<Config>, queue: &m6_core::limits::Limit) -> anyhow::Result<History> {
+    let mut history = History {
+        cfg: cfg.clone(),
+        store: None,
+        status: Status::default(),
+        queue: m6_core::limits::Bounded::new(queue),
+        dropped: 0,
     };
-    let store = match Store::open(&cfg) {
-        Ok(s) => Some(s),
+    let Some(cfg) = cfg else {
+        return Ok(history);
+    };
+    match Store::open(&cfg) {
+        Ok(s) => history.store = Some(s),
         Err(e) if is_fatal(&e) => {
             return Err(e.context(format!("history file {}", cfg.file.display())))
         }
         Err(e) => {
             let msg = format!("{e:#}");
-            tracing::error!(error = %msg, "history is not being written");
-            shared.status().open_error = Some(msg);
-            None
+            m6_core::log::error!(error = %msg, "history is not being written");
+            history.status.open_error = Some(msg);
         }
-    };
-    let (tx, rx) = sync_channel(QUEUE_POLLS);
-    spawn_writer(
-        rx,
-        Writer {
-            store,
-            cfg,
-            shared: Arc::clone(&shared),
-        },
-    )?;
-    Ok((
-        Recorder {
-            tx: Some(tx),
-            shared: Arc::clone(&shared),
-        },
-        HistoryHandle(shared),
-    ))
-}
-
-fn spawn_writer(rx: Receiver<Batch>, mut w: Writer) -> anyhow::Result<()> {
-    let guard = StopGuard(Arc::clone(&w.shared));
-    std::thread::Builder::new()
-        .name("m6-monitor-history".into())
-        .spawn(move || {
-            let _guard = guard;
-            for b in rx {
-                w.handle(&b);
-            }
-        })?;
-    Ok(())
+    }
+    Ok(history)
 }
 
 // ── reading ──────────────────────────────────────────────────────────────────
@@ -1488,8 +1652,11 @@ pub struct PageRow {
     pub traffic_error: Option<String>,
     pub rtt_ms: Option<f64>,
     pub binary: Option<String>,
-    pub version: Option<String>,
-    pub hash: Option<String>,
+    pub release: Option<String>,
+    pub commit: Option<String>,
+    /// 1 when the tree the binary was built from had uncommitted changes.
+    /// `null` when the row names no build at all.
+    pub dirty: Option<i64>,
     pub uptime_s: Option<i64>,
     pub host_uptime_s: Option<i64>,
     pub requests_total: Option<i64>,
@@ -1514,7 +1681,6 @@ pub struct PageRow {
     pub cert_not_after_unix: Option<i64>,
     pub cert_expires_in_s: Option<i64>,
     pub tunnel: Option<TunnelOut>,
-    pub log_reopen: Option<ReopenRow>,
     pub net: Vec<NetRow>,
     pub channels: Vec<ChannelOut>,
     pub findings: Vec<FindingOut>,
@@ -1525,14 +1691,14 @@ pub struct PageRow {
 
 const HEALTH_SELECT: &str =
     "SELECT h.id, h.at_ms, n.name, h.level, p.level, h.reachable, h.status, \
-h.detail, h.traffic_error, h.rtt_ms, b.binary, b.version, b.hash, h.uptime_s, h.host_uptime_s, \
-h.requests_total, h.monitor_requests, h.cache_hits, h.cache_misses, h.backend_errors, \
-h.hit_samples, h.hit_p50_ns, h.hit_p99_ns, h.miss_samples, h.miss_p50_ns, h.miss_p99_ns, \
+h.detail, h.traffic_error, h.rtt_ms, b.binary, b.\"release\", b.\"commit\", b.dirty, \
+h.uptime_s, h.host_uptime_s, h.requests_total, h.monitor_requests, h.cache_hits, \
+h.cache_misses, h.backend_errors, h.hit_samples, h.hit_p50_ns, h.hit_p99_ns, \
+h.miss_samples, h.miss_p50_ns, h.miss_p99_ns, \
 h.load_one, h.cpus, h.memory_used, h.memory_total_bytes, h.disk_used, h.disk_total_bytes, \
 h.thermal_max_c, h.cert_not_after_unix, h.tunnel_rtt_ms, h.tunnel_rtt_n, h.tunnel_probe, \
 h.tunnel_probe_error, h.tunnel_handshake, h.tunnel_handshake_age_s, h.tunnel_handshake_detail, \
-h.reopen_state, h.reopen_age_s, h.reopen_last_unix, h.reopen_reopens, h.reopen_failures, \
-h.reopen_last_failure_age_s, h.reopen_detail, h.poll_id \
+h.poll_id \
 FROM health h JOIN node n ON n.id = h.node_id JOIN poll p ON p.id = h.poll_id \
 LEFT JOIN build b ON b.id = h.build_id \
 WHERE h.at_ms >= ?1 AND h.at_ms < ?2 AND (?3 IS NULL OR h.node_id = ?3) \
@@ -1619,33 +1785,20 @@ pub fn health_page(
         let limit = iu(rows);
         let mapped = stmt.query_map(params![from_ms, to_ms, node, a_at, a_id, limit], |r| {
             let at: i64 = r.get(1)?;
-            let hits: Option<i64> = r.get(17)?;
-            let misses: Option<i64> = r.get(18)?;
-            let cert: Option<i64> = r.get(33)?;
-            let tunnel_probe: Option<String> = r.get(36)?;
+            let hits: Option<i64> = r.get(18)?;
+            let misses: Option<i64> = r.get(19)?;
+            let cert: Option<i64> = r.get(34)?;
+            let tunnel_probe: Option<String> = r.get(37)?;
             let tunnel = match tunnel_probe {
                 None => None,
                 Some(probe) => Some(TunnelOut {
-                    rtt_ms: r.get(34)?,
-                    rtt_n: r.get(35)?,
+                    rtt_ms: r.get(35)?,
+                    rtt_n: r.get(36)?,
                     probe,
-                    probe_error: r.get(37)?,
-                    handshake: r.get(38)?,
-                    handshake_age_s: r.get(39)?,
-                    handshake_detail: r.get(40)?,
-                }),
-            };
-            let reopen_state: Option<String> = r.get(41)?;
-            let log_reopen = match reopen_state {
-                None => None,
-                Some(state) => Some(ReopenRow {
-                    state,
-                    age_s: r.get(42)?,
-                    last_unix: r.get(43)?,
-                    reopens: r.get(44)?,
-                    failures: r.get(45)?,
-                    last_failure_age_s: r.get(46)?,
-                    detail: r.get(47)?,
+                    probe_error: r.get(38)?,
+                    handshake: r.get(39)?,
+                    handshake_age_s: r.get(40)?,
+                    handshake_detail: r.get(41)?,
                 }),
             };
             Ok(PageRow {
@@ -1661,38 +1814,38 @@ pub fn health_page(
                 traffic_error: r.get(8)?,
                 rtt_ms: r.get(9)?,
                 binary: none_if_empty(r.get(10)?),
-                version: none_if_empty(r.get(11)?),
-                hash: none_if_empty(r.get(12)?),
-                uptime_s: r.get(13)?,
-                host_uptime_s: r.get(14)?,
-                requests_total: r.get(15)?,
-                monitor_requests: r.get(16)?,
+                release: none_if_empty(r.get(11)?),
+                commit: none_if_empty(r.get(12)?),
+                dirty: r.get(13)?,
+                uptime_s: r.get(14)?,
+                host_uptime_s: r.get(15)?,
+                requests_total: r.get(16)?,
+                monitor_requests: r.get(17)?,
                 cache_hits: hits,
                 cache_misses: misses,
                 hit_rate: rate(hits, misses),
-                backend_errors: r.get(19)?,
-                hit_samples: r.get(20)?,
-                hit_p50_ns: r.get(21)?,
-                hit_p99_ns: r.get(22)?,
-                miss_samples: r.get(23)?,
-                miss_p50_ns: r.get(24)?,
-                miss_p99_ns: r.get(25)?,
-                load_one: r.get(26)?,
-                cpus: r.get(27)?,
-                memory_used: r.get(28)?,
-                memory_total_bytes: r.get(29)?,
-                disk_used: r.get(30)?,
-                disk_total_bytes: r.get(31)?,
-                thermal_max_c: r.get(32)?,
+                backend_errors: r.get(20)?,
+                hit_samples: r.get(21)?,
+                hit_p50_ns: r.get(22)?,
+                hit_p99_ns: r.get(23)?,
+                miss_samples: r.get(24)?,
+                miss_p50_ns: r.get(25)?,
+                miss_p99_ns: r.get(26)?,
+                load_one: r.get(27)?,
+                cpus: r.get(28)?,
+                memory_used: r.get(29)?,
+                memory_total_bytes: r.get(30)?,
+                disk_used: r.get(31)?,
+                disk_total_bytes: r.get(32)?,
+                thermal_max_c: r.get(33)?,
                 cert_not_after_unix: cert,
                 cert_expires_in_s: cert.map(|c| c - at / 1000),
                 tunnel,
-                log_reopen,
                 net: Vec::new(),
                 channels: Vec::new(),
                 findings: Vec::new(),
                 other_findings: Vec::new(),
-                poll_id: r.get(48)?,
+                poll_id: r.get(42)?,
             })
         })?;
         mapped.collect::<rusqlite::Result<_>>()?
@@ -1964,8 +2117,10 @@ pub fn fill_page<T: Keyed>(
 mod tests {
     use super::*;
     use crate::digest::{self, Thresholds};
-    use m6_core::host::{Disk, HostSnapshot, LoadAverage, Memory, MemorySource, NetDevice};
     use m6_core::monitoring::{LoggingHealth, TrafficReport};
+    use m6_core::platform::host::{
+        Disk, HostSnapshot, LoadAverage, Memory, MemorySource, NetDevice,
+    };
     use m6_core::telemetry::ChannelSnapshot;
 
     const T0: i64 = 1_800_000_000_000;
@@ -1981,6 +2136,7 @@ mod tests {
         TrafficReport {
             node: "n".into(),
             window_minutes: window,
+            events_dropped: 0,
             total_requests: 900,
             status: [(200u16, 800u64), (404, 100)].into_iter().collect(),
             notable: vec![],
@@ -1992,7 +2148,6 @@ mod tests {
             logging: LoggingHealth {
                 events_total: 5,
                 seconds_since_last: Some(1),
-                reopen: None,
             },
             firewall: None,
         }
@@ -2004,6 +2159,8 @@ mod tests {
             requests: 12,
             client_ips: vec!["192.0.2.1".into(), "192.0.2.2".into()],
             paths: vec!["/".into(), "/a".into()],
+            first_seen: "2026-10-01T09:00:00Z".into(),
+            last_seen: "2026-10-01T09:05:00Z".into(),
         }
     }
 
@@ -2045,7 +2202,7 @@ mod tests {
                 total_bytes: 2000,
                 available_bytes: 500,
             }),
-            thermal: vec![m6_core::host::ThermalZone {
+            thermal: vec![m6_core::platform::host::ThermalZone {
                 name: "cpu".into(),
                 celsius: 45.5,
             }],
@@ -2082,8 +2239,12 @@ mod tests {
             name: name.into(),
             role: "origin".into(),
             url: "http://x".into(),
-            health: None,
-            health_status: None,
+            health: Some(m6_core::monitoring::HealthReport {
+                process_index: None,
+                status: "ok".into(),
+                node: name.into(),
+            }),
+            health_status: Some(200),
             perf: Some(p),
             perf_error: None,
             header_checks: vec![],
@@ -2120,12 +2281,58 @@ mod tests {
             .unwrap()
     }
 
+    /// The tables migration 1 and 2 create, in their creation order.
+    const TABLES: [&str; 13] = [
+        "node",
+        "channel",
+        "iface",
+        "agent",
+        "build",
+        "poll",
+        "poll_finding",
+        "health",
+        "health_channel",
+        "health_net",
+        "crawl_window",
+        "crawl_sighting",
+        "crawl_status",
+    ];
+
+    /// The rows one SQL statement returns, as raw values, so a test compares
+    /// what the file holds without a struct in the way.
+    fn rows_of(c: &Connection, sql: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut stmt = c.prepare(sql).unwrap();
+        let n = stmt.column_count();
+        stmt.query_map([], |r| (0..n).map(|i| r.get(i)).collect())
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// Every row of one table, ordered by its own text, so a before-and-after
+    /// comparison does not depend on the row order a table happens to have.
+    fn every_row(c: &Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut rows = rows_of(c, &format!("SELECT * FROM {table}"));
+        rows.sort_by_key(|r| format!("{r:?}"));
+        rows
+    }
+
+    fn columns_of(c: &Connection, table: &str) -> Vec<String> {
+        let mut stmt = c
+            .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
     #[test]
     fn a_fresh_install_creates_the_directory_file_and_schema() {
         let dir = tempfile::tempdir().unwrap();
         let s = open(dir.path());
         assert!(cfg(dir.path(), 1).file.exists());
-        assert_eq!(sqlite::schema_version(&s.conn).unwrap(), 1);
+        assert_eq!(sqlite::schema_version(&s.conn).unwrap(), 3);
         let mut stmt = s
             .conn
             .prepare("SELECT name, strict FROM pragma_table_list WHERE schema = 'main' AND name NOT LIKE 'sqlite_%'")
@@ -2137,6 +2344,12 @@ mod tests {
             .collect();
         assert_eq!(tables.len(), 13, "{tables:?}");
         assert!(tables.iter().all(|(_, strict)| *strict == 1), "{tables:?}");
+        assert_eq!(
+            columns_of(&s.conn, "build"),
+            ["id", "binary", "release", "commit", "dirty"],
+            "a file created at 3 starts with the four build facts"
+        );
+        assert_eq!(count(&s, "build"), 0);
     }
 
     #[test]
@@ -2167,7 +2380,174 @@ mod tests {
         let s = open(dir.path());
         assert_eq!(count(&s, "poll"), 1);
         assert_eq!(count(&s, "health"), 1);
-        assert_eq!(sqlite::schema_version(&s.conn).unwrap(), 1);
+        assert_eq!(sqlite::schema_version(&s.conn).unwrap(), 3);
+    }
+
+    /// The last-200 read is answered from the partial index. The plan must name
+    /// it and must not scan the health table, which grows with the history.
+    #[test]
+    fn the_last_ok_read_uses_the_partial_index_and_no_table_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = open(dir.path());
+        let mut stmt = s
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {LAST_OK_SQL}"))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let plan = plan.join("\n");
+        assert!(plan.contains("health_ok_node_at"), "{plan}");
+        assert!(
+            !plan
+                .lines()
+                .any(|l| l.contains("SCAN h") || l.contains("SCAN health")),
+            "{plan}"
+        );
+    }
+
+    /// A version 2 file built by this test from the migration 1 and 2 SQL
+    /// opens at 3 with its build rows gone, its health rows whole, and every
+    /// other row and column unchanged.
+    ///
+    /// The file has rows in every table, so "every other table" is compared
+    /// rather than asserted: a migration that quietly rewrote one of them would
+    /// fail here whatever it did.
+    #[test]
+    fn a_version_2_file_is_rebuilt_at_3_and_keeps_every_other_fact() {
+        use rusqlite::types::Value;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = cfg(dir.path(), 1).file;
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        {
+            let c = Connection::open(&file).unwrap();
+            // Migrations 1 and 2 run exactly this SQL, and a migration that has
+            // shipped is never edited, so this makes a real version 2 file with
+            // nothing in it a reader cannot inspect.
+            c.execute_batch(SCHEMA_V1).unwrap();
+            c.execute_batch(SCHEMA_V2).unwrap();
+            c.pragma_update(None, "user_version", 2).unwrap();
+            c.execute_batch(
+                "INSERT INTO node (id, name) VALUES (1, 'origin'), (2, 'edge-a');
+                 INSERT INTO channel (id, label) VALUES (1, 'http/2/external');
+                 INSERT INTO iface (id, name) VALUES (1, 'wg0');
+                 INSERT INTO agent (id, user_agent) VALUES (1, 'Bot/1.0');
+                 INSERT INTO build (id, binary, version, hash) VALUES
+                   (1, 'm6-http', '1.15.0', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'),
+                   (2, 'm6-http', '1.15.0', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'),
+                   (3, 'm6-http', '1.16.0-rc.1+abc123def456', 'abc123def456');
+                 INSERT INTO poll (id, at_ms, level, faults, warns) VALUES (1, 1000, 1, 0, 1);
+                 INSERT INTO poll_finding (id, poll_id, level, node, polled, text)
+                   VALUES (1, 1, 1, 'origin', 1, 'a finding');
+                 INSERT INTO health (id, poll_id, at_ms, node_id, level, reachable, status,
+                   detail, rtt_ms, build_id, uptime_s, requests_total, load_one, tunnel_probe)
+                 VALUES
+                   (1, 1, 1000, 1, 0, 1, 'ok', NULL, 1.5, 1, 10, 100, 0.25, 'ok'),
+                   (2, 1, 1001, 1, 1, 1, 'ok', 'slow', 2.5, 2, 11, 101, 0.5, NULL),
+                   (3, 1, 1002, 2, 2, 0, 'down', 'refused', NULL, 3, NULL, NULL, NULL, NULL),
+                   (4, 1, 1003, 2, 0, 0, 'down', NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+                 INSERT INTO health_channel (health_id, channel_id, requests, hits, misses,
+                   backend_errors, hit_samples, hit_p50_ns, hit_p99_ns, miss_samples,
+                   miss_p50_ns, miss_p99_ns)
+                   VALUES (1, 1, 7, 5, 2, 0, 5, 900, 4000, 2, 70000, 90000);
+                 INSERT INTO health_net (health_id, iface_id, rx_bytes, rx_errs, rx_drop,
+                   tx_bytes, tx_errs, tx_drop) VALUES (1, 1, 10, 0, 0, 20, 0, 0);
+                 INSERT INTO crawl_window (id, poll_id, at_ms, node_id, window_minutes,
+                   total_requests, forged_bot_requests, forgers)
+                   VALUES (1, 1, 1000, 1, 60, 50, 0, '[]');
+                 INSERT INTO crawl_sighting (window_id, agent_id, requests, client_ips, paths)
+                   VALUES (1, 1, 12, '[]', '[]');
+                 INSERT INTO crawl_status (window_id, code, requests) VALUES (1, 200, 30);",
+            )
+            .unwrap();
+        }
+        let before: Vec<(String, Vec<String>, Vec<Vec<Value>>)> = {
+            let c = Connection::open(&file).unwrap();
+            assert_eq!(sqlite::schema_version(&c).unwrap(), 2);
+            TABLES
+                .iter()
+                .map(|t| ((*t).to_string(), columns_of(&c, t), every_row(&c, t)))
+                .collect()
+        };
+
+        let s = open(dir.path());
+        assert_eq!(sqlite::schema_version(&s.conn).unwrap(), 3);
+        assert_eq!(
+            columns_of(&s.conn, "build"),
+            ["id", "binary", "release", "commit", "dirty"],
+            "a build is the four facts that name it"
+        );
+        assert_eq!(
+            count(&s, "build"),
+            0,
+            "an old build row names an md5 and a bare release, so no row is carried across"
+        );
+
+        // Health keeps every observation. The one column that moves is
+        // build_id, and it moves to NULL because every build it could name was
+        // discarded.
+        let mut health = before
+            .iter()
+            .find(|(t, _, _)| t == "health")
+            .map(|(_, _, r)| r.clone())
+            .expect("health is in the list");
+        let build_id = columns_of(&s.conn, "health")
+            .iter()
+            .position(|c| c == "build_id")
+            .expect("health has build_id");
+        assert_eq!(
+            health.iter().filter(|r| r[build_id] != Value::Null).count(),
+            3,
+            "the file named a build in three of its four health rows"
+        );
+        for r in &mut health {
+            r[build_id] = Value::Null;
+        }
+        assert_eq!(
+            every_row(&s.conn, "health"),
+            health,
+            "every health row survives and only build_id changes"
+        );
+
+        for (table, columns, rows) in &before {
+            if table == "build" || table == "health" {
+                continue;
+            }
+            assert_eq!(columns_of(&s.conn, table), *columns, "{table} columns");
+            assert_eq!(&every_row(&s.conn, table), rows, "{table} rows");
+        }
+
+        assert!(
+            sqlite::is_append_only(&s.conn, "build").unwrap(),
+            "the rebuilt table keeps the lookup-table rule"
+        );
+        let broken: i64 = s
+            .conn
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(broken, 0, "no health row names a build that is gone");
+    }
+
+    /// The reset line is written by the open that loses the rows, and by no
+    /// other open: a fresh file had nothing to lose, and a file already at 3
+    /// runs no migration.
+    #[test]
+    fn only_a_file_that_predates_schema_3_announces_the_build_reset() {
+        assert!(!announces_build_reset(0), "a fresh file has no build rows");
+        assert!(announces_build_reset(1), "a version 1 file had build rows");
+        assert!(announces_build_reset(2), "a version 2 file had build rows");
+        assert!(!announces_build_reset(3), "an open at 3 runs no migration");
+        assert!(
+            !BUILD_RESET.contains('\n'),
+            "one log line, so the message carries no newline"
+        );
+        assert!(BUILD_RESET.contains("not comparable"));
+        assert!(BUILD_RESET.contains("dropped"));
     }
 
     #[test]
@@ -2175,7 +2555,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         drop(open(dir.path()));
         let c = Connection::open(cfg(dir.path(), 1).file).unwrap();
-        c.pragma_update(None, "user_version", 2).unwrap();
+        c.pragma_update(None, "user_version", 4).unwrap();
         drop(c);
         let err = Store::open(&cfg(dir.path(), 1)).err().expect("refused");
         assert!(is_fatal(&err), "{err:#}");
@@ -2248,7 +2628,7 @@ mod tests {
     }
 
     #[test]
-    fn tunnel_and_log_reopen_figures_are_stored() {
+    fn tunnel_figures_are_stored() {
         use crate::tunnel::{Handshake, Probe, ProbeResult, TunnelReading};
         let dir = tempfile::tempdir().unwrap();
         let mut s = open(dir.path());
@@ -2264,22 +2644,13 @@ mod tests {
             file_age_s: Some(1),
         });
         s.write(&make(T0, &[r])).unwrap();
-        let (rtt, n, probe, hs, age, state): (f64, i64, String, String, i64, String) = s
+        let (rtt, n, probe, hs, age): (f64, i64, String, String, i64) = s
             .conn
             .query_row(
                 "SELECT tunnel_rtt_ms, tunnel_rtt_n, tunnel_probe, tunnel_handshake, \
-                 tunnel_handshake_age_s, reopen_state FROM health",
+                 tunnel_handshake_age_s FROM health",
                 [],
-                |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                    ))
-                },
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .unwrap();
         assert_eq!(
@@ -2287,7 +2658,6 @@ mod tests {
             (3, "connected", "ok", 42)
         );
         assert!((rtt - 0.4).abs() < 1e-9);
-        assert_eq!(state, "unknown");
     }
 
     #[test]
@@ -2390,17 +2760,43 @@ mod tests {
         assert_eq!(count(&s, "health"), 6);
     }
 
+    /// The release tag is one fact and the commit is another, so two builds of
+    /// one tag are two rows. This is the case the old table keyed on `hash`
+    /// missed when the hash and the version carried the same commit.
     #[test]
-    fn a_new_build_gets_its_own_row() {
+    fn two_builds_that_differ_only_in_commit_are_two_rows() {
+        use rusqlite::types::Value;
+
         let dir = tempfile::tempdir().unwrap();
         let mut s = open(dir.path());
         s.write(&make(T0, &[reading("a")])).unwrap();
         let mut r = reading("a");
         if let Some(p) = r.perf.as_mut() {
-            p.build.hash = "f".repeat(32);
+            p.build.version = "1.4.0+ffffffffffff".into();
         }
         s.write(&make(T0 + 30_000, &[r])).unwrap();
         assert_eq!(count(&s, "build"), 2);
+        assert_eq!(
+            rows_of(
+                &s.conn,
+                r#"SELECT binary, "release", "commit", dirty FROM build ORDER BY id"#
+            ),
+            vec![
+                vec![
+                    Value::Text("m6-http".into()),
+                    Value::Text("1.4.0".into()),
+                    Value::Text("0123456789ab".into()),
+                    Value::Integer(0),
+                ],
+                vec![
+                    Value::Text("m6-http".into()),
+                    Value::Text("1.4.0".into()),
+                    Value::Text("ffffffffffff".into()),
+                    Value::Integer(0),
+                ],
+            ],
+            "the release is one column and the commit is its own"
+        );
         let distinct: i64 = s
             .conn
             .query_row("SELECT count(DISTINCT build_id) FROM health", [], |r| {
@@ -2408,6 +2804,31 @@ mod tests {
             })
             .unwrap();
         assert_eq!(distinct, 2);
+    }
+
+    /// A dirty tree is a build of its own: same commit, different bytes. The
+    /// four-column key says so, and comparing the commit alone would not.
+    #[test]
+    fn a_dirty_build_of_one_commit_is_its_own_row() {
+        use rusqlite::types::Value;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path());
+        s.write(&make(T0, &[reading("a")])).unwrap();
+        let mut r = reading("a");
+        if let Some(p) = r.perf.as_mut() {
+            p.build.version = "1.4.0+0123456789ab.dirty".into();
+        }
+        s.write(&make(T0 + 30_000, &[r])).unwrap();
+        assert_eq!(count(&s, "build"), 2);
+        assert_eq!(
+            rows_of(&s.conn, r#"SELECT "commit", dirty FROM build ORDER BY id"#),
+            vec![
+                vec![Value::Text("0123456789ab".into()), Value::Integer(0)],
+                vec![Value::Text("0123456789ab".into()), Value::Integer(1)],
+            ],
+            "one commit, two builds, and the flag is what tells them apart"
+        );
     }
 
     #[test]
@@ -2460,7 +2881,10 @@ mod tests {
     #[test]
     fn the_file_stays_under_its_cap_and_prunes_whole_polls() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = Store::open(&cfg(dir.path(), 1)).unwrap();
+        // The assertion below is this cap plus one SQLite page, so the two
+        // move together. A 1 MB cap with a 2 MB bound let a 1.9 MB file pass a
+        // test whose name says the file stays under its cap.
+        let mut s = Store::open(&cfg(dir.path(), 2)).unwrap();
         let mut pruned = 0;
         for k in 0..1500 {
             let mut rs = vec![reading("a"), reading("b"), reading("c")];
@@ -2475,7 +2899,7 @@ mod tests {
         }
         assert!(pruned > 0, "the cap was never reached");
         assert!(
-            file_len(dir.path()) <= (1 << 20) + 65_536,
+            file_len(dir.path()) <= (2 << 20) + 65_536,
             "{}",
             file_len(dir.path())
         );
@@ -2644,14 +3068,25 @@ mod tests {
             keys(&v),
             words(
                 "id at at_unix_ms node level poll_level reachable status detail traffic_error \
-                 rtt_ms binary version hash uptime_s host_uptime_s requests_total monitor_requests \
+                 rtt_ms binary release commit dirty uptime_s host_uptime_s \
+                 requests_total monitor_requests \
                  cache_hits cache_misses hit_rate backend_errors hit_samples hit_p50_ns hit_p99_ns \
                  miss_samples miss_p50_ns miss_p99_ns load_one cpus memory_used memory_total_bytes \
                  disk_used disk_total_bytes thermal_max_c cert_not_after_unix cert_expires_in_s \
-                 tunnel log_reopen net channels findings other_findings"
+                 tunnel net channels findings other_findings"
             )
         );
         assert_eq!(v["at"], "2027-01-15T08:00:00.000Z");
+        assert_eq!(
+            (
+                v["binary"].as_str(),
+                v["release"].as_str(),
+                v["commit"].as_str()
+            ),
+            (Some("m6-http"), Some("1.4.0"), Some("0123456789ab")),
+            "a reader names the build from four columns and parses no string"
+        );
+        assert_eq!(v["dirty"], 0, "the fixture is a clean build");
         assert!(v["tunnel"].is_null());
         assert!(
             v["cert_expires_in_s"].is_null(),
@@ -2715,37 +3150,91 @@ mod tests {
         assert_eq!(b.level, 2);
     }
 
+    /// A write that meets another connection's lock returns at once and its
+    /// batch is kept. The next poll writes the held batch and its own.
     #[test]
-    fn record_never_blocks_when_the_writer_is_stuck() {
+    fn a_busy_history_database_keeps_the_batch() {
         let dir = tempfile::tempdir().unwrap();
-        let shared = new_shared(Some(cfg(dir.path(), 1)));
-        let (tx, _rx) = sync_channel(QUEUE_POLLS);
-        let rec = Recorder {
-            tx: Some(tx),
-            shared: Arc::clone(&shared),
-        };
-        let h = HistoryHandle(shared);
-        let b = make(T0, &[reading("a")]);
-        let started = Instant::now();
-        for _ in 0..QUEUE_POLLS + 3 {
-            rec.record(b.clone());
-        }
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let mut h = start(Some(cfg(dir.path(), 64))).unwrap();
+        let lock = Connection::open(&cfg(dir.path(), 64).file).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let started = m6_core::platform::now();
+        h.record(make(T0, &[reading("a")]));
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "record waited on the lock: {:?}",
+            started.elapsed()
+        );
         let d = h.digest();
-        assert_eq!(d.dropped, 3);
+        assert_eq!(d.writes, 0);
         assert_eq!(d.state, "behind");
+
+        lock.execute_batch("COMMIT").unwrap();
+        h.record(make(T0 + 1, &[reading("a")]));
+        let d = h.digest();
+        assert_eq!(d.writes, 2, "the held batch and the new one");
+        assert_eq!(d.state, "ok");
     }
 
-    fn writer(c: Config) -> (Writer, HistoryHandle) {
-        let shared = new_shared(Some(c.clone()));
-        (
-            Writer {
-                store: None,
-                cfg: c,
-                shared: Arc::clone(&shared),
-            },
-            HistoryHandle(shared),
-        )
+    /// A hold past the `history_queue` maximum refuses the new poll with an
+    /// error naming the key and counts it, so what is held stays whole and in
+    /// order.
+    #[test]
+    fn a_hold_past_its_maximum_refuses_the_new_poll_and_counts_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = super::start(Some(cfg(dir.path(), 64)), &queue_limit(2, QUEUE_POLLS)).unwrap();
+        let lock = Connection::open(&cfg(dir.path(), 64).file).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        for i in 0..QUEUE_POLLS as i64 + 2 {
+            h.record(make(T0 + i, &[reading("a")]));
+        }
+        let d = h.digest();
+        assert_eq!(d.dropped, 2);
+        assert_eq!(d.writes, 0);
+
+        lock.execute_batch("COMMIT").unwrap();
+        h.flush();
+        assert_eq!(h.digest().writes, QUEUE_POLLS as u64);
+        let rows: Vec<i64> = h
+            .store
+            .as_ref()
+            .unwrap()
+            .conn
+            .prepare("SELECT at_ms FROM poll ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let want: Vec<i64> = (0..QUEUE_POLLS as i64).map(|i| T0 + i).collect();
+        assert_eq!(
+            rows, want,
+            "the first {QUEUE_POLLS} polls are kept in order"
+        );
+    }
+
+    /// The most polls a test's hold takes.
+    const QUEUE_POLLS: usize = 8;
+
+    /// `start` with the hold's default limit.
+    fn start(cfg: Option<Config>) -> anyhow::Result<History> {
+        super::start(cfg, &queue_limit(2, QUEUE_POLLS))
+    }
+
+    /// The hold's limit for a test.
+    fn queue_limit(start: usize, max: usize) -> m6_core::limits::Limit {
+        m6_core::limits::Limit::custom(&m6_core::limits::HISTORY_QUEUE, start, max)
+    }
+
+    fn history(c: Config) -> History {
+        History {
+            cfg: Some(c),
+            store: None,
+            status: Status::default(),
+            queue: m6_core::limits::Bounded::new(&queue_limit(2, QUEUE_POLLS)),
+            dropped: 0,
+        }
     }
 
     #[test]
@@ -2753,15 +3242,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let blocker = dir.path().join("sub");
         std::fs::write(&blocker, b"a file where the directory should be").unwrap();
-        let (mut w, h) = writer(cfg(dir.path(), 1));
+        let mut h = history(cfg(dir.path(), 1));
         let b = make(T0, &[reading("a")]);
-        w.handle(&b);
+        h.record(b.clone());
         let d = h.digest();
         assert_eq!(d.state, "not_open");
         assert_eq!(d.failures, 1);
         assert!(finding(&d).is_some());
         std::fs::remove_file(&blocker).unwrap();
-        w.handle(&b);
+        h.record(b);
         let d = h.digest();
         assert_eq!((d.state, d.writes), ("ok", 1));
         assert_eq!(d.last_error, None);
@@ -2771,16 +3260,73 @@ mod tests {
     #[test]
     fn a_failed_write_is_failing_until_one_succeeds() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut w, h) = writer(cfg(dir.path(), 1));
-        w.handle(&make(T0, &[reading("a")]));
+        let mut h = history(cfg(dir.path(), 1));
+        h.record(make(T0, &[reading("a")]));
         let mut bad = make(T0 + 1, &[reading("a")]);
         let dup = bad.rows[0].channels[0].clone();
         bad.rows[0].channels.push(dup);
-        w.handle(&bad);
+        h.record(bad);
         assert_eq!(h.digest().state, "failing");
-        w.handle(&make(T0 + 2, &[reading("a")]));
+        h.record(make(T0 + 2, &[reading("a")]));
         let d = h.digest();
         assert_eq!((d.state, d.writes, d.failures), ("ok", 2, 1));
+    }
+
+    /// The age of each node's last 200 is read from the rows, and a restarted
+    /// monitor reads the same answer out of the file.
+    #[test]
+    fn the_age_of_the_last_200_comes_from_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = history(cfg(dir.path(), 64));
+        let mut r = reading("origin");
+        r.health = Some(m6_core::monitoring::HealthReport {
+            process_index: None,
+            status: "ok".into(),
+            node: "origin".into(),
+        });
+        r.health_status = Some(200);
+        h.record(make(now_ms() - 300_000, std::slice::from_ref(&r)));
+        let d = h.digest();
+        let last_ok = d.last_ok.clone().expect("the history was read");
+        assert_eq!(last_ok.len(), 1, "{last_ok:?}");
+        assert_eq!(last_ok[0].node, "origin");
+        assert!(
+            (300..=301).contains(&last_ok[0].age_s),
+            "300 seconds ago reads as {:?}",
+            last_ok[0]
+        );
+        // A new process asks the file the same question.
+        let reopened = start(Some(cfg(dir.path(), 64))).unwrap();
+        let again = reopened.digest().last_ok.expect("the history was read");
+        assert_eq!(again.len(), 1, "{again:?}");
+        assert_eq!(again[0].node, "origin");
+        assert!((300..=301).contains(&again[0].age_s), "{again:?}");
+    }
+
+    /// A degraded poll is not a 200, so the age keeps running from the last
+    /// answer that was.
+    #[test]
+    fn a_degraded_poll_does_not_reset_the_age_of_the_last_200() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = history(cfg(dir.path(), 64));
+        let mut r = reading("origin");
+        r.health = Some(m6_core::monitoring::HealthReport {
+            process_index: None,
+            status: "ok".into(),
+            node: "origin".into(),
+        });
+        r.health_status = Some(200);
+        h.record(make(now_ms() - 300_000, std::slice::from_ref(&r)));
+        r.health = Some(m6_core::monitoring::HealthReport {
+            process_index: None,
+            status: "degraded".into(),
+            node: "origin".into(),
+        });
+        r.health_status = Some(503);
+        h.record(make(now_ms() - 1000, std::slice::from_ref(&r)));
+        let last_ok = h.digest().last_ok.expect("the history was read");
+        assert_eq!(last_ok.len(), 1, "{last_ok:?}");
+        assert!((300..=301).contains(&last_ok[0].age_s), "{last_ok:?}");
     }
 
     #[test]
@@ -2832,47 +3378,42 @@ mod tests {
 
     #[test]
     fn history_digest_states_and_their_findings() {
-        let off = HistoryHandle(new_shared(None));
+        let off = start(None).unwrap();
         assert_eq!(off.digest().state, "off");
         assert!(finding(&off.digest()).is_none());
 
         let dir = tempfile::tempdir().unwrap();
-        let shared = new_shared(Some(cfg(dir.path(), 1)));
-        let h = HistoryHandle(Arc::clone(&shared));
-        let f = |h: &HistoryHandle| finding(&h.digest()).map(|f| (f.level, f.node, f.text));
-        assert_eq!(h.digest().state, "ok");
-        assert_eq!(f(&h), None);
-
-        shared.status().open_error = Some("denied".into());
+        let mut h = start(Some(cfg(dir.path(), 1))).unwrap();
         let path = cfg(dir.path(), 1).file.display().to_string();
+        assert_eq!(h.digest().state, "ok");
+        assert!(finding(&h.digest()).is_none());
+
+        h.status.open_error = Some("denied".into());
         assert_eq!(
-            f(&h).unwrap(),
-            (
+            finding(&h.digest()).map(|f| (f.level, f.node, f.text)),
+            Some((
                 Level::Warn,
                 "monitor".into(),
                 format!(
                     "history file {path} could not be opened, so no history is being kept: denied"
                 )
-            )
+            ))
         );
-        shared.status().open_error = None;
-        shared.status().last_error = Some("disk full".into());
+        h.status.open_error = None;
+        h.status.last_error = Some("disk full".into());
         assert_eq!(
-            f(&h).unwrap().2,
+            finding(&h.digest()).unwrap().text,
             "the last history write failed, so that poll is missing from the history: disk full"
         );
-        shared.status().last_error = None;
-        shared.dropped.store(2, Ordering::Relaxed);
+        h.status.last_error = None;
+        h.dropped = 2;
+        let held = h.queue.push_back(make(T0, &[reading("a")]), "a poll");
+        assert!(held.is_ok(), "the hold has room");
+        assert_eq!(h.digest().state, "behind");
         assert_eq!(
-            f(&h).unwrap().2,
-            "the history writer is behind and has dropped 2 poll(s) since start: is the disk slow or the file locked?"
+            finding(&h.digest()).unwrap().text,
+            "the history is behind and has dropped 2 poll(s) since start: is the disk slow or the file locked?"
         );
-        shared.stopped.store(true, Ordering::Relaxed);
-        assert_eq!(
-            f(&h).unwrap().2,
-            "the history writer has stopped, so no history is being kept"
-        );
-        assert_eq!(h.digest().state, "stopped");
     }
 
     fn crawl_reading(name: &str, crawlers: Vec<CrawlerReport>) -> NodeReading {
@@ -2951,11 +3492,17 @@ mod tests {
     #[test]
     fn unique_agents_across_many_windows_keep_the_file_under_its_cap() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = Store::open(&cfg(dir.path(), 8)).unwrap();
+        // A 2 MB cap, not 8 MB. The property is that the cap is reached and the
+        // unused agent rows are pruned, and it needs enough windows for the
+        // file to overflow whatever cap is set. 8 MB meant 1500 windows and
+        // 30,000 inserts, 10.8 s for one unit test on the build host. The same
+        // overflow arrives at 2 MB with 350 windows, which is still many
+        // windows, and it still leaves more than the 100-poll floor below.
+        let mut s = Store::open(&cfg(dir.path(), 2)).unwrap();
         let mut pruned = 0;
-        let windows = 1500i64;
+        let windows = 350i64;
         for k in 0..windows {
-            let crawlers = (0..20u64)
+            let crawlers = (0..10u64)
                 .map(|j| sighting(format!("bot-{k}-{j}-{}", "x".repeat(300)), 1 + j))
                 .collect();
             let w = s
@@ -2966,7 +3513,7 @@ mod tests {
         }
         assert!(pruned > 0, "the cap was never reached");
         assert!(
-            file_len(dir.path()) <= (8 << 20) + 65_536,
+            file_len(dir.path()) <= (2 << 20) + 65_536,
             "{}",
             file_len(dir.path())
         );
@@ -2976,7 +3523,11 @@ mod tests {
                 Ok((r.get(0)?, r.get(1)?))
             })
             .unwrap();
-        assert!(polls >= 100, "{polls}");
+        // A 2 MB cap retains about 94 polls at this window size, so the floor
+        // is the same "a useful history survives" check scaled to the smaller
+        // cap. It is above zero by a wide margin, so a prune that emptied the
+        // history still fails.
+        assert!(polls >= 90, "{polls}");
         assert_eq!(newest, T0 + (windows - 1) * 3_600_000);
         let unused: i64 = s
             .conn
@@ -3204,8 +3755,8 @@ mod tests {
     fn a_failed_prune_is_not_a_lost_poll() {
         let dir = tempfile::tempdir().unwrap();
         let c = tight(dir.path(), 20_000);
-        let (mut w, h) = writer(c.clone());
-        w.handle(&make(T0, &[reading("a")]));
+        let mut h = start(Some(c.clone())).unwrap();
+        h.record(make(T0, &[reading("a")]));
         let blocker = sqlite::open(&c.file).unwrap();
         blocker
             .execute_batch(
@@ -3215,7 +3766,7 @@ mod tests {
             .unwrap();
         let mut writes = 1;
         for k in 1..200 {
-            w.handle(&make(T0 + k * 1000, &[reading("a")]));
+            h.record(make(T0 + k * 1000, &[reading("a")]));
             writes += 1;
             if h.digest().state != "ok" {
                 break;
@@ -3233,7 +3784,7 @@ mod tests {
             .unwrap();
         assert_eq!(polls, writes as i64);
         blocker.execute_batch("DROP TRIGGER keep_polls").unwrap();
-        w.handle(&make(T0 + 1_000_000, &[reading("a")]));
+        h.record(make(T0 + 1_000_000, &[reading("a")]));
         let d = h.digest();
         assert_eq!(d.state, "ok", "{d:?}");
         assert!(d.pruned > 0);
@@ -3243,11 +3794,12 @@ mod tests {
     #[test]
     fn a_cap_that_cannot_be_met_is_over_cap_and_keeps_the_poll() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut w, h) = writer(Config {
+        let mut h = start(Some(Config {
             max_bytes: 4096,
             ..cfg(dir.path(), 1)
-        });
-        w.handle(&make(T0, &[reading("a")]));
+        }))
+        .unwrap();
+        h.record(make(T0, &[reading("a")]));
         let d = h.digest();
         assert_eq!((d.state, d.writes, d.failures), ("over_cap", 1, 0));
         let f = finding(&d).unwrap();
@@ -3288,13 +3840,11 @@ mod tests {
         assert_eq!(rows, vec![T0 + 30_000]);
     }
 
-    #[cfg(unix)]
     fn mode(p: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(p).unwrap().permissions().mode() & 0o777
     }
 
-    #[cfg(unix)]
     #[test]
     fn the_history_directory_and_file_are_private() {
         let dir = tempfile::tempdir().unwrap();
@@ -3317,7 +3867,6 @@ mod tests {
         assert_eq!(mode(c.file.parent().unwrap()), 0o755);
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_journal_beside_the_history_file_is_private() {
         let dir = tempfile::tempdir().unwrap();

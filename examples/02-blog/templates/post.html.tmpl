@@ -1,0 +1,30 @@
+{% extends "templates/base.html.tmpl" %}
+{% block title %}
+  {%- set post_list = documents | filter(attribute="stem", value=stem) -%}
+  {%- if post_list | length == 0 %}{{ not_found() }}{% endif -%}
+  {%- set post = post_list | first -%}
+  {{ post.title }} · {{ site_name }}
+{% endblock %}
+{% block content %}
+  {% set post_list = documents | filter(attribute="stem", value=stem) %}
+  {% if post_list | length == 0 %}{{ not_found() }}{% endif %}
+  {% set post = post_list | first %}
+  {% if post.cover %}
+  <img class="post-hero" src="{{ post.cover }}" alt="">
+  {% endif %}
+  <div class="post-header">
+    <div class="post-card-meta" style="margin-bottom:0.75rem;">
+      <span class="post-date">{{ post.date | date_format(fmt="%B %d, %Y") }}</span>
+      {% if post.tags is defined %}
+      <div class="post-tags">
+        {% for tag in post.tags %}<span class="tag">{{ tag }}</span>{% endfor %}
+      </div>
+      {% endif %}
+    </div>
+    <h1>{{ post.title }}</h1>
+    {% if post.summary %}<p style="color:var(--muted);font-size:1.05rem;margin-top:0.5rem;">{{ post.summary }}</p>{% endif %}
+  </div>
+  <div class="post-body">
+    {{ post.body | safe }}
+  </div>
+{% endblock %}

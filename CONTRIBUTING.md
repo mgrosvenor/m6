@@ -1,90 +1,100 @@
 # Contributing to m6
 
-m6 is a small, self-contained HTTP stack: an origin, an edge cache, a renderer
-and a monitor, meant to serve a website from your own servers. Contributions are
-welcome; so are bug reports that simply say what you saw.
+m6 is a web hosting engine made of an origin, an edge cache, a renderer and a monitor.
+This page holds the rules a contributor needs to get a change merged: the branch model, the checks, the version policy and how to report a bug.
+House rules, including the documentation ruleset R0 to R10, are in [`CLAUDE.md`](CLAUDE.md).
 
-## The short version
+1. [The short version](#1-the-short-version)
+2. [Branches](#2-branches)
+3. [What has to pass](#3-what-has-to-pass)
+4. [Releases](#4-releases)
+5. [A check that cannot measure must fail](#5-a-check-that-cannot-measure-must-fail)
+6. [Style](#6-style)
+7. [Commit messages](#7-commit-messages)
+8. [Reporting a bug](#8-reporting-a-bug)
+9. [Changes the event-loop rule needs approved](#9-changes-the-event-loop-rule-needs-approved)
+10. [Summary](#10-summary)
+
+## 1. The short version
+
+Three commands make a change:
 
 ```sh
 ./tools/branch.sh <issue> <slug> --type fix   # branches off develop
 # work, commit
-git push origin fix/<issue>-<slug>            # runs the fast checks
-gh pr create --base develop --fill           # CI runs everything, then merge on GitHub
+git push origin fix/<issue>-<slug>
+gh pr create --base develop --fill            # CI runs every check, then merge on GitHub
 ```
 
-`CLAUDE.md` has the full model. The rules below are the ones a contributor
-needs.
+File the issue first: `tools/branch.sh` stops when `gh` cannot find the issue.
 
-## Branches
+## 2. Branches
 
-- `main` is releases only. Nothing is pushed to it by hand.
-- `develop` is where work is integrated.
-- Work happens on `<type>/<issue>-<slug>`, branched from `develop`.
-- Types: `feat` `fix` `perf` `docs` `refactor` `test` `chore`.
+Table 1 gives the three branches.
 
-Every branch names an issue, because a branch named after an issue nobody
-filed is a branch nobody can find six months later. File the issue first; it
-can be two sentences.
+| branch | what it is |
+|---|---|
+| `main` | releases only. Nothing is pushed to it by hand |
+| `develop` | where work is integrated |
+| `<type>/<issue>-<slug>` | one branch per issue, cut from `develop` |
 
-## What has to pass
+**Table 1: the three branches.**
+Take from it that work starts on a work branch cut from `develop` and lands back by pull request.
 
-All of it, on Linux, before anything merges into `develop`:
+The types are `feat`, `fix`, `perf`, `docs`, `refactor`, `test` and `chore`.
 
-- the whole test suite
-- **zero compiler warnings**, release and test builds, including ones that were
-  already there
-- clippy **silent**: `-D warnings`, no ceiling, since 2026-09-13. This said "at
-  or under its recorded count" until 2026-09-26, which was the old model and had
-  been replaced because a number in a file reads as an allowance and has to be
-  maintained by hand. A new lint from a toolchain upgrade gets fixed, or gets a
-  targeted `#[allow]` naming the lint with the reason argued in the commit.
-- h1, h2 and h3 conformance, at or above their recorded scores
-- the performance check, within its margin
+## 3. What has to pass
 
-CI runs them on the pull request, and again on the push to `main` or `develop`
-that merges it, and on a release tag. `tools/build-host-tests.sh` runs the same
-ground plus the performance check, which a shared runner cannot measure.
+A change merges into `develop` after every check in Table 2 passes.
+Table 2 lists each check with the *CI* (continuous integration) job that runs it.
+The build and tests job runs on Linux x86_64, and two more jobs repeat its build, test, clippy and rustdoc checks on macOS arm64 and Linux arm64.
 
-[`docs/m6-testing.md`](docs/m6-testing.md) covers what each check proves and how
-to run it, including the procedure for running h2spec or h3spec by hand and the
-five traps that come with it.
+| check | CI job |
+|---|---|
+| formatting (`cargo fmt --all --check`) | build and tests |
+| zero compiler warnings in release and test builds, pre-existing included | build and tests |
+| the test suite (`cargo test --workspace`) | build and tests |
+| m6-core with every feature on (`cargo test -p m6-core --lib --all-features` and `--doc --all-features`) | build and tests |
+| rustdoc silent (`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`, then with `--all-features`) | build and tests |
+| clippy silent (`tools/clippy.sh`) | clippy |
+| h1, h2 and h3 conformance at or above the recorded floors (`tools/conformance.sh`) | h1, h2, h3 conformance |
+| the HTTP/2 unit tests and h2spec with debug assertions off, in the `release-asserts` profile | h1, h2, h3 conformance |
+| the same build and tests on the other two supported platforms | macOS arm64 build and tests, Linux arm64 build and tests |
+| dependencies (`cargo deny check`) | advisories, licences, duplicates |
+| shellcheck clean at warning level | shell scripts |
+| a teardown kills only a pid this run recorded (`tools/check-kill-safety.sh`) | shell scripts |
+| documents name live commits (`tools/check-commit-hashes.sh`) | documents name live commits |
+| the C client builds with no warnings | perf tools |
+| the examples build and work | the examples build and work |
+| the minimum supported Rust version in `Cargo.toml` builds the workspace | minimum supported Rust version |
 
-### A release also has to be documented, and that is enforced
+**Table 2: the checks a merge must pass, and the CI job that runs each one.**
+Take from it that five checks run in the build and tests job, and the rest run in ten more jobs.
 
-A pull request into `main` **is** the release, and two more checks apply to it:
+The workspace test run does not compile m6-core's off-by-default features, so CI builds and tests m6-core with every feature on.
+Every other check builds the dev profile, where a `debug_assert!` argument runs, so the conformance job also builds the `release-asserts` profile: the dev profile with debug assertions off, as in a release binary ([`docs/m6-testing.md`](docs/m6-testing.md) §4.3).
+The performance check runs on the build host, because it needs a quiet machine.
+The address and leak sanitisers run in their own workflow, `.github/workflows/sanitizer.yml`, on pushes to `develop` and on pull requests to it.
+That workflow is advisory: a finding in code older than the pull request leaves the merge clear.
 
-- `CHANGELOG.md` has a `## <version>` section: what changed, why it mattered, and how it
-  was verified.
-- m6's own documents still hold. The ones making current-state claims are
-  `README.md`, this file, `docs/PERFORMANCE.md` and
-  `tools/conformance-scores.txt`. The release checklist in the pull request template
-  asks for this, because freshness is judgement and CI cannot decide it.
+CI runs every check except performance on the pull request, on the push to `main` or `develop` that merges it, and on a release tag.
+`tools/build-host-tests.sh` runs the same checks plus the performance check, with conformance against a real h2spec and h3spec install.
+Run it before opening the pull request when the change could touch either.
 
-  This was a check on `HANDOVER.md` until 2026-09-26, requiring it to mention the
-  version. That file states which of one particular deployment's boxes runs what,
-  so it is not a public document and now lives in the private deployment
-  repository, where a workflow here cannot read it. **The rule did not move with
-  it**: a release is a claim about what is now true, so the documents that say
-  what is true are part of the release.
+[`docs/m6-testing.md`](docs/m6-testing.md) covers what each check proves and how to run it.
 
-**Docs being up to date is a fundamental part of a release, not a follow-up to one.**
-Owner's rule, 2026-09-25, and it was earned: 1.11.0 shipped while a working document
-on `main` still named the previous release as current, in the first bullet of the first
-section a cold reader opens. The correction existed on `develop` and could not reach
-`main`, because a docs-only `develop` to `main` pull request fails the "version is not
-already tagged" check, so the stale text sat on the default branch until a later
-release happened to carry it. 1.11.1 had to be cut for documentation alone.
+## 4. Releases
 
-The checklist is deliberately judgement and not machinery. Nothing here can know what
-any deployment is running, and a check that cannot perform its measurement must not
-pretend to: this repository's trap list is mostly those. What the checklist guarantees
-is that you open the files while cutting the release, which is when you know what is
-true.
+A pull request into `main` is the release, and four checks apply to it.
+CI enforces three of them.
+The `main takes develop only` job refuses a work branch aimed at `main`.
+The `changelog` job checks that `CHANGELOG.md` has a `## <version>` section, and that the version is not already tagged.
+The fourth check is the author's judgement: the documents that state current facts must still hold, and the release checklist in the pull request template asks for it.
 
-### Versions
+### 4.1. Versions
 
-A version is `X.Y.Z`, and what changed decides which number moves (Table 1).
+A version is `X.Y.Z`, and what changed decides which number moves.
+Table 3 gives the three numbers.
 
 | number | moves when | example |
 |---|---|---|
@@ -92,65 +102,109 @@ A version is `X.Y.Z`, and what changed decides which number moves (Table 1).
 | Y | a breaking change to an API, configuration, library or behaviour, or a major new feature | a config key renamed, or a new protocol |
 | Z | bug fixes, minor updates or minor new features | a corrected cache clear |
 
-*Table 1: the three version numbers and what moves each. A release that does two things takes the larger move.*
+**Table 3: the three version numbers and what moves each.**
+Take from it that a release doing two things takes the larger move.
 
 A change to configuration or behaviour that needs a migration note is a Y change.
 It carries a Migration section in its `CHANGELOG.md` entry, ahead of the list of changes.
 
-### If you make something faster
+A release candidate carries the SemVer pre-release field.
+On `develop` the workspace version is `X.Y.Z-rc.N`, and each candidate built from `develop` for staging is tagged `vX.Y.Z-rc.N`.
+The release commit sets `X.Y.Z` and is tagged `vX.Y.Z`.
+The release is the promoted candidate, and no second build is cut for it.
 
-Record the new number, in the commit that earned it:
+The version alone says which kind of build a binary is.
+A `-rc.N` is a develop build for staging, a plain `X.Y.Z` is the release, and `.dirty` in the build metadata marks a tree with uncommitted changes.
+A dirty build anywhere but the dev environment is a finding, and so is a pre-release build on prod.
+`m6-monitor` reports both as faults.
 
-```sh
-./tools/perfcheck.sh --update
+### 4.2. Reading a build's version
+
+Every m6 binary reports its version two ways, before it reads any configuration, and exits 0.
+`--version` (or `-V`) prints the tag form, `vX.Y.Z-rc.N` or `vX.Y.Z`, with no crate name and no build metadata, on a dirty tree too.
+`--version-full` prints one line per m6 crate in the binary, the binary's own name first, each as `<crate> - <full SemVer with build metadata>`.
+A reader that needs the dirty marker uses `--version-full` or the `version` field of the start-up record.
+
+The build metadata is the twelve-character commit, with `.dirty` appended on a tree with uncommitted changes.
+A build with no git, such as a source tarball, reads `1.16.0-rc.1+unknown`.
+Each line comes from that crate's own build-time constants, so a mixed build shows two commits.
+
+Example 1 shows `m6-http`:
+
+```text
+$ m6-http --version
+v1.16.0-rc.1
+$ m6-http --version-full
+m6-http - 1.16.0-rc.1+abc123def456
+m6-core - 1.16.0-rc.1+abc123def456
+m6-log - 1.16.0-rc.1+abc123def456
+m6-platform - 1.16.0-rc.1+abc123def456
 ```
 
-Those numbers are taken on the build host and mean nothing on another machine.
-`docs/PERFORMANCE.md` explains why and holds the real measurements.
+**Example 1: the two version forms of a clean m6-http build.**
 
-### If you make something slower
+The first line names the binary, from `CARGO_BIN_NAME`.
+Eight binaries share the `m6-http` package, so each names itself first and lists `m6-http` second.
+Example 2 shows `m6-bench`:
 
-Say why in the commit message. The check will refuse the merge until the
-number is updated deliberately, which is the point: accepting a regression is
-a decision, not an accident.
+```text
+$ m6-bench --version-full
+m6-bench - 1.16.0-rc.1+abc123def456
+m6-http - 1.16.0-rc.1+abc123def456
+m6-core - 1.16.0-rc.1+abc123def456
+m6-log - 1.16.0-rc.1+abc123def456
+m6-platform - 1.16.0-rc.1+abc123def456
+```
 
-## A check that cannot measure must fail
+**Example 2: a binary whose name differs from its package's name.**
 
-If you add a check, it fails when it cannot run. It does not print "skipped"
-and return success. The conformance script did that in four different places
-and reported PASS through all of them, and h2 and h3 went untested for months
-as a result. `tools/conformance.sh`'s header lists the four and what each cost.
+### 4.3. A speed change
 
-## Style
+The A/B gate on the build host (`tools/perfcheck.sh`) measures a change against its base.
+Each target runs 100 rounds of 500 requests, because a fresh server per round settles at its own speed, and more rounds narrow the spread where more requests do not.
+The gate prints the median candidate-to-base ratio and its 99% confidence interval per target.
+A slowdown of 3% or more with the whole interval above 1 fails the merge.
 
-- **Run `cargo fmt --all`.** CI runs `cargo fmt --all --check` and the build
-  fails on a difference. This file said the opposite until 2026-09-26, that
-  `cargo fmt` is "not run over this tree" because the code aligned struct fields
-  by hand: that was true until 2026-09-13, when the tree was formatted and the
-  owner's call was to run it and accept the result. Formatting has one answer
-  now and nobody has to hold it in their head.
-- Comments explain *why*, and especially why something is not the obvious
-  thing. The best comments in this codebase name the defect that made the code
-  look the way it does.
-- No em dashes in prose.
-- Plain technical English. No borrowed management vocabulary.
+`PERFCHECK_ACCEPT_SLOWER="<reason>"` accepts a slowdown.
+The reason is recorded in `tools/perf-history.jsonl`, and the commit message says why.
 
-## Commit messages
+The figures are valid on the build host only.
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) explains why and holds the measurements.
 
-What changed, why it mattered, and how it was verified. "Verified" means
-measured against something running, not inferred from the source: a good number
-of the defects in `CHANGELOG.md` were invisible in the code and only showed up
-against a running server.
+## 5. A check that cannot measure must fail
 
-## Reporting a bug
+A check you add fails when it cannot run.
+[`tools/conformance.sh`](tools/conformance.sh) shows the cost: its header lists the three ways it printed "skipped" or a pass while measuring nothing.
 
-Say what you did, what you expected, and what happened. A packet capture, a log
-line with its timestamp, or a `curl -v` is worth more than a description of
-either. If it involves the edge, say which role: origin, edge cache or monitor.
+## 6. Style
 
-**Reproduce it against something a reader can run**, not against your own live
-server. `m6-examples`, example 05's end-to-end suite, and h2spec or h3spec against
-a loopback instance all work. Evidence from a private deployment cannot be re-run
-by anyone else, which makes it an assertion rather than evidence.
+- Run `cargo fmt --all`.
+  CI runs `cargo fmt --all --check` and fails on a difference.
+- Comments explain why.
+- Prose follows the documentation ruleset R0 to R10 in [`CLAUDE.md`](CLAUDE.md).
 
-Security issues go to `SECURITY.md`, not to the issue tracker.
+## 7. Commit messages
+
+A commit says what changed, why it mattered, and how it was verified.
+[`CLAUDE.md`](CLAUDE.md) has the full rule.
+
+## 8. Reporting a bug
+
+Say what you did, what you expected, and what happened.
+A packet capture, a log line with its timestamp, or a `curl -v` output is worth more than a description.
+If the bug involves the edge, say which role: origin, edge cache or monitor.
+
+Reproduce the bug against something any reader can run: the examples in `examples/`, example 05's end-to-end suite, or h2spec and h3spec against a loopback instance.
+Evidence from a private deployment cannot be re-run by anyone else, so it is an assertion.
+
+Security issues go to [`SECURITY.md`](SECURITY.md).
+
+## 9. Changes the event-loop rule needs approved
+
+A change that adds an `#[expect(clippy::disallowed_methods)]`, a thread, a heap allocation on a loop's hot path or an `unsafe` block names the project owner's approval in its pull request description and quotes the reason given.
+
+## 10. Summary
+
+Branch from `develop`, open a pull request into `develop`, and pass every check in Table 2.
+File the issue first, say in the commit what changed and how it was verified, and report defects against something a reader can run.
+Release by merging `develop` into `main` with a changelog entry and the documents still true.

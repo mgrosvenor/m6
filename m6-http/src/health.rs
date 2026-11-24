@@ -1,30 +1,30 @@
-//! m6-http's side of the monitoring endpoints.
+//! m6-http's side of monitoring: the `/health` endpoint and the two documents
+//! a monitor reads.
 //!
-//! The endpoints themselves, and the shape of what they publish, are
+//! The documents themselves, and the shape of what they carry, are
 //! `m6_core::monitoring`. They are an m6 feature rather than this binary's:
-//! every deployment serves them, and an aggregator that reads them needs the
+//! every deployment writes them, and an aggregator that reads them needs the
 //! same types the server writes. One definition, shared, rather than a
 //! consumer re-deriving the format by looking at a sample.
 //!
 //! What remains here is the part that is genuinely about this binary: which
-//! backend name a monitoring response is tagged with, and keeping those
-//! responses out of the site traffic counters.
+//! backend name a monitoring response is tagged with, keeping those responses
+//! out of the site traffic counters, and building the metrics and traffic
+//! documents the log lines carry.
 
 use std::net::IpAddr;
 
-use crate::auth::{self, PublicKey, Refusal};
-use crate::config::HealthConfig;
+use crate::config::GenidConfig;
+use crate::stats::Iface;
 
-pub use m6_core::monitoring::{
-    metrics_authorised, HealthReport, PerfAccess, PerfOutcome, PerfReport, PerfSubject, PoolHealth,
-};
+pub use m6_core::monitoring::{not_found, HealthReport, PerfReport, PerfSubject, PoolHealth};
 
 /// Backend name tagged onto a `/health` response.
 pub const HEALTH_BACKEND: &str = "health";
-/// Backend name tagged onto a `/perf` response.
-pub const PERF_BACKEND: &str = "perf";
+/// Backend name tagged onto a `/genid` response, for stats and analytics.
+pub const GENID_BACKEND: &str = "genid";
 
-/// Whether a completed response came from the monitoring endpoints.
+/// Whether a completed response came from the health endpoint.
 ///
 /// These must not be counted as site traffic. Both answer from local state
 /// and return `Ready`, so the cache-miss accounting on the serving paths
@@ -38,49 +38,148 @@ pub const PERF_BACKEND: &str = "perf";
 /// stopped moving" can no longer detect a traffic stall, because the monitor
 /// keeps it moving on its own.
 pub fn is_monitoring_endpoint(backend: &str) -> bool {
-    backend == HEALTH_BACKEND || backend == PERF_BACKEND
+    backend == HEALTH_BACKEND
+}
+
+/// Which population a request on a public listener belongs to, from the peer
+/// address the connection proved.
+///
+/// The TLS and QUIC listener faces the internet, so a real visitor's address
+/// is public after NAT. The monitor runs on the private network, and its polls
+/// arrive from a private, link-local, shared or unique-local address. That
+/// address class is the signal this returns: [`Iface::Monitor`] for such a
+/// peer and [`Iface::External`] for every other one. A connect from a private
+/// address cannot be forged from the internet, so no header is read and no
+/// list is consulted.
+///
+/// Loopback is external on purpose. It is the address of a shell on this host,
+/// a development client and every loopback test, so counting it as monitor
+/// would hide the traffic of the machine the server runs on. A health check on
+/// loopback is classified by its path instead, which `/health` already is.
+///
+/// The internal h2c listener is classified by the socket instead, before this
+/// is called. Classification is one address parse and a range check: no
+/// allocation, and no table whose lookup grows with traffic.
+pub fn peer_iface(peer: IpAddr) -> Iface {
+    let peer = peer.to_canonical();
+    if !peer.is_loopback() && m6_core::net::is_private_ip(peer) {
+        Iface::Monitor
+    } else {
+        Iface::External
+    }
+}
+
+// ── /health's dependency flags ───────────────────────────────────────────────
+//
+// `/health` answers for the process and for the dependencies whose failure the
+// loop already observes. It reads flags and never probes: each flag is set
+// where a real request's outcome is already known and cleared by the next
+// heartbeat answer. That is what keeps the answer a JSON serialisation on the
+// most frequently hit path on the box.
+
+/// Whether this node's origin is failing, which is what a cache node's
+/// `degraded` answer reports.
+///
+/// The flag is the follower's own `down` bit. `Follower::answered` sets it
+/// where a heartbeat's failure is already observed and clears it on the next
+/// heartbeat answer, and `Follower::failed` sets it where a forwarded request's
+/// failure is already observed. A successful client request clears nothing: the
+/// heartbeat observes the recovery, and it is due immediately after a failure.
+/// `/health` reads the flag and does nothing else, so the cost is one branch,
+/// with no timer, no probe, no clock and no round trip.
+///
+/// A second dependency is one more term at the call site in `main.rs`: the auth
+/// checker's flag is added where its `/check` call fails and ORed into the
+/// same `degraded` bit.
+pub fn origin_down(role: &crate::genid::Role) -> bool {
+    role.cache().is_some_and(crate::genid::Follower::down)
+}
+
+/// The `/health` answer: `ok` while every dependency answers, `degraded` while
+/// one is failing.
+///
+/// The status carries the answer, 200 or 503. `m6-monitor` reads a non-200 as
+/// `degraded` without consulting the body, which is the mapping the two
+/// answers were built to fit. The body names the node and never the dependency:
+/// `/health` is public and unsecured, so the dependency is in the warn and info
+/// lines the process logs on the change instead.
+pub fn health_answer(degraded: bool, node: &str) -> (u16, HealthReport) {
+    if degraded {
+        HealthReport::degraded(node)
+    } else {
+        HealthReport::build(node)
+    }
 }
 
 #[cfg(test)]
-mod token_file_tests {
-    use crate::config::HealthConfig;
+mod health_state_tests {
+    use super::*;
+    use crate::genid::{Follower, Genid, Role};
+    use std::time::{Duration, Instant};
 
-    /// `--dump-config` serialises the whole Config. The resolved token must
-    /// never appear in that output, or the secret ends up in any log or
-    /// paste of a config dump.
-    #[test]
-    fn resolved_token_is_never_serialised() {
-        let health = HealthConfig {
-            enabled: true,
-            path: "/health".to_string(),
-            perf_path: "/perf".to_string(),
-            traffic_path: "/traffic".to_string(),
-            traffic_cache_s: 60,
-            metrics_token_file: Some("/etc/m6/perf-token".to_string()),
-            metrics_token: Some("super-secret-value".to_string()),
-            metrics_require: None,
-            metrics_peers: None,
-            metrics_peer_ips: None,
-        };
-        let dumped = serde_json::to_string(&health).expect("serialisable");
-        assert!(
-            !dumped.contains("super-secret-value"),
-            "token leaked into serialised config: {dumped}"
-        );
-        // The path is configuration and should still be visible.
-        assert!(dumped.contains("/etc/m6/perf-token"));
+    /// A follower that has answered once, then met `result` on the next
+    /// heartbeat.
+    fn cache_after(result: Result<(u64, Duration), &'static str>, at: Instant) -> Role {
+        let mut f = Follower::new(Duration::from_secs(10), at);
+        f.answered(Ok((7, Duration::ZERO)), at);
+        f.answered(result, at);
+        Role::Cache(f)
     }
 
-    /// The file indirection has to be enforced, not advisory: a token written
-    /// inline in site.toml must not be honoured, because site.toml is
-    /// committed and shipped to every node.
+    /// A node with no origin is known to be one from config, so it has no
+    /// dependency to lose and answers `ok` while its process runs.
     #[test]
-    fn inline_token_in_toml_is_ignored() {
-        let parsed: HealthConfig =
-            toml::from_str("metrics_token = \"inline-secret\"").expect("parses");
+    fn a_source_has_no_origin_flag() {
+        let role = Role::Source(Genid::new(0, None));
+        assert!(!origin_down(&role));
+        let (code, report) = health_answer(origin_down(&role), "origin");
+        assert_eq!(code, 200);
+        assert_eq!(report.status, "ok");
+    }
+
+    /// A cache whose origin has not failed answers `ok`.
+    #[test]
+    fn a_cache_whose_origin_answers_is_ok() {
+        let role = cache_after(Ok((7, Duration::ZERO)), m6_core::platform::now());
+        assert!(!origin_down(&role));
+        let (code, report) = health_answer(origin_down(&role), "edge-a");
+        assert_eq!(code, 200);
+        assert_eq!(report.status, "ok");
+    }
+
+    /// A cache that has observed its origin fail answers 503 `degraded`, and
+    /// the public body names the node and nothing a stranger can aim at.
+    #[test]
+    fn a_cache_whose_origin_fails_is_degraded_and_names_nothing() {
+        let role = cache_after(Err("connect failed"), m6_core::platform::now());
+        assert!(origin_down(&role));
+        let (code, report) = health_answer(origin_down(&role), "edge-a");
+        assert_eq!(code, 503);
+        assert_eq!(report.status, "degraded");
+        let (code, _, body) = report.into_response(code);
+        assert_eq!(code, 503);
         assert_eq!(
-            parsed.metrics_token, None,
-            "an inline token must not be accepted from config"
+            String::from_utf8(body).unwrap(),
+            r#"{"status":"degraded","node":"edge-a"}"#
+        );
+    }
+
+    /// The answer reads a flag and not a clock: a success an hour old with no
+    /// observed failure is still `ok`, so `/health` needs no staleness window
+    /// and no probe.
+    #[test]
+    fn an_old_answer_is_not_a_failure() {
+        let t0 = m6_core::platform::now();
+        let role = cache_after(Ok((7, Duration::ZERO)), t0);
+        let later = t0 + Duration::from_secs(3600);
+        assert_eq!(
+            role.cache().unwrap().last_ok_s(later),
+            Some(3600),
+            "the success is an hour old"
+        );
+        assert!(
+            !origin_down(&role),
+            "no failure was observed, so the flag is clear"
         );
     }
 }
@@ -90,19 +189,18 @@ mod monitoring_exclusion_tests {
     use super::*;
 
     /// Regression guard. The cache-miss accounting on the serving paths fires
-    /// on any `Ready` outcome, and /health and /perf both return Ready. Left
-    /// uncounted for, every health check was recorded as a cache miss: 10
-    /// checks moved requests_total by 11 on the live origin.
+    /// on any `Ready` outcome, and `/health` returns Ready. Left uncounted
+    /// for, every health check was recorded as a cache miss: 10 checks moved
+    /// requests_total by 11.
     ///
     /// That defeats the counter's purpose. A monitor polling every 30s would
     /// keep requests_total rising through a total traffic stall, so "the
     /// number stopped moving" would never fire.
     #[test]
-    fn monitoring_endpoints_are_excluded_from_traffic_stats() {
+    fn the_health_endpoint_is_excluded_from_traffic_stats() {
         assert!(is_monitoring_endpoint(HEALTH_BACKEND));
-        assert!(is_monitoring_endpoint(PERF_BACKEND));
         assert!(is_monitoring_endpoint("health"));
-        assert!(is_monitoring_endpoint("perf"));
+        assert!(!is_monitoring_endpoint("perf"));
     }
 
     /// Real backends must still be counted. An over-broad match here would
@@ -115,7 +213,7 @@ mod monitoring_exclusion_tests {
             "m6-html",
             "m6-file",
             "render-contact",
-            "render-analytics",
+            "render-reports",
             "origin",
             "method-check",
             "",
@@ -128,422 +226,943 @@ mod monitoring_exclusion_tests {
     }
 }
 
-// ── /traffic ─────────────────────────────────────────────────────────────────
+// ── The traffic document ────────────────────────────────────────────────────
 
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use m6_core::monitoring::TrafficReport;
-
-/// Last summary and when it was built.
-///
-/// One node, one cache. Behind a Mutex because building a summary reads a file
-/// and there is no reason to let two scrapes do it at once; the lock is held
-/// across the read deliberately, so a second caller waits for the first
-/// answer rather than starting a second 47MB tail.
-static CACHE: Mutex<Option<(Instant, TrafficReport)>> = Mutex::new(None);
+use m6_core::telemetry::{RequestView, Stamp};
+// The one marker for a value a cap cut short. The slot and the report use the
+// same value, so the two cuts cannot drift apart.
+use m6_core::telemetry::USER_AGENT_TRUNCATED as TRUNCATED;
 
 /// Where the privileged collector leaves `nft -j list ruleset` output.
 const FIREWALL_JSON: &str = "/var/lib/m6/firewall.json";
 
-/// Read the last `window_minutes` of the analytics log and summarise it.
-///
-/// The newest rotated file is read as well, so the window survives a rotation.
-/// It is read only when the live tail did not fill the budget and the file was written inside the window, and a gzip file only when it is small (see `m6_core::log::read_recent_counted`).
-/// This runs inline on the event loop, so the work is bounded.
-///
-/// The tail is bounded rather than reading the whole file: an hour of traffic
-/// is at most a few hundred KB and the file is tens of MB, so reading it all
-/// would be almost entirely wasted work. 24MB is a wide margin over the
-/// busiest hour observed (370KB, during a 890-request probe).
-fn build_report(node: &str, path: &str, window_minutes: u64) -> anyhow::Result<TrafficReport> {
-    const TAIL_BYTES: usize = 24 * 1024 * 1024;
+/// The most events the traffic window keeps. Allocated once at start.
+const TRAFFIC_SLOTS: usize = 32_768;
 
-    // The newest rotated file is read before the live one, so the summary
-    // spans a rotation. A mid-record start is expected after a cut, and
-    // `ndjson::read_str` skips what it cannot parse, so it costs nothing.
-    let since_time =
-        std::time::SystemTime::now() - Duration::from_secs(window_minutes.saturating_mul(60));
-    let buf = m6_core::log::read_recent(std::path::Path::new(path), TAIL_BYTES, since_time)?;
+/// How far back the traffic report covers, in minutes.
+///
+/// The ring holds far more than an hour at the busiest rate observed (about
+/// 1,000 lines in an hour), so the hour is applied when the report is built
+/// rather than when an event is kept. A node busy enough to wrap the ring
+/// inside the hour reports the shorter span it still holds and counts what it
+/// lost.
+const TRAFFIC_WINDOW_MINUTES: u64 = 60;
 
-    let since = m6_core::util::iso8601_minutes_ago(window_minutes);
-    let mut report = TrafficReport::build(node, &buf, &since, window_minutes);
+/// Microseconds in one minute.
+const MICROS_PER_MINUTE: u64 = 60 * 1_000_000;
+
+/// The reporting window in microseconds.
+const WINDOW_US: u64 = TRAFFIC_WINDOW_MINUTES * MICROS_PER_MINUTE;
+
+/// One drop cell per minute of the window plus the minute in progress.
+const DROP_CELLS: usize = TRAFFIC_WINDOW_MINUTES as usize + 1;
+
+/// The most bytes a slot keeps of a path, marker included. The report shows
+/// the cut path, the log keeps the whole one.
+const PATH_CAP: usize = 512;
+
+/// The most bytes a slot keeps of a client address. An IPv6 address is at most
+/// 45 characters.
+const IP_CAP: usize = 45;
+
+/// The most bytes a slot keeps of a user agent, marker included.
+const UA_CAP: usize = 256;
+
+/// The three analytics lines m6-http writes per request or poll.
+///
+/// A request and a rate-limited request both log `"message":"request"`: the
+/// rate limiter logs that row with status 429. A monitor poll logs
+/// `"message":"monitor"`, which keeps it out of the site traffic counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Request,
+    Monitor,
+    RateLimited,
+}
+
+impl Kind {
+    fn message(self) -> &'static str {
+        match self {
+            Kind::Request | Kind::RateLimited => "request",
+            Kind::Monitor => "monitor",
+        }
+    }
+}
+
+/// A capped string in a fixed array, copied into a slot without allocating.
+#[derive(Clone)]
+struct Field<const N: usize> {
+    /// Byte length, or `ABSENT` when the event carried no such value.
+    len: u16,
+    bytes: [u8; N],
+}
+
+impl<const N: usize> Field<N> {
+    /// The length that marks a value the event did not carry.
+    ///
+    /// Only the user agent uses it. An absent user agent is not an empty one,
+    /// and the record has to keep the difference because the report is built
+    /// from the record the log line would have parsed to.
+    const ABSENT: u16 = u16::MAX;
+
+    fn empty() -> Self {
+        Self {
+            len: 0,
+            bytes: [0; N],
+        }
+    }
+
+    /// Copy `s` in, cut at `N` bytes on a character boundary.
+    ///
+    /// A value the cap cuts ends in [`TRUNCATED`], so every reader of a slot
+    /// can tell a cut value from a whole one. The marker reserves its own
+    /// bytes inside the cap. The return value is the machine-readable form of
+    /// the same fact, which the report needs because the marker is a rendering
+    /// choice and a cut field can hide a probe marker.
+    fn set(&mut self, s: &str) -> bool {
+        if s.len() <= N {
+            self.bytes[..s.len()].copy_from_slice(s.as_bytes());
+            self.len = s.len() as u16;
+            return false;
+        }
+        let mut end = N - TRUNCATED.len();
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.bytes[..end].copy_from_slice(&s.as_bytes()[..end]);
+        self.bytes[end..end + TRUNCATED.len()].copy_from_slice(TRUNCATED.as_bytes());
+        self.len = (end + TRUNCATED.len()) as u16;
+        true
+    }
+
+    fn mark_absent(&mut self) {
+        self.len = Self::ABSENT;
+    }
+
+    fn as_str(&self) -> &str {
+        let len = if self.len == Self::ABSENT {
+            0
+        } else {
+            usize::from(self.len)
+        };
+        std::str::from_utf8(&self.bytes[..len]).unwrap_or_default()
+    }
+
+    fn as_opt(&self) -> Option<&str> {
+        (self.len != Self::ABSENT).then(|| self.as_str())
+    }
+}
+
+/// One logged event, as the traffic window needs it.
+///
+/// Fixed size, so the ring is one allocation and a push is one copy. The
+/// fields are the ones the report reads, plus the time, the kind and whether a
+/// cap cut the event.
+#[derive(Clone)]
+struct TrafficSlot {
+    at_us: u64,
+    kind: Kind,
+    status: u16,
+    path: Field<PATH_CAP>,
+    client_ip: Field<IP_CAP>,
+    user_agent: Field<UA_CAP>,
+    /// A cap cut the path or the user agent.
+    ///
+    /// The slot keeps the marker on the cut value, and this bit beside it is
+    /// what the report reads. A cut field can hide a probe marker past the
+    /// cap, so the request counts as probe-shaped. The bit is assigned on
+    /// every push, so a reused slot never carries the previous event's answer.
+    truncated: bool,
+}
+
+impl TrafficSlot {
+    fn empty() -> Self {
+        Self {
+            at_us: 0,
+            kind: Kind::Request,
+            status: 0,
+            path: Field::empty(),
+            client_ip: Field::empty(),
+            user_agent: Field::empty(),
+            truncated: false,
+        }
+    }
+}
+
+/// The last events this process logged, for the traffic report. Allocated at
+/// start.
+///
+/// A ring of fixed slots and a write index. A logged request copies a few
+/// hundred bytes into the next slot, overwriting the oldest when the ring is
+/// full: no allocation and no system call. The report reads the slots.
+///
+/// The window is a count of events rather than a size in bytes, and the hour
+/// is applied when the report is built. When the ring wraps inside the hour,
+/// the report says which span it still holds and how many events it dropped.
+pub struct TrafficWindow {
+    slots: Box<[TrafficSlot]>,
+    next: usize,
+    filled: usize,
+    started: Instant,
+    /// Events overwritten while still inside the window, one cell per minute
+    /// of the event's timestamp. A cell counts one minute only, so a later
+    /// event in the same minute slot replaces a stale count. Nothing allocates
+    /// and nothing expires on a timer.
+    drops: [DropCell; DROP_CELLS],
+}
+
+/// The events dropped in one minute of event time.
+#[derive(Clone, Copy)]
+struct DropCell {
+    /// Minutes since the Unix epoch, or `NONE` for a cell never written.
+    minute: u64,
+    count: u64,
+}
+
+impl DropCell {
+    const NONE: u64 = u64::MAX;
+    const EMPTY: Self = Self {
+        minute: Self::NONE,
+        count: 0,
+    };
+}
+
+impl Default for TrafficWindow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TrafficWindow {
+    /// Allocate the ring once, at start, at the full configured size.
+    pub fn new() -> Self {
+        Self {
+            slots: vec![TrafficSlot::empty(); TRAFFIC_SLOTS].into_boxed_slice(),
+            next: 0,
+            filled: 0,
+            started: m6_core::platform::now(),
+            drops: [DropCell::EMPTY; DROP_CELLS],
+        }
+    }
+
+    /// Record one logged event, overwriting the oldest slot when the ring is
+    /// full.
+    ///
+    /// One copy into a slot that was allocated at start. No allocation and no
+    /// system call, which is what keeps the cost of logging a request in
+    /// memory instead of a file read.
+    pub fn push(
+        &mut self,
+        at_us: u64,
+        kind: Kind,
+        status: u16,
+        path: &str,
+        client_ip: &str,
+        user_agent: Option<&str>,
+    ) {
+        let slot = &mut self.slots[self.next];
+        let overwritten_at_us = slot.at_us;
+        slot.at_us = at_us;
+        slot.kind = kind;
+        slot.status = status;
+        let path_cut = slot.path.set(path);
+        slot.client_ip.set(client_ip);
+        let user_agent_cut = match user_agent {
+            Some(ua) => slot.user_agent.set(ua),
+            None => {
+                slot.user_agent.mark_absent();
+                false
+            }
+        };
+        slot.truncated = path_cut || user_agent_cut;
+        self.next += 1;
+        if self.next == self.slots.len() {
+            self.next = 0;
+        }
+        if self.filled < self.slots.len() {
+            self.filled += 1;
+        } else {
+            self.count_drop(overwritten_at_us, at_us);
+        }
+    }
+
+    /// Count an event the ring just overwrote, if it was still in the window.
+    ///
+    /// `now_us` is the pushed event's time: the overwritten event leaves the
+    /// ring at the same moment, so it belonged in a report only when it was
+    /// not already older than the window.
+    fn count_drop(&mut self, dropped_at_us: u64, now_us: u64) {
+        if dropped_at_us < now_us.saturating_sub(WINDOW_US) {
+            return;
+        }
+        let minute = dropped_at_us / MICROS_PER_MINUTE;
+        let cell = &mut self.drops[(minute % DROP_CELLS as u64) as usize];
+        if cell.minute != minute {
+            cell.minute = minute;
+            cell.count = 0;
+        }
+        cell.count += 1;
+    }
+
+    /// The minutes the ring covers: the configured hour, less the time since
+    /// start, less the span the ring still holds once it has wrapped.
+    ///
+    /// The last term keeps a full ring honest. Overwriting events that are
+    /// still inside the hour means the report no longer covers the hour, and
+    /// the age of the oldest retained slot is the span it does cover. A report
+    /// soon after a restart says how long it covers, so an empty figure is not
+    /// read as an hour with no traffic.
+    fn covered_minutes(&self, now_us: u64) -> u64 {
+        let elapsed = (self.started.elapsed().as_secs() / 60).min(TRAFFIC_WINDOW_MINUTES);
+        if self.filled < self.slots.len() {
+            return elapsed;
+        }
+        let Some(oldest) = self.oldest_first().next() else {
+            return elapsed;
+        };
+        elapsed.min(now_us.saturating_sub(oldest.at_us) / MICROS_PER_MINUTE)
+    }
+
+    /// Events the ring overwrote while they were still inside the window.
+    ///
+    /// The count is by the minute of the overwritten event, and a cell older
+    /// than the window is left out, so a flood an hour ago is not reported
+    /// against a quiet hour now. The report states it, so a short window is
+    /// not read as a quiet one.
+    fn dropped_in_window(&self, now_us: u64) -> u64 {
+        let first_minute = now_us.saturating_sub(WINDOW_US) / MICROS_PER_MINUTE;
+        self.drops
+            .iter()
+            .filter(|c| c.minute != DropCell::NONE && c.minute >= first_minute)
+            .map(|c| c.count)
+            .sum()
+    }
+
+    /// The recorded slots from oldest to newest.
+    fn oldest_first(&self) -> impl Iterator<Item = &TrafficSlot> {
+        let len = self.slots.len();
+        let start = if self.filled == len { self.next } else { 0 };
+        let slots = &self.slots;
+        (0..self.filled).map(move |i| &slots[(start + i) % len])
+    }
+}
+
+/// Unix microseconds, the precision the analytics envelope records.
+pub(crate) fn unix_micros_now() -> u64 {
+    m6_core::platform::wall()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros() as u64)
+}
+
+/// Build the traffic summary from the window, for the `type=traffic` line.
+///
+/// The slots of the last hour are read in place as borrowed views, and
+/// `TrafficReport::from_views` builds the report body with the rules a log
+/// read uses, so the figures match the ones the same lines would produce. A
+/// value the slot cut is the one difference, and `truncated` tells the
+/// summary, because a cut field can hide a probe marker. The report also
+/// states how long a window it actually covers and how many events the ring
+/// overwrote inside that window.
+pub fn build_report(node: &str, window: &TrafficWindow) -> TrafficReport {
+    let now_us = unix_micros_now();
+    let cutoff = now_us.saturating_sub(WINDOW_US);
+    let views = window
+        .oldest_first()
+        .filter(|slot| slot.at_us >= cutoff)
+        .map(|slot| RequestView {
+            at: Stamp::Micros(slot.at_us),
+            message: slot.kind.message(),
+            status: slot.status,
+            path: slot.path.as_str(),
+            client_ip: slot.client_ip.as_str(),
+            user_agent: slot.user_agent.as_opt().unwrap_or(""),
+            truncated: slot.truncated,
+        });
+    let mut report = TrafficReport::from_views(node, views, window.covered_minutes(now_us));
+    report.events_dropped = window.dropped_in_window(now_us);
     // Written by the m6-firewall-stats timer. A node without the timer
     // reports no firewall state rather than an empty one.
     report.firewall =
         m6_core::firewall::FirewallState::from_file(std::path::Path::new(FIREWALL_JSON))
             .unwrap_or(None);
-    Ok(report)
+    report
 }
 
-/// Serve `/traffic` to a caller [`metrics_gate`] has already let through:
-/// this node's summary of its own traffic.
-///
-/// Gate first, then work, as for `/perf`, so an anonymous caller never causes
-/// a file read.
-///
-/// The cache is what makes a file read safe to expose at all. Without it a
-/// monitor polling every thirty seconds makes every node re-read its analytics
-/// tail every thirty seconds, forever, to produce an answer that changes
-/// slowly. With it the read happens at most once per TTL however often the
-/// endpoint is scraped. The lock is held across the read deliberately: a
-/// second caller arriving mid-read waits for the first answer rather than
-/// starting a second tail.
-pub fn traffic_authorised(
-    node: &str,
-    log_path: &str,
-    window_minutes: u64,
-    cache_for: Duration,
-) -> PerfOutcome {
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((built, report)) = cache.as_ref() {
-        if built.elapsed() < cache_for {
-            return PerfOutcome::Traffic(Box::new(report.clone()));
-        }
-    }
-    match build_report(node, log_path, window_minutes) {
-        Ok(r) => {
-            *cache = Some((Instant::now(), r.clone()));
-            PerfOutcome::Traffic(Box::new(r))
-        }
-        Err(e) => PerfOutcome::TrafficError(format!("{e}")),
-    }
-}
-
-/// The verdict of the metrics gate for one request.
+/// The verdict of the genid gate for one request.
 pub enum Gate {
-    /// Serve the report.
+    /// Serve the request.
     Open,
-    /// Answer with this and do nothing else.
-    Refused(PerfOutcome),
+    /// Answer with this exact status, headers and body and do nothing else:
+    /// the 404 a disabled endpoint gives.
+    Refused(u16, Vec<(String, String)>, Vec<u8>),
+    /// A credential check is required, with this `require` string. The caller
+    /// asks `POST /check` and resumes with the decision.
+    Check(String),
 }
 
-/// Decide whether `/perf` or `/traffic` may be served to this request.
+impl Gate {
+    /// The 404 an endpoint answers when it is not configured.
+    fn disabled() -> Self {
+        let (code, headers, body) = not_found();
+        Gate::Refused(code, headers, body)
+    }
+}
+
+/// Decide whether a `GET` or `POST /genid` may be served to this request.
 ///
 /// Two rules, in this order:
 ///
-/// 1. `metrics_peers`, when set: the request must not have arrived on an
-///    internal h2c listener (there the client address is a forwarded claim),
-///    and its peer address must be listed. Otherwise `Disabled`, the 404 an
-///    unconfigured endpoint gives, before any token is looked at.
-/// 2. `metrics_require`, when set: an API token that passes the claim check
-///    (`Unauthorised` for none or a bad one, `Forbidden` for the wrong claim).
-///    When unset, the legacy `metrics_token_file` gate.
-///
-/// The address rule allocates nothing: one parse of the peer address and a
-/// scan of a short slice, and only on these two paths.
-pub fn metrics_gate(
-    h: &HealthConfig,
-    key: Option<&PublicKey>,
-    headers: &[(String, String)],
-    client_ip: &str,
-    from_internal: bool,
-) -> Gate {
-    if let Some(peers) = &h.metrics_peer_ips {
-        let listed = !from_internal
-            && client_ip
-                .parse::<IpAddr>()
-                .is_ok_and(|ip| peers.contains(&ip.to_canonical()));
-        if !listed {
-            return Gate::Refused(PerfOutcome::Disabled);
-        }
+/// 1. The peer is loopback, or the request arrived on an internal listener.
+///    Anyone else gets the 404 an unknown path gives, before a token is read.
+///    Neither claim set is the same 404: the endpoint does not exist.
+/// 2. The one token check decides with `read_require` for a `GET` or
+///    `write_require` for a `POST`. It is called once, here, and its refusal
+///    is the answer unchanged. Unconfigured is the same 404.
+pub fn genid_gate(g: &GenidConfig, client_ip: &str, from_internal: bool, write: bool) -> Gate {
+    if !genid_address_ok(client_ip, from_internal) {
+        return Gate::disabled();
     }
-    match h.metrics_require.as_deref() {
-        Some(require) => {
-            let Some(key) = key else {
-                return Gate::Refused(PerfOutcome::Unauthorised);
-            };
-            match auth::authorise(key, headers, require) {
-                Ok(_) => Gate::Open,
-                Err(Refusal::Insufficient) => Gate::Refused(PerfOutcome::Forbidden),
-                Err(Refusal::NoToken | Refusal::Invalid(_)) => {
-                    Gate::Refused(PerfOutcome::Unauthorised)
-                }
-            }
-        }
-        None => match (PerfAccess {
-            headers,
-            configured_token: h.metrics_token.as_deref(),
-        })
-        .refusal()
-        {
-            Some(refused) => Gate::Refused(refused),
-            None => Gate::Open,
+    let require = if write {
+        g.write_require.as_deref()
+    } else {
+        g.read_require.as_deref()
+    };
+    match require {
+        Some(require) => Gate::Check(require.to_string()),
+        None => Gate::disabled(),
+    }
+}
+
+/// The address rule alone: loopback, or an internal listener.
+///
+/// A cache node forwards the caller's own token to the source, so it applies
+/// this rule and nothing else. A public peer still gets the 404 an unknown
+/// path gives, before the request is forwarded.
+pub fn genid_address_ok(client_ip: &str, from_internal: bool) -> bool {
+    let loopback = client_ip
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| ip.to_canonical().is_loopback());
+    from_internal || loopback
+}
+
+/// The disk-cache figures the metrics document adds, gathered so the document
+/// keeps one argument for them: the writer's counters, the load's counts, and
+/// the first heartbeat's decision.
+pub struct DiskPerf<'a> {
+    pub writer: &'a crate::disk_cache::DiskWriter,
+    pub queued: usize,
+    pub loaded_entries: usize,
+    pub loaded_bad: usize,
+    pub state: crate::disk_cache::LoadState,
+}
+
+/// The metrics document, with this node's generation and disk blocks added.
+///
+/// One definition for the metrics line, which carries exactly this document in
+/// `fields.perf`.
+///
+/// The blocks sit beside the report this node already built, so `m6-core`
+/// keeps no notion of a generation or a disk cache: it hands over the
+/// monitoring payload and m6-http adds the fields that are this binary's. A
+/// source reports the ID it owns and the peers that read it. A cache node
+/// reports the ID it follows, where it follows it from, and whether that
+/// upstream is answering.
+///
+/// It is `Serialize` and borrows what it reports, so the log line writes it
+/// field by field into its buffer with no JSON tree built first.
+///
+/// `None` is a node with no `[genid]` table: the report alone, which is what
+/// such a node's metrics document has always carried.
+pub fn perf_document<'a>(
+    report: &'a PerfReport,
+    genid: Option<(
+        &'a crate::genid::Role,
+        &'a GenidConfig,
+        Option<DiskPerf<'a>>,
+    )>,
+) -> PerfDocument<'a> {
+    let now = m6_core::platform::now();
+    let (genid, disk_cache) = match genid {
+        None => (None, None),
+        Some((role, config, disk)) => (
+            Some(genid_block(role, config, now)),
+            disk.map(|disk| DiskCacheBlock {
+                dir_bytes: disk.writer.dir_bytes(),
+                queued: disk.queued,
+                written_last_tick: disk.writer.written_last_tick(),
+                written_bytes_last_tick: disk.writer.written_bytes_last_tick(),
+                skipped_full: disk.writer.skipped_full(),
+                ticks: disk.writer.ticks(),
+                tick_last_ns: disk.writer.tick_last_ns(),
+                loaded_entries: disk.loaded_entries,
+                loaded_bad: disk.loaded_bad,
+                state: disk.state.as_str(),
+            }),
+        ),
+    };
+    PerfDocument {
+        report,
+        genid,
+        disk_cache,
+    }
+}
+
+/// What [`perf_document`] returns: the report's own fields, then the blocks.
+#[derive(serde::Serialize)]
+pub struct PerfDocument<'a> {
+    #[serde(flatten)]
+    report: &'a PerfReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    genid: Option<GenidBlock<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk_cache: Option<DiskCacheBlock>,
+}
+
+/// The `disk_cache` object.
+#[derive(serde::Serialize)]
+struct DiskCacheBlock {
+    dir_bytes: u64,
+    queued: usize,
+    written_last_tick: usize,
+    written_bytes_last_tick: u64,
+    skipped_full: u64,
+    ticks: u64,
+    tick_last_ns: u64,
+    loaded_entries: usize,
+    loaded_bad: usize,
+    state: &'static str,
+}
+
+/// The `genid` object, by role.
+#[derive(serde::Serialize)]
+#[serde(tag = "role", rename_all = "lowercase")]
+enum GenidBlock<'a> {
+    Source {
+        id: Decimal,
+        sequence_running: bool,
+        peers: Vec<GenidPeer>,
+    },
+    Cache {
+        id: Option<Decimal>,
+        upstream: &'a str,
+        upstream_down: bool,
+        upstream_rtt_ms: Option<f64>,
+        last_ok_s: Option<u64>,
+    },
+}
+
+/// One peer that read a source's ID.
+#[derive(serde::Serialize)]
+struct GenidPeer {
+    addr: IpAddr,
+    last_get_s: u64,
+}
+
+/// A generation ID, written as a decimal string, as it always has been.
+struct Decimal(u64);
+
+impl serde::Serialize for Decimal {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&self.0)
+    }
+}
+
+fn genid_block<'a>(
+    role: &crate::genid::Role,
+    config: &'a GenidConfig,
+    now: std::time::Instant,
+) -> GenidBlock<'a> {
+    match role {
+        crate::genid::Role::Source(g) => GenidBlock::Source {
+            id: Decimal(g.current()),
+            sequence_running: g.sequence_running(),
+            peers: g
+                .peers(now)
+                .into_iter()
+                .map(|(addr, last_get_s)| GenidPeer { addr, last_get_s })
+                .collect(),
+        },
+        crate::genid::Role::Cache(f) => GenidBlock::Cache {
+            id: f.current().map(Decimal),
+            upstream: config.upstream.as_deref().unwrap_or(""),
+            upstream_down: f.down(),
+            upstream_rtt_ms: f.rtt().map(|rtt| rtt.as_secs_f64() * 1000.0),
+            last_ok_s: f.last_ok_s(now),
         },
     }
 }
 
 #[cfg(test)]
-mod traffic_endpoint_tests {
+mod traffic_document_tests {
     use super::*;
-    use std::io::Write;
+    use std::time::Duration;
 
-    fn row(ts: &str, ip: &str, path: &str, status: u16, ua: &str) -> String {
-        format!(
-            r#"{{"timestamp":"{ts}","level":"INFO","fields":{{"message":"request","node":"origin","path":"{path}","status":{status},"client_ip":"{ip}","user_agent":"{ua}"}}}}"#
-        )
-    }
-
-    /// No token configured means the endpoint does not exist: a 404, so it
-    /// does not advertise a door. A wrong token is refused by the gate,
-    /// which runs before `traffic_authorised` and so before any file is
-    /// opened.
     #[test]
-    fn the_legacy_gate_refuses_before_the_log_is_read() {
-        let none = HealthConfig::default();
-        let Gate::Refused(out) = metrics_gate(&none, None, &[], "127.0.0.1", false) else {
-            panic!("no token configured must refuse");
-        };
-        assert_eq!(out.into_response().0, 404);
-
-        let h = HealthConfig {
-            metrics_token: Some("right".to_string()),
-            ..HealthConfig::default()
-        };
-        let wrong = vec![("Authorization".to_string(), "Bearer wrong".to_string())];
-        assert!(matches!(
-            metrics_gate(&h, None, &wrong, "127.0.0.1", false),
-            Gate::Refused(PerfOutcome::Unauthorised)
-        ));
-    }
-
-    /// An unreadable log is reported, not silently served as a quiet hour.
-    /// This codebase has made that mistake: an absent file at the expected
-    /// path looked exactly like a feature switched off.
-    #[test]
-    fn an_unreadable_log_is_a_503_with_a_reason() {
-        let out = traffic_authorised(
-            "origin",
-            "/definitely/not/a/file",
-            60,
-            Duration::from_secs(0),
+    fn summarises_the_window_for_the_traffic_line() {
+        let mut window = TrafficWindow::new();
+        let now = unix_micros_now();
+        window.push(
+            now - 2_000_000,
+            Kind::Request,
+            200,
+            "/",
+            "192.0.2.10",
+            Some("Chrome/131"),
         );
-        let (code, _, body) = out.into_response();
-        assert_eq!(code, 503);
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(!v["error"].as_str().unwrap_or("").is_empty());
-    }
-
-    #[test]
-    fn summarises_a_real_log_and_serves_it() {
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        let now = m6_core::util::now_iso8601();
-        let ts = now.trim_end_matches('Z');
-        writeln!(
-            f,
-            "{}",
-            row(&format!("{ts}.100Z"), "1.2.3.4", "/", 200, "Chrome/131")
-        )
-        .unwrap();
-        writeln!(
-            f,
-            "{}",
-            row(
-                &format!("{ts}.200Z"),
-                "5.6.7.8",
-                "/robots.txt",
-                200,
-                "Mozilla/5.0 (compatible; ClaudeBot/1.0; +claudebot@anthropic.com)"
-            )
-        )
-        .unwrap();
-        f.flush().unwrap();
-
-        let out = traffic_authorised(
-            "origin",
-            f.path().to_str().unwrap(),
-            60,
-            Duration::from_secs(0),
+        window.push(
+            now - 1_000_000,
+            Kind::Request,
+            200,
+            "/robots.txt",
+            "192.0.2.11",
+            Some("Mozilla/5.0 (compatible; ExampleBot/1.0)"),
         );
-        let (code, headers, body) = out.into_response();
-        assert_eq!(code, 200);
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let report = build_report("origin", &window);
+        let v = serde_json::to_value(&report).unwrap();
         assert_eq!(v["node"], "origin");
         assert_eq!(v["total_requests"], 2);
         assert!(v["crawlers"][0]["user_agent"]
             .as_str()
             .unwrap()
-            .contains("ClaudeBot"));
+            .contains("ExampleBot"));
         assert!(v["logging"].is_object(), "logging health travels with it");
-        // Never cached by anything in between.
-        assert!(headers
-            .iter()
-            .any(|(k, val)| k.eq_ignore_ascii_case("cache-control") && val == "no-store"));
     }
 
-    /// After an hourly rotation the live file is nearly empty, and the
-    /// monitor's sixty minute sections must not shrink with it.
+    /// The age filter keeps the window to an hour: 61 minutes old is out,
+    /// 59 is in.
     #[test]
-    fn the_window_spans_the_newest_rotated_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let now = m6_core::util::now_iso8601();
-        let ts = now.trim_end_matches('Z');
-        let live = dir.path().join("analytics.ndjson");
-        std::fs::write(
-            &live,
-            format!(
-                "{}\n",
-                row(&format!("{ts}.300Z"), "1.2.3.4", "/c", 200, "x")
-            ),
-        )
-        .unwrap();
-        let rotated = format!(
-            "{}\n{}\n",
-            row(&format!("{ts}.100Z"), "1.2.3.4", "/a", 200, "x"),
-            row(&format!("{ts}.200Z"), "1.2.3.4", "/b", 200, "x")
+    fn the_window_drops_records_older_than_an_hour() {
+        let mut window = TrafficWindow::new();
+        let now = unix_micros_now();
+        window.push(
+            now - 61 * 60 * 1_000_000,
+            Kind::Request,
+            404,
+            "/old",
+            "192.0.2.1",
+            None,
         );
-        // Plain here. The gzip path is covered by `m6_core::log`'s tests.
-        std::fs::write(dir.path().join("analytics.ndjson-2026010101"), rotated).unwrap();
-        let out = traffic_authorised("origin", live.to_str().unwrap(), 60, Duration::from_secs(0));
-        let (code, _, body) = out.into_response();
-        assert_eq!(code, 200);
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["total_requests"], 3);
+        window.push(
+            now - 59 * 60 * 1_000_000,
+            Kind::Request,
+            200,
+            "/new",
+            "192.0.2.2",
+            None,
+        );
+        let report = build_report("origin", &window);
+        assert_eq!(report.total_requests, 1, "only the last hour counts");
+        assert_eq!(report.status.get(&200), Some(&1));
+        assert_eq!(report.status.get(&404), None);
+    }
+
+    /// A full ring keeps the newest events and drops the oldest, rather than
+    /// stopping and reporting a frozen hour forever.
+    #[test]
+    fn the_ring_overwrites_the_oldest() {
+        let mut window = TrafficWindow::new();
+        let now = unix_micros_now();
+        for _ in 0..10 {
+            window.push(now, Kind::Request, 418, "/oldest", "192.0.2.1", None);
+        }
+        for _ in 0..TRAFFIC_SLOTS {
+            window.push(now, Kind::Request, 200, "/kept", "192.0.2.2", None);
+        }
+        window.push(now, Kind::Request, 429, "/newest", "192.0.2.3", None);
+
+        let report = build_report("origin", &window);
+        assert_eq!(report.total_requests, TRAFFIC_SLOTS as u64);
+        assert_eq!(
+            report.status.get(&418),
+            None,
+            "the ten oldest slots were overwritten"
+        );
+        assert_eq!(
+            report.status.get(&429),
+            Some(&1),
+            "the newest event is present"
+        );
+    }
+
+    /// A ring that wraps inside the hour reports the span it still holds and
+    /// the number of events it overwrote while they were still inside the
+    /// hour, rather than claiming a full 60 minutes over a short total.
+    #[test]
+    fn a_full_ring_reports_the_span_it_holds_and_what_it_dropped() {
+        let now = unix_micros_now();
+        let mut window = TrafficWindow {
+            slots: vec![TrafficSlot::empty(); TRAFFIC_SLOTS].into_boxed_slice(),
+            next: 0,
+            filled: 0,
+            // An hour since start, so the span is the ring's, not elapsed time.
+            started: m6_core::platform::now() - Duration::from_secs(3600),
+            drops: [DropCell::EMPTY; DROP_CELLS],
+        };
+        // Fill the ring over 50 minutes and 30 seconds, leaving a margin over
+        // 50 whole minutes after the overwrites below.
+        let span_us = 50 * MICROS_PER_MINUTE + 30 * 1_000_000;
+        let step = span_us / (TRAFFIC_SLOTS as u64 - 1);
+        for i in 0..TRAFFIC_SLOTS {
+            window.push(
+                now - span_us + i as u64 * step,
+                Kind::Request,
+                200,
+                "/kept",
+                "192.0.2.1",
+                None,
+            );
+        }
+        // Every one of these overwrites an event still inside the hour.
+        for _ in 0..10 {
+            window.push(now, Kind::Request, 200, "/kept", "192.0.2.1", None);
+        }
+
+        let report = build_report("origin", &window);
+        assert_eq!(
+            report.events_dropped, 10,
+            "ten events were overwritten inside the hour"
+        );
+        assert_eq!(
+            report.window_minutes, 50,
+            "the ring holds 50 minutes, not the 60 it claims"
+        );
+    }
+
+    /// An overwrite of an event that had already left the hour is not counted
+    /// against the hour, so the count does not grow for the life of the
+    /// process.
+    #[test]
+    fn drops_older_than_the_window_are_not_counted() {
+        let now = unix_micros_now();
+        let mut window = TrafficWindow {
+            slots: vec![TrafficSlot::empty(); TRAFFIC_SLOTS].into_boxed_slice(),
+            next: 0,
+            filled: 0,
+            started: m6_core::platform::now() - Duration::from_secs(7200),
+            drops: [DropCell::EMPTY; DROP_CELLS],
+        };
+        // 70 minutes of events, so the ten overwritten below are older than
+        // the hour.
+        let span_us = 70 * MICROS_PER_MINUTE;
+        let step = span_us / (TRAFFIC_SLOTS as u64 - 1);
+        for i in 0..TRAFFIC_SLOTS {
+            window.push(
+                now - span_us + i as u64 * step,
+                Kind::Request,
+                200,
+                "/kept",
+                "192.0.2.1",
+                None,
+            );
+        }
+        for _ in 0..10 {
+            window.push(now, Kind::Request, 200, "/kept", "192.0.2.1", None);
+        }
+
+        let report = build_report("origin", &window);
+        assert_eq!(
+            report.events_dropped, 0,
+            "the overwritten events were already outside the hour"
+        );
+        assert_eq!(report.window_minutes, 60, "the ring holds over an hour");
+    }
+
+    /// A drop cell is reported for one window and then forgotten. The cell
+    /// stays in the ring until a later event reuses its minute 61 minutes on,
+    /// so the read-time filter is what keeps a past burst out of a quiet hour.
+    /// `dropped_in_window` takes the time, so this needs no sleep.
+    #[test]
+    fn a_drop_leaves_the_count_once_the_window_passes_it() {
+        let mut window = TrafficWindow::new();
+        let now = unix_micros_now();
+        // One drop inside the window and one at the oldest minute the window
+        // still covers. The report includes an event exactly at the cutoff, so
+        // the edge drop counts too.
+        window.count_drop(now, now);
+        window.count_drop(now - WINDOW_US, now);
+        assert_eq!(
+            window.dropped_in_window(now),
+            2,
+            "both drops are inside the window"
+        );
+        assert_eq!(
+            window.dropped_in_window(now + 61 * MICROS_PER_MINUTE),
+            0,
+            "a past burst's drops are not reported against a quiet hour"
+        );
+    }
+
+    /// A path longer than its cap is cut on a character boundary and marked as
+    /// cut. Cutting at the byte cap regardless can split a multi-byte
+    /// character, and the slot would then not be UTF-8.
+    #[test]
+    fn a_long_path_is_cut_on_a_character_boundary() {
+        let mut window = TrafficWindow::new();
+        // "/" plus 300 two-byte characters: 601 bytes, and byte 512 falls in
+        // the middle of a character.
+        let path = format!("/{}", "é".repeat(300));
+        window.push(
+            unix_micros_now(),
+            Kind::Request,
+            200,
+            &path,
+            "192.0.2.1",
+            None,
+        );
+        let stored = window.slots[0].path.as_str();
+        assert!(stored.len() <= PATH_CAP, "stored {} bytes", stored.len());
+        let kept = stored
+            .strip_suffix(TRUNCATED)
+            .expect("a cut path ends in the marker");
+        assert!(!kept.is_empty(), "the cut keeps as much as it can");
+        assert!(
+            path.starts_with(kept),
+            "the stored value is a prefix of the request path"
+        );
+    }
+
+    /// A user agent the slot cap cut is marked where the report reads it, so
+    /// the report's 160-character cut cannot mistake the stored prefix for a
+    /// short agent and present it as whole.
+    #[test]
+    fn a_cut_user_agent_is_marked_in_the_report() {
+        let mut window = TrafficWindow::new();
+        // 200 two-byte characters is 400 bytes, so the 256-byte cap keeps 126
+        // characters: fewer than the report's 160-character mark.
+        let ua = "é".repeat(200);
+        for path in ["/.env", "/wp-admin/setup.php", "/@fs/etc/passwd"] {
+            window.push(
+                unix_micros_now(),
+                Kind::Request,
+                404,
+                path,
+                "192.0.2.1",
+                Some(&ua),
+            );
+        }
+        let report = build_report("origin", &window);
+        assert_eq!(report.notable.len(), 1, "three probes from one address");
+        let shown = &report.notable[0].user_agents[0];
+        assert!(shown.ends_with(TRUNCATED), "shown as whole: {shown:?}");
+        assert!(shown.chars().count() <= 160);
+    }
+
+    /// The owner's test: a path that hides a probe marker past the 512-byte
+    /// cap is still probe-shaped. "Not shown" is not "not a probe", and an
+    /// honest client does not send a 512-byte path.
+    #[test]
+    fn a_probe_marker_past_the_path_cap_is_still_probe_shaped() {
+        let mut window = TrafficWindow::new();
+        let path = format!("/{}/.env", "a".repeat(PATH_CAP + 8));
+        window.push(
+            unix_micros_now(),
+            Kind::Request,
+            404,
+            &path,
+            "192.0.2.1",
+            None,
+        );
+        let report = build_report("origin", &window);
+        // `probe_noise` is the report's record of `ClientSummary::probe_paths`
+        // for an address below the notable threshold.
+        assert_eq!(report.probe_noise.len(), 1, "the cut request is flagged");
+        let shown = report.probe_noise[0]
+            .strip_prefix("192.0.2.1 ")
+            .expect("the noise line names the address");
+        assert!(!shown.contains(".env"), "the marker was cut: {shown:?}");
+        assert!(
+            !m6_core::telemetry::looks_like_probe(shown),
+            "the stored bytes carry no marker, so the flag is what catches it"
+        );
+        assert_eq!(
+            report.forgers,
+            vec!["192.0.2.1".to_string()],
+            "the address reads as scanning"
+        );
+    }
+
+    /// A user agent the cap cut counts as probe-shaped too, on an ordinary
+    /// path: the part not shown may carry a marker.
+    #[test]
+    fn a_cut_user_agent_counts_as_probe_shaped() {
+        let mut window = TrafficWindow::new();
+        let ua = format!("Mozilla/5.0 {}", "x".repeat(UA_CAP));
+        window.push(
+            unix_micros_now(),
+            Kind::Request,
+            200,
+            "/",
+            "192.0.2.2",
+            Some(&ua),
+        );
+        let report = build_report("origin", &window);
+        assert_eq!(
+            report.probe_noise,
+            vec!["192.0.2.2 /".to_string()],
+            "a cut user agent is probe-shaped"
+        );
+        assert_eq!(report.forgers, vec!["192.0.2.2".to_string()]);
     }
 }
 
 #[cfg(test)]
-mod metrics_gate_tests {
+mod genid_gate_tests {
     use super::*;
-    use crate::auth::test_keys::{bearer, keypair, mint};
 
-    fn token(private_pem: &str, roles: &[&str]) -> Vec<(String, String)> {
-        bearer(&mint(private_pem, roles, 3600))
-    }
-
-    fn health(peers: Option<&[&str]>, require: Option<&str>, legacy: Option<&str>) -> HealthConfig {
-        HealthConfig {
-            metrics_require: require.map(str::to_string),
-            metrics_peer_ips: peers.map(|p| {
-                p.iter()
-                    .map(|s| s.parse::<IpAddr>().unwrap().to_canonical())
-                    .collect()
-            }),
-            metrics_token: legacy.map(str::to_string),
-            ..HealthConfig::default()
+    fn config() -> GenidConfig {
+        GenidConfig {
+            read_require: Some("role:reader".to_string()),
+            write_require: Some("role:writer".to_string()),
+            ..GenidConfig::default()
         }
     }
 
-    fn is_disabled(g: &Gate) -> bool {
-        matches!(g, Gate::Refused(PerfOutcome::Disabled))
-    }
-
+    /// Address first, check never made: a public peer sees the 404 an unknown
+    /// path gives, whether or not it carries a credential.
     #[test]
-    fn an_unlisted_peer_is_404_before_any_token_check() {
-        let (_d, key, private) = keypair();
-        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"), None);
-        let good = token(&private, &["monitor"]);
-        for ip in ["203.0.113.7", "2001:db8::1", "10.0.0.8"] {
-            let g = metrics_gate(&h, Some(&key), &good, ip, false);
-            assert!(is_disabled(&g), "{ip} must get 404 even with a valid token");
-        }
-        // No token and an unlisted peer is still 404, not 401: a stranger
-        // learns nothing about the credential.
-        assert!(is_disabled(&metrics_gate(
-            &h,
-            Some(&key),
-            &[],
-            "203.0.113.7",
-            false
-        )));
-    }
-
-    #[test]
-    fn a_listed_peer_passes_the_address_rule() {
-        let (_d, key, private) = keypair();
-        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"), None);
-        let good = token(&private, &["monitor"]);
-        assert!(matches!(
-            metrics_gate(&h, Some(&key), &good, "10.0.0.9", false),
-            Gate::Open
-        ));
-        // An IPv4-mapped IPv6 peer is the same host, so the comparison is canonical.
-        assert!(matches!(
-            metrics_gate(&h, Some(&key), &good, "::ffff:10.0.0.9", false),
-            Gate::Open
-        ));
-    }
-
-    #[test]
-    fn an_unparseable_client_address_is_refused() {
-        let (_d, key, private) = keypair();
-        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"), None);
-        let good = token(&private, &["monitor"]);
-        for ip in ["", "unknown", "10.0.0.9:443", "10.0.0.9, 1.2.3.4"] {
-            assert!(
-                is_disabled(&metrics_gate(&h, Some(&key), &good, ip, false)),
-                "{ip:?}"
-            );
+    fn an_external_peer_is_refused_before_any_check() {
+        let g = config();
+        for write in [false, true] {
+            let Gate::Refused(code, _, _) = genid_gate(&g, "192.0.2.10", false, write) else {
+                panic!("a public peer must be refused");
+            };
+            assert_eq!(code, 404);
+            let Gate::Refused(code, _, _) = genid_gate(&g, "::ffff:192.0.2.10", false, write)
+            else {
+                panic!("a canonical public peer must be refused");
+            };
+            assert_eq!(code, 404);
         }
     }
 
     #[test]
-    fn a_listed_peer_on_an_internal_listener_is_refused() {
-        let (_d, key, private) = keypair();
-        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"), None);
-        let good = token(&private, &["monitor"]);
-        assert!(is_disabled(&metrics_gate(
-            &h,
-            Some(&key),
-            &good,
-            "10.0.0.9",
-            true
-        )));
-    }
-
-    #[test]
-    fn a_listed_peer_with_a_valid_token_but_wrong_role_is_403() {
-        let (_d, key, private) = keypair();
-        let h = health(Some(&["10.0.0.9"]), Some("role:monitor"), None);
-        let reader = token(&private, &["reader"]);
+    fn a_loopback_peer_asks_for_the_methods_claim() {
+        let g = config();
+        let Gate::Check(read) = genid_gate(&g, "127.0.0.1", false, false) else {
+            panic!("a loopback GET must ask for a check");
+        };
+        assert_eq!(read, "role:reader");
+        let Gate::Check(write) = genid_gate(&g, "127.0.0.1", false, true) else {
+            panic!("a loopback POST must ask for a check");
+        };
+        assert_eq!(write, "role:writer");
+        // The internal listener is the other allowed path and asks the same.
         assert!(matches!(
-            metrics_gate(&h, Some(&key), &reader, "10.0.0.9", false),
-            Gate::Refused(PerfOutcome::Forbidden)
+            genid_gate(&g, "203.0.113.7", true, false),
+            Gate::Check(_)
         ));
     }
 
     #[test]
-    fn metrics_require_without_a_loaded_key_fails_closed() {
-        let h = health(None, Some("role:monitor"), None);
-        assert!(matches!(
-            metrics_gate(&h, None, &[], "10.0.0.9", false),
-            Gate::Refused(PerfOutcome::Unauthorised)
-        ));
-    }
-
-    #[test]
-    fn metrics_require_refuses_the_legacy_bearer_string() {
-        let (_d, key, _) = keypair();
-        let h = health(None, Some("role:monitor"), Some("legacy-secret"));
-        let legacy = vec![(
-            "authorization".to_string(),
-            "Bearer legacy-secret".to_string(),
-        )];
-        assert!(matches!(
-            metrics_gate(&h, Some(&key), &legacy, "10.0.0.9", false),
-            Gate::Refused(PerfOutcome::Unauthorised)
-        ));
-    }
-
-    #[test]
-    fn without_new_keys_the_gate_is_todays() {
-        let h = health(None, None, Some("right"));
-        let ok = vec![("authorization".to_string(), "Bearer right".to_string())];
-        let bad = vec![("authorization".to_string(), "Bearer wrong".to_string())];
-        // Any peer, internal or not: there is no address rule.
-        for (ip, internal) in [("203.0.113.7", false), ("10.0.0.9", true)] {
-            assert!(matches!(
-                metrics_gate(&h, None, &ok, ip, internal),
-                Gate::Open
-            ));
-            assert!(matches!(
-                metrics_gate(&h, None, &bad, ip, internal),
-                Gate::Refused(PerfOutcome::Unauthorised)
-            ));
-        }
-        let none = health(None, None, None);
-        assert!(is_disabled(&metrics_gate(
-            &none, None, &ok, "10.0.0.9", false
-        )));
+    fn no_claims_is_the_endpoint_not_existing() {
+        let none = GenidConfig::default();
+        let Gate::Refused(code, _, _) = genid_gate(&none, "127.0.0.1", false, false) else {
+            panic!("no claims must be refused");
+        };
+        assert_eq!(code, 404);
     }
 }

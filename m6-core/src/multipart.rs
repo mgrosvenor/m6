@@ -28,12 +28,10 @@ pub fn parse_upload(
     let boundary = multer::parse_boundary(content_type_header)
         .map_err(|e| crate::error::Error::BadRequest(format!("multipart boundary: {e}")))?;
 
-    // multer is async-first; use a single-threaded tokio runtime to drive it.
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .map_err(|e| crate::error::Error::Other(anyhow::anyhow!("tokio rt: {e}")))?;
-
-    rt.block_on(async {
+    // multer is async-first, but this future needs no IO: drive it on the
+    // current thread with a minimal executor instead of building a tokio
+    // runtime per upload.
+    futures_executor::block_on(async {
         let body_bytes = bytes::Bytes::copy_from_slice(body);
         let stream =
             futures_util::stream::once(
@@ -78,9 +76,15 @@ pub fn parse_upload(
 mod tests {
     use super::*;
 
-    /// Build a minimal multipart/form-data body for testing.
-    fn make_multipart(boundary: &str, field_name: &str, filename: &str, data: &[u8]) -> Vec<u8> {
-        let mut body = Vec::new();
+    /// Append one form-data part to `body`, without the closing boundary.
+    fn push_part(
+        body: &mut Vec<u8>,
+        boundary: &str,
+        field_name: &str,
+        filename: &str,
+        content_type: &str,
+        data: &[u8],
+    ) {
         body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
         body.extend_from_slice(
             format!(
@@ -88,9 +92,16 @@ mod tests {
             )
             .as_bytes(),
         );
-        body.extend_from_slice(b"Content-Type: image/png\r\n\r\n");
+        body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
         body.extend_from_slice(data);
-        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
+
+    /// Build a minimal single-part multipart/form-data body for testing.
+    fn make_multipart(boundary: &str, field_name: &str, filename: &str, data: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        push_part(&mut body, boundary, field_name, filename, "image/png", data);
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
         body
     }
 
@@ -114,5 +125,39 @@ mod tests {
         let ct = format!("multipart/form-data; boundary={boundary}");
         let err = parse_upload(&body, &ct, "nonexistent");
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_parse_upload_two_parts() {
+        let boundary = "TESTBOUNDARY";
+        let mut body = Vec::new();
+        push_part(
+            &mut body,
+            boundary,
+            "caption",
+            "note.txt",
+            "text/plain",
+            b"a caption",
+        );
+        push_part(
+            &mut body,
+            boundary,
+            "avatar",
+            "photo.png",
+            "image/png",
+            b"fake-png-data",
+        );
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        let ct = format!("multipart/form-data; boundary={boundary}");
+
+        let caption = parse_upload(&body, &ct, "caption").unwrap();
+        assert_eq!(caption.filename, "note.txt");
+        assert_eq!(caption.data, b"a caption");
+        assert!(caption.content_type.contains("text/plain"));
+
+        let avatar = parse_upload(&body, &ct, "avatar").unwrap();
+        assert_eq!(avatar.filename, "photo.png");
+        assert_eq!(avatar.data, b"fake-png-data");
+        assert!(avatar.content_type.contains("image/png"));
     }
 }

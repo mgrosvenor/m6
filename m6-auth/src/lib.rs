@@ -1,9 +1,20 @@
+pub mod build_info;
 pub mod jwt;
 
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::time::Duration;
 use uuid::Uuid;
+
+/// A new identifier for a token's `jti`.
+///
+/// One place makes these, so an access token, an API token and a refresh token
+/// all name one mint the same way. At this tip nothing looks the value up: the
+/// row that can end a token is part of the shelved token-rules work.
+pub fn new_token_id() -> String {
+    Uuid::new_v4().to_string()
+}
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -52,14 +63,37 @@ pub enum AuthError {
     #[error("api token not found: {0}")]
     ApiTokenNotFound(String),
 
+    #[error("roles column for user {0} is not valid JSON: {1}")]
+    Roles(String, serde_json::Error),
+
     #[error("database error: {0}")]
     Db(#[from] rusqlite::Error),
+
+    #[error("opening the database: {0}")]
+    Open(#[from] m6_core::sqlite::SqliteError),
 
     #[error("password hashing error: {0}")]
     Bcrypt(#[from] bcrypt::BcryptError),
 }
 
 pub type Result<T> = std::result::Result<T, AuthError>;
+
+impl AuthError {
+    /// Whether SQLite refused the statement because a lock is held, which the
+    /// caller can retry once the lock is gone.
+    ///
+    /// SQLite reports a lock as `SQLITE_BUSY` while it is waiting and as
+    /// `SQLITE_LOCKED` when the statement conflicts with one on the same
+    /// connection. Every other failure is not retryable.
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self,
+            AuthError::Db(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::DatabaseBusy
+                    || e.code == rusqlite::ErrorCode::DatabaseLocked
+        )
+    }
+}
 
 // ── Schema ───────────────────────────────────────────────────────────────────
 
@@ -99,24 +133,100 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 );
 ";
 
+/// The cost production hashes at.
+///
+/// A test fixture that needs a user hashes it at bcrypt's lowest cost, 4, through
+/// `user_create_with_cost` or `user_set_password_with_cost`, which only exist
+/// under `cfg(test)` or the `testkit` feature. The production functions pass
+/// this number, and `production_hashes_at_cost_twelve` hashes through
+/// `user_create` and reads the cost out of the stored hash, so a call site
+/// cannot lower the round count a deployed site uses.
 const BCRYPT_COST: u32 = 12;
+
+/// A fixed cost-12 bcrypt hash, verified on the missing-user path so a login
+/// for a username that does not exist does the same work as one for a user
+/// with the wrong password. Nothing is ever verified against it, so the
+/// plaintext it came from is irrelevant.
+const DUMMY_BCRYPT_HASH: &str = "$2b$12$zAhvXKspUKstZwuwfyLAN.7EmoU2t6AEgKCQyIQqVVKZBLX7lAT6.";
+
+// Count of bcrypt verifications, for the test that both the wrong-password
+// and the missing-user paths run exactly one. Thread-local so parallel tests
+// do not share the count. Present only under `cfg(test)`.
+#[cfg(test)]
+std::thread_local! {
+    static BCRYPT_VERIFIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Verify `password` against `hash`, counting the call under test so the two
+/// login paths can be shown to do equal work.
+fn verify_bcrypt(password: &str, hash: &str) -> Result<bool> {
+    #[cfg(test)]
+    BCRYPT_VERIFIES.with(|count| count.set(count.get() + 1));
+    Ok(bcrypt::verify(password, hash)?)
+}
 
 // ── Db ───────────────────────────────────────────────────────────────────────
 
 pub struct Db(Connection);
 
 impl Db {
+    /// Open a connection and apply the schema.
+    ///
+    /// The connection comes from `m6_core::sqlite`, in WAL mode with a five
+    /// second busy timeout and foreign keys on. Every connection to one file
+    /// uses WAL, so the journal mode is set there and nowhere else. Workers
+    /// that open one new database at the same time are covered by the retry
+    /// of the WAL switch in that opener. The opener refuses a read-only file
+    /// with `AuthError::Open` and turns on `recursive_triggers`.
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        conn.execute_batch(
-            "
-            PRAGMA journal_mode=WAL;
-            PRAGMA busy_timeout=5000;
-            PRAGMA foreign_keys=ON;
-        ",
-        )?;
+        let conn = m6_core::sqlite::OpenOptions::default()
+            .journal(m6_core::sqlite::Journal::Wal)
+            .open(path)?;
         conn.execute_batch(SCHEMA)?;
         Ok(Db(conn))
+    }
+
+    /// Open an existing database for reading, without applying the schema.
+    ///
+    /// This is the check side's opener. It needs the users, groups and
+    /// memberships rows and never writes one, so the process that answers
+    /// `/check` cannot be the one that creates the schema or edits a role.
+    /// [`Db::open`] owns both, on the login side.
+    ///
+    /// The file is opened by [`m6_core::sqlite::open_read_only`], which cannot
+    /// create the file and refuses every write through the connection.
+    /// [`Db::schema_present`] is the start check that the login side has
+    /// already created the schema.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn = m6_core::sqlite::open_read_only(path)?;
+        Ok(Db(conn))
+    }
+
+    /// Check that the file carries the auth schema, without writing it.
+    ///
+    /// A reader does not apply the schema, so a check process on a file the
+    /// login side has not initialized asks this before it binds. A missing
+    /// table is `Err`, as a corrupt database is.
+    pub fn schema_present(&self) -> Result<()> {
+        match self
+            .0
+            .query_row("SELECT 1 FROM users LIMIT 1", [], |_| Ok(()))
+        {
+            Ok(()) | Err(rusqlite::Error::QueryReturnedNoRows) => Ok(()),
+            Err(e) => Err(AuthError::Db(e)),
+        }
+    }
+
+    /// Stop waiting for another connection's lock, so a statement that meets one
+    /// fails with `SQLITE_BUSY` at once.
+    ///
+    /// A service in an event loop calls this after its start-time open and
+    /// defers a request that gets the error, because a wait here would hold the
+    /// loop and every request behind it. A one-shot tool keeps `Db::open`'s
+    /// five-second wait.
+    pub fn no_busy_wait(&self) -> Result<()> {
+        self.0.busy_timeout(Duration::ZERO)?;
+        Ok(())
     }
 
     /// Close the database, handing the `Connection` back on failure so the
@@ -149,7 +259,8 @@ impl Db {
         roles_json: String,
         created_at: i64,
     ) -> Result<User> {
-        let roles: Vec<String> = serde_json::from_str(&roles_json).unwrap_or_default();
+        let roles: Vec<String> =
+            serde_json::from_str(&roles_json).map_err(|e| AuthError::Roles(username.clone(), e))?;
         let groups = self.user_groups_by_id(&id)?;
         Ok(User {
             id,
@@ -163,6 +274,38 @@ impl Db {
     // ── User ops ─────────────────────────────────────────────────────────────
 
     pub fn user_create(&self, username: &str, password: &str, roles: &[&str]) -> Result<User> {
+        self.user_create_at_cost(username, password, roles, BCRYPT_COST)
+    }
+
+    /// As [`Db::user_create`], hashing at `cost`.
+    ///
+    /// The cost is a parameter so a test fixture can create users at bcrypt's
+    /// lowest cost, 4, which an unoptimised build hashes in a fraction of the
+    /// time. The production path passes `BCRYPT_COST`, and no site setting
+    /// chooses the round count.
+    ///
+    /// Compiled only for this crate's tests or with the `testkit` feature,
+    /// which the fixture crates enable from their dev-dependencies. A
+    /// production build cannot call this with a cost below `BCRYPT_COST`
+    /// (private, so named here in backticks).
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn user_create_with_cost(
+        &self,
+        username: &str,
+        password: &str,
+        roles: &[&str],
+        cost: u32,
+    ) -> Result<User> {
+        self.user_create_at_cost(username, password, roles, cost)
+    }
+
+    fn user_create_at_cost(
+        &self,
+        username: &str,
+        password: &str,
+        roles: &[&str],
+        cost: u32,
+    ) -> Result<User> {
         // Check for duplicate username first to give a good error
         let exists: bool = self.0.query_row(
             "SELECT COUNT(*) FROM users WHERE username = ?1",
@@ -174,13 +317,9 @@ impl Db {
         }
 
         let id = Uuid::new_v4().to_string();
-        let hash = bcrypt::hash(password, BCRYPT_COST)?;
-        let roles_vec: Vec<&str> = roles.to_vec();
-        let roles_json = serde_json::to_string(&roles_vec).unwrap_or_else(|_| "[]".to_string());
-        let created_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        let hash = bcrypt::hash(password, cost)?;
+        let roles_json = serde_json::to_string(&roles).expect("serialising roles cannot fail");
+        let created_at = crate::jwt::now_secs();
 
         self.0.execute(
             "INSERT INTO users (id, username, password, roles, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -275,7 +414,26 @@ impl Db {
     }
 
     pub fn user_set_password(&self, username: &str, password: &str) -> Result<()> {
-        let hash = bcrypt::hash(password, BCRYPT_COST)?;
+        self.user_set_password_at_cost(username, password, BCRYPT_COST)
+    }
+
+    /// As [`Db::user_set_password`], hashing at `cost`.
+    ///
+    /// The production path passes `BCRYPT_COST`. A test fixture passes 4, and
+    /// this is compiled only for this crate's tests or with the `testkit`
+    /// feature the fixture crates enable from their dev-dependencies.
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn user_set_password_with_cost(
+        &self,
+        username: &str,
+        password: &str,
+        cost: u32,
+    ) -> Result<()> {
+        self.user_set_password_at_cost(username, password, cost)
+    }
+
+    fn user_set_password_at_cost(&self, username: &str, password: &str, cost: u32) -> Result<()> {
+        let hash = bcrypt::hash(password, cost)?;
         let n = self.0.execute(
             "UPDATE users SET password = ?1 WHERE username = ?2",
             params![hash, username],
@@ -287,8 +445,7 @@ impl Db {
     }
 
     pub fn user_set_roles(&self, username: &str, roles: &[&str]) -> Result<()> {
-        let roles_vec: Vec<&str> = roles.to_vec();
-        let roles_json = serde_json::to_string(&roles_vec).unwrap_or_else(|_| "[]".to_string());
+        let roles_json = serde_json::to_string(&roles).expect("serialising roles cannot fail");
         let n = self.0.execute(
             "UPDATE users SET roles = ?1 WHERE username = ?2",
             params![roles_json, username],
@@ -317,14 +474,23 @@ impl Db {
 
         match result {
             Ok((id, uname, hash, roles_json, created_at)) => {
-                let valid = bcrypt::verify(password, &hash)?;
-                if valid {
-                    Ok(Some(self.row_to_user(id, uname, roles_json, created_at)?))
+                // Read the whole user, groups included, before the expensive
+                // verify. The verify is then the last step, so a database read
+                // that fails busy leaves no password verified behind it.
+                let user = self.row_to_user(id, uname, roles_json, created_at)?;
+                if verify_bcrypt(password, &hash)? {
+                    Ok(Some(user))
                 } else {
                     Ok(None)
                 }
             }
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                // Run a verify against a fixed hash so a missing user costs the
+                // same as a user with the wrong password, and the response time
+                // does not reveal which usernames exist.
+                let _ = verify_bcrypt(password, DUMMY_BCRYPT_HASH)?;
+                Ok(None)
+            }
             Err(e) => Err(AuthError::Db(e)),
         }
     }
@@ -475,10 +641,7 @@ impl Db {
 
     /// Returns the user_id if the token exists and has not expired.
     pub fn refresh_token_verify(&self, token_hash: &str) -> Result<Option<String>> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        let now = crate::jwt::now_secs();
 
         let result = self.0.query_row(
             "SELECT user_id FROM refresh_tokens WHERE token_hash = ?1 AND expires_at > ?2",
@@ -509,6 +672,19 @@ impl Db {
         Ok(())
     }
 
+    /// Delete every refresh-token row, for the key-rotation step.
+    ///
+    /// This is the interim form of the auth API design's `sessions revoke-all`.
+    /// The auth generation, the new epoch and list key, and the acknowledgement
+    /// from every cache arrive with the token-rules step. At this tip no node
+    /// holds a decision list, so this deletion is the whole effect of
+    /// `revoke-all` on refresh tokens. One DELETE is one transaction, and it
+    /// returns the number of rows it removed.
+    pub fn sessions_revoke_all(&self) -> Result<usize> {
+        let deleted = self.0.execute("DELETE FROM refresh_tokens", [])?;
+        Ok(deleted)
+    }
+
     // ── API token ops ────────────────────────────────────────────────────────
 
     pub fn api_token_create(
@@ -520,10 +696,7 @@ impl Db {
         expires_at: i64,
     ) -> Result<ApiToken> {
         let id = Uuid::new_v4().to_string();
-        let created_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        let created_at = crate::jwt::now_secs();
         self.0.execute(
             "INSERT INTO api_tokens (id, user_id, name, token_hash, created_at, expires_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -642,6 +815,64 @@ mod tests {
         (db, f)
     }
 
+    /// The cost a unit test hashes at: bcrypt's lowest, 4.
+    ///
+    /// Production passes `BCRYPT_COST`, and the test below reads that number.
+    const TEST_BCRYPT_COST: u32 = 4;
+
+    /// Create a user at [`TEST_BCRYPT_COST`]. The production `user_create` is
+    /// the same code with `BCRYPT_COST` passed in.
+    trait TestUser {
+        fn user_create_test(&self, username: &str, password: &str, roles: &[&str]) -> Result<User>;
+        fn user_set_password_test(&self, username: &str, password: &str) -> Result<()>;
+    }
+
+    impl TestUser for Db {
+        fn user_create_test(&self, username: &str, password: &str, roles: &[&str]) -> Result<User> {
+            self.user_create_with_cost(username, password, roles, TEST_BCRYPT_COST)
+        }
+
+        fn user_set_password_test(&self, username: &str, password: &str) -> Result<()> {
+            self.user_set_password_with_cost(username, password, TEST_BCRYPT_COST)
+        }
+    }
+
+    // ── The hash cost ────────────────────────────────────────────────────────
+
+    /// Production hashes at cost 12 even though these tests hash at 4.
+    ///
+    /// Reading `BCRYPT_COST` alone would not catch a call site that passed
+    /// some other number to `user_create`. This hashes through `user_create`
+    /// and reads the cost back out of the stored bcrypt hash, so lowering the
+    /// round count anywhere on the production path fails it.
+    #[test]
+    fn production_hashes_at_cost_twelve() {
+        let (db, _f) = tmp_db();
+        db.user_create("cost-check", "hunter2", &["user"])
+            .expect("create a user at production's cost");
+        let hash: String =
+            db.0.query_row(
+                "SELECT password FROM users WHERE username = ?1",
+                ["cost-check"],
+                |row| row.get(0),
+            )
+            .expect("the stored hash");
+        // bcrypt's modular crypt format: $2b$<cost>$<salt><hash>.
+        let cost: u32 = hash
+            .split('$')
+            .nth(2)
+            .and_then(|field| field.parse().ok())
+            .unwrap_or_else(|| panic!("not a bcrypt hash: {hash}"));
+        assert_eq!(
+            cost, 12,
+            "user_create hashed at cost {cost}, so every stored password is weaker than production requires"
+        );
+        assert!(
+            TEST_BCRYPT_COST < cost,
+            "the test cost {TEST_BCRYPT_COST} is not cheaper than production's {cost}"
+        );
+    }
+
     // ── WAL mode ─────────────────────────────────────────────────────────────
 
     #[test]
@@ -653,13 +884,75 @@ mod tests {
         assert_eq!(mode, "wal");
     }
 
+    // ── Read-only open ───────────────────────────────────────────────────────
+
+    /// The reader beside a writer reads the rows the writer committed.
+    #[test]
+    fn an_open_for_reading_reads_the_writers_rows() {
+        let (writer, f) = tmp_db();
+        writer
+            .user_create_test("alice", "pass", &["admin"])
+            .expect("create");
+        let reader = Db::open_read_only(f.path()).expect("open for reading");
+        reader.schema_present().expect("the schema is present");
+        let got = reader
+            .user_get("alice")
+            .expect("get")
+            .expect("alice exists");
+        assert_eq!(got.roles, vec!["admin".to_string()]);
+    }
+
+    /// A write through the reader fails with `SQLITE_READONLY`. This is the
+    /// check side's guarantee: the process that parses a client token on every
+    /// protected request cannot edit a role.
+    #[test]
+    fn an_open_for_reading_refuses_a_write() {
+        let (writer, f) = tmp_db();
+        writer
+            .user_create_test("alice", "pass", &[])
+            .expect("create");
+        let reader = Db::open_read_only(f.path()).expect("open for reading");
+        let err = reader
+            .user_create_test("bob", "pass", &[])
+            .expect_err("a write through a reader must fail");
+        assert!(
+            matches!(
+                err,
+                AuthError::Db(rusqlite::Error::SqliteFailure(ref e, _))
+                    if e.code == rusqlite::ErrorCode::ReadOnly
+            ),
+            "expected SQLITE_READONLY, got {err}"
+        );
+    }
+
+    /// A reader never creates the file, so a check process on a missing
+    /// database stops at start and leaves no file behind.
+    #[test]
+    fn an_open_for_reading_does_not_create_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("absent.db");
+        assert!(Db::open_read_only(&path).is_err());
+        assert!(!path.exists(), "the reader created {}", path.display());
+    }
+
+    /// A file with no auth schema is not present, and asking is not a write.
+    #[test]
+    fn schema_present_is_false_without_the_schema() {
+        let f = NamedTempFile::new().expect("tempfile");
+        let reader = Db::open_read_only(f.path()).expect("open for reading");
+        assert!(
+            reader.schema_present().is_err(),
+            "an empty file has no users table"
+        );
+    }
+
     // ── User create / get ─────────────────────────────────────────────────────
 
     #[test]
     fn test_user_create_and_get() {
         let (db, _f) = tmp_db();
         let u = db
-            .user_create("alice", "hunter2", &["admin", "user"])
+            .user_create_test("alice", "hunter2", &["admin", "user"])
             .expect("create");
         assert_eq!(u.username, "alice");
         assert!(u.roles.contains(&"admin".to_string()));
@@ -673,9 +966,10 @@ mod tests {
     #[test]
     fn test_user_create_duplicate() {
         let (db, _f) = tmp_db();
-        db.user_create("alice", "pass1", &[]).expect("first create");
+        db.user_create_test("alice", "pass1", &[])
+            .expect("first create");
         let err = db
-            .user_create("alice", "pass2", &[])
+            .user_create_test("alice", "pass2", &[])
             .expect_err("should fail");
         assert!(matches!(err, AuthError::UserExists(_)));
     }
@@ -690,7 +984,9 @@ mod tests {
     #[test]
     fn test_user_get_by_id() {
         let (db, _f) = tmp_db();
-        let u = db.user_create("bob", "pass", &["user"]).expect("create");
+        let u = db
+            .user_create_test("bob", "pass", &["user"])
+            .expect("create");
         let got = db.user_get_by_id(&u.id).expect("get").expect("some");
         assert_eq!(got.username, "bob");
     }
@@ -698,12 +994,26 @@ mod tests {
     #[test]
     fn test_user_list() {
         let (db, _f) = tmp_db();
-        db.user_create("alice", "p1", &[]).expect("c1");
-        db.user_create("bob", "p2", &[]).expect("c2");
+        db.user_create_test("alice", "p1", &[]).expect("c1");
+        db.user_create_test("bob", "p2", &[]).expect("c2");
         let list = db.user_list().expect("list");
         assert_eq!(list.len(), 2);
         assert!(list.iter().any(|u| u.username == "alice"));
         assert!(list.iter().any(|u| u.username == "bob"));
+    }
+
+    #[test]
+    fn test_corrupted_roles_is_an_error() {
+        let (db, _f) = tmp_db();
+        db.user_create_test("alice", "pass", &["admin"])
+            .expect("create");
+        db.0.execute(
+            "UPDATE users SET roles = 'not-json' WHERE username = 'alice'",
+            [],
+        )
+        .expect("corrupt roles");
+        let err = db.user_get("alice").expect_err("should fail");
+        assert!(matches!(err, AuthError::Roles(..)));
     }
 
     // ── user_delete cascade ───────────────────────────────────────────────────
@@ -711,7 +1021,7 @@ mod tests {
     #[test]
     fn test_user_delete_cascades() {
         let (db, _f) = tmp_db();
-        let u = db.user_create("alice", "pass", &[]).expect("create");
+        let u = db.user_create_test("alice", "pass", &[]).expect("create");
         let _g = db.group_create("admins").expect("group");
         db.group_member_add("admins", "alice").expect("add member");
         db.refresh_token_store(&u.id, "tok_hash_1", i64::MAX)
@@ -744,8 +1054,10 @@ mod tests {
     #[test]
     fn test_user_set_password() {
         let (db, _f) = tmp_db();
-        db.user_create("alice", "old_pass", &[]).expect("create");
-        db.user_set_password("alice", "new_pass").expect("set pw");
+        db.user_create_test("alice", "old_pass", &[])
+            .expect("create");
+        db.user_set_password_test("alice", "new_pass")
+            .expect("set pw");
 
         assert!(db
             .user_verify_password("alice", "old_pass")
@@ -760,7 +1072,8 @@ mod tests {
     #[test]
     fn test_user_set_roles() {
         let (db, _f) = tmp_db();
-        db.user_create("alice", "pass", &["user"]).expect("create");
+        db.user_create_test("alice", "pass", &["user"])
+            .expect("create");
         db.user_set_roles("alice", &["admin", "mod"])
             .expect("set roles");
         let u = db.user_get("alice").expect("get").expect("some");
@@ -774,7 +1087,7 @@ mod tests {
     #[test]
     fn test_verify_correct_password() {
         let (db, _f) = tmp_db();
-        db.user_create("alice", "correct", &["user"])
+        db.user_create_test("alice", "correct", &["user"])
             .expect("create");
         let u = db
             .user_verify_password("alice", "correct")
@@ -786,7 +1099,8 @@ mod tests {
     #[test]
     fn test_verify_wrong_password_returns_none() {
         let (db, _f) = tmp_db();
-        db.user_create("alice", "correct", &[]).expect("create");
+        db.user_create_test("alice", "correct", &[])
+            .expect("create");
         let r = db.user_verify_password("alice", "wrong").expect("verify");
         assert!(r.is_none());
     }
@@ -796,6 +1110,23 @@ mod tests {
         let (db, _f) = tmp_db();
         let r = db.user_verify_password("nobody", "pass").expect("verify");
         assert!(r.is_none());
+    }
+
+    #[test]
+    fn test_verify_runs_one_bcrypt_verify_on_both_paths() {
+        let (db, _f) = tmp_db();
+        db.user_create_test("alice", "correct", &[])
+            .expect("create");
+
+        BCRYPT_VERIFIES.with(|count| count.set(0));
+        let wrong = db.user_verify_password("alice", "wrong").expect("verify");
+        assert!(wrong.is_none());
+        assert_eq!(BCRYPT_VERIFIES.with(|count| count.get()), 1);
+
+        BCRYPT_VERIFIES.with(|count| count.set(0));
+        let missing = db.user_verify_password("nobody", "wrong").expect("verify");
+        assert!(missing.is_none());
+        assert_eq!(BCRYPT_VERIFIES.with(|count| count.get()), 1);
     }
 
     // ── Group ops ─────────────────────────────────────────────────────────────
@@ -856,7 +1187,7 @@ mod tests {
     #[test]
     fn test_group_member_add_remove() {
         let (db, _f) = tmp_db();
-        db.user_create("alice", "p", &[]).expect("user");
+        db.user_create_test("alice", "p", &[]).expect("user");
         db.group_create("team").expect("group");
         db.group_member_add("team", "alice").expect("add");
 
@@ -875,7 +1206,7 @@ mod tests {
     #[test]
     fn test_group_member_add_idempotent() {
         let (db, _f) = tmp_db();
-        db.user_create("alice", "p", &[]).expect("user");
+        db.user_create_test("alice", "p", &[]).expect("user");
         db.group_create("team").expect("group");
         db.group_member_add("team", "alice").expect("first add");
         db.group_member_add("team", "alice")
@@ -887,7 +1218,7 @@ mod tests {
     #[test]
     fn test_group_member_add_unknown_group() {
         let (db, _f) = tmp_db();
-        db.user_create("alice", "p", &[]).expect("user");
+        db.user_create_test("alice", "p", &[]).expect("user");
         let err = db
             .group_member_add("nonexistent", "alice")
             .expect_err("should fail");
@@ -907,7 +1238,7 @@ mod tests {
     #[test]
     fn test_user_groups_populated_on_get() {
         let (db, _f) = tmp_db();
-        db.user_create("alice", "p", &[]).expect("user");
+        db.user_create_test("alice", "p", &[]).expect("user");
         db.group_create("alpha").expect("g1");
         db.group_create("beta").expect("g2");
         db.group_member_add("alpha", "alice").expect("add1");
@@ -922,7 +1253,7 @@ mod tests {
     #[test]
     fn test_refresh_token_store_and_verify() {
         let (db, _f) = tmp_db();
-        let u = db.user_create("alice", "p", &[]).expect("user");
+        let u = db.user_create_test("alice", "p", &[]).expect("user");
         db.refresh_token_store(&u.id, "hash1", i64::MAX)
             .expect("store");
         let uid = db
@@ -935,7 +1266,7 @@ mod tests {
     #[test]
     fn test_refresh_token_expired() {
         let (db, _f) = tmp_db();
-        let u = db.user_create("alice", "p", &[]).expect("user");
+        let u = db.user_create_test("alice", "p", &[]).expect("user");
         // expires_at = 1 (far in the past)
         db.refresh_token_store(&u.id, "hash_exp", 1).expect("store");
         let r = db.refresh_token_verify("hash_exp").expect("verify");
@@ -945,7 +1276,7 @@ mod tests {
     #[test]
     fn test_refresh_token_revoke() {
         let (db, _f) = tmp_db();
-        let u = db.user_create("alice", "p", &[]).expect("user");
+        let u = db.user_create_test("alice", "p", &[]).expect("user");
         db.refresh_token_store(&u.id, "tok", i64::MAX)
             .expect("store");
         db.refresh_token_revoke("tok").expect("revoke");
@@ -956,12 +1287,30 @@ mod tests {
     #[test]
     fn test_refresh_tokens_revoke_all() {
         let (db, _f) = tmp_db();
-        let u = db.user_create("alice", "p", &[]).expect("user");
+        let u = db.user_create_test("alice", "p", &[]).expect("user");
         db.refresh_token_store(&u.id, "tok1", i64::MAX).expect("s1");
         db.refresh_token_store(&u.id, "tok2", i64::MAX).expect("s2");
         db.refresh_tokens_revoke_all(&u.id).expect("revoke all");
         assert!(db.refresh_token_verify("tok1").expect("v1").is_none());
         assert!(db.refresh_token_verify("tok2").expect("v2").is_none());
+    }
+
+    /// The rotation step ends every user's refresh rows, not one user's.
+    #[test]
+    fn test_sessions_revoke_all_deletes_every_users_rows() {
+        let (db, _f) = tmp_db();
+        let alice = db.user_create_test("alice", "p", &[]).expect("alice");
+        let bob = db.user_create_test("bob", "p", &[]).expect("bob");
+        db.refresh_token_store(&alice.id, "a1", i64::MAX)
+            .expect("a1");
+        db.refresh_token_store(&alice.id, "a2", i64::MAX)
+            .expect("a2");
+        db.refresh_token_store(&bob.id, "b1", i64::MAX).expect("b1");
+        let deleted = db.sessions_revoke_all().expect("revoke all");
+        assert_eq!(deleted, 3, "every refresh row is deleted");
+        assert!(db.refresh_token_verify("a1").expect("a1").is_none());
+        assert!(db.refresh_token_verify("a2").expect("a2").is_none());
+        assert!(db.refresh_token_verify("b1").expect("b1").is_none());
     }
 
     // ── Concurrent open (WAL allows multiple readers + one writer) ───────────
@@ -975,10 +1324,11 @@ mod tests {
         let db2 = Db::open(&path).expect("db2");
 
         // Interleave writes
-        db1.user_create("alice", "pass_a", &["admin"])
+        db1.user_create_test("alice", "pass_a", &["admin"])
             .expect("alice");
-        db2.user_create("bob", "pass_b", &["user"]).expect("bob");
-        db1.user_create("carol", "pass_c", &[]).expect("carol");
+        db2.user_create_test("bob", "pass_b", &["user"])
+            .expect("bob");
+        db1.user_create_test("carol", "pass_c", &[]).expect("carol");
 
         // Both connections see all rows
         let list1 = db1.user_list().expect("list1");
@@ -992,7 +1342,7 @@ mod tests {
     #[test]
     fn test_api_token_create_and_list() {
         let (db, _f) = tmp_db();
-        let u = db.user_create("alice", "pass", &[]).expect("user");
+        let u = db.user_create_test("alice", "pass", &[]).expect("user");
         let tok = db
             .api_token_create(&u.id, "alice", "ci-deploy", "hash1", i64::MAX)
             .expect("create");
@@ -1009,7 +1359,7 @@ mod tests {
     #[test]
     fn test_api_token_list_multiple() {
         let (db, _f) = tmp_db();
-        let u = db.user_create("bob", "pass", &[]).expect("user");
+        let u = db.user_create_test("bob", "pass", &[]).expect("user");
         db.api_token_create(&u.id, "bob", "token-a", "hash_a", i64::MAX)
             .expect("a");
         db.api_token_create(&u.id, "bob", "token-b", "hash_b", i64::MAX)
@@ -1023,7 +1373,7 @@ mod tests {
     #[test]
     fn test_api_token_list_empty() {
         let (db, _f) = tmp_db();
-        db.user_create("carol", "pass", &[]).expect("user");
+        db.user_create_test("carol", "pass", &[]).expect("user");
         let list = db.api_token_list("carol").expect("list");
         assert!(list.is_empty());
     }
@@ -1038,7 +1388,7 @@ mod tests {
     #[test]
     fn test_api_token_revoke() {
         let (db, _f) = tmp_db();
-        let u = db.user_create("alice", "pass", &[]).expect("user");
+        let u = db.user_create_test("alice", "pass", &[]).expect("user");
         let tok = db
             .api_token_create(&u.id, "alice", "my-token", "hashX", i64::MAX)
             .expect("create");
@@ -1059,7 +1409,7 @@ mod tests {
     #[test]
     fn test_api_token_cascade_on_user_delete() {
         let (db, _f) = tmp_db();
-        let u = db.user_create("alice", "pass", &[]).expect("user");
+        let u = db.user_create_test("alice", "pass", &[]).expect("user");
         db.api_token_create(&u.id, "alice", "tok", "hashY", i64::MAX)
             .expect("create");
         db.user_delete("alice").expect("delete");
@@ -1071,7 +1421,7 @@ mod tests {
     #[test]
     fn test_api_token_hash_unique() {
         let (db, _f) = tmp_db();
-        let u = db.user_create("alice", "pass", &[]).expect("user");
+        let u = db.user_create_test("alice", "pass", &[]).expect("user");
         db.api_token_create(&u.id, "alice", "tok-1", "same_hash", i64::MAX)
             .expect("first");
         // Same hash must fail (UNIQUE constraint on token_hash)
@@ -1079,5 +1429,33 @@ mod tests {
             .api_token_create(&u.id, "alice", "tok-2", "same_hash", i64::MAX)
             .expect_err("duplicate hash");
         assert!(matches!(err, AuthError::Db(_)));
+    }
+
+    /// Only SQLite's two lock codes are retryable. A caller that treats every
+    /// `SqliteFailure` as busy would retry a constraint failure forever.
+    #[test]
+    fn is_busy_is_true_only_for_busy_and_locked() {
+        let failed = |code| {
+            AuthError::from(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                None,
+            ))
+        };
+        assert!(
+            failed(rusqlite::ffi::SQLITE_BUSY).is_busy(),
+            "SQLITE_BUSY is a lock"
+        );
+        assert!(
+            failed(rusqlite::ffi::SQLITE_LOCKED).is_busy(),
+            "SQLITE_LOCKED is a lock"
+        );
+        assert!(
+            !failed(rusqlite::ffi::SQLITE_CONSTRAINT).is_busy(),
+            "a constraint failure is not a lock"
+        );
+        assert!(
+            !AuthError::UserNotFound("alice".to_string()).is_busy(),
+            "an answered row is not a lock"
+        );
     }
 }

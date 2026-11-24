@@ -10,7 +10,7 @@
 //!   response cache key, so `gzip` and `gzip, deflate, br, zstd` were separate
 //!   entries for one byte-identical response.
 //!
-//! What each implementation served, against the HTML path. The `served`
+//! What each implementation served, against an HTML route. The `served`
 //! column is what the `ae_contains` substring match produced, which this
 //! module replaced, so it is a record of the defect rather than something a
 //! current build reproduces. The `correct` column is what this code answers
@@ -28,8 +28,8 @@
 //! an unrelated token. The third ignores preference entirely, because the
 //! candidates were tested in our order and the first match won.
 //!
-//! One implementation, because the alternative is what the site already had:
-//! the rules restated per crate, drifting apart, with only one copy ever
+//! One implementation, because the alternative is what the services already
+//! had: the rules restated per crate, drifting apart, with only one copy ever
 //! getting the fix.
 
 /// The q-value a client assigned to one content-coding.

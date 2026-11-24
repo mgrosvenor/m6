@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "a load generator, not a service: it measures from outside"
+)]
+
 /// bench-url-backend — minimal HTTP server for URL-backend benchmarking.
 ///
 /// Listens on a TCP port and responds to every GET with a fixed 200 OK body.
@@ -66,7 +71,7 @@ fn parse_args() -> Args {
         i += 1;
     }
     if a.proto.is_empty() || a.addr.is_empty() {
-        eprintln!("usage: bench-url-backend --proto <http|https|h2c|h2s> --addr HOST:PORT [--cert C --key K]");
+        eprintln!("usage: bench-url-backend --proto <http|https|h2c|h2s> --addr HOST:PORT [--cert C --key K] [--version] [--version-full]");
         std::process::exit(1);
     }
     a
@@ -306,9 +311,12 @@ fn send_response(send_buf: &mut Vec<u8>, enc: &mut hpack::Encoder, sid: u32) {
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .ok();
+    // `--version` and `--version-full` answer from constants fixed at build
+    // time, before any measurement arguments are required.
+    m6_core::version_flags!(m6_core::build_info::linked());
+
+    // Exactly one rustls provider feature is enabled (aws-lc-rs), so the first
+    // config builder resolves and installs it.
     let args = parse_args();
 
     let tls_config = if args.proto == "https" || args.proto == "h2s" {

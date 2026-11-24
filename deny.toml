@@ -9,6 +9,10 @@
 
 [graph]
 all-features = false
+# The three supported targets, so the licences and advisories of the crates
+# only one of them links (sysinfo and libc on macOS, rustix on Linux) are
+# checked by this one Linux run.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin"]
 
 [advisories]
 # A known vulnerability in anything we ship fails the build. There is no
@@ -69,6 +73,53 @@ ignore = [
     # neither is worth doing for an unreachable path. Re-check if lightningcss
     # ever moves to rkyv 0.8, or if we start reading sourcemaps.
     { id = "RUSTSEC-2026-0235", reason = "rkyv only reached via lightningcss sourcemap building; its one deserialise entry point is never called, and m6 touches no archives. Cannot patch: lightningcss pins 0.7" },
+
+    # ── chrono and its timezone crates: unmaintained, no upgrade exists ──────
+    #
+    # THREE ENTRIES, ONE ROOT, added 2026-11-17. RUSTSEC-2026-0543 is the
+    # advisory against chrono itself. The other two are named after the crates
+    # they cover: RUSTSEC-2026-0555 is chrono-tz and RUSTSEC-2026-0559 is
+    # chrono-tz-build, the build-time half of chrono-tz. All three are
+    # `informational = "unmaintained"` with an empty `patched` list, and all
+    # three arrived on this host at 21:30 today, in the advisory database's
+    # commit 233155b. The checkout had existed since 2026-11-15 without them,
+    # so an older database copy passes while this tree has not changed at all.
+    #
+    # WHAT PULLS THEM IN. m6-core declares chrono directly and uses it in
+    # production code. tera 1.20 pulls chrono-tz 0.9 and chrono-tz-build 0.3
+    # through its default `builtins` feature.
+    #
+    # WHY THE FIX IS NOT SMALL. There are 33 `chrono::` references in
+    # m6-core/src across six modules, and they parse and do calendar arithmetic
+    # as well as print:
+    #   util.rs        ISO dates from the wall clock and from file mtimes
+    #   telemetry.rs   the log envelope's microsecond timestamp
+    #   time_range.rs  RFC 3339 parsing of the from and to query keys
+    #   template.rs    the date_format filter, RFC 3339 and %Y-%m-%d
+    #   tls.rs         notBefore and notAfter as calendar dates, via NaiveDate
+    #   site.rs        the datetime and year template keys, and their tests
+    # Replacing chrono with jiff or time means rewriting all of that, including
+    # the certificate time parser and the strftime output of the date_format
+    # filter. That is a branch of its own, not a dependency bump, so it goes on
+    # the post-release list.
+    #
+    # NO MAINTAINED VERSION EXISTS. chrono 0.4.45 is the newest published
+    # release and all three advisories say `patched = []`. The newest
+    # chrono-tz, 0.10.4, still depends on chrono 0.4 and on chrono-tz-build
+    # 0.5, so moving it would swap one advisory for another. tera 2.4.0 has
+    # dropped chrono entirely, and that is a major template-engine upgrade on
+    # the same post-release list.
+    #
+    # SEVERITY. None of the three is a vulnerability. RUSTSEC-2020-0159, the
+    # localtime_r segfault, is patched from 0.4.20 and 0.4.45 is past it, so it
+    # does not fire and is not ignored here.
+    #
+    # REVISIT when the date code moves to jiff or time after the release, or
+    # when tera moves to 2.x. Delete these three entries then rather than
+    # leaving them to rot.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, not a vulnerability; replacing with jiff or time after the release. https://rustsec.org/advisories/RUSTSEC-2026-0543" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz is unmaintained, not a vulnerability; replacing with jiff or time after the release. https://rustsec.org/advisories/RUSTSEC-2026-0555" },
+    { id = "RUSTSEC-2026-0559", reason = "chrono-tz-build is unmaintained, not a vulnerability; replacing with jiff or time after the release. https://rustsec.org/advisories/RUSTSEC-2026-0559" },
 ]
 
 # ── RESOLVED on 2026-09-13, issue #3, rather than documented ──────────────────
@@ -112,11 +163,6 @@ allow = [
     # BSD Zero Clause, the most permissive of the family: no attribution
     # requirement at all. `quoted_printable`, via lettre, uses it.
     "0BSD",
-    "OpenSSL",
-    # The Mozilla root certificate store, shipped as data by webpki-roots. The
-    # Community Data License Agreement is permissive; it governs the data set
-    # rather than code, which is why it is not one of the usual names.
-    "CDLA-Permissive-2.0",
 ]
 
 [bans]
@@ -159,9 +205,12 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # THIS LIST IS WHY CI WENT RED AND THE BUILD HOST DID NOT. Repointing m6-http at
 # the fork changed the source and nothing updated this, so `cargo deny` failed on
 # every push from 2026-09-13 06:41 onwards while `deploy/run-tests.sh` kept
-# saying everything passed. cargo-deny runs ONLY in CI: the build host has no
-# cargo-deny and run-tests.sh does not call it. A gate that runs in one place
-# only is the third time this project has been caught by that shape.
+# saying everything passed. That script has since been deleted. The build host
+# now runs `cargo deny check` too: `tools/build-host-tests.sh:304-316` runs it
+# when cargo-deny is installed, and the report at line 618 fails the run on any
+# status other than 0, so a missing binary reports DENY_STATUS=127 and fails
+# rather than skips. A gate that runs in one place only is the third time this
+# project has been caught by that shape.
 #
 # Listed explicitly so that adding another git dependency is a decision somebody
 # makes rather than something that arrives with a transitive update.

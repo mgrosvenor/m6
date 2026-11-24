@@ -1,0 +1,69 @@
+[site]
+name   = "API Token Demo"
+domain = "localhost"
+
+[errors]
+mode             = "custom"
+path             = "/_errors"
+verbose_fallback = true
+
+[log]
+level  = "info"
+
+[[backend]]
+name    = "m6-html"
+sockets = "/tmp/m6/m6-html-api*.sock"
+
+[[backend]]
+name    = "m6-file"
+sockets = "/tmp/m6/m6-file-api*.sock"
+
+[[backend]]
+name    = "m6-auth"
+sockets = "/tmp/m6/m6-auth-api*.sock"
+
+[[backend]]
+name    = "m6-auth-check"
+sockets = "/tmp/m6/check-m6-auth-api*.sock"
+
+# Public pages
+[[route]]
+path    = "/"
+backend = "m6-html"
+
+[[route]]
+path    = "/login"
+backend = "m6-html"
+
+[[route]]
+path    = "/auth/login"
+backend = "m6-auth"
+
+[[route]]
+path    = "/auth/logout"
+backend = "m6-auth"
+
+[[route]]
+path    = "/auth/refresh"
+backend = "m6-auth"
+
+# Protected API endpoint — requires a valid Bearer token (or session cookie)
+[[route]]
+path    = "/api/data"
+backend = "m6-html"
+require = "role:api"
+
+# Protected dashboard — requires a valid session cookie
+[[route]]
+path    = "/dashboard"
+backend = "m6-html"
+require = "role:user"
+
+[[route]]
+path    = "/_errors"
+backend = "m6-html"
+
+[[route_group]]
+glob    = "assets/**/*"
+path    = "/assets/{relpath}"
+backend = "m6-file"

@@ -1,0 +1,16 @@
+[package]
+name    = "integration-test"
+version = "0.1.0"
+edition = "2021"
+
+# This crate has no library or binary — it exists solely for the integration test.
+[[test]]
+name    = "global_deployment"
+path    = "tests/global_deployment.rs"
+
+[dev-dependencies]
+rcgen         = "0.13"
+rustls        = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+tempfile      = "3"
+serde_json    = "1"

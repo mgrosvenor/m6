@@ -44,6 +44,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR/.."
 
+# The workflow sets CARGO_TERM_COLOR=always, and cargo then prefixes every
+# finding with an ANSI escape. The filter below reads `error` and `warning` at
+# the start of a line, so under colour it matched nothing and a failing run
+# printed only "clippy is not silent" with no finding named. Never colour the
+# capture: a gate that cannot say what failed costs the next reader a rerun.
+export CARGO_TERM_COLOR=never
+
 if [[ "${1:-}" == "--update" ]]; then
   echo "--update is gone: there is no ceiling to update. clippy must be silent." >&2
   exit 2

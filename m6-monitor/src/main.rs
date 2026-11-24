@@ -1,7 +1,8 @@
 //! `m6-monitor`: one page that says how the fleet is.
 //!
-//! Runs at origin, polls every node's `/health` and `/perf` over the backbone,
-//! and serves the digest. These routes:
+//! Runs at origin, polls every node's `/health` over the backbone, reads every
+//! node's metrics and traffic documents and every start-up record from mon's
+//! own journal, and serves the digest. These routes:
 //!
 //!   GET /          the page
 //!   GET /digest    the same thing as JSON, for anything that is not a person
@@ -13,37 +14,127 @@
 //! no token code. Access control is the `require` rule of the m6-http placed in
 //! front of the socket. See `history.rs` for the history and a front example.
 //!
+//! # One process and one event loop
+//!
+//! The monitor's `main` is start, run and stop, the shape every service has
+//! since the event-loop refactor: `m6_core::event` supplies the signals, the deadlines and the
+//! connection table, and `m6_core::platform` the reactor. The fleet poll is not a thread.
+//! It is a table of steps in this loop (`poll.rs`): each node's `/health`
+//! request, each tunnel connect and each crawler lookup is a descriptor the
+//! loop waits on, and so is the `journalctl` pipe `journal.rs` reads the two
+//! documents from, so a node that hangs holds only its own step and never the
+//! monitor.
+//!
+//! Nothing blocks while serving. The fleet, every node's host name, the
+//! history file and the host's certificate store are read at start, and a
+//! change to any of them needs a restart.
+//!
 //! It is an ordinary m6 service. It links `m6-core` and nothing else, gets its
-//! server loop, routing, templating and config from there, and is configured
-//! the way every other m6 service is. The interesting part is `digest.rs`,
-//! which is the only module here allowed to hold an opinion about what a
-//! number means.
+//! config, routing and logging from there, and is configured the way every
+//! other m6 service is. The interesting part is `digest.rs`, which is the only
+//! module here allowed to hold an opinion about what a number means.
 //!
 //! # Why this is not a script over ssh
 //!
-//! It used to be. `/health` and `/perf` are HTTP endpoints and the analytics
-//! stream is a file m6 writes, so the data was always reachable without a
-//! shell; what was missing was the host's own numbers, which are now on
-//! `/perf`. Polling over the backbone rather than shelling in means the
-//! monitor needs no credentials on the boxes, measures the path it actually
-//! cares about, and fails the way a service fails rather than the way a script
-//! does.
+//! `/health` is an HTTP endpoint and each node ships its journal to mon over
+//! the tunnel, so the data is reachable without a shell. What was missing was
+//! the host's own numbers, which the metrics line now carries. Polling and
+//! reading a journal rather than shelling in means the monitor needs no
+//! credentials on the boxes, measures the path it actually cares about, and
+//! fails the way a service fails rather than the way a script does.
+
+#![deny(unsafe_code)]
 
 mod check;
 mod digest;
+mod events;
 mod fleet;
 mod history;
+mod journal;
 mod poll;
+mod startup;
 mod tunnel;
 
-use std::time::Duration;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use anyhow::Result;
+use m6_core::drain::{Drain, Step};
+use m6_core::event::{LoopTrace, Slots, Timeouts};
+use m6_core::h1::{close_conn, head_slots, Flush, Read, RequestHead, ServerConn};
+use m6_core::net::listen_unix;
+use m6_core::platform::process::raise_fd_limit;
+use m6_core::platform::Signals;
+use m6_core::platform::{Events, Interest, Poll, Token};
 use m6_core::prelude::*;
+use m6_core::signal::{Action, Lifecycle};
+use m6_core::site::RouteMethod;
+use m6_core::{genid_failed, genid_ok};
 
-fn main() -> anyhow::Result<()> {
-    // `m6-monitor --check <config>` prints the hourly health check and exits,
-    // which is what `tools/health-check.py` used to do over ssh. Same code
-    // path as the page, so the two cannot disagree.
+/// The global allocator: mimalloc, which also counts calls when the
+/// `count-allocations` feature turns on m6-core's `alloc-count`. The counting
+/// is not compiled in a plain build.
+#[global_allocator]
+static ALLOC: m6_core::alloc::M6Alloc = m6_core::alloc::M6Alloc;
+
+const LISTENER: Token = Token(usize::MAX);
+const SIGNALS: Token = Token(usize::MAX - 1);
+/// The operational log's stdout, registered while it holds bytes a full
+/// destination would not take.
+const LOG: Token = Token(usize::MAX - 2);
+/// The journal reader's pipe: the `journalctl` child of the read in flight.
+const JOURNAL: Token = Token(usize::MAX - 3);
+/// The event series' own journal read. A second descriptor, so the two
+/// readers cannot take each other's lines.
+const EVENTS_JOURNAL: Token = Token(usize::MAX - 4);
+/// The accounting tick, and the longest the loop waits when nothing happens.
+const TICK: Duration = Duration::from_secs(1);
+const EVENTS: usize = 256;
+/// The five routes, in the order the service answers them. A code route's
+/// index in this slice is what `Handled::Code` carries. The first three are
+/// answered from the loop's own stored bytes; the last two read the history.
+const ROUTES: [CodeRoute; 5] = [
+    CodeRoute {
+        pattern: "/",
+        method: RouteMethod::Get,
+    },
+    CodeRoute {
+        pattern: "/digest",
+        method: RouteMethod::Get,
+    },
+    CodeRoute {
+        pattern: "/check",
+        method: RouteMethod::Get,
+    },
+    CodeRoute {
+        pattern: "/history",
+        method: RouteMethod::Get,
+    },
+    CodeRoute {
+        pattern: "/crawlers",
+        method: RouteMethod::Get,
+    },
+];
+
+/// How often the poll refreshes the fleet view.
+///
+/// Every request used to poll the whole fleet itself, which meant load on the
+/// nodes scaled with how often anyone LOOKED at the monitor, two requests
+/// moments apart could disagree because they came from different polls, and a
+/// plain `/digest` fetch took 2.9 to 3.6 seconds. A monitoring endpoint should
+/// answer instantly from a recent reading.
+const DEFAULT_POLL_SECS: u64 = 30;
+
+fn main() -> Result<()> {
+    // `--version` and `--version-full` answer from constants fixed at build
+    // time, before a config path is required. `--check` is read below.
+    m6_core::version_flags!(m6_core::build_info::linked());
+
+    // Never hand freed memory back to the OS: the heap grows and does not shrink.
+    m6_core::alloc::never_return();
+    // `m6-monitor --check <config>` prints the hourly health check and exits.
+    // Same poll code as the page, so the two cannot disagree.
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--check") {
         let config = args
@@ -51,212 +142,770 @@ fn main() -> anyhow::Result<()> {
             .skip(1)
             .find(|a| !a.starts_with("--"))
             .ok_or_else(|| anyhow::anyhow!("usage: m6-monitor --check <config-path>"))?;
-        return run_check(std::path::Path::new(config));
+        // A one-shot tool: no loop, so the log starts here and stops before
+        // the process exits.
+        m6_core::log::init(m6_core::log::Level::Info)?;
+        let result = run_check(Path::new(config));
+        m6_core::log::stop()?;
+        return result;
     }
-
-    App::with_global(build_state)
-        .on_reload(note_restart_only)
-        .route_get("/", page)
-        .route_get("/digest", digest_json)
-        .route_get("/check", check_text)
-        .route_get("/history", history_ndjson)
-        .route_get("/crawlers", crawlers_ndjson)
-        .run()?;
-    Ok(())
+    run_service()
 }
 
-/// How often the background poller refreshes the fleet view.
+/// A completed fleet poll and the three answers built from it.
 ///
-/// Every request used to poll the whole fleet itself, which meant load on the
-/// production nodes scaled with how often anyone LOOKED at the monitor, two
-/// requests moments apart could disagree because they came from different polls,
-/// and a plain `/digest` fetch took 2.9 to 3.6 seconds. A monitoring endpoint
-/// should answer instantly from a recent reading.
-const DEFAULT_POLL_SECS: u64 = 30;
-
-/// A completed fleet poll, and when it completed.
+/// The loop owns it: the poll writes it by plain assignment when it finishes
+/// and every request reads it through a shared borrow. One owner, no lock and
+/// no shared handle.
 struct Snapshot {
     digest: digest::Digest,
     readings: Vec<poll::NodeReading>,
-    at: std::time::Instant,
+    verdicts: check::Verdicts,
+    /// The page, rendered once per poll. Its figures never change between
+    /// polls, so a request copies the bytes.
+    page: Vec<u8>,
+    page_status: u16,
+    at: Instant,
     at_utc: String,
 }
 
-/// What every route reads. Nothing here polls.
-struct MonitorState {
-    /// `None` until the first poll completes. Reported as such rather than
-    /// served as zeroes: "not measured yet" and "measured as zero" are different
-    /// claims and this file already makes that distinction for sample counts.
-    latest: std::sync::Arc<std::sync::RwLock<Option<Snapshot>>>,
-    interval: Duration,
-    history: history::HistoryHandle,
-    /// What the config said at start for the keys read only then: the poll
-    /// interval in seconds and the history settings. A reload compares against
-    /// it to name a change that only a restart applies.
-    started: (u64, Option<history::Config>),
-}
-
-impl MonitorState {
-    /// Age of the current snapshot, and whether it is stale enough to distrust.
+impl Snapshot {
+    /// Age of the snapshot, and whether it is stale enough to distrust.
     ///
-    /// Stale at three missed intervals. A monitor serving an old reading without
-    /// saying so is worse than one that is plainly down, because it looks like
-    /// current information.
-    fn age(&self, snap: &Snapshot) -> (f64, bool) {
-        let age = snap.at.elapsed().as_secs_f64();
-        (age, age > self.interval.as_secs_f64() * 3.0)
+    /// Stale at three missed intervals. A monitor serving an old reading
+    /// without saying so is worse than one that is plainly down, because it
+    /// looks like current information.
+    fn age(&self, interval: Duration) -> (f64, bool) {
+        let age = self.at.elapsed().as_secs_f64();
+        (age, age > interval.as_secs_f64() * 3.0)
     }
 }
 
-/// Build the shared state and start the poller.
-fn build_state(ctx: &AppContext) -> Result<MonitorState> {
-    let interval_s = fleet::poll_interval_s(|k| ctx.config.get(k).and_then(|v| v.as_u64()));
-    let interval = Duration::from_secs(interval_s);
-    let latest: std::sync::Arc<std::sync::RwLock<Option<Snapshot>>> =
-        std::sync::Arc::new(std::sync::RwLock::new(None));
+// ── start, run and stop ─────────────────────────────────────────────────────
 
-    // `config_path` from the AppContext rather than argv. The old code read
-    // `std::env::args().nth(2)` inside the request handler, which quietly assumed
-    // an argument position.
-    let path = ctx.config_path.to_path_buf();
-    let writer = std::sync::Arc::clone(&latest);
-    // A bad key or a file from a newer release stops the start here (exit 2).
-    let history_config = history::config_from(ctx.config.get("monitor"), ctx.site_dir)?;
-    let (recorder, handle) = history::start(history_config.clone())?;
-    let poller_handle = handle.clone();
-    std::thread::spawn(move || loop {
-        match collect_from(&path, Some((&recorder, &poller_handle))) {
-            Ok((digest, readings)) => {
-                let snap = Snapshot {
-                    digest,
-                    readings,
-                    at: std::time::Instant::now(),
-                    at_utc: m6_core::util::now_iso8601(),
-                };
-                match writer.write() {
-                    Ok(mut g) => *g = Some(snap),
-                    Err(e) => tracing::error!(error = %e, "snapshot lock poisoned"),
-                }
-            }
-            // The previous snapshot is KEPT on failure, and its age keeps
-            // growing, which every response reports. Replacing it with an error
-            // would throw away the last known good reading; hiding the failure
-            // would present a stale one as current.
-            Err(e) => tracing::warn!(error = %format!("{e:#}"), "fleet poll failed"),
-        }
-        std::thread::sleep(interval);
-    });
+fn run_service() -> Result<()> {
+    // Block the signals before anything else: the mask is inherited only by
+    // threads created after this point, and logging starts one.
+    m6_core::signal::block();
 
-    Ok(MonitorState {
-        latest,
-        interval,
-        history: handle,
-        started: (interval_s, history_config),
-    })
-}
+    // ── start: blocking and allocation are fine ──────────────────────────
+    let mut site = Site::load_deferring_dump("m6-monitor", &ROUTES, &[], &NoTemplates);
+    let read_timeout = site.read_timeout();
+    let interval = Duration::from_secs(fleet::poll_interval_s(|k| {
+        site.user_config().get(k).and_then(|v| v.as_u64())
+    }));
+    let fleet = fleet::Fleet::from_config(site.config_path())
+        .unwrap_or_else(|e| fail("reading the fleet", format!("{e:#}")));
+    let history_config = history::config_from(site.user_config().get("monitor"), site.site_dir())
+        .unwrap_or_else(|e| fail("reading the history config", format!("{e:#}")));
 
-/// The keys of a reloaded config that differ from what was read at start.
-///
-/// The poller thread captured the interval and the history writer was opened
-/// with its file and size cap, so none of the three can change while the
-/// service runs.
-fn restart_only_changes(
-    started: &(u64, Option<history::Config>),
-    interval_s: u64,
-    history: &Option<history::Config>,
-) -> Vec<&'static str> {
-    let mut named = Vec::new();
-    if interval_s != started.0 {
-        named.push("poll_interval_s");
+    // `--dump-config` stops here, after the same fleet and history parse the
+    // start runs and before anything resolves a name, opens a file or binds a
+    // socket. One sequence, so the dump cannot accept a config the start
+    // refuses.
+    if site.dump_requested() {
+        std::process::exit(site.dump(&ROUTES, &[]));
     }
-    let file = |c: &Option<history::Config>| c.as_ref().map(|c| c.file.clone());
-    let cap = |c: &Option<history::Config>| c.as_ref().map(|c| c.max_bytes);
-    if file(history) != file(&started.1) {
-        named.push("[monitor].history_file");
-    }
-    if cap(history) != cap(&started.1) {
-        named.push("[monitor].history_max_mb");
-    }
-    named
-}
 
-/// Name a changed key that needs a restart.
-///
-/// The fleet in `[monitor]` is read again on every poll, so a change to it
-/// applies by itself. The poll interval and the history settings are read once.
-/// An invalid history key is a warning and not an `Err`: those keys are not
-/// applied live, and an `Err` would make core retry the reload every minute for
-/// nothing.
-fn note_restart_only(state: &MonitorState, ctx: &AppContext) -> Result<()> {
-    let interval_s = fleet::poll_interval_s(|k| ctx.config.get(k).and_then(|v| v.as_u64()));
-    let history = match history::config_from(ctx.config.get("monitor"), ctx.site_dir) {
-        Ok(h) => h,
-        Err(e) => {
-            tracing::warn!(error = %e, "config reload: the history keys are invalid and are ignored");
-            state.started.1.clone()
-        }
-    };
-    for key in restart_only_changes(&state.started, interval_s, &history) {
-        tracing::warn!("config reload: {key} changed; restart m6-monitor to apply it");
-    }
-    Ok(())
-}
-
-/// Poll the fleet, print the check, exit 1 on faults.
-fn run_check(config_path: &std::path::Path) -> anyhow::Result<()> {
-    let (d, readings) = collect_from(config_path, None)?;
-    print!("{}", check::render(&d, &readings));
-    if d.level == digest::Level::Fault {
-        std::process::exit(1);
-    }
-    Ok(())
-}
-
-/// Poll the fleet and build a digest, or explain why not.
-///
-/// With a recorder, the poll is also handed to the history writer. The history
-/// finding is added before the poll is recorded, so the stored verdict equals
-/// the one `/check` shows.
-fn collect_from(
-    config_path: &std::path::Path,
-    history: Option<(&history::Recorder, &history::HistoryHandle)>,
-) -> anyhow::Result<(digest::Digest, Vec<poll::NodeReading>)> {
-    let fleet = fleet::Fleet::from_config(config_path)?;
-    let token = fleet.perf_token();
-    let mut readings = poll::fleet(
-        &fleet.nodes,
-        token.as_deref(),
-        Duration::from_millis(fleet.timeout_ms),
-        &fleet.header_check,
+    m6_core::alloc::reserve(site.limits().get(&m6_core::limits::HEAP_RESERVE).start());
+    let tls = Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(
+                m6_core::client::system_roots()
+                    .unwrap_or_else(|e| fail("reading the host certificate store", e)),
+            )
+            .with_no_client_auth(),
     );
-    // Sequential with the HTTPS polls on purpose: the round trip is not taken
-    // while this host is doing its own TLS work.
-    let tunnels = tunnel::fleet(&fleet, Duration::from_millis(fleet.timeout_ms));
-    for (r, t) in readings.iter_mut().zip(tunnels) {
-        r.tunnel = t;
-    }
+    let nodes = fleet
+        .resolve(&tls)
+        .unwrap_or_else(|e| fail("resolving the fleet", format!("{e:#}")));
+    // The journal read's `--lines` window follows the fleet count, so it is
+    // taken before the fleet moves into the poller.
+    let node_count = nodes.len();
+    m6_core::ndjson::set_page_limit(site.limits().get(&m6_core::limits::NDJSON_PAGE));
+    let nameserver = m6_core::dns::nameserver()
+        .unwrap_or_else(|e| fail("reading the resolver configuration", e));
+    let mut history = history::start(
+        history_config,
+        site.limits().get(&m6_core::limits::HISTORY_QUEUE),
+    )
+    .unwrap_or_else(|e| fail("opening the history file", format!("{e:#}")));
     let thresholds = digest::Thresholds {
         tunnel_handshake_age_s: fleet.tunnel_handshake_max_age_s,
-        log_reopen_age_s: fleet.log_reopen_max_age_s,
+        health_last_ok_age_s: fleet.health_last_ok_limit_s(),
+        one_certificate: fleet.one_certificate,
         ..Default::default()
     };
-    let at_ms = unix_ms();
-    let mut d = digest::build(&readings, &thresholds, now_iso8601());
-    if let Some((recorder, handle)) = history {
-        let h = handle.digest();
-        if let Some(f) = history::finding(&h) {
-            d.add_finding(f);
+    let mut poller = poll::Poller::new(poll::Setup {
+        nodes,
+        timeout: Duration::from_millis(fleet.timeout_ms),
+        header_checks: fleet.header_check.clone(),
+        nameserver,
+        wg_file: fleet.wg_handshakes_file.clone(),
+        wg_max_age_s: fleet.tunnel_handshake_max_age_s,
+        lookup_cap: check::MAX_LOOKUPS_PER_POLL,
+        upstream_read: site.limits().get(&m6_core::limits::UPSTREAM_READ).clone(),
+        upstream_request: site
+            .limits()
+            .get(&m6_core::limits::UPSTREAM_REQUEST)
+            .clone(),
+        expected_file: fleet.expected_deploy_path(site.site_dir()),
+        environment: fleet.environment.clone(),
+        event_series: fleet.event_series.clone(),
+    });
+
+    // The journal is where a node's metrics and traffic lines are read from.
+    // A directory that is not there is said once and reported as a fault,
+    // never a refusal to start: the monitor's own page and check still run.
+    let journal_limit = site.limits().get(&m6_core::limits::JOURNAL_LINE).clone();
+    // One answer for both readers: the documents read and the event-series
+    // read are given the same directory, and the same reason when it is not
+    // there, so the page cannot report one of them working and the other not.
+    let journal_dir = fleet
+        .journal_path(site.site_dir())
+        .map_err(|e| format!("{e:#}"));
+    poller.journal = match &journal_dir {
+        Ok(dir) => journal::Reader::open(dir, node_count, interval, &journal_limit),
+        Err(reason) => {
+            m6_core::log::error!(error = %reason, "the journal cannot be read");
+            journal::Reader::unavailable(reason.clone(), &journal_limit)
         }
-        d.history = Some(h);
-        recorder.record(history::batch(at_ms, &readings, &d));
+    };
+    poller.open_event_read(journal_dir, &journal_limit, interval);
+
+    let ceiling = raise_fd_limit().unwrap_or_else(|e| fail("raising the open file limit", e));
+    if ceiling == 0 {
+        fail("the open file limit", "leaves no connection table");
     }
-    Ok((d, readings))
+    // A table larger than the descriptors the limit allows could never report
+    // itself full: `Slots::is_full` would stay false past the kernel's limit.
+    // The connection table follows the `connections` limit, and the open-file
+    // limit can lower its maximum.
+    let table = site.limits().get(&m6_core::limits::CONNECTIONS);
+    let ceiling = ceiling.min(table.max());
+    let initial = table.start().min(ceiling);
+    let mut poll = Poll::new().unwrap_or_else(|e| fail("creating the poll", e));
+    // The signal descriptor opens before the socket exists. Its existence is how
+    // a caller knows the service is ready, so a caller that waits for the socket
+    // and then sends SIGTERM must find the handler armed. A stop that arrives
+    // while the mask is blocked and no descriptor is open is discarded on
+    // macOS, and the service would then ignore the stop that followed its own
+    // bind.
+    let mut signals = Signals::new().unwrap_or_else(|e| fail("opening the signal descriptor", e));
+    let mut listener = listen_unix(site.socket_path(), site.socket_mode())
+        .unwrap_or_else(|e| fail(&format!("binding {}", site.socket_path().display()), e));
+    // The reserve the accept loop spends to refuse a connection when the
+    // process is out of descriptors. Opened here, before any pressure, and on
+    // the listener's own socket family.
+    let mut spare = m6_core::platform::net::SpareDescriptor::for_unix()
+        .unwrap_or_else(|e| fail("opening the reserve descriptor", e));
+    let mut refusals = m6_core::net::Refusals::new();
+    poll.registry()
+        .register(&mut listener, LISTENER, Interest::READABLE)
+        .unwrap_or_else(|e| fail("registering the listener", e));
+    poll.registry()
+        .register_fd(signals.raw_fd(), SIGNALS, Interest::READABLE)
+        .unwrap_or_else(|e| fail("registering the signal descriptor", e));
+    let mut lifecycle = Lifecycle::new(site.name(), Some(site.socket_path().to_path_buf()));
+    lifecycle.started();
+
+    // The whole connection table, every buffer in it, the deadlines, the
+    // outgoing slots and the events: made here, never grown except by `Slots`.
+    let read_limit = site.limits().get(&m6_core::limits::REQUEST_BODY).clone();
+    let write_limit = site.limits().get(&m6_core::limits::RESPONSE_BUFFER).clone();
+    let mut conns = Slots::new(initial, ceiling, move || {
+        ServerConn::with_limits(&read_limit, &write_limit)
+    });
+    // Accepted work and the shutdown drain, for client connections only: an
+    // outgoing node request is the monitor's own work and no client is waiting
+    // on it.
+    let drain_timeout = site.drain_timeout();
+    let mut drain = Drain::new(drain_timeout, initial);
+    // A config with `read_timeout_s = 0` keeps the zero duration and never
+    // touches a deadline.
+    let mut deadlines = Timeouts::new(initial, read_timeout.unwrap_or(Duration::ZERO));
+    let mut events = Events::with_capacity(EVENTS);
+    let mut trace = LoopTrace::new(&["accept", "client", "node", "probe", "dns", "tick", "log"]);
+    let mut out = poller.out();
+    let mut accepting = true;
+    let mut snapshot: Option<Snapshot> = None;
+    let mut poll_reported_late = false;
+    let mut last = m6_core::platform::now();
+    let mut last_report = last;
+    #[cfg(feature = "count-allocations")]
+    let mut client_allocs = 0u64;
+
+    // The journal's pipe joins the loop as one more descriptor, when there is
+    // one. It leaves again when the child stops, after the reactor has let the
+    // descriptor go.
+    let mut journal_fd = None;
+    if let Some(fd) = poller.journal.fd() {
+        poll.registry()
+            .register_fd(fd, JOURNAL, Interest::READABLE)
+            .unwrap_or_else(|e| fail("registering the journal", e));
+        journal_fd = Some(fd);
+    }
+    // The event-series read is its own child and its own pipe, so it cannot
+    // take the documents read's turn.
+    let mut events_fd = None;
+    if let Some(fd) = poller.events_journal.fd() {
+        poll.registry()
+            .register_fd(fd, EVENTS_JOURNAL, Interest::READABLE)
+            .unwrap_or_else(|e| fail("registering the event-series journal", e));
+        events_fd = Some(fd);
+    }
+
+    // The first poll starts with the service, so the page and the check have a
+    // reading before the first interval passes.
+    let first = poller
+        .start(&poll, &mut out, m6_core::platform::now())
+        .unwrap_or_else(|e| fail("starting the first poll", e));
+    publish(first, &mut snapshot, &thresholds, &mut history);
+
+    // ── run: nothing blocks ──────────────────────────────────────────────
+    'run: loop {
+        // The wait is the earlier of the two deadline tables and the tick. The
+        // poll starts on a tick, not on its own timer: one interval is 30
+        // ticks, and a second of lateness on the first request is the price of
+        // not keeping a second clock.
+        let now = m6_core::platform::now();
+        let mut wait = deadlines.timeout(now, TICK).min(poller.timeout(now, TICK));
+        // While draining, the wait is capped at the deadline: nothing else
+        // would wake the loop to notice it.
+        if let Some(left) = drain.poll_timeout(now) {
+            wait = wait.min(left);
+        }
+        match poll.poll(&mut events, Some(wait)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+        let now = m6_core::platform::now();
+        trace.waited(now - last);
+        // One sample per iteration, under the kind of its first event, as the
+        // other services report the trace.
+        let nodes = nodes_in(&out);
+        let trigger = match events.iter().next().map(|ev| ev.token()) {
+            Some(LISTENER) => 0,
+            Some(SIGNALS) => 5,
+            Some(LOG) => 6,
+            Some(JOURNAL) | Some(EVENTS_JOURNAL) => 6,
+            Some(Token(t)) if t < poll::CLIENT_BASE => 1,
+            Some(Token(t)) => {
+                let slot = t - poll::CLIENT_BASE;
+                if slot < nodes {
+                    2
+                } else if slot < nodes + tunnel::PROBES_PER_POLL {
+                    3
+                } else {
+                    4
+                }
+            }
+            None => 5,
+        };
+
+        for ev in &events {
+            match ev.token() {
+                // New connections: take a free slot for each, register it,
+                // start its read deadline.
+                LISTENER => {
+                    let mut served = false;
+                    while let Some(taken) = conns.take() {
+                        if let Some(new_len) = taken.grew_to {
+                            deadlines.grow(new_len);
+                            drain.grown(new_len);
+                        }
+                        let mut stream = match listener.accept() {
+                            Ok((stream, _)) => stream,
+                            // No connection was pending after all: give
+                            // the slot back rather than leaking it.
+                            Err(e) => match m6_core::platform::net::accept_error(&e) {
+                                m6_core::platform::net::Accept::Drained => {
+                                    conns.free(taken.key);
+                                    break;
+                                }
+                                m6_core::platform::net::Accept::SkipOne => {
+                                    conns.free(taken.key);
+                                    continue;
+                                }
+                                // Out of descriptors: close the reserve and take and
+                                // close every connection already queued, so the turn
+                                // ends with the queue empty and nothing waiting for a
+                                // wakeup that a full queue cannot deliver.
+                                m6_core::platform::net::Accept::Exhausted => {
+                                    conns.free(taken.key);
+                                    let drained = spare.drain(|| {
+                                        let (stream, _) = listener.accept()?;
+                                        drop(stream);
+                                        Ok(())
+                                    });
+                                    for _ in 0..drained.refused {
+                                        refusals.refused();
+                                    }
+                                    if let Some(e) = &drained.stopped {
+                                        m6_core::log::warn!(error = %e, "accept failed while draining the queued connections");
+                                    }
+                                    if let Some(e) = &drained.lost {
+                                        m6_core::log::warn!(error = %e, "the reserve descriptor could not be reopened");
+                                    }
+                                    if drained.needs_rearm() {
+                                        poll.registry().reregister(
+                                            &mut listener,
+                                            LISTENER,
+                                            Interest::READABLE,
+                                        )?;
+                                    }
+                                    break;
+                                }
+                                // Any other error: say so once and keep the
+                                // listener armed, so a connection still
+                                // queued is reported again rather than left
+                                // edge-triggered and unread.
+                                m6_core::platform::net::Accept::Stop => {
+                                    conns.free(taken.key);
+                                    m6_core::log::warn!(error = %e, "accept failed");
+                                    poll.registry().reregister(
+                                        &mut listener,
+                                        LISTENER,
+                                        Interest::READABLE,
+                                    )?;
+                                    break;
+                                }
+                            },
+                        };
+                        poll.registry().register(
+                            &mut stream,
+                            Token(taken.key),
+                            Interest::READABLE,
+                        )?;
+                        if read_timeout.is_some() {
+                            deadlines.touch(Token(taken.key), now);
+                        }
+                        conns.get_mut(taken.key).attach(stream);
+                        // Counted here, at the accept, not when a turn reads
+                        // the request: the window between the two is what
+                        // issue #338 measured.
+                        drain.begin(taken.key);
+                        served = true;
+                    }
+                    let counts = if served {
+                        refusals.flush(now)
+                    } else {
+                        refusals.due(now)
+                    };
+                    if let Some(counts) = counts {
+                        m6_core::net::warn_refused("m6-monitor", counts);
+                    }
+                    if conns.is_full() {
+                        // At the ceiling: stop accepting. New clients wait in
+                        // the kernel's backlog.
+                        poll.registry().deregister(&mut listener)?;
+                        accepting = false;
+                    }
+                }
+                SIGNALS => {
+                    while let Some(signal) = signals.read() {
+                        if lifecycle.on_signal(signal) == Action::Stop {
+                            // Stop accepting now, then answer what was already
+                            // accepted, until the count is zero or the
+                            // deadline passes. Nothing accepted means nothing
+                            // to wait for.
+                            stop_accepting(poll.registry(), &mut listener, &mut accepting)?;
+                            // Do not leave here even when nothing is in
+                            // flight: the zero-timeout turn the drain gives
+                            // the loop is what reads a request already in a
+                            // kept-alive socket. `step` decides, after it.
+                            drain.start(now);
+                        }
+                    }
+                }
+                LOG => m6_core::log::flush(),
+                JOURNAL => {
+                    if poller.read_journal() == journal::Event::Exited {
+                        if let Some(fd) = journal_fd.take() {
+                            let _ = poll.registry().deregister_fd(fd);
+                        }
+                        poller.journal.retire();
+                    }
+                }
+                EVENTS_JOURNAL => {
+                    if poller.read_events_journal() == journal::Event::Exited {
+                        if let Some(fd) = events_fd.take() {
+                            let _ = poll.registry().deregister_fd(fd);
+                        }
+                        poller.events_journal.retire();
+                    }
+                }
+                // One connection's turn: answer from the snapshot, or from
+                // the history for the two paged routes.
+                Token(k) if k < poll::CLIENT_BASE => {
+                    // A turn on the connection is accepted work. An idle
+                    // connection that sent another request is counted here,
+                    // so a request that arrives during the drain is answered.
+                    drain.begin(k);
+                    #[cfg(feature = "count-allocations")]
+                    let before = m6_core::testkit::alloc_count::now();
+                    let conn = conns.get_mut(k);
+                    let was = conn.interest();
+                    let turn = turn(conn, &mut site, snapshot.as_ref(), &history, interval);
+                    match turn {
+                        Ok(true) => {
+                            // Re-register only when the turn changed what the
+                            // connection waits for.
+                            if conn.interest() != was {
+                                let interest = conn.interest();
+                                let stream = conn
+                                    .stream()
+                                    .expect("every registered token has an attached connection");
+                                poll.registry().reregister(stream, Token(k), interest)?;
+                            }
+                            if read_timeout.is_some() {
+                                deadlines.touch(Token(k), now);
+                            }
+                            // Answered and holding nothing: idle, so it stops
+                            // holding the drain.
+                            if conn.served() > 0 && !conn.pending() {
+                                drain.end(k);
+                            }
+                        }
+                        _ => close(&poll, &mut conns, &mut deadlines, &mut drain, k)?,
+                    }
+                    #[cfg(feature = "count-allocations")]
+                    {
+                        client_allocs += (m6_core::testkit::alloc_count::now() - before) as u64;
+                    }
+                }
+                // One outgoing slot: a node's request, a tunnel connect or a
+                // crawler lookup.
+                Token(t) => {
+                    let slot = t - poll::CLIENT_BASE;
+                    let progress = poller.drive(&poll, &mut out, slot, m6_core::platform::now())?;
+                    publish(progress, &mut snapshot, &thresholds, &mut history);
+                }
+            }
+        }
+
+        // A full stdout holds its bytes in the Sink. Watch it for writability
+        // only while it does, so the loop never waits on the log.
+        if let Err(e) = m6_core::log::watch(poll.registry(), LOG) {
+            m6_core::log::error!(error = %e, "log descriptor registration failed");
+        }
+
+        // Outgoing work whose deadline passed: a timed-out node step, a lost
+        // probe or a failed lookup, each recorded and moved on.
+        while let Some(progress) = poller.expire(&poll, &mut out, m6_core::platform::now())? {
+            publish(progress, &mut snapshot, &thresholds, &mut history);
+        }
+        // Close every client whose read deadline passed, with no response.
+        while let Some(Token(k)) = deadlines.expired(m6_core::platform::now()) {
+            close(&poll, &mut conns, &mut deadlines, &mut drain, k)?;
+        }
+
+        // The drain: leave the turn the last accepted request finishes, or at
+        // the deadline, and say how many were left when it was the deadline.
+        if drain.draining() {
+            match drain.step(m6_core::platform::now()) {
+                Step::Draining => {}
+                Step::Finished => break 'run,
+                Step::DeadlinePassed(unfinished) => {
+                    m6_core::log::warn!(
+                        unfinished,
+                        timeout_s = drain_timeout.as_secs(),
+                        "drain deadline passed with requests still in flight"
+                    );
+                    break 'run;
+                }
+            }
+        }
+
+        // A slot came free while the table was full: accept again. Never
+        // while draining: the listener stays closed.
+        if !accepting && !drain.draining() && !conns.is_full() {
+            poll.registry()
+                .register(&mut listener, LISTENER, Interest::READABLE)?;
+            accepting = true;
+        }
+
+        // The tick: start a poll when the interval has passed since the last
+        // one started and none is running. A poll still running at its next
+        // due time is not restarted; the tick says so once and waits.
+        let now = m6_core::platform::now();
+        let due = poller
+            .last_start()
+            .is_none_or(|start| now.duration_since(start) >= interval);
+        if due && poller.is_running() {
+            if !poll_reported_late {
+                m6_core::log::debug!("a poll is still running at its next due time; waiting");
+                poll_reported_late = true;
+            }
+        } else if due {
+            poll_reported_late = false;
+            let progress = poller.start(&poll, &mut out, now)?;
+            publish(progress, &mut snapshot, &thresholds, &mut history);
+        }
+
+        // The journal read has the poll's interval and the loop's own tick, and
+        // no timer of its own. A read in flight past one interval is killed and
+        // reported. At most one read starts per interval, so a poll that
+        // overruns does not turn this into a read on every pass, and a read
+        // still in flight is not doubled. A read that starts gets its pipe
+        // registered here.
+        if poller.journal.expire(now) {
+            if let Some(fd) = journal_fd.take() {
+                let _ = poll.registry().deregister_fd(fd);
+            }
+            poller.journal.retire();
+            m6_core::log::error!(
+                error = poller.journal.stopped.as_deref().unwrap_or_default(),
+                "the journal read overran"
+            );
+        }
+        if poller.journal.start_if_idle(now) {
+            if let Some(fd) = poller.journal.fd() {
+                poll.registry()
+                    .register_fd(fd, JOURNAL, Interest::READABLE)?;
+                journal_fd = Some(fd);
+            }
+        }
+        if poller.events_journal.expire(now) {
+            if let Some(fd) = events_fd.take() {
+                let _ = poll.registry().deregister_fd(fd);
+            }
+            poller.events_journal.retire();
+            m6_core::log::error!(
+                error = poller.events_journal.stopped.as_deref().unwrap_or_default(),
+                "the event-series journal read overran"
+            );
+        }
+        if poller.events_journal.start_if_idle(now) {
+            if let Some(fd) = poller.events_journal.fd() {
+                poll.registry()
+                    .register_fd(fd, EVENTS_JOURNAL, Interest::READABLE)?;
+                events_fd = Some(fd);
+            }
+        }
+
+        // The accounting tick: report and clear the loop's wait and work per
+        // trigger. The monitor serves no metrics page, so the report is the
+        // tick's own accounting rather than a served number.
+        let end = m6_core::platform::now();
+        trace.worked(trigger, end - now);
+        last = end;
+        if end - last_report >= TICK {
+            m6_core::log::tick(m6_core::platform::wall());
+            m6_core::alloc::note_growth();
+            let _ = trace.report();
+            last_report = end;
+        }
+    }
+
+    // ── stop: blocking and allocation are fine ───────────────────────────
+    // Outgoing work in flight is dropped. A batch held for a busy database is
+    // tried once more; a failure is logged, never a wait.
+    history.flush();
+    #[cfg(feature = "count-allocations")]
+    eprintln!("{client_allocs} allocation(s) in the client arm outside table growth");
+    // The journal's child is killed here, so no `journalctl` outlives the
+    // monitor.
+    poller.journal.retire();
+    // Reaching here means nothing accepted is left, or the drain deadline
+    // passed and the warning already named how many were. `complete` removes
+    // the socket and logs the line.
+    //
+    // A refusal the rate limit was still holding back when the loop ended is
+    // written here. There is no later turn to carry it, so the interval does
+    // not apply: the last line reports every count the process took.
+    m6_core::net::close_refusals("m6-monitor", &mut refusals);
+    lifecycle.complete();
+    m6_core::log::stop()?;
+    Ok(())
 }
 
-fn unix_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+/// Stop accepting, so new clients wait in the kernel's backlog.
+fn stop_accepting(
+    registry: &m6_core::platform::Registry,
+    listener: &mut m6_core::platform::net::UnixListener,
+    accepting: &mut bool,
+) -> std::io::Result<()> {
+    if *accepting {
+        registry.deregister(listener)?;
+        *accepting = false;
+    }
+    Ok(())
+}
+
+/// Close one client connection and stop counting its accepted work.
+fn close(
+    poll: &Poll,
+    conns: &mut Slots<ServerConn>,
+    deadlines: &mut Timeouts,
+    drain: &mut Drain,
+    k: usize,
+) -> std::io::Result<()> {
+    drain.end(k);
+    close_conn(poll, conns, deadlines, k)
+}
+
+/// One connection's turn: write what is owed, read, answer and write until the
+/// socket would block. Returns whether the connection stays open.
+fn turn(
+    conn: &mut ServerConn,
+    site: &mut Site,
+    snapshot: Option<&Snapshot>,
+    history: &history::History,
+    interval: Duration,
+) -> std::io::Result<bool> {
+    loop {
+        // Write what is owed before reading anything. A streamed body is not
+        // in the output buffer, so a read here would let the next request's
+        // answer replace it mid-body.
+        if conn.interest() == Interest::WRITABLE {
+            match conn.flush()? {
+                Flush::Done => {}
+                Flush::More => return Ok(true),
+                Flush::Close => return Ok(false),
+            }
+        }
+        // Made where it is used: the head borrows the slots, and a mutable
+        // reference to a long-lived array cannot be reborrowed per turn.
+        let mut heads = head_slots();
+        let read = conn.read(&mut heads)?;
+        let (reply, idle) = match read {
+            Read::Request(head) => (
+                Some(answer(&head, site, snapshot, history, interval)),
+                false,
+            ),
+            Read::More => (None, true),
+            Read::Closed => return Ok(false),
+        };
+        if let Some(reply) = reply {
+            let reply = match reply {
+                // The reserved path: run the start path again and assign the
+                // new Site in the loop's own binding, or keep serving the old
+                // one and answer the cause.
+                Answer::Reload(reload) => {
+                    let response = match site.reload(&ROUTES, &[], &NoTemplates) {
+                        Ok(next) => {
+                            *site = next;
+                            genid_ok()
+                        }
+                        Err(e) => genid_failed(&e),
+                    };
+                    Answer::Response(m6_core::site::finish_reload(&reload, response))
+                }
+                answer => answer,
+            };
+            match reply {
+                Answer::Bytes {
+                    status,
+                    headers,
+                    body,
+                } => conn.respond(status, headers, body),
+                Answer::Response(response) => conn.respond_response(response),
+                Answer::Reload(_) => unreachable!("the reload arm above replaced it"),
+            }
+        }
+        match conn.flush()? {
+            // The answer is out and the connection keeps alive. A pipelined
+            // request may already be buffered, so read again before waiting.
+            Flush::Done if !idle => {}
+            Flush::Done | Flush::More => return Ok(true),
+            Flush::Close => return Ok(false),
+        }
+    }
+}
+
+/// What one request is answered with: stored bytes that copy into the
+/// connection's buffer, or a response the request built.
+enum Answer<'a> {
+    Bytes {
+        status: u16,
+        headers: &'static [(&'static str, &'static str)],
+        body: &'a [u8],
+    },
+    Response(Response),
+    /// `POST /genid`: the turn runs the start path again and assigns the new
+    /// Site, which only the loop can do, then writes the reload's access line.
+    Reload(m6_core::site::Reload),
+}
+
+/// The answer to one parsed request.
+///
+/// `/`, `/digest` and `/check` are answered here from the loop's snapshot.
+/// `/history` and `/crawlers` go through the site's dispatch, because they
+/// parse a query and read the store, which allocate anyway. Every other path
+/// is the site's 404.
+fn answer<'a>(
+    head: &RequestHead<'_>,
+    site: &Site,
+    snapshot: Option<&'a Snapshot>,
+    history: &history::History,
+    interval: Duration,
+) -> Answer<'a> {
+    // The stored answers are all GETs. Any other method falls through to the
+    // site's dispatch, which answers the 404 a route without that method earns.
+    if head.method == "GET" {
+        match head.path {
+            "/" => return page_answer(snapshot),
+            "/digest" => return Answer::Response(digest_json(snapshot, interval)),
+            "/check" => return Answer::Response(check_text(snapshot, interval)),
+            _ => {}
+        }
+    }
+    match site.handle(head) {
+        Handled::Done(response) => Answer::Response(response),
+        // `find_route` trims outer slashes, so `/digest/`, `//` and a
+        // relative `digest` arrive here as the code routes the byte-equal arm
+        // above answers. They are answered from the snapshot the same way,
+        // because a slash is not a reason to abort the loop.
+        Handled::Code(index, req) => match index {
+            0 => page_answer(snapshot),
+            1 => Answer::Response(digest_json(snapshot, interval)),
+            2 => Answer::Response(check_text(snapshot, interval)),
+            3 => Answer::Response(routed(history_ndjson(&req, history), &req, site)),
+            4 => Answer::Response(routed(crawlers_ndjson(&req, history), &req, site)),
+            // Five routes give indices nought to four. A sixth cannot exist;
+            // a 404 is a cheaper answer than ending the process if one ever did.
+            _ => Answer::Response(site.finish(&req, Response::not_found())),
+        },
+        Handled::Named(..) => unreachable!("m6-monitor registers no named handler"),
+        Handled::Reload(reload) => Answer::Reload(reload),
+    }
+}
+
+/// Finish a paged route's answer, with an error turned into the site's own
+/// error response.
+fn routed(response: m6_core::Result<Response>, req: &Request, site: &Site) -> Response {
+    match response {
+        Ok(response) => site.finish(req, response),
+        Err(e) => site.finish(req, m6_core::response::error_to_response(&e)),
+    }
+}
+
+const HTML: &[(&str, &str)] = &[
+    ("Content-Type", "text/html; charset=utf-8"),
+    ("Cache-Control", "no-store"),
+    ("X-Robots-Tag", "noindex, nofollow"),
+];
+const JSON: &[(&str, &str)] = &[
+    ("Content-Type", "application/json"),
+    ("Cache-Control", "no-store"),
+];
+
+/// The page, or "no poll yet" as JSON, from bytes the poll stored.
+fn page_answer(snapshot: Option<&Snapshot>) -> Answer<'_> {
+    match snapshot {
+        Some(snap) => Answer::Bytes {
+            status: snap.page_status,
+            headers: HTML,
+            body: &snap.page,
+        },
+        None => Answer::Bytes {
+            status: 503,
+            headers: JSON,
+            body: b"{\"error\":\"no fleet poll has completed yet\"}",
+        },
+    }
 }
 
 /// A plain-text answer that no cache may keep.
@@ -267,12 +916,59 @@ fn plain(status: u16, text: &str) -> Response {
         .header("X-Content-Type-Options", "nosniff")
 }
 
-fn history_ndjson(req: &Request, st: &MonitorState) -> Result<Response> {
-    paged(req, st, history::health_page)
+/// The digest from the latest snapshot, as JSON.
+///
+/// The body is serialized per request because its age fields are the age of
+/// the reading at this request: the plan's stored-bytes shape would freeze
+/// them at the poll that made it, and a consumer could no longer tell a
+/// 3-second-old digest from a 40-minute-old one.
+fn digest_json(snapshot: Option<&Snapshot>, interval: Duration) -> Response {
+    let Some(snap) = snapshot else {
+        return Response::json_status(json!({"error": "no fleet poll has completed yet"}), 503)
+            .header("Cache-Control", "no-store");
+    };
+    let (age, stale) = snap.age(interval);
+    let mut v = serde_json::to_value(&snap.digest).unwrap_or(json!({}));
+    // Age is part of the reading, not metadata.
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("snapshot_age_s".into(), json!((age * 10.0).round() / 10.0));
+        obj.insert("snapshot_at".into(), json!(snap.at_utc));
+        obj.insert("poll_interval_s".into(), json!(interval.as_secs()));
+        obj.insert("stale".into(), json!(stale));
+    }
+    Response::json(v).header("Cache-Control", "no-store")
 }
 
-fn crawlers_ndjson(req: &Request, st: &MonitorState) -> Result<Response> {
-    paged(req, st, history::crawl_page)
+/// The whole A-to-H report, as text, from the latest snapshot.
+///
+/// Its first line is the age of the reading at this request, so the body is
+/// built per request for the same reason `/digest`'s is.
+fn check_text(snapshot: Option<&Snapshot>, interval: Duration) -> Response {
+    let Some(snap) = snapshot else {
+        return Response::text("no fleet poll has completed yet\n").with_status(503);
+    };
+    let (age, stale) = snap.age(interval);
+    let mut out = String::new();
+    // The age goes FIRST, before any figure, so it cannot be read past.
+    if stale {
+        out.push_str(&format!(
+            "STALE: this reading is {age:.0}s old and the poll interval is {}s. \
+             The poller is failing; the figures below are not current.\n\n",
+            interval.as_secs()
+        ));
+    } else {
+        out.push_str(&format!("polled {age:.1}s ago ({})\n", snap.at_utc));
+    }
+    out.push_str(&check::render(&snap.digest, &snap.readings, &snap.verdicts));
+    Response::text(&out).header("Cache-Control", "no-store")
+}
+
+fn history_ndjson(req: &Request, history: &history::History) -> m6_core::Result<Response> {
+    paged(req, history, history::health_page)
+}
+
+fn crawlers_ndjson(req: &Request, history: &history::History) -> m6_core::Result<Response> {
+    paged(req, history, history::crawl_page)
 }
 
 /// The shared read path of `/history` and `/crawlers`.
@@ -281,12 +977,12 @@ fn crawlers_ndjson(req: &Request, st: &MonitorState) -> Result<Response> {
 /// chunks of 256 rows, and stops reading when the page is full.
 fn paged<T: history::Keyed>(
     req: &Request,
-    st: &MonitorState,
+    history: &history::History,
     read: history::PageFn<T>,
-) -> Result<Response> {
+) -> m6_core::Result<Response> {
     use m6_core::ndjson::{Cursor, PageLimits};
 
-    let Some(path) = st.history.file() else {
+    let Some(path) = history.file() else {
         return Ok(plain(
             503,
             "history is off: set [monitor] history_file to keep one\n",
@@ -336,122 +1032,129 @@ fn paged<T: history::Keyed>(
     Ok(page.into_response(req.query(), next.as_ref()))
 }
 
-/// The digest from the latest snapshot, for the HTML page.
-///
-/// Clones the digest because the page holds it across the render while the lock
-/// must not be. A digest is small; blocking the poller for the length of an HTML
-/// build would not be.
-fn snapshot_digest(st: &MonitorState) -> anyhow::Result<digest::Digest> {
-    let guard = st
-        .latest
-        .read()
-        .map_err(|e| anyhow::anyhow!("snapshot unreadable: {e}"))?;
-    let snap = guard
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("no fleet poll has completed yet"))?;
-    Ok(snap.digest.clone())
-}
+// ── the poll's result becomes the snapshot ──────────────────────────────────
 
-/// The whole A-to-H report, as text, from the latest snapshot.
-///
-/// This is what `--check` printed, and the only reason that flag existed: the
-/// report had no route out. With this it is reachable the way everything else is,
-/// over an ssh-forwarded socket:
-///
-/// ```text
-/// ssh -fN -L /tmp/m6mon.sock:/run/m6/m6-monitor.sock user@example.com
-/// curl --unix-socket /tmp/m6mon.sock http://localhost/check
-/// ```
-fn check_text(_req: &Request, st: &MonitorState) -> Result<Response> {
-    let guard = match st.latest.read() {
-        Ok(g) => g,
-        Err(e) => return Ok(Response::text(&format!("snapshot unreadable: {e}")).with_status(503)),
+/// Store a finished poll: the digest, the history batch, the page bytes and
+/// the reading a check reads. A poll that did not finish changes nothing, so
+/// the previous snapshot is kept and its age keeps growing.
+fn publish(
+    progress: poll::Progress,
+    snapshot: &mut Option<Snapshot>,
+    thresholds: &digest::Thresholds,
+    history: &mut history::History,
+) {
+    let poll::Progress::Done(polled) = progress else {
+        return;
     };
-    let Some(snap) = guard.as_ref() else {
-        return Ok(Response::text("no fleet poll has completed yet\n").with_status(503));
-    };
-    let (age, stale) = st.age(snap);
-    let mut out = String::new();
-    // The age goes FIRST, before any figure, so it cannot be read past.
-    if stale {
-        out.push_str(&format!(
-            "STALE: this reading is {age:.0}s old and the poll interval is {}s. \
-             The poller is failing; the figures below are not current.\n\n",
-            st.interval.as_secs()
-        ));
-    } else {
-        out.push_str(&format!("polled {age:.1}s ago ({})\n", snap.at_utc));
+    let at_ms = history::now_ms();
+    let mut d = digest::build(&polled.readings, thresholds, now_iso8601());
+    // The start-up record's checks: the deploy's expectation file and the
+    // journal's own records, judged beside every other reading.
+    startup::judge(&mut d, &polled.startup);
+    // The event series: the counts on the page, and a Fault for any series
+    // whose refusal names the service's own configuration.
+    d.events = polled.events;
+    for f in events::findings(&d.events) {
+        d.add_finding(f);
     }
-    out.push_str(&check::render(&snap.digest, &snap.readings));
-    Ok(Response::text(&out))
-}
-
-fn digest_json(_req: &Request, st: &MonitorState) -> Result<Response> {
-    let guard = match st.latest.read() {
-        Ok(g) => g,
-        // 503 rather than 500: the monitor is up, the fleet view is not.
-        Err(e) => {
-            return Ok(Response::json_status(
-                json!({"error": format!("snapshot unreadable: {e}")}),
-                503,
-            ))
-        }
-    };
-    let Some(snap) = guard.as_ref() else {
-        return Ok(Response::json_status(
-            json!({"error": "no fleet poll has completed yet"}),
-            503,
-        ));
-    };
-    let (age, stale) = st.age(snap);
-    let mut v = serde_json::to_value(&snap.digest).unwrap_or(json!({}));
-    // Age is part of the reading, not metadata. A consumer that cannot tell a
-    // 3-second-old digest from a 40-minute-old one is guessing.
-    if let Some(obj) = v.as_object_mut() {
-        obj.insert("snapshot_age_s".into(), json!((age * 10.0).round() / 10.0));
-        obj.insert("snapshot_at".into(), json!(snap.at_utc));
-        obj.insert("poll_interval_s".into(), json!(st.interval.as_secs()));
-        obj.insert("stale".into(), json!(stale));
+    let h = history.digest();
+    if let Some(f) = history::finding(&h) {
+        d.add_finding(f);
     }
-    Ok(Response::json(v))
-}
-
-fn page(_req: &Request, st: &MonitorState) -> Result<Response> {
-    let d = match snapshot_digest(st) {
-        Ok(d) => d,
-        Err(e) => {
-            return Ok(Response::json_status(
-                json!({"error": format!("{e:#}")}),
-                503,
-            ));
+    d.history = Some(h);
+    // The HEALTH section's own judgement reaches the verdict through the same
+    // list as every other fault, so a line that reads FAULT cannot sit above
+    // an ALL CLEAR. The digest already raises the unreachable and degraded
+    // ones, and this adds the age of the last 200, which only the history
+    // knows.
+    for r in &polled.readings {
+        if let Some(f) =
+            check::stale_last_ok_finding(r, d.history.as_ref(), thresholds.health_last_ok_age_s)
+        {
+            d.add_finding(f);
         }
-    };
-    // 503 when something is actually broken, so a check pointed at this page
-    // is useful without parsing it.
-    let code = if d.level == digest::Level::Fault {
+    }
+    history.record(history::batch(at_ms, &polled.readings, &d));
+    let page_status = if d.level == digest::Level::Fault {
         503
     } else {
         200
     };
-    Ok(Response::html(render(&d))
-        .with_status(code)
-        // A monitoring page must never be served from a cache, by us or by
-        // anything between us and the reader.
-        .header("Cache-Control", "no-store")
-        .header("X-Robots-Tag", "noindex, nofollow"))
+    let page = render(&d).into_bytes();
+    *snapshot = Some(Snapshot {
+        digest: d,
+        readings: polled.readings,
+        verdicts: polled.verdicts,
+        page,
+        page_status,
+        at: polled.at,
+        at_utc: now_iso8601(),
+    });
 }
 
-fn dur(secs: u64) -> String {
-    let d = secs / 86_400;
-    let h = (secs % 86_400) / 3_600;
-    let m = (secs % 3_600) / 60;
-    if d > 0 {
-        format!("{d}d {h}h")
-    } else if h > 0 {
-        format!("{h}h {m}m")
-    } else {
-        format!("{m}m")
+/// How many of the outgoing slots are nodes' requests.
+fn nodes_in(out: &[poll::Out]) -> usize {
+    out.len() - tunnel::PROBES_PER_POLL - check::MAX_LOOKUPS_PER_POLL
+}
+
+// ── --check: the same poll, once, in its own process ────────────────────────
+
+/// Build the poll with its own reactor, drive it until it finishes, print the
+/// check, and exit 1 on faults.
+///
+/// It shares every poll function with the service, so the page and the check
+/// cannot disagree.
+fn run_check(config_path: &Path) -> Result<()> {
+    let fleet = fleet::Fleet::from_config(config_path)?;
+    let tls = Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(m6_core::client::system_roots()?)
+            .with_no_client_auth(),
+    );
+    let thresholds = digest::Thresholds {
+        tunnel_handshake_age_s: fleet.tunnel_handshake_max_age_s,
+        health_last_ok_age_s: fleet.health_last_ok_limit_s(),
+        one_certificate: fleet.one_certificate,
+        ..Default::default()
+    };
+    // One run, one cache, with the wider one-shot cap. `--check` keeps no
+    // history, so its digest says so.
+    let mut poller = poll::one_shot_poller(
+        &fleet,
+        &tls,
+        m6_core::dns::nameserver()?,
+        check::MAX_LOOKUPS_PER_CHECK,
+    )?;
+    // The deploy's expectation file, resolved the same way the journal
+    // directory is: against the config file's own directory.
+    let site_dir = config_path.parent().unwrap_or(Path::new("."));
+    poller.set_expected_file(fleet.expected_deploy_path(site_dir));
+    // The metrics and traffic documents are read from the journal before the
+    // poll, until every node has both or the settle bound passes. A one-shot
+    // tool may wait here, so this is a bounded read rather than a loop turn.
+    let limit = m6_core::limits::Limit::builtin(&m6_core::limits::JOURNAL_LINE);
+    poller.read_journal_once(
+        fleet
+            .journal_path(config_path.parent().unwrap_or(Path::new(".")))
+            .map_err(|e| format!("{e:#}")),
+        &limit,
+    );
+    let mut out = poller.out();
+    let polled = poll::drive_to_end(&mut poller, &mut out, None)?;
+    let mut d = digest::build(&polled.readings, &thresholds, now_iso8601());
+    startup::judge(&mut d, &polled.startup);
+    d.events = polled.events;
+    for f in events::findings(&d.events) {
+        d.add_finding(f);
     }
+    // The report goes through `print!`, so stop the log first: it flushes and
+    // puts stdout back to the blocking flag the process started with.
+    m6_core::log::stop()?;
+    print!("{}", check::render(&d, &polled.readings, &polled.verdicts));
+    if d.level == digest::Level::Fault {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn bytes(n: u64) -> String {
@@ -572,8 +1275,12 @@ fn render(d: &digest::Digest) -> String {
             n.thermal_max_c
                 .map(|c| format!("{c:.0}C"))
                 .unwrap_or_else(|| "-".into()),
-            n.uptime_s.map(dur).unwrap_or_else(|| "-".into()),
-            n.host_uptime_s.map(dur).unwrap_or_else(|| "-".into()),
+            n.uptime_s
+                .map(digest::fmt_uptime)
+                .unwrap_or_else(|| "-".into()),
+            n.host_uptime_s
+                .map(digest::fmt_uptime)
+                .unwrap_or_else(|| "-".into()),
             // The same wording as /check section H.
             match &n.tunnel {
                 Some(t) => m6_core::util::html_escape(&format!(
@@ -594,7 +1301,7 @@ fn render(d: &digest::Digest) -> String {
         } else {
             n.pools
                 .iter()
-                .map(|(name, a, t)| format!("{name} {a}/{t}"))
+                .map(|(name, count)| format!("{name} {count}"))
                 .collect::<Vec<_>>()
                 .join(" &middot; ")
         };
@@ -606,6 +1313,12 @@ fn render(d: &digest::Digest) -> String {
     }
     h.push_str("</table></div>");
     h
+}
+
+/// A failure at start is an error: print it and exit 2.
+fn fail(what: &str, error: impl std::fmt::Display) -> ! {
+    eprintln!("m6-monitor: {what}: {error}");
+    std::process::exit(2)
 }
 
 #[cfg(test)]
@@ -659,6 +1372,22 @@ mod tests {
         assert!(html.contains("no tunnel"), "{html}");
     }
 
+    /// The page's "svc up" column uses the same formatter as the check, so a
+    /// node up 42 minutes reads "42m" on both and never "0h".
+    #[test]
+    fn the_page_uses_the_shared_uptime_formatter() {
+        let mut d = digest::build(&[], &digest::Thresholds::default(), "now".into());
+        let mut n = node_digest("edge-a", None);
+        n.uptime_s = Some(42 * 60);
+        d.nodes = vec![n];
+        let html = render(&d);
+        assert!(
+            html.contains(&format!("<td>{}</td>", digest::fmt_uptime(42 * 60))),
+            "{html}"
+        );
+        assert_eq!(digest::fmt_uptime(42 * 60), "42m");
+    }
+
     /// Node name, role and status come from config and from the nodes, and
     /// reach the page as HTML.
     #[test]
@@ -682,5 +1411,38 @@ mod tests {
         assert!(html.contains("&lt;i&gt;edge&lt;/i&gt;"), "{html}");
         assert!(html.contains("&lt;b&gt;cache&lt;/b&gt;"), "{html}");
         assert!(html.contains("&lt;u&gt;ok&lt;/u&gt;"), "{html}");
+    }
+
+    /// The automatic client-config builder resolves the one provider.
+    ///
+    /// This replaces the source scan that required every
+    /// `ClientConfig::builder()` call to name its provider. That rule existed
+    /// because a workspace-wide test build compiled rustls with both providers:
+    /// m6-http's dev-dependency `tokio-rustls` pulled `aws-lc-rs` in while the
+    /// direct dependency named ring, so the automatic builder had no default
+    /// and panicked. A per-crate build compiled only ring and hid it, which is
+    /// how a per-crate gate passed while the workspace build failed.
+    ///
+    /// m6-monitor, m6-core and m6-http now all name `aws_lc_rs` and none names
+    /// `ring`, so there is one provider in every build and the automatic
+    /// builder is unambiguous. This test holds that invariant by behaviour: a
+    /// second provider pulled into any workspace build panics the builder, and
+    /// a workspace that resolved a different single provider fails the
+    /// key-exchange check. X25519MLKEM768 is what tells aws-lc-rs's default
+    /// apart from ring's.
+    #[test]
+    fn the_automatic_client_config_builder_resolves_the_one_provider() {
+        let _config = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let provider = rustls::crypto::CryptoProvider::get_default()
+            .expect("the automatic builder installs the provider from the crate features");
+        assert!(
+            provider
+                .kx_groups
+                .iter()
+                .any(|g| matches!(g.name(), rustls::NamedGroup::X25519MLKEM768)),
+            "the automatic builder resolved a provider other than aws-lc-rs"
+        );
     }
 }

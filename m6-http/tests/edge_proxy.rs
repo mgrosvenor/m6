@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 /// Edge proxy integration tests.
 ///
 /// Validates m6-http in the "edge load-balancer" deployment model:
@@ -98,7 +103,7 @@ fn skip_verify_client_config() -> Arc<rustls::ClientConfig> {
             Ok(HandshakeSignatureValid::assertion())
         }
         fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            rustls::crypto::ring::default_provider()
+            rustls::crypto::aws_lc_rs::default_provider()
                 .signature_verification_algorithms
                 .supported_schemes()
         }
@@ -184,7 +189,7 @@ fn setup_site(dir: &std::path::Path, html_sock: &str, file_sock: &str) {
     std::fs::create_dir_all(dir.join("configs")).unwrap();
 
     std::fs::write(
-        dir.join("templates/home.html"),
+        dir.join("templates/home.html.tmpl"),
         b"<!doctype html><html><body><h1>global</h1></body></html>",
     )
     .unwrap();
@@ -205,7 +210,9 @@ mode = "internal"
 
 [log]
 level  = "warn"
-format = "text"
+
+[analytics]
+enabled = false
 
 [[backend]]
 name    = "m6-html"
@@ -240,11 +247,11 @@ global_params = ["data/site.json"]
 
 [[route]]
 path     = "/"
-template = "templates/home.html"
+template = "templates/home.html.tmpl"
 
 [[route]]
 path     = "/nocache/"
-template = "templates/home.html"
+template = "templates/home.html.tmpl"
 cache    = "no-store"
 "#,
     )
@@ -279,7 +286,9 @@ mode = "internal"
 
 [log]
 level  = "warn"
-format = "text"
+
+[analytics]
+enabled = false
 
 [[backend]]
 name           = "global"
@@ -310,7 +319,7 @@ struct EdgeStack {
     // they serve from is removed, and the port claims are released last.
     _global_html: Service,
     _global_file: Service,
-    _global_http: Service,
+    global_http: Service,
     _edge_http: Service,
     global_port: u16,
     edge_port: u16,
@@ -327,11 +336,11 @@ struct EdgeStack {
 
 impl EdgeStack {
     fn start() -> Self {
-        rustls::crypto::ring::default_provider()
+        rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .ok();
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).unwrap();
         let base = tmp.path();
 
         // ── Ports ─────────────────────────────────────────────────────────
@@ -363,7 +372,7 @@ impl EdgeStack {
         // global system.toml
         let global_sys = base.join("global-system.toml");
         std::fs::write(&global_sys, format!(
-            "[server]\nbind     = \"127.0.0.1:{global_port}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\n",
+            "[node]\nname = \"global\"\n\n[server]\nbind     = \"127.0.0.1:{global_port}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\n",
             gc_f.path().display(), gk_f.path().display()
         )).unwrap();
 
@@ -373,7 +382,7 @@ impl EdgeStack {
 
         let edge_sys = base.join("edge-system.toml");
         std::fs::write(&edge_sys, format!(
-            "[server]\nbind     = \"127.0.0.1:{edge_port}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\n",
+            "[node]\nname = \"edge\"\n\n[server]\nbind     = \"127.0.0.1:{edge_port}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\n",
             ec_f.path().display(), ek_f.path().display()
         )).unwrap();
 
@@ -407,12 +416,10 @@ impl EdgeStack {
         // This was `sleep(300ms)`. Alone that was enough; in a full workspace
         // run it is not remotely — a dozen of these stacks start at once, each
         // spawning four processes, and m6-http would come up with an empty
-        // backend pool. Every request then returned 502, which read as an
-        // assertion failure in whichever test happened to run first. m6-http
-        // also only rescans for backend sockets periodically, so a socket that
-        // appears late is not picked up promptly either.
-        html_proc.wait_for_path(&html_sock, Duration::from_secs(15));
-        file_proc.wait_for_path(&file_sock, Duration::from_secs(15));
+        // backend pool and refuse to start. m6-http reads its pool once at
+        // start, so the sockets must exist before it is spawned.
+        html_proc.wait_for_path(&html_sock, m6_core::testkit::STARTUP_BOUND);
+        file_proc.wait_for_path(&file_sock, m6_core::testkit::STARTUP_BOUND);
 
         // ── Start global m6-http ──────────────────────────────────────────
         let mut global_proc = Service::spawn(
@@ -424,7 +431,7 @@ impl EdgeStack {
                 "warn",
             ]),
         );
-        global_proc.wait_for_tcp(global_port, Duration::from_secs(5));
+        global_proc.wait_for_tcp(global_port, m6_core::testkit::STARTUP_BOUND);
 
         // ── Start edge m6-http ────────────────────────────────────────────
         let mut edge_proc = Service::spawn(
@@ -436,17 +443,16 @@ impl EdgeStack {
                 "warn",
             ]),
         );
-        edge_proc.wait_for_tcp(edge_port, Duration::from_secs(5));
+        edge_proc.wait_for_tcp(edge_port, m6_core::testkit::STARTUP_BOUND);
 
         let edge_tls = trusted_client_config(&ec_der);
 
-        // Listening on a port is not the same as being able to serve: the
-        // backend pool is populated by a periodic rescan, so there is a window
-        // where the port accepts and every request 502s. Poll until the stack
-        // actually answers, rather than assuming a fixed delay is enough. This
+        // Listening on a port is not the same as being able to serve: a backend
+        // that has not finished starting answers 502, so poll until the stack
+        // actually answers rather than assuming a fixed delay is enough. This
         // is the difference between a suite that passes alone and one that
         // passes under load.
-        let ready_deadline = Instant::now() + Duration::from_secs(20);
+        let ready_deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
         loop {
             let (status, _, _) = https_get(global_port, "/", &[], skip_verify_client_config());
             if status_code(&status) == 200 {
@@ -462,7 +468,7 @@ impl EdgeStack {
         EdgeStack {
             _global_html: html_proc,
             _global_file: file_proc,
-            _global_http: global_proc,
+            global_http: global_proc,
             _edge_http: edge_proc,
             global_port,
             edge_port,
@@ -488,6 +494,16 @@ impl EdgeStack {
     fn get_global(&self, path: &str) -> (String, String, Vec<u8>) {
         https_get(self.global_port, path, &[], skip_verify_client_config())
     }
+
+    /// Kill the global m6-http the edge proxies to, and reap it.
+    ///
+    /// A cache hit that still opened a connection to the backend cannot answer
+    /// once this has run, so a test that calls it proves the hit came from the
+    /// edge's own store. `Service::kill` waits for the child, so the backend is
+    /// gone before the next request.
+    fn stop_global(&mut self) {
+        self.global_http.kill();
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -506,67 +522,43 @@ fn test_basic_proxy() {
     let _ = headers;
 }
 
-/// 2. Cache hit — second request is served from edge cache (same body, much faster).
+/// 2. Cache hit: the second request is served from the edge cache.
+///
+/// `/` cannot be used for this: m6-http warms its own cache at startup by
+/// fetching every concrete route, so the first request for `/` already carries
+/// `Age`. The asset is reached only through a `[[route_group]]`, which the
+/// warm-up skips because a pattern is not a URL. It is also cacheable, which
+/// `/nocache/` deliberately is not.
 #[test]
 fn test_cache_hit() {
     let stack = EdgeStack::start();
 
-    // First request — cache miss, goes to global. Timed so the hit below can
-    // be compared against this same machine's own miss rather than against a
-    // constant that assumes an idle box.
+    // First request: a miss, which goes to global and m6-file.
     let t_miss = Instant::now();
-    let (s1, _, b1) = stack.get("/");
+    let (s1, h1, b1) = stack.get("/assets/hello.txt");
     let miss_latency = t_miss.elapsed();
     assert_eq!(status_code(&s1), 200);
+    assert!(
+        !has_header(&h1, "age"),
+        "the first request for the asset should be a miss, but it carried an age header:\n{h1}"
+    );
 
-    // Second request — should be a cache hit at the edge.
+    // Second request: served from a cache.
     let t0 = Instant::now();
-    let (s2, _, b2) = stack.get("/");
-    let first_hit = t0.elapsed();
+    let (s2, h2, b2) = stack.get("/assets/hello.txt");
+    let hit_latency = t0.elapsed();
     assert_eq!(status_code(&s2), 200);
     assert_eq!(b1, b2, "cache hit body must match cache miss body");
-
-    // Timing is asserted as a RATIO against this stack's own cache miss, plus
-    // a generous absolute ceiling — not as a tight absolute bound.
-    //
-    // This previously asserted `hit < 5ms`. A cache hit is ~3us of server
-    // work, so a 5ms bound is ~1600x that and was really bounding process
-    // scheduling and the loopback round trip. On the 4-core build host that
-    // is unbounded: the test passed 5/5 alone and 4/4 with only its own
-    // binary running, and failed only under the full workspace suite, where
-    // many test binaries compete for the same cores. A wall-clock bound on a
-    // shared machine measures the machine.
-    //
-    // Same trap as the benchmark harness (see docs/BENCHMARKS.md): co-locating
-    // the load with the thing being measured produced a 50x spread between
-    // identical runs. A test that fails on a busy machine is not detecting a
-    // regression, it is detecting the other tests.
-    //
-    // Minimum of several samples is the right statistic for "how fast can
-    // this be": scheduling noise only ever adds time, so the floor is stable
-    // where the mean and the single sample are not.
-    let best_hit = (0..3)
-        .map(|_| {
-            let t = Instant::now();
-            let (s, _, _) = stack.get("/");
-            assert_eq!(status_code(&s), 200);
-            t.elapsed()
-        })
-        .chain(std::iter::once(first_hit))
-        .min()
-        .expect("at least one sample");
-
     assert!(
-        best_hit < miss_latency,
-        "cache hit ({best_hit:?}) should beat the cache miss ({miss_latency:?})"
+        has_header(&h2, "age"),
+        "the second request should have been served from a cache, but it \
+         carried no age header:\n{h2}"
     );
-    // Catches a pathological regression (a hit that goes to the backend
-    // anyway) without pretending to measure microseconds through a loopback
-    // socket on a contended box.
-    assert!(
-        best_hit < Duration::from_millis(50),
-        "cache hit took {best_hit:?}, far beyond any plausible hit"
-    );
+
+    // The latencies are a report line, not a pass condition. On loopback the
+    // two populations are microseconds apart and a comparison measures the
+    // machine: a recorded run inverted by 1.3 percent while the cache worked.
+    println!("cache-miss latency: {miss_latency:?}, cache-hit latency: {hit_latency:?}");
 }
 
 /// 3. Cache miss — nocache path always forwards to global.
@@ -607,11 +599,9 @@ fn test_static_file_cache_hit() {
 
     // Assert the cache state, not the clock.
     //
-    // This used to be `hit_latency < 5ms`, which measures the machine. It is
-    // named in the site handover's traps as the wall-clock example, and on
-    // 2026-09-12 it duly failed on the loaded Linux build box while the code
-    // was perfectly correct. A test that fails when the machine is busy tells
-    // you about the machine.
+    // This used to be `hit_latency < 5ms`, which measures the machine: it
+    // failed on a loaded build machine while the code was correct. A test that
+    // fails when the machine is busy tells you about the machine.
     //
     // `Age` is the structural answer and it discriminates exactly: the edge
     // adds it when it serves from its own store, so a miss carries no `age`
@@ -684,58 +674,49 @@ fn test_hop_by_hop_stripped() {
     );
 }
 
-/// 10. Performance — cache-hit latency must be substantially lower than cache-miss.
-///     Simulates the edge-cache benefit: cache hit serves from memory without the
-///     RTT to the global backend.
+/// 10. A cache hit opens no connection to the backend.
+///
+/// The previous version compared ten cache-miss samples with ten cache-hit
+/// samples and required the hit median to be lower. On loopback the two
+/// populations are microseconds apart, so the assertion measured scheduling
+/// noise: a recorded run inverted by 1.3 percent while the cache worked.
+///
+/// A hit is defined by where the bytes came from. This primes the cache, kills
+/// the global m6-http that every route proxies to, and requires the edge to
+/// answer from its own store anyway. A hit that opened a connection to the
+/// backend could not answer at all.
 #[test]
-fn test_cache_hit_faster_than_miss() {
-    let stack = EdgeStack::start();
+fn test_cache_hit_does_not_reach_the_backend() {
+    let mut stack = EdgeStack::start();
 
-    // Warm up global connection
-    let _ = stack.get("/nocache/");
+    // Prime the cache with the asset. `/` is already warm at start, and it is
+    // a template route, so the asset is the response whose first request is
+    // demonstrably a miss.
+    let miss_started = Instant::now();
+    let (s1, _, b1) = stack.get("/assets/hello.txt");
+    let miss_latency = miss_started.elapsed();
+    assert_eq!(status_code(&s1), 200);
 
-    // Measure cache-miss latency (nocache path always goes to global).
-    let mut miss_times = Vec::new();
-    for _ in 0..10 {
-        let t0 = Instant::now();
-        let (s, _, _) = stack.get("/nocache/");
-        assert_eq!(status_code(&s), 200);
-        miss_times.push(t0.elapsed());
-    }
+    // The backend is gone, so anything the edge cannot answer by itself fails.
+    stack.stop_global();
 
-    // Prime the cache for / (first request is a miss).
-    let _ = stack.get("/");
-
-    // Measure cache-hit latency (/ is now cached at edge).
-    let mut hit_times = Vec::new();
-    for _ in 0..10 {
-        let t0 = Instant::now();
-        let (s, _, _) = stack.get("/");
-        assert_eq!(status_code(&s), 200);
-        hit_times.push(t0.elapsed());
-    }
-
-    let miss_median = {
-        let mut v = miss_times.clone();
-        v.sort();
-        v[v.len() / 2]
-    };
-    let hit_median = {
-        let mut v = hit_times.clone();
-        v.sort();
-        v[v.len() / 2]
-    };
-
-    println!("cache-miss median: {:?}", miss_median);
-    println!("cache-hit  median: {:?}", hit_median);
-
-    // Cache hit should be meaningfully faster (at least 2× on loopback).
-    assert!(
-        hit_median < miss_median,
-        "cache hit ({:?}) should be faster than cache miss ({:?})",
-        hit_median,
-        miss_median
+    let hit_started = Instant::now();
+    let (s2, h2, b2) = stack.get("/assets/hello.txt");
+    let hit_latency = hit_started.elapsed();
+    assert_eq!(
+        status_code(&s2),
+        200,
+        "a cached asset must still be served with the backend gone: {s2}"
     );
+    assert_eq!(b1, b2, "the hit must return the bytes the miss stored");
+    assert!(
+        has_header(&h2, "age"),
+        "the response must come from the edge cache, but it carried no age header:\n{h2}"
+    );
+
+    // A report line, not a pass condition: on loopback the two populations are
+    // microseconds apart, so a comparison measures the machine.
+    println!("cache-miss latency: {miss_latency:?}, cache-hit latency: {hit_latency:?}");
 }
 
 /// 11. TLS — edge exposes TLS to clients; clients without valid certs get errors.
@@ -766,21 +747,22 @@ fn test_tls_required() {
     let _ = result;
 }
 
-/// 12. RTT simulation — verify that with an artificial 2ms delay between
-///     edge and global, cache hits remain fast while cache misses pay the RTT.
+/// 12. RTT simulation: a cache hit is answered from the edge's own store, so a
+///     slow or distant backend cannot make it wait.
 ///
-/// Note: this test does not inject real network delay (would require pfctl/tc).
-/// Instead it measures that cache hits are consistently sub-millisecond while
-/// a loopback cache miss includes backend round-trip overhead.
+/// The test cannot inject a real network delay without pfctl or tc, so there is
+/// no timing claim to assert: the previous version required a 5ms P50 on
+/// loopback and failed at 5.615ms under the parallel suite on a branch that
+/// could not have touched the hit path. The property that a hit does not reach
+/// the backend is held by `test_cache_hit_does_not_reach_the_backend`. This
+/// test reports the numbers over 20 hits and 10 misses and asserts only that
+/// every request was answered.
 #[test]
 fn test_rtt_simulation() {
     let stack = EdgeStack::start();
 
-    // Prime the cache.
-    let (s, _, _) = stack.get("/");
-    assert_eq!(status_code(&s), 200);
-
-    // 20 cache hits — measure latencies to document the cache-hit speed.
+    // 20 requests for the warmed page. The numbers document the speed on this
+    // machine; they are a report line, not a pass condition.
     let mut hit_times: Vec<Duration> = Vec::with_capacity(20);
     for _ in 0..20 {
         let t0 = Instant::now();
@@ -791,15 +773,9 @@ fn test_rtt_simulation() {
     hit_times.sort();
     let hit_p50 = hit_times[10];
     let hit_p90 = hit_times[18];
-    // P50 must be under 5ms on loopback even in a debug build with parallel tests.
-    assert!(
-        hit_p50 < Duration::from_millis(5),
-        "cache-hit P50 {:?} exceeded 5ms on loopback",
-        hit_p50
-    );
-    println!("cache-hit p50={:?} p90={:?}", hit_p50, hit_p90);
+    println!("cache-hit p50={hit_p50:?} p90={hit_p90:?}");
 
-    // 10 cache misses (nocache) — measure and report (no strict assert on RTT).
+    // 10 cache misses (nocache): measured and reported, with no timing assert.
     let mut miss_total = Duration::ZERO;
     for _ in 0..10 {
         let t0 = Instant::now();
@@ -808,8 +784,6 @@ fn test_rtt_simulation() {
         miss_total += t0.elapsed();
     }
     println!("avg cache-miss (no artificial RTT): {:?}", miss_total / 10);
-    println!("Note: over a 5ms link, cache-miss adds ~10ms (TCP round-trip);");
-    println!("      cache-hit serves from local Arc<Bytes> in <1ms regardless of RTT.");
 }
 
 /// One HTTP/1.1 POST to the edge with a body of `size` bytes.

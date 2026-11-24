@@ -48,18 +48,21 @@ constexpr size_t kMaxBody = 1u * 1024 * 1024;
 char g_sock_path[512];
 int g_listen_fd = -1;
 volatile sig_atomic_t g_shutting_down = 0;
+volatile sig_atomic_t g_listening = 0;
 
 // Shutdown, spec §8.2: stop accepting, finish what is in flight, remove the
 // socket, exit 0. A second signal exits immediately.
 //
 // Closing the listening fd from the handler is what makes accept() return, so
-// the loop notices without polling.
+// the loop notices without polling. It closes only once listen() has returned:
+// a stop between bind() and listen(), when the socket file already exists,
+// would otherwise make listen() fail and the process exit 1 rather than 0.
 void OnSignal(int) {
     if (g_shutting_down) {
         _exit(0);
     }
     g_shutting_down = 1;
-    if (g_listen_fd >= 0) {
+    if (g_listening && g_listen_fd >= 0) {
         ::close(g_listen_fd);
     }
 }
@@ -340,9 +343,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // 3. chmod 0666. The proxy runs as a different user and cannot connect
-    //    otherwise. The spec calls this the single most common cause of a
-    //    backend that starts cleanly and is never contacted.
+    // 3. chmod 0666: a test convention. The example runs as its own user, so
+    //    this lets the proxy's user connect. Protocol §1.2 step 3 sets the rule, and
+    //    0666 in a 0755 directory lets any local user connect. A deployment uses
+    //    0660 with a trusted group.
     if (::chmod(g_sock_path, 0666) < 0) {
         std::fprintf(stderr, "chmod %s: %s\n", g_sock_path, std::strerror(errno));
         return 1;
@@ -353,6 +357,10 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "listen: %s\n", std::strerror(errno));
         return 1;
     }
+
+    // From here the handler may close the fd to wake a blocked accept(). A stop
+    // that arrived earlier set the flag, so the loop below is skipped.
+    g_listening = 1;
 
     // Spec §7 requires only that a new connection can be accepted while another
     // is handled, and allows threads, processes or an event loop. A detached

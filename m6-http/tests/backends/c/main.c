@@ -48,6 +48,7 @@ static char *g_status_body = NULL;
 static size_t g_status_len = 0;
 static int g_listen_fd = -1;
 static volatile sig_atomic_t g_shutting_down = 0;
+static volatile sig_atomic_t g_listening = 0;
 
 /* ── Shutdown, spec §8.2 ──────────────────────────────────────────────────
  *
@@ -64,7 +65,12 @@ static void on_signal(int sig) {
         _exit(0); /* second signal: immediate */
     }
     g_shutting_down = 1;
-    if (g_listen_fd >= 0) {
+    /* Close the listener only once it is listening. A stop can arrive between
+     * bind() and listen(), when the socket file already exists but the fd is
+     * still being set up. Closing it there makes listen() fail with EBADF and
+     * the process exit 1 instead of 0. The accept loop's condition reads the
+     * flag and leaves without ever accepting in that case. */
+    if (g_listening && g_listen_fd >= 0) {
         close(g_listen_fd);
     }
 }
@@ -338,9 +344,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* 3. chmod 0666. The proxy runs as a different user and cannot connect
-     *    otherwise. The spec calls this the single most common cause of a
-     *    backend that starts cleanly and is never contacted. */
+    /* 3. chmod 0666: a test convention. The example runs as its own user, so
+     *    this lets the proxy's user connect. Protocol §1.2 step 3 sets the rule, and
+     *    0666 in a 0755 directory lets any local user connect. A deployment uses
+     *    0660 with a trusted group. */
     if (chmod(g_sock_path, 0666) < 0) {
         fprintf(stderr, "chmod %s: %s\n", g_sock_path, strerror(errno));
         return 1;
@@ -351,6 +358,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "listen: %s\n", strerror(errno));
         return 1;
     }
+
+    /* From here the handler may close the fd to wake a blocked accept(). A stop
+     * that arrived earlier set the flag, so the loop below is skipped. */
+    g_listening = 1;
 
     while (!g_shutting_down) {
         int fd = accept(g_listen_fd, NULL, NULL);

@@ -16,7 +16,7 @@
 //! | # | setting | value | reason |
 //! |---|---|---|---|
 //! | 1 | `journal_mode` | `DELETE` (rollback journal) | The journal file is removed at every commit, so at rest the database is exactly one file. Copying that file copies everything. WAL keeps `-wal` and `-shm` files beside it, and a copy of the main file alone can miss committed work. [`Journal::Wal`] is available for services that want it |
-//! | 2 | `busy_timeout` | 5 s ([`BUSY_TIMEOUT`]) | A second connection waits for a lock instead of failing at once with `SQLITE_BUSY` |
+//! | 2 | `busy_timeout` | 5 s ([`BUSY_TIMEOUT`]) | A second connection waits for a lock instead of failing at once with `SQLITE_BUSY`. A service in an event loop sets it to zero after its start-time open and defers the statement on `SQLITE_BUSY`, because a wait in the loop holds every request behind it |
 //! | 3 | `foreign_keys` | on | SQLite has them off in every new connection, so `ON DELETE CASCADE` does nothing without it. The value is read back after it is set |
 //! | 4 | `recursive_triggers` | on | SQLite fires DELETE triggers for rows removed by `INSERT OR REPLACE` only with this on. Without it the append-only rule can be bypassed |
 //!
@@ -103,9 +103,9 @@
 //! # }
 //! ```
 //!
-//! A service keeps the connection in one `Arc<Mutex<Connection>>`, or opens one
-//! per worker through `App::with_thread_state`. Both are safe with the busy
-//! timeout and the migration rules above.
+//! A service opens its one connection at start and keeps it in its `main`.
+//! One thread owns it, so it needs no lock, and the busy timeout and the
+//! migration rules above make it safe.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -114,9 +114,15 @@ use std::time::Duration;
 pub use rusqlite;
 pub use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
-use rusqlite::{DatabaseName, TransactionBehavior};
+use rusqlite::{TransactionBehavior, MAIN_DB};
 
 /// The busy timeout [`open`] sets: 5 seconds.
+///
+/// A service in an event loop sets its connection's busy timeout to zero after
+/// the start-time open and defers a statement that returns `SQLITE_BUSY`. A wait
+/// in the one loop holds every connection in the process, so the error is the
+/// part the loop can retry. A one-shot tool keeps the five seconds, because
+/// nothing else waits on it.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The journal mode of a database file.
@@ -177,14 +183,19 @@ impl OpenOptions {
     ///
     /// Changing the journal mode needs the file to itself. If another
     /// connection is using the file in WAL mode, a request for a different mode
-    /// fails with `SQLITE_BUSY` once the busy timeout runs out. Open every connection to a file
-    /// with the same [`Journal`].
+    /// fails with `SQLITE_BUSY` once the busy timeout runs out. Open every
+    /// connection to a file with the same [`Journal`].
+    ///
+    /// The switch to [`Journal::Wal`] is retried on `SQLITE_BUSY` for up to the
+    /// busy timeout, because several connections opening one new file at once
+    /// make SQLite refuse the switch without waiting. A read-only file is
+    /// refused before any journal change is tried.
     pub fn open(&self, path: &Path) -> Result<Connection, SqliteError> {
         let conn = Connection::open(path).map_err(|source| SqliteError::Open {
             path: path.to_path_buf(),
             source,
         })?;
-        if conn.is_readonly(DatabaseName::Main)? {
+        if conn.is_readonly(MAIN_DB)? {
             return Err(SqliteError::ReadOnly(path.to_path_buf()));
         }
         // First, so that changing the journal mode waits for a lock instead of
@@ -199,8 +210,30 @@ impl OpenOptions {
             Journal::Rollback => "delete",
             Journal::Wal => "wal",
         };
-        let got: String =
-            conn.pragma_update_and_check(None, "journal_mode", wanted, |r| r.get(0))?;
+        // Switching a file to WAL takes a short exclusive lock, and SQLite
+        // answers `SQLITE_BUSY` for that pragma without waiting on the busy
+        // timeout. Connections that open one new file at the same time retry
+        // the switch until one of them has made it or the busy timeout has
+        // passed. Only the switch to WAL retries: a request for another mode
+        // fails when the file is in use, as the doc comment above says.
+        let deadline = crate::platform::now() + self.busy_timeout;
+        let got: String = loop {
+            match conn.pragma_update_and_check(None, "journal_mode", wanted, |r| r.get(0)) {
+                Ok(got) => break got,
+                Err(rusqlite::Error::SqliteFailure(e, _))
+                    if self.journal == Journal::Wal
+                        && e.code == rusqlite::ErrorCode::DatabaseBusy
+                        && crate::platform::now() < deadline =>
+                {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "open at start, before the loop: SQLite does not apply busy_timeout to the WAL switch (owner-approved permanent exception)"
+                    )]
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
         if !got.eq_ignore_ascii_case(wanted) {
             return Err(SqliteError::JournalMode { wanted, got });
         }
@@ -241,6 +274,40 @@ pub fn open_reader(path: &Path) -> Result<Connection, SqliteError> {
     let ms: i64 = conn.pragma_query_value(None, "busy_timeout", |r| r.get(0))?;
     if u128::try_from(ms).ok() != Some(BUSY_TIMEOUT.as_millis()) {
         return Err(SqliteError::BusyTimeout);
+    }
+    Ok(conn)
+}
+
+/// Open an existing file for reading without changing it, beside a writer in
+/// WAL mode.
+///
+/// A service that shares a WAL database with a writer process needs a reader
+/// that starts on its own. [`open_reader`] opens read-only, and a read-only
+/// connection cannot read a WAL database while its `-shm` file is absent, which
+/// is the state after the writer's clean shutdown. This opens with
+/// [`SQLITE_OPEN_READ_WRITE`](rusqlite::OpenFlags) and without
+/// [`SQLITE_OPEN_CREATE`](rusqlite::OpenFlags), so a missing file is still an
+/// error and SQLite can build the WAL index. It then sets `PRAGMA query_only`
+/// and reads it back, so every write through this connection fails with
+/// `SQLITE_READONLY`.
+///
+/// It sets only the [`BUSY_TIMEOUT`], read back, as [`open_reader`] does. It
+/// leaves the journal mode and the schema alone.
+pub fn open_read_only(path: &Path) -> Result<Connection, SqliteError> {
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(|source| SqliteError::Open {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    let ms: i64 = conn.pragma_query_value(None, "busy_timeout", |r| r.get(0))?;
+    if u128::try_from(ms).ok() != Some(BUSY_TIMEOUT.as_millis()) {
+        return Err(SqliteError::BusyTimeout);
+    }
+    conn.pragma_update(None, "query_only", true)?;
+    let query_only: bool = conn.pragma_query_value(None, "query_only", |r| r.get(0))?;
+    if !query_only {
+        return Err(SqliteError::QueryOnly);
     }
     Ok(conn)
 }
@@ -475,6 +542,8 @@ pub enum SqliteError {
     BusyTimeout,
     #[error("recursive_triggers did not take effect")]
     RecursiveTriggers,
+    #[error("query_only did not take effect")]
+    QueryOnly,
     #[error("migration list entry {index} has version {version}, expected {}", index + 1)]
     MigrationList { index: usize, version: u32 },
     #[error("database is at schema version {db}, this code knows up to {code}")]
@@ -510,6 +579,10 @@ impl From<rusqlite::Error> for crate::Error {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
 mod tests {
     use super::*;
     use rusqlite::ErrorCode;
@@ -691,6 +764,37 @@ mod tests {
         match open(&path) {
             Err(SqliteError::ReadOnly(p)) => assert_eq!(p, path),
             other => panic!("expected ReadOnly, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wal_switch_survives_threads_opening_one_new_file_at_once() {
+        const THREADS: usize = 8;
+        // One race is easy to win by luck, so repeat it on fresh files.
+        for round in 0..200 {
+            let (_d, path) = db();
+            let barrier = Arc::new(Barrier::new(THREADS));
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let path = path.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        OpenOptions::default().journal(Journal::Wal).open(&path)
+                    })
+                })
+                .collect();
+            let conns: Vec<Connection> = handles
+                .into_iter()
+                .map(|h| {
+                    h.join().unwrap().unwrap_or_else(|e| {
+                        panic!("round {round}: a concurrent WAL open failed: {e}")
+                    })
+                })
+                .collect();
+            for c in &conns {
+                assert_eq!(pragma_s(c, "journal_mode"), "wal");
+            }
         }
     }
 
@@ -970,7 +1074,7 @@ mod tests {
             let r = migrate(&mut c, &[M1, M2]);
             (r, c)
         });
-        let start = std::time::Instant::now();
+        let start = crate::platform::now();
         while !WAITING.load(Ordering::SeqCst) {
             assert!(
                 start.elapsed() < Duration::from_secs(10),

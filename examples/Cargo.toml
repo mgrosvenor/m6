@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "03-contact/render-contact",
+    "common/genid-publisher",
+    "05-cms/render-cms",
+    "07-dev-to-production/render-cms",
+    "09-global-deployment/integration-test",
+    "11-admin-dashboard/render-admin",
+]
+resolver = "2"
+
+# To build all renderers: cargo build --release
+# To build one:           cargo build --release -p render-contact
+#                         cargo build --release -p render-cms

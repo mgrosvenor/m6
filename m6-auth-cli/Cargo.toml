@@ -11,12 +11,17 @@ name = "m6-auth-cli"
 
 [dependencies]
 m6-auth     = { path = "../m6-auth" }
+m6-core     = { path = "../m6-core", default-features = false }
 toml        = "0.8"
 anyhow      = "1"
 rpassword   = "7"
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 
+[build-dependencies]
+m6-platform = { path = "../m6-platform" }
+
 [dev-dependencies]
 tempfile = "3"
-m6-core  = { path = "../m6-core", features = ["testkit"] }
+m6-core  = { path = "../m6-core", default-features = false, features = ["testkit"] }
+m6-auth  = { path = "../m6-auth", features = ["testkit"] }

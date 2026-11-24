@@ -1,12 +1,13 @@
 // Integration tests for m6-http: Phases 10-13.
-// Covers: routing, caching, auth enforcement, hot reload.
+// Covers: routing, caching, auth enforcement, config loading.
 
 use std::path::Path;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn write_file(dir: &Path, name: &str, content: &str) {
-    std::fs::write(dir.join(name), content).unwrap();
+    let replaced = content.replace("{DIR}", &dir.display().to_string());
+    std::fs::write(dir.join(name), replaced).unwrap();
 }
 
 // ── Phase 10: Routing + Forwarding ───────────────────────────────────────────
@@ -26,7 +27,11 @@ mod phase10 {
         write_file(dir, "cert.pem", "dummy");
         write_file(dir, "key.pem", "dummy");
         write_file(dir, "site.toml", site_toml);
-        write_file(dir, "system.toml", "");
+        write_file(
+            dir,
+            "system.toml",
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n",
+        );
     }
 
     #[test]
@@ -37,10 +42,6 @@ mod phase10 {
             r#"
 [site]
 domain = "example.com"
-[server]
-bind = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
 [[backend]]
 name = "b"
 sockets = "/run/m6/*.sock"
@@ -58,10 +59,6 @@ sockets = "/run/m6/*.sock"
             r#"
 [site]
 name = "Test"
-[server]
-bind = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
 [[backend]]
 name = "b"
 sockets = "/run/m6/*.sock"
@@ -78,19 +75,17 @@ sockets = "/run/m6/*.sock"
     #[test]
     fn validation_missing_bind_exits_2() {
         let dir = tempfile::tempdir().unwrap();
-        setup(
+        write_file(dir.path(), "cert.pem", "dummy");
+        write_file(dir.path(), "key.pem", "dummy");
+        write_file(
             dir.path(),
-            r#"
-[site]
-name   = "Test"
-domain = "example.com"
-[server]
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
-[[backend]]
-name = "b"
-sockets = "/run/m6/*.sock"
-"#,
+            "site.toml",
+            "[site]\nname = \"Test\"\ndomain = \"example.com\"\n\n[[backend]]\nname = \"b\"\nsockets = \"/run/m6/*.sock\"\n",
+        );
+        write_file(
+            dir.path(),
+            "system.toml",
+            "[node]\nname = \"test\"\n\n[server]\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n",
         );
         let err = load(dir.path()).unwrap_err().to_string();
         assert!(err.contains("bind"), "error should mention 'bind': {}", err);
@@ -103,20 +98,13 @@ sockets = "/run/m6/*.sock"
         write_file(
             dir.path(),
             "site.toml",
-            r#"
-[site]
-name   = "Test"
-domain = "example.com"
-[server]
-bind     = "0.0.0.0:443"
-tls_cert = "missing.pem"
-tls_key  = "key.pem"
-[[backend]]
-name = "b"
-sockets = "/run/m6/*.sock"
-"#,
+            "[site]\nname = \"Test\"\ndomain = \"example.com\"\n\n[[backend]]\nname = \"b\"\nsockets = \"/run/m6/*.sock\"\n",
         );
-        write_file(dir.path(), "system.toml", "");
+        write_file(
+            dir.path(),
+            "system.toml",
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/missing.pem\"\ntls_key = \"{DIR}/key.pem\"\n",
+        );
         let err = load(dir.path()).unwrap_err().to_string();
         assert!(
             err.contains("tls_cert"),
@@ -134,10 +122,6 @@ sockets = "/run/m6/*.sock"
 [site]
 name   = "Test"
 domain = "example.com"
-[server]
-bind     = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
 [[backend]]
 name = "b"
 sockets = "/run/m6/*.sock"
@@ -163,10 +147,6 @@ backend = "unknown"
 [site]
 name   = "Test"
 domain = "example.com"
-[server]
-bind     = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
 [[backend]]
 name = "b"
 sockets = "/run/m6/*.sock"
@@ -195,10 +175,6 @@ backend = "b"
 [site]
 name   = "Test"
 domain = "example.com"
-[server]
-bind     = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
 [[backend]]
 name = "b"
 sockets = "/run/m6/*.sock"
@@ -225,10 +201,6 @@ require = "group:editors"
 [site]
 name   = "Test"
 domain = "example.com"
-[server]
-bind     = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
 [errors]
 mode = "custom"
 [[backend]]
@@ -245,63 +217,19 @@ sockets = "/run/m6/*.sock"
     }
 
     #[test]
-    fn validation_auth_public_key_not_found_exits_2() {
-        let dir = tempfile::tempdir().unwrap();
-        write_file(dir.path(), "cert.pem", "dummy");
-        write_file(dir.path(), "key.pem", "dummy");
-        write_file(dir.path(), "system.toml", "");
-        write_file(
-            dir.path(),
-            "site.toml",
-            r#"
-[site]
-name   = "Test"
-domain = "example.com"
-[server]
-bind     = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
-[auth]
-backend    = "b"
-public_key = "missing-key.pub"
-[[backend]]
-name = "b"
-sockets = "/run/m6/*.sock"
-"#,
-        );
-        let err = load(dir.path()).unwrap_err().to_string();
-        assert!(
-            err.contains("public_key"),
-            "error should mention 'public_key': {}",
-            err
-        );
-    }
-
-    #[test]
     fn validation_auth_backend_not_in_backends_exits_2() {
         let dir = tempfile::tempdir().unwrap();
         write_file(dir.path(), "cert.pem", "dummy");
         write_file(dir.path(), "key.pem", "dummy");
-        write_file(dir.path(), "auth.pub", "dummy-key");
-        write_file(dir.path(), "system.toml", "");
         write_file(
             dir.path(),
             "site.toml",
-            r#"
-[site]
-name   = "Test"
-domain = "example.com"
-[server]
-bind     = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
-[auth]
-backend    = "missing-auth-backend"
-public_key = "auth.pub"
-[[backend]]
-name = "b"
-sockets = "/run/m6/*.sock"
-"#,
+            "[site]\nname = \"Test\"\ndomain = \"example.com\"\n\n[[backend]]\nname = \"b\"\nsockets = \"/run/m6/*.sock\"\n",
+        );
+        write_file(
+            dir.path(),
+            "system.toml",
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n\n[auth]\nbackend = \"missing-auth-backend\"\n",
         );
         let err = load(dir.path()).unwrap_err().to_string();
         assert!(
@@ -312,35 +240,45 @@ sockets = "/run/m6/*.sock"
     }
 
     #[test]
-    fn system_config_server_wins() {
+    fn validation_auth_backend_is_a_url_backend_exits_2() {
         let dir = tempfile::tempdir().unwrap();
         write_file(dir.path(), "cert.pem", "dummy");
         write_file(dir.path(), "key.pem", "dummy");
         write_file(
             dir.path(),
             "site.toml",
-            r#"
-[site]
-name   = "Test"
-domain = "example.com"
-[server]
-bind     = "127.0.0.1:8443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
-[[backend]]
-name = "b"
-sockets = "/run/m6/*.sock"
-"#,
+            "[site]\nname = \"Test\"\ndomain = \"example.com\"\n\n[[backend]]\nname = \"remote\"\nurl = \"https://example.com\"\n",
         );
         write_file(
             dir.path(),
             "system.toml",
-            r#"
-[server]
-bind = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
-"#,
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n\n[auth]\nbackend = \"remote\"\n",
+        );
+        let err = load(dir.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("URL backend"),
+            "the error must say the auth backend is a URL backend: {err}"
+        );
+        assert!(
+            err.contains("remote"),
+            "the error must name the backend: {err}"
+        );
+    }
+
+    #[test]
+    fn bind_comes_from_the_system_config() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "cert.pem", "dummy");
+        write_file(dir.path(), "key.pem", "dummy");
+        write_file(
+            dir.path(),
+            "site.toml",
+            "[site]\nname = \"Test\"\ndomain = \"example.com\"\n\n[[backend]]\nname = \"b\"\nsockets = \"/run/m6/*.sock\"\n",
+        );
+        write_file(
+            dir.path(),
+            "system.toml",
+            "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n",
         );
         let cfg = m6_http_lib::config::load(dir.path(), &dir.path().join("system.toml")).unwrap();
         assert_eq!(cfg.server.bind, "0.0.0.0:443");
@@ -363,8 +301,9 @@ mod phase11 {
         assert!(should_cache(200, &headers));
 
         let resp = CachedResponse {
+            genid: 0,
             status: 200,
-            headers: std::sync::Arc::new(headers.clone()),
+            headers: m6_http_lib::cache::HeaderBlock::from_pairs(headers.clone()),
             body: bytes::Bytes::from_static(b"cached"),
         };
         cache.insert(key.clone(), resp);
@@ -376,8 +315,12 @@ mod phase11 {
         let cache = Cache::new();
         let key = CacheKey::new("/page", None, "");
         let resp = CachedResponse {
+            genid: 0,
             status: 200,
-            headers: std::sync::Arc::new(vec![("cache-control".to_string(), "public".to_string())]),
+            headers: m6_http_lib::cache::HeaderBlock::from_pairs(vec![(
+                "cache-control".to_string(),
+                "public".to_string(),
+            )]),
             body: bytes::Bytes::from_static(b"body"),
         };
         cache.insert(key.clone(), resp);
@@ -409,8 +352,9 @@ mod phase11 {
         cache.insert(
             key_gzip.clone(),
             CachedResponse {
+                genid: 0,
                 status: 200,
-                headers: std::sync::Arc::new(vec![(
+                headers: m6_http_lib::cache::HeaderBlock::from_pairs(vec![(
                     "content-encoding".to_string(),
                     "gzip".to_string(),
                 )]),
@@ -424,8 +368,9 @@ mod phase11 {
         cache.insert(
             key_br.clone(),
             CachedResponse {
+                genid: 0,
                 status: 200,
-                headers: std::sync::Arc::new(vec![(
+                headers: m6_http_lib::cache::HeaderBlock::from_pairs(vec![(
                     "content-encoding".to_string(),
                     "br".to_string(),
                 )]),
@@ -462,8 +407,9 @@ mod phase11 {
         cache.insert(
             key.clone(),
             CachedResponse {
+                genid: 0,
                 status: 200,
-                headers: std::sync::Arc::new(vec![(
+                headers: m6_http_lib::cache::HeaderBlock::from_pairs(vec![(
                     "cache-control".to_string(),
                     "public".to_string(),
                 )]),
@@ -471,8 +417,8 @@ mod phase11 {
             },
         );
 
-        // Simulate: inotify fires on content/posts/hello-world.json
-        // invalidation map maps that file → /blog/hello-world
+        // Simulate: content/posts/hello-world.json changed, and the invalidation
+        // map maps that file to /blog/hello-world
         // evict the affected cache entry
         cache.evict_path("/blog/hello-world");
         assert!(cache.get(&key).is_none());
@@ -499,39 +445,12 @@ mod phase11 {
 // ── Phase 12: Auth ───────────────────────────────────────────────────────────
 
 mod phase12 {
-    use base64::Engine;
-    use m6_http_lib::auth::{
-        check_require, encode_claims_header, extract_refresh_cookie, extract_token,
-        is_browser_request, Claims,
-    };
-
-    fn make_claims(groups: Option<Vec<&str>>, roles: Option<Vec<&str>>) -> Claims {
-        Claims {
-            sub: Some("user1".to_string()),
-            iss: None,
-            exp: Some(9999999999),
-            groups: groups.map(|g| g.iter().map(|s| s.to_string()).collect()),
-            roles: roles.map(|r| r.iter().map(|s| s.to_string()).collect()),
-            extra: Default::default(),
-        }
-    }
+    use m6_http_lib::auth::{extract_refresh_cookie, extract_token, is_browser_request};
 
     #[test]
-    fn public_route_no_auth_code_executed() {
-        // The contract: for public routes, zero auth code is executed.
-        // We verify this by checking that extract_token is not called
-        // when no `require` is set. This is a structural test.
-        //
-        // The handle_request function only calls auth code when route.require.is_some().
-        // We verify the behavior indirectly: a request to a public route
-        // with no token should be forwarded (not rejected).
-        //
-        // Since we can't easily test the full stack without a real server,
-        // we test the auth module is not invoked for public routes
-        // by verifying extract_token with no headers returns None.
+    fn extract_token_returns_none_without_an_auth_header_or_session_cookie() {
         let token = extract_token(None, None);
         assert_eq!(token, None);
-        // The caller (handle_request) only calls this if route.require.is_some()
     }
 
     #[test]
@@ -555,92 +474,13 @@ mod phase12 {
         let refresh = extract_refresh_cookie(Some("refresh=my-refresh-token; session=old"));
         assert_eq!(refresh, Some("my-refresh-token"));
     }
-
-    #[test]
-    fn valid_jwt_wrong_group_gets_403() {
-        let claims = make_claims(Some(vec!["users"]), None);
-        assert!(!check_require(&claims, "group:editors"));
-    }
-
-    #[test]
-    fn valid_jwt_correct_group_passes() {
-        let claims = make_claims(Some(vec!["editors", "users"]), None);
-        assert!(check_require(&claims, "group:editors"));
-    }
-
-    #[test]
-    fn valid_jwt_correct_role_passes() {
-        let claims = make_claims(None, Some(vec!["admin"]));
-        assert!(check_require(&claims, "role:admin"));
-    }
-
-    #[test]
-    fn valid_jwt_wrong_role_gets_403() {
-        let claims = make_claims(None, Some(vec!["user"]));
-        assert!(!check_require(&claims, "role:admin"));
-    }
-
-    #[test]
-    fn x_auth_claims_header_is_base64_json() {
-        let claims = make_claims(Some(vec!["editors"]), None);
-        let encoded = encode_claims_header(&claims);
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(&encoded)
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
-        assert_eq!(json["sub"], "user1");
-        assert_eq!(json["groups"][0], "editors");
-    }
 }
 
-// ── Phase 13: Hot Reload ─────────────────────────────────────────────────────
+// ── Config load ───────────────────────────────────────────────────────────────
 
-mod phase13 {
-    use m6_http_lib::pool::{BackendPool, PoolManager};
-    use std::path::{Path, PathBuf};
-
+mod config_load {
     #[test]
-    fn socket_appears_added_to_pool() {
-        let mut mgr = PoolManager::new();
-        mgr.add_pool(BackendPool::new(
-            "m6-html".to_string(),
-            "/run/m6/m6-html-*.sock".to_string(),
-        ));
-
-        let sock = Path::new("/run/m6/m6-html-1.sock");
-        mgr.socket_appeared(sock);
-        assert_eq!(mgr.get_pool("m6-html").unwrap().total_count(), 1);
-    }
-
-    #[test]
-    fn socket_disappears_removed_from_pool() {
-        let mut mgr = PoolManager::new();
-        let mut pool =
-            BackendPool::new("m6-html".to_string(), "/run/m6/m6-html-*.sock".to_string());
-        pool.add_socket(PathBuf::from("/run/m6/m6-html-1.sock"));
-        mgr.add_pool(pool);
-
-        assert_eq!(mgr.get_pool("m6-html").unwrap().total_count(), 1);
-        mgr.socket_disappeared(Path::new("/run/m6/m6-html-1.sock"));
-        assert_eq!(mgr.get_pool("m6-html").unwrap().total_count(), 0);
-    }
-
-    #[test]
-    fn all_sockets_gone_pool_is_empty() {
-        let mut pool =
-            BackendPool::new("m6-html".to_string(), "/run/m6/m6-html-*.sock".to_string());
-        pool.add_socket(PathBuf::from("/run/m6/m6-html-1.sock"));
-        pool.remove_socket(Path::new("/run/m6/m6-html-1.sock"));
-        assert_eq!(pool.total_count(), 0);
-        // Connecting to empty pool returns PoolError::Empty
-        assert!(matches!(
-            pool.connect(),
-            Err(m6_http_lib::pool::PoolError::Empty)
-        ));
-    }
-
-    #[test]
-    fn site_toml_reload_updates_route_table() {
+    fn a_changed_site_toml_loads_into_a_new_route_table() {
         use m6_http_lib::config;
         use m6_http_lib::router::RouteTable;
         use tempfile::TempDir;
@@ -651,17 +491,21 @@ mod phase13 {
         // Write initial config
         std::fs::write(dir_path.join("cert.pem"), "dummy").unwrap();
         std::fs::write(dir_path.join("key.pem"), "dummy").unwrap();
-        std::fs::write(dir_path.join("system.toml"), "").unwrap();
+        std::fs::write(
+            dir_path.join("system.toml"),
+            format!(
+                "[node]\nname = \"test\"\n\n[server]\nbind = \"0.0.0.0:443\"\ntls_cert = \"{}/cert.pem\"\ntls_key = \"{}/key.pem\"\n",
+                dir_path.display(),
+                dir_path.display()
+            ),
+        )
+        .unwrap();
         std::fs::write(
             dir_path.join("site.toml"),
             r#"
 [site]
 name   = "Test"
 domain = "example.com"
-[server]
-bind     = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
 [[backend]]
 name = "b"
 sockets = "/run/m6/*.sock"
@@ -684,10 +528,6 @@ backend = "b"
 [site]
 name   = "Test"
 domain = "example.com"
-[server]
-bind     = "0.0.0.0:443"
-tls_cert = "cert.pem"
-tls_key  = "key.pem"
 [[backend]]
 name = "b"
 sockets = "/run/m6/*.sock"

@@ -1,3 +1,16 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
+use m6_core::platform::process::raise_fd_limit;
+use m6_core::platform::{Events, Interest, Poll, Token};
+use m6_http_lib::forward::HttpRequest;
+use m6_http_lib::http11::{
+    make_tls_server_config, HitHeaders, Http11Listener, RequestHead, RequestOutcome,
+    DEFAULT_MAX_REQUESTS_PER_CONN, INITIAL_CONNECTIONS,
+};
+use quiche::h3::NameValue as _;
 /// Functional integration tests for m6-http protocol handling.
 ///
 /// HTTP/1.1: spins up Http11Listener in-process with a self-signed cert (rcgen),
@@ -9,17 +22,12 @@ use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::thread;
 use std::time::Duration;
 
-use m6_http_lib::forward::HttpRequest;
-use m6_http_lib::http11::{make_tls_server_config, Http11Listener, RequestOutcome};
-use m6_http_lib::poller::{Poller, Token};
-use quiche::h3::NameValue as _;
-
-const TOKEN_TCP: Token = Token(1);
+const TOKEN_TCP: Token = Token(usize::MAX);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -54,7 +62,7 @@ fn write_pem_files(tc: &TestCert) -> (tempfile::NamedTempFile, tempfile::NamedTe
 
 /// Build a rustls ClientConfig that trusts the given DER certificate.
 fn make_test_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
-    rustls::crypto::ring::default_provider()
+    rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .ok();
     let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());
@@ -75,28 +83,112 @@ fn start_http11_server<F>(cert_path: &str, key_path: &str, handler: F) -> (u16, 
 where
     F: Fn(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String) + Send + 'static,
 {
-    rustls::crypto::ring::default_provider()
+    start_http11_server_limited(cert_path, key_path, DEFAULT_MAX_REQUESTS_PER_CONN, handler)
+}
+
+/// As `start_http11_server`, with `[server] max_requests_per_connection` set.
+fn start_http11_server_limited<F>(
+    cert_path: &str,
+    key_path: &str,
+    max_requests: u32,
+    handler: F,
+) -> (u16, Arc<AtomicBool>)
+where
+    F: Fn(&HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>, String) + Send + 'static,
+{
+    rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .ok();
     let tls_cfg = make_tls_server_config(cert_path, key_path).expect("tls config");
-    let mut listener = Http11Listener::bind("127.0.0.1:0", tls_cfg).expect("bind");
+    let ceiling = raise_fd_limit().unwrap_or(4096);
+    let mut listener = Http11Listener::bind(
+        "127.0.0.1:0",
+        tls_cfg,
+        max_requests,
+        INITIAL_CONNECTIONS,
+        ceiling,
+    )
+    .expect("bind");
     let port = listener.local_addr().unwrap().port();
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = Arc::clone(&stop);
 
     thread::spawn(move || {
-        let poller = Poller::new().expect("poller");
+        let mut poll = Poll::new().expect("poll");
+        poll.registry()
+            .register_fd(listener.raw_fd(), TOKEN_TCP, Interest::READABLE)
+            .expect("register listener");
+        let mut events = Events::with_capacity(64);
+        let mut on_head = |_: &mut (), head: &RequestHead<'_>, buf: &[u8], ip: &str| {
+            let req = match m6_core::h1::materialize(head, buf) {
+                m6_core::h1::ParseResult::Complete(r) => r,
+                _ => {
+                    return RequestOutcome::Ready(400, vec![], Vec::new(), "test".to_string(), None)
+                }
+            };
+            let (s, h, b, be) = handler(&req, ip);
+            RequestOutcome::Ready(s, h, b, be, None)
+        };
+        let mut on_owned = |_: &mut (), req: m6_http_lib::http2::RequestRef<'_>, ip: &str| {
+            let (s, h, b, be) = match req {
+                m6_http_lib::http2::RequestRef::Owned(req) => handler(req, ip),
+                m6_http_lib::http2::RequestRef::H2(req) => {
+                    let owned = req.into_owned();
+                    handler(&owned, ip)
+                }
+            };
+            RequestOutcome::Ready(s, h, b, be, None)
+        };
+        let mut on_head_early =
+            |_: &mut (), _: &RequestHead<'_>, _: &str| -> Option<RequestOutcome> { None };
+        let hit = HitHeaders {
+            alt_svc: std::sync::Arc::from(&[] as &[u8]),
+            describedby: None,
+        };
         while !stop2.load(Ordering::Relaxed) {
-            listener.accept_pending(&poller, TOKEN_TCP);
-            listener.drive_all(
-                |req, client_ip| {
-                    let (s, h, b, be) = handler(req, client_ip);
-                    RequestOutcome::Ready(s, h, b, be)
-                },
-                |_resp, _ctx| (503, vec![], vec![], "none".to_string()),
-                &poller,
-            );
-            thread::sleep(Duration::from_millis(2));
+            match poll.poll(&mut events, Some(Duration::from_millis(2))) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+            for ev in &events {
+                match ev.token() {
+                    TOKEN_TCP => {
+                        while let Some(taken) = listener.take_slot() {
+                            let key = taken.key;
+                            let Some(mut conn) = listener.accept_one() else {
+                                listener.free_slot(key);
+                                break;
+                            };
+                            conn.set_token(Token(key));
+                            conn.set_interest(Interest::READABLE);
+                            if poll
+                                .registry()
+                                .register_fd(conn.raw_fd(), Token(key), Interest::READABLE)
+                                .is_err()
+                            {
+                                listener.free_slot(key);
+                                continue;
+                            }
+                            *listener.slot_mut(key) = conn;
+                        }
+                    }
+                    Token(k) => {
+                        let drive = listener.drive_one(
+                            k,
+                            &mut (),
+                            &mut on_head,
+                            &mut on_owned,
+                            &mut on_head_early,
+                            &hit,
+                            poll.registry(),
+                        );
+                        if drive.done {
+                            listener.close_one(k, poll.registry());
+                        }
+                    }
+                }
+            }
         }
     });
 
@@ -234,6 +326,63 @@ fn http11_connection_close_after_response() {
     );
 }
 
+/// Read one response whose body is two bytes (`ok`) from a TLS stream, and
+/// return its headers in lower case. A 204 would not do, because m6-http
+/// closes after a response it cannot frame with a `Content-Length`.
+fn read_response_head<S: Read>(tls: &mut S) -> String {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        tls.read_exact(&mut byte).expect("read response head");
+        head.push(byte[0]);
+    }
+    let mut body = [0u8; 2];
+    tls.read_exact(&mut body).expect("read response body");
+    String::from_utf8(head)
+        .expect("utf8 head")
+        .to_ascii_lowercase()
+}
+
+#[test]
+fn http11_closes_after_max_requests_per_connection() {
+    let tc = generate_test_cert();
+    let (cert_file, key_file) = write_pem_files(&tc);
+    let client_cfg = make_test_client_config(&tc.cert_der);
+
+    let (port, stop) = start_http11_server_limited(
+        cert_file.path().to_str().unwrap(),
+        key_file.path().to_str().unwrap(),
+        3,
+        |_req, _ip| (200, vec![], b"ok".to_vec(), "test".to_string()),
+    );
+
+    let stream = TcpStream::connect(format!("127.0.0.1:{}", port)).expect("tcp connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let server_name = rustls::pki_types::ServerName::try_from("localhost")
+        .unwrap()
+        .to_owned();
+    let mut conn = rustls::ClientConnection::new(client_cfg, server_name).unwrap();
+    let mut stream_ref = &stream;
+    let mut tls = rustls::Stream::new(&mut conn, &mut stream_ref);
+
+    let request = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let mut heads = Vec::new();
+    for _ in 0..3 {
+        tls.write_all(request).expect("write request");
+        tls.flush().ok();
+        heads.push(read_response_head(&mut tls));
+    }
+    stop.store(true, Ordering::Relaxed);
+
+    for head in &heads[..2] {
+        assert!(head.starts_with("http/1.1 200"), "head: {head}");
+        assert!(!head.contains("connection: close"), "head: {head}");
+    }
+    assert!(heads[2].contains("connection: close"), "head: {}", heads[2]);
+}
+
 #[test]
 fn http11_version_field_is_http11() {
     let tc = generate_test_cert();
@@ -271,7 +420,7 @@ fn http11_version_field_is_http11() {
 
 /// Build a rustls ClientConfig that trusts the given DER cert and advertises h2.
 fn make_h2_client_config(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
-    rustls::crypto::ring::default_provider()
+    rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .ok();
     let cert = rustls::pki_types::CertificateDer::from(cert_der.to_vec());
@@ -324,6 +473,75 @@ const H2_REQUEST_HEADERS: &[u8] = &[
 ];
 const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
+/// Connect to an in-process HTTP/2 listener, send the client preface, an empty
+/// SETTINGS, one GET / HEADERS frame and a GOAWAY, and return the raw response
+/// bytes the server sent before closing.
+fn h2_tls_request(port: u16, client_cfg: &Arc<rustls::ClientConfig>) -> Vec<u8> {
+    const FLAG_END_STREAM: u8 = 0x1;
+    const FLAG_END_HEADERS: u8 = 0x4;
+
+    let stream = TcpStream::connect(format!("127.0.0.1:{}", port)).expect("tcp connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    let server_name = rustls::pki_types::ServerName::try_from("localhost")
+        .unwrap()
+        .to_owned();
+    let mut conn = rustls::ClientConnection::new(Arc::clone(client_cfg), server_name).unwrap();
+    let mut stream_ref = &stream;
+    let mut tls = rustls::Stream::new(&mut conn, &mut stream_ref);
+
+    tls.write_all(H2_PREFACE).unwrap();
+    tls.write_all(&h2_frame(0x4, 0x0, 0, &[])).unwrap(); // empty SETTINGS
+    tls.write_all(&h2_frame(
+        0x1,
+        FLAG_END_STREAM | FLAG_END_HEADERS,
+        1,
+        H2_REQUEST_HEADERS,
+    ))
+    .unwrap();
+    // GOAWAY so the server closes after responding (last_stream_id=1, NO_ERROR).
+    let goaway_payload = [0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
+    tls.write_all(&h2_frame(0x7, 0x0, 0, &goaway_payload))
+        .unwrap();
+    tls.flush().ok();
+
+    // Read until the response is COMPLETE, not until the connection closes.
+    // The server is an in-process thread that the caller stops after this
+    // returns, so read-to-EOF could only end on this socket's 5 s read timeout:
+    // three HTTP/2 tests each sat there for the full timeout with the response
+    // already in hand. A frame on stream 1 carrying END_STREAM is the
+    // observable that the answer has arrived.
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut scanned = 0usize;
+    loop {
+        match tls.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&buf[..n]);
+                while let Some((ftype, flags, stream_id, _payload, next)) =
+                    next_h2_frame(&raw, scanned)
+                {
+                    scanned = next;
+                    // Frames that end the response: HEADERS or DATA on our
+                    // stream with END_STREAM. The server's SETTINGS and its
+                    // ACK do not carry it.
+                    let response_frame = ftype == 0x0 || ftype == 0x1;
+                    if response_frame && stream_id == 1 && flags & FLAG_END_STREAM != 0 {
+                        return raw;
+                    }
+                }
+            }
+            // A read error is the peer closing without a TLS close_notify, which
+            // is ordinary for this in-process server.
+            Err(_) => break,
+        }
+    }
+    raw
+}
+
 #[test]
 fn http2_get_returns_200_with_body() {
     let tc = generate_test_cert();
@@ -344,40 +562,7 @@ fn http2_get_returns_200_with_body() {
     );
     thread::sleep(Duration::from_millis(20));
 
-    let stream = TcpStream::connect(format!("127.0.0.1:{}", port)).expect("tcp connect");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-
-    let server_name = rustls::pki_types::ServerName::try_from("localhost")
-        .unwrap()
-        .to_owned();
-    let mut conn = rustls::ClientConnection::new(client_cfg, server_name).unwrap();
-    let mut stream_ref = &stream;
-    let mut tls = rustls::Stream::new(&mut conn, &mut stream_ref);
-
-    // Send: client connection preface + empty SETTINGS + HEADERS(stream=1, GET /) + GOAWAY
-    const FLAG_END_STREAM: u8 = 0x1;
-    const FLAG_END_HEADERS: u8 = 0x4;
-    tls.write_all(H2_PREFACE).unwrap();
-    tls.write_all(&h2_frame(0x4, 0x0, 0, &[])).unwrap(); // empty SETTINGS
-    tls.write_all(&h2_frame(
-        0x1,
-        FLAG_END_STREAM | FLAG_END_HEADERS,
-        1,
-        H2_REQUEST_HEADERS,
-    ))
-    .unwrap();
-    // GOAWAY so server closes after responding (last_stream_id=1, error=NO_ERROR)
-    let goaway_payload = [0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
-    tls.write_all(&h2_frame(0x7, 0x0, 0, &goaway_payload))
-        .unwrap();
-    tls.flush().ok();
-
-    // Read until EOF (server will close after handling our GOAWAY).
-    let mut raw = Vec::new();
-    let _ = tls.read_to_end(&mut raw);
-
+    let raw = h2_tls_request(port, &client_cfg);
     stop.store(true, Ordering::Relaxed);
 
     // Walk frames; verify :status 200 in HEADERS and "hello h2" in DATA.
@@ -434,37 +619,7 @@ fn http2_version_field_is_http2() {
     );
     thread::sleep(Duration::from_millis(20));
 
-    let stream = TcpStream::connect(format!("127.0.0.1:{}", port)).expect("tcp connect");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-
-    let server_name = rustls::pki_types::ServerName::try_from("localhost")
-        .unwrap()
-        .to_owned();
-    let mut conn = rustls::ClientConnection::new(client_cfg, server_name).unwrap();
-    let mut stream_ref = &stream;
-    let mut tls = rustls::Stream::new(&mut conn, &mut stream_ref);
-
-    const FLAG_END_STREAM: u8 = 0x1;
-    const FLAG_END_HEADERS: u8 = 0x4;
-    tls.write_all(H2_PREFACE).unwrap();
-    tls.write_all(&h2_frame(0x4, 0x0, 0, &[])).unwrap();
-    tls.write_all(&h2_frame(
-        0x1,
-        FLAG_END_STREAM | FLAG_END_HEADERS,
-        1,
-        H2_REQUEST_HEADERS,
-    ))
-    .unwrap();
-    let goaway_payload = [0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
-    tls.write_all(&h2_frame(0x7, 0x0, 0, &goaway_payload))
-        .unwrap();
-    tls.flush().ok();
-
-    let mut raw = Vec::new();
-    let _ = tls.read_to_end(&mut raw);
-
+    let raw = h2_tls_request(port, &client_cfg);
     stop.store(true, Ordering::Relaxed);
 
     let mut body_bytes = Vec::new();
@@ -480,6 +635,42 @@ fn http2_version_field_is_http2() {
         b"HTTP/2",
         "expected version HTTP/2 in body, got {:?}",
         String::from_utf8_lossy(&body_bytes)
+    );
+}
+
+/// The client address an HTTP/2 over TLS request carries must be the peer that
+/// connected. This test fails if the handler receives any other address, which
+/// would attribute the request to the wrong client.
+#[test]
+fn http2_records_the_peer_client_address() {
+    let tc = generate_test_cert();
+    let (cert_file, key_file) = write_pem_files(&tc);
+    let client_cfg = make_h2_client_config(&tc.cert_der);
+
+    let seen = Arc::new(Mutex::new(String::new()));
+    let seen_in_handler = Arc::clone(&seen);
+
+    let (port, stop) = start_http11_server(
+        cert_file.path().to_str().unwrap(),
+        key_file.path().to_str().unwrap(),
+        move |_req, client_ip| {
+            *seen_in_handler.lock().unwrap() = client_ip.to_string();
+            (
+                200,
+                vec![("content-type".to_string(), "text/plain".to_string())],
+                b"ok".to_vec(),
+                "test".to_string(),
+            )
+        },
+    );
+
+    let _ = h2_tls_request(port, &client_cfg);
+    stop.store(true, Ordering::Relaxed);
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        "127.0.0.1",
+        "the HTTP/2 over TLS request must record the connecting peer address as client_ip"
     );
 }
 
@@ -675,7 +866,7 @@ fn run_h3_client_once(server_addr: std::net::SocketAddr) -> Result<(u16, Vec<u8>
     let mut body: Vec<u8> = Vec::new();
     let mut done = false;
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + m6_core::testkit::STARTUP_BOUND;
 
     loop {
         if std::time::Instant::now() > deadline {

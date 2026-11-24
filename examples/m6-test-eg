@@ -1,0 +1,263 @@
+#!/bin/bash
+# m6-test-eg — integration test runner for all m6 examples.
+#
+# Starts each example via m6-run-eg, runs its test.sh (if present),
+# then stops it. Reports a summary at the end.
+#
+# Usage:
+#   m6-test-eg                  test all examples
+#   m6-test-eg 3 5 10 11        test specific examples by number
+#   m6-test-eg --keep           leave servers running after tests (debug)
+#   m6-test-eg --no-stop        alias for --keep
+#
+# Exit code: 0 if all tests pass, 1 if any fail.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+EXAMPLES_DIR="$SCRIPT_DIR"
+M6_RUN="$SCRIPT_DIR/m6-run-eg"
+
+KEEP=0
+PASS=0
+FAIL=0
+SKIPPED=0
+declare -a RESULTS=()
+
+# Examples that cannot run as a local dev stack:
+#   06 — systemd production config only, no dev.sh
+#   09 — multi-node global deployment, requires manual VMs
+SKIP_ALWAYS="06 09"
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+green()  { printf '\033[0;32m%s\033[0m' "$*"; }
+red()    { printf '\033[0;31m%s\033[0m' "$*"; }
+yellow() { printf '\033[0;33m%s\033[0m' "$*"; }
+bold()   { printf '\033[1m%s\033[0m' "$*"; }
+
+pad() { printf '%-36s' "$*"; }
+
+should_skip() {
+    local n
+    n=$(printf "%02d" "$((10#$1))")
+    for s in $SKIP_ALWAYS; do
+        [ "$n" = "$(printf "%02d" "$((10#$s))")" ] && return 0
+    done
+    return 1
+}
+
+# Return true if the example has a dev.sh
+has_dev() {
+    local dir
+    dir=$(find "$EXAMPLES_DIR" -maxdepth 1 -type d -name "$(printf "%02d" "$((10#$1))")-*" | head -1)
+    [ -n "$dir" ] && [ -f "$dir/dev.sh" ]
+}
+
+# Return the test.sh path if it exists, else empty.
+test_sh() {
+    local dir
+    dir=$(find "$EXAMPLES_DIR" -maxdepth 1 -type d -name "$(printf "%02d" "$((10#$1))")-*" | head -1)
+    local ts="$dir/test.sh"
+    [ -f "$ts" ] && echo "$ts" || echo ""
+}
+
+# A test.sh that declares M6_SELF_STARTING=1 starts and stops its own stack.
+# The driver must not start dev.sh for it first: a second stack on the same
+# port would force test.sh to stop a process it did not start.
+self_starting() {
+    grep -q '^# M6_SELF_STARTING=1' "$1" 2>/dev/null
+}
+
+example_name() {
+    basename "$(find "$EXAMPLES_DIR" -maxdepth 1 -type d -name "$(printf "%02d" "$((10#$1))")-*" | head -1)"
+}
+
+# ── run one example ───────────────────────────────────────────────────────────
+
+run_example() {
+    local n="$1"
+    local num
+    num=$(printf "%02d" "$((10#$n))")
+    local name
+    name=$(example_name "$n" 2>/dev/null || echo "${num}-unknown")
+    local log="/tmp/m6-eg-${num}-test.log"
+
+    printf "  [%s] %s\n" "$num" "$(bold "$name")"
+
+    # ── skip? ────────────────────────────────────────────────────────────────
+    if should_skip "$n"; then
+        printf "        start: %s  (multi-node / production-only — skipped)\n" "$(yellow "SKIP")"
+        RESULTS+=("[$num] $name: SKIP (multi-node/production-only)")
+        SKIPPED=$((SKIPPED + 1))
+        return
+    fi
+
+    if ! has_dev "$n"; then
+        printf "        start: %s  (no dev.sh)\n" "$(yellow "SKIP")"
+        RESULTS+=("[$num] $name: SKIP (no dev.sh)")
+        SKIPPED=$((SKIPPED + 1))
+        return
+    fi
+
+    # ── start ────────────────────────────────────────────────────────────────
+    local ts
+    ts=$(test_sh "$n")
+    local self_start=0
+    if [ -n "$ts" ] && self_starting "$ts"; then
+        self_start=1
+    fi
+
+    local start_ok=0
+    if [ "$self_start" -eq 1 ]; then
+        printf "        start: %s  (test.sh starts and stops its own stack)\n" "$(yellow "self")"
+        start_ok=1
+    elif "$M6_RUN" "$n" start --no-browser >"$log" 2>&1; then
+        # Verify server is still running a moment after start (catches immediate crashes)
+        sleep 0.5
+        if "$M6_RUN" "$n" 2>/dev/null | grep -q "running" 2>/dev/null || \
+           grep -q "up\." "$log" 2>/dev/null; then
+            start_ok=1
+        fi
+        # Simpler: check if port is still open
+        local port
+        port=$(grep -m1 "waiting for port" "$log" 2>/dev/null | grep -o '[0-9]*$' || echo "8443")
+        if lsof -ti ":$port" &>/dev/null; then
+            start_ok=1
+        fi
+    fi
+
+    if [ "$start_ok" -eq 0 ]; then
+        printf "        start: %s\n" "$(red "FAIL")"
+        printf "        log:   %s\n" "$log"
+        # Show last few lines of log
+        tail -5 "$log" 2>/dev/null | sed 's/^/               /'
+        RESULTS+=("[$num] $name: FAIL (server did not start)")
+        FAIL=$((FAIL + 1))
+        "$M6_RUN" "$n" stop >/dev/null 2>&1 || true
+        return
+    fi
+
+    if [ "$self_start" -eq 0 ]; then
+        printf "        start: %s\n" "$(green "PASS")"
+    fi
+
+    # ── test.sh ──────────────────────────────────────────────────────────────
+
+    if [ -z "$ts" ]; then
+        printf "        test:  %s\n" "$(yellow "none")"
+        RESULTS+=("[$num] $name: PASS (start only — no test.sh)")
+        PASS=$((PASS + 1))
+    else
+        local test_log="/tmp/m6-eg-${num}-test-output.log"
+        local test_exit=0
+        local timed_out=0
+        # Run test.sh with a 120-second hard timeout. A timeout is a FAILURE:
+        # test.sh owns whatever it starts, so it must stop its servers and
+        # return.
+        bash "$ts" >"$test_log" 2>&1 &
+        local ts_pid=$!
+        local ts_secs=0
+        while kill -0 "$ts_pid" 2>/dev/null && [ "$ts_secs" -lt 120 ]; do
+            sleep 1; ts_secs=$((ts_secs + 1))
+        done
+        if kill -0 "$ts_pid" 2>/dev/null; then
+            timed_out=1
+            kill -TERM "$ts_pid" 2>/dev/null || true
+            sleep 1
+            kill -KILL "$ts_pid" 2>/dev/null || true
+        fi
+        # Redirect stderr to suppress bash's "Terminated: 15" job notification.
+        exec 3>&2 2>/dev/null
+        wait "$ts_pid" || test_exit=$?
+        exec 2>&3 3>&-
+        if [ "$timed_out" -eq 1 ]; then
+            test_exit=124
+        fi
+
+        # Parse pass/fail counts from test.sh output (format: "N passed, M failed")
+        local t_pass t_fail
+        t_pass=$(grep -oE '[0-9]+ passed' "$test_log" | tail -1 | grep -o '[0-9]*' || echo "")
+        t_fail=$(grep -oE '[0-9]+ failed' "$test_log"  | tail -1 | grep -o '[0-9]*' || echo "")
+        local summary=""
+        [ -n "$t_pass" ] && summary="${t_pass} passed"
+        [ -n "$t_fail" ] && summary="${summary:+$summary, }${t_fail} failed"
+        [ -n "$summary" ] && summary=" ($summary)"
+
+        if [ "$test_exit" -eq 0 ]; then
+            printf "        test:  %s%s\n" "$(green "PASS")" "$summary"
+            RESULTS+=("[$num] $name: PASS${summary}")
+            PASS=$((PASS + 1))
+        else
+            if [ "$timed_out" -eq 1 ]; then
+                summary=" (timed out after 120s)"
+            fi
+            printf "        test:  %s%s\n" "$(red "FAIL")" "$summary"
+            printf "        log:   %s\n" "$test_log"
+            # Show failing lines
+            grep -i "FAIL\|error\|Error" "$test_log" 2>/dev/null | head -8 | sed 's/^/               /'
+            RESULTS+=("[$num] $name: FAIL${summary}")
+            FAIL=$((FAIL + 1))
+        fi
+    fi
+
+    # ── stop ─────────────────────────────────────────────────────────────────
+    if [ "$KEEP" -eq 0 ]; then
+        "$M6_RUN" "$n" stop >/dev/null 2>&1 || true
+    fi
+}
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+# Parse args
+TARGETS=()
+for arg in "$@"; do
+    case "$arg" in
+        --keep|--no-stop) KEEP=1 ;;
+        --*)              echo "unknown flag: $arg" >&2; exit 2 ;;
+        [0-9]*)           TARGETS+=("$arg") ;;
+        *)                echo "usage: m6-test-eg [--keep] [N ...]" >&2; exit 2 ;;
+    esac
+done
+
+# If no targets given, find all example numbers
+if [ "${#TARGETS[@]}" -eq 0 ]; then
+    for dir in "$EXAMPLES_DIR"/[0-9][0-9]-*/; do
+        [ -d "$dir" ] || continue
+        num=$(basename "$dir" | cut -d- -f1)
+        TARGETS+=("$((10#$num))")
+    done
+fi
+
+echo ""
+bold "=== m6 examples integration tests ==="; echo ""
+echo ""
+
+for n in "${TARGETS[@]}"; do
+    run_example "$n"
+    echo ""
+done
+
+# ── summary ──────────────────────────────────────────────────────────────────
+bold "=== Results ==="; echo ""
+echo ""
+for r in "${RESULTS[@]}"; do
+    case "$r" in
+        *PASS*) echo "  $(green "✓") $r" ;;
+        *FAIL*) echo "  $(red   "✗") $r" ;;
+        *SKIP*) echo "  $(yellow "-") $r" ;;
+    esac
+done
+echo ""
+
+total=$((PASS + FAIL))
+if [ "$FAIL" -eq 0 ]; then
+    printf "  %s  %d/%d passed" "$(green "ALL PASS")" "$PASS" "$total"
+else
+    printf "  %s  %d/%d passed, %d failed" "$(red "FAILURES")" "$PASS" "$total" "$FAIL"
+fi
+[ "$SKIPPED" -gt 0 ] && printf "  (%d skipped)" "$SKIPPED"
+echo ""
+echo ""
+
+[ "$FAIL" -eq 0 ]

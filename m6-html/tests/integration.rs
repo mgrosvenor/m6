@@ -1,8 +1,13 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use m6_core::testkit::{binary, Service};
 
@@ -45,7 +50,7 @@ fn config_path() -> PathBuf {
 /// failed against `""`. It passed in isolation every time, which is what made
 /// it look like noise.
 fn spawn_server(id: &str) -> (Server, PathBuf) {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     // Short name: a unix socket path is capped near 104 bytes on macOS, and
     // the temp directory already spends most of that.
     let socket_path = dir.path().join(format!("{id}.sock"));
@@ -57,7 +62,8 @@ fn spawn_server(id: &str) -> (Server, PathBuf) {
             .arg(config_path())
             .env("M6_SOCKET_OVERRIDE", &socket_path),
     );
-    svc.wait_for_path(&socket_path, Duration::from_secs(10));
+    svc.wait_for_path(&socket_path, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
 
     let mut ready = false;
     for _ in 0..200 {
@@ -86,15 +92,19 @@ fn http_request(socket_path: &Path, request: &str) -> String {
         Ok(s) => s,
         Err(_) => return String::new(),
     };
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
     if stream.write_all(request.as_bytes()).is_err() {
         return String::new();
     }
     // One response, not read-to-EOF: the connection stays open (RFC 9112 9.3),
-    // so waiting for a close waits for the idle timeout.
+    // so waiting for a close waits for the idle timeout. The wait is on the
+    // response event, with the testkit's response ceiling as its bound.
     stream.shutdown(std::net::Shutdown::Write).ok();
-    let response = m6_core::testkit::read_one(&mut stream, request.split(' ').next().unwrap_or(""))
-        .unwrap_or_default();
+    let response = m6_core::testkit::read_response_event(
+        stream,
+        request.split(' ').next().unwrap_or(""),
+        m6_core::testkit::RESPONSE_BOUND,
+    )
+    .unwrap_or_default();
     String::from_utf8_lossy(&response).into_owned()
 }
 
@@ -105,13 +115,16 @@ fn http_request_bytes(socket_path: &Path, request: &str) -> Vec<u8> {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
     if stream.write_all(request.as_bytes()).is_err() {
         return Vec::new();
     }
     stream.shutdown(std::net::Shutdown::Write).ok();
-    m6_core::testkit::read_one(&mut stream, request.split(' ').next().unwrap_or(""))
-        .unwrap_or_default()
+    m6_core::testkit::read_response_event(
+        stream,
+        request.split(' ').next().unwrap_or(""),
+        m6_core::testkit::RESPONSE_BOUND,
+    )
+    .unwrap_or_default()
 }
 
 /// Return just the body bytes from a raw HTTP response bytes (after \r\n\r\n).
@@ -150,6 +163,130 @@ fn l1_valid_config_starts_and_socket_appears() {
     );
 }
 
+/// An unknown `--log-level` is a startup error: the service names the level,
+/// exits 2, and never binds its socket.
+#[test]
+fn an_unknown_log_level_exits_2_before_binding() {
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
+    let socket_path = dir.path().join("verbose.sock");
+
+    let mut svc = Service::spawn(
+        "m6-html",
+        Command::new(binary("m6-html"))
+            .arg(fixtures_dir())
+            .arg(config_path())
+            .arg("--log-level")
+            .arg("verbose")
+            .env("M6_SOCKET_OVERRIDE", &socket_path),
+    );
+
+    let status = svc
+        .wait_for_exit(std::time::Instant::now() + m6_core::testkit::STARTUP_BOUND)
+        .expect("m6-html should exit on an unknown log level");
+    assert_eq!(status.code(), Some(2), "--- output ---\n{}", svc.output());
+    assert!(
+        svc.output().contains("unknown log level"),
+        "--- output ---\n{}",
+        svc.output()
+    );
+    assert!(
+        !socket_path.exists(),
+        "the socket should never have been bound: {}",
+        socket_path.display()
+    );
+}
+
+/// A `site.toml` key other than `level` is a start error naming the setting:
+/// the documented refusal applies to every core service, not only to m6-http
+/// and to service configs.
+#[test]
+fn a_site_toml_log_format_exits_2_and_names_it() {
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
+    let site = dir.path().join("site");
+    std::fs::create_dir(&site).expect("the site directory");
+    for entry in std::fs::read_dir(fixtures_dir()).expect("the fixtures") {
+        let entry = entry.expect("a fixture");
+        if entry.file_name() == "site.toml" {
+            continue;
+        }
+        std::os::unix::fs::symlink(entry.path(), site.join(entry.file_name()))
+            .expect("a fixture link");
+    }
+    std::fs::write(
+        site.join("site.toml"),
+        "[site]\nname = \"Test Site\"\ndomain = \"localhost\"\n\n[log]\nformat = \"text\"\n",
+    )
+    .expect("the site file");
+    let socket_path = dir.path().join("format.sock");
+
+    let mut svc = Service::spawn(
+        "m6-html",
+        Command::new(binary("m6-html"))
+            .arg(&site)
+            .arg(site.join("configs").join("m6-html.conf"))
+            .env("M6_SOCKET_OVERRIDE", &socket_path),
+    );
+
+    let status = svc
+        .wait_for_exit(std::time::Instant::now() + m6_core::testkit::STARTUP_BOUND)
+        .expect("m6-html should exit on a [log] format key");
+    assert_eq!(status.code(), Some(2), "--- output ---\n{}", svc.output());
+    assert!(
+        svc.output().contains("unknown key [log] format"),
+        "--- output ---\n{}",
+        svc.output()
+    );
+    assert!(
+        !socket_path.exists(),
+        "the socket should never have been bound: {}",
+        socket_path.display()
+    );
+}
+
+/// A line logged after start reaches the process's stdout within one
+/// accounting tick. Only the loop can write it: the Sink holds it until the
+/// tick flushes, and the process is alive and idle.
+///
+/// Break: remove the `tick` call from m6-html's loop, and the line sits in the
+/// 16 KiB buffer until the process stops. The Sink does not register stdout
+/// here: a line waiting for the tick is not a full destination.
+#[test]
+fn a_quiet_service_flushes_within_a_tick() {
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
+    let socket_path = dir.path().join("tick.sock");
+    let mut svc = Service::spawn(
+        "m6-html",
+        Command::new(binary("m6-html"))
+            .arg(fixtures_dir())
+            .arg(config_path())
+            .arg("--log-level")
+            .arg("debug")
+            .env("M6_SOCKET_OVERRIDE", &socket_path),
+    );
+    svc.wait_for_path(&socket_path, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
+    let response = http_request(
+        &socket_path,
+        "GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(
+        response.contains("200 OK"),
+        "the request was not served: {response}"
+    );
+
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
+    while Instant::now() < deadline {
+        if svc.output().contains("\"message\":\"request complete\"") {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!(
+        "no request line in the captured stdout within 3 s\n--- output ---\n{}",
+        svc.output()
+    );
+}
+
 /// secrets_file pointing at a non-existent path is silently ignored.
 #[test]
 fn l1_secrets_file_absent_still_starts() {
@@ -183,7 +320,7 @@ fn l1_sigterm_exits_zero() {
     // what the process did, which passed whatever happened — including the
     // process being killed outright by the signal.
     let mut guard = guard;
-    let status = guard.svc.terminate(Duration::from_secs(5));
+    let status = guard.svc.terminate(m6_core::testkit::STARTUP_BOUND);
     assert!(
         status.success(),
         "m6-html should exit 0 on SIGTERM, got {status}. A signal exit status means the \
@@ -200,6 +337,160 @@ fn l1_sigterm_exits_zero() {
         socket_path.display()
     );
     m6_core::testkit::assert_lifecycle_logged("m6-html", &guard.svc.output());
+}
+
+// ---------------------------------------------------------------------------
+// L1b — One loop thread
+// ---------------------------------------------------------------------------
+
+/// An answered request was served on the thread that accepted it, not on a
+/// worker of its own. Nine connections are answered and left open while the
+/// count is taken: a thread per connection would still be blocked in its next
+/// read on each of them, so it would show up here.
+#[test]
+fn a_request_is_served_on_the_accepting_thread() {
+    let (server, socket_path) = spawn_server("thread-count");
+
+    // Keep-alive: the write side stays open, so the server holds each
+    // connection instead of reading EOF and closing it. A connection that
+    // closed would let a per-connection thread exit before the count.
+    let mut clients = Vec::new();
+    for _ in 0..9 {
+        let mut client = UnixStream::connect(&socket_path).expect("connect");
+        client
+            .write_all(b"GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("send the request");
+        let response = m6_core::testkit::read_response_event(
+            client.try_clone().expect("clone the client"),
+            "GET",
+            m6_core::testkit::RESPONSE_BOUND,
+        )
+        .expect("one response");
+        assert!(
+            String::from_utf8_lossy(&response).contains("200 OK"),
+            "the request was not served: {}",
+            String::from_utf8_lossy(&response[..response.len().min(200)])
+        );
+        clients.push(client);
+    }
+    let pid = server.svc.pid();
+
+    // The wait is for the count to settle, never a fixed sleep: the assertion
+    // below is the signal and the deadline is the bound.
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
+    let mut threads = thread_count(pid);
+    while threads != 1 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+        threads = thread_count(pid);
+    }
+    assert_eq!(
+        threads,
+        1,
+        "m6-html (pid {pid}) runs {threads} threads with {} keep-alive connections open: \
+         one loop thread and no logging thread\n--- output ---\n{}",
+        clients.len(),
+        server.svc.output()
+    );
+    drop(clients);
+}
+
+/// The connection table is clamped to the open-file ceiling, so a client
+/// beyond it waits in the kernel's backlog instead of ending the process.
+///
+/// The child runs with a hard limit of 64 descriptors, so the ceiling is 48
+/// and the table holds 48. The 49th connection stays in the backlog until one
+/// of the 48 closes; then the listener is registered again and it is answered.
+/// A hard limit below the reserved descriptors is a start failure, exit 2.
+#[test]
+fn a_lowered_open_file_limit_sheds_load_instead_of_exiting() {
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
+    let socket_path = dir.path().join("limit.sock");
+    let mut command = m6_core::testkit::lowered_fd_limit_command(64, 0, binary("m6-html"));
+    command
+        .arg(fixtures_dir())
+        .arg(config_path())
+        .env("M6_SOCKET_OVERRIDE", &socket_path);
+    let mut svc = Service::spawn("m6-html", &mut command);
+    svc.wait_for_path(&socket_path, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
+    let ready = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
+        !http_request(
+            &socket_path,
+            "GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .is_empty()
+    });
+    assert!(
+        ready,
+        "m6-html never answered a request\n--- output ---\n{}",
+        svc.output()
+    );
+    svc.assert_alive("after the first answered request");
+
+    // The ceiling is the hard limit minus the 16 descriptors the listener,
+    // the signal and poll descriptors and stdio reserve. One hard limit's
+    // worth of connections is more than the process can hold, so the whole
+    // table fills and the rest wait in the kernel's backlog.
+    const HARD: usize = 64;
+    const CEILING: usize = HARD - 16;
+    let mut held: Vec<UnixStream> = (0..HARD)
+        .map(|_| UnixStream::connect(&socket_path).expect("connect"))
+        .collect();
+    svc.assert_alive("with the table at its ceiling and connections in the backlog");
+
+    // Free a slot. The first connection waiting in the backlog is the next
+    // one the listener takes, so that one is answered.
+    let mut spare = held.remove(CEILING);
+    drop(held.remove(0));
+    spare
+        .write_all(b"GET /blog HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("send the request");
+    let response =
+        m6_core::testkit::read_response_event(spare, "GET", m6_core::testkit::RESPONSE_BOUND)
+            .unwrap_or_else(|e| {
+                panic!(
+            "the connection that waited in the backlog was not served after a slot freed: {e}\n\
+             --- output ---\n{}",
+            svc.output()
+        )
+            });
+    assert!(
+        String::from_utf8_lossy(&response).contains("200 OK"),
+        "the backlog connection was answered with {}",
+        String::from_utf8_lossy(&response[..response.len().min(200)])
+    );
+    svc.assert_alive("after answering a connection that waited in the backlog");
+
+    // A hard limit that cannot hold a table is a start failure, exit 2, and
+    // nothing is bound.
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
+    let socket_path = dir.path().join("none.sock");
+    let mut command = m6_core::testkit::lowered_fd_limit_command(16, 0, binary("m6-html"));
+    command
+        .arg(fixtures_dir())
+        .arg(config_path())
+        .env("M6_SOCKET_OVERRIDE", &socket_path);
+    let mut svc = Service::spawn("m6-html", &mut command);
+    let status = svc
+        .wait_for_exit(Instant::now() + m6_core::testkit::STARTUP_BOUND)
+        .expect("m6-html should exit when the limit cannot hold a table");
+    assert_eq!(status.code(), Some(2), "--- output ---\n{}", svc.output());
+    assert!(
+        svc.output().contains("open file limit"),
+        "the failure must name the limit\n--- output ---\n{}",
+        svc.output()
+    );
+    assert!(
+        !socket_path.exists(),
+        "a start failure must not bind the socket: {}",
+        socket_path.display()
+    );
+}
+
+/// The thread count of a running process, through the platform layer, which
+/// answers the same question on every target.
+fn thread_count(pid: u32) -> usize {
+    m6_core::platform::process::thread_count(pid).unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -433,9 +724,9 @@ fn l6_no_store_cache_control() {
     );
 }
 
-/// Default route → Cache-Control: public.
+/// Default route -> the browser-caching pattern, with an ETag.
 #[test]
-fn l6_default_cache_control_public() {
+fn l6_default_cache_control_is_the_browser_caching_pattern() {
     let (_guard, socket_path) = spawn_server("l6-public");
 
     let resp = http_request(
@@ -444,8 +735,14 @@ fn l6_default_cache_control_public() {
     );
     assert!(resp.contains("200 OK"), "expected 200");
     assert!(
-        resp.to_lowercase().contains("cache-control: public"),
-        "expected Cache-Control: public, got headers:\n{}",
+        resp.to_lowercase()
+            .contains("cache-control: public, max-age=0, must-revalidate, s-maxage=86400"),
+        "expected the page default, got headers:\n{}",
+        &resp[..resp.find("\r\n\r\n").unwrap_or(resp.len().min(500))]
+    );
+    assert!(
+        resp.to_lowercase().contains("etag:"),
+        "a page must carry an ETag so it can be revalidated, got headers:\n{}",
         &resp[..resp.find("\r\n\r\n").unwrap_or(resp.len().min(500))]
     );
 }
@@ -570,32 +867,29 @@ fn l8_concurrent_requests_all_routes() {
         let sp = socket_path.clone();
         let (req, expected) = routes[i % routes.len()];
         let handle = std::thread::spawn(move || {
-            // Retry up to 3 times to handle transient 503s from a full queue.
-            let mut last_resp = String::new();
-            for _attempt in 0..3 {
-                let resp = http_request(&sp, req);
-                if !resp.is_empty() {
-                    last_resp = resp;
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
+            let response = http_request(&sp, req);
             assert!(
-                !last_resp.is_empty(),
-                "request {} ({}): got empty response after retries",
+                !response.is_empty(),
+                "request {} ({}): got no response",
                 i,
                 req.split_whitespace().nth(1).unwrap_or("?"),
             );
-            // Accept 200 or 503 (server queue full) — the test verifies no crashes.
-            // For routes that must return 200, also accept 503 under load.
-            let ok = last_resp.contains(expected) || last_resp.contains("503");
+            // There is no queue and no 503 path in this service any more:
+            // every accepted connection is served on the loop.
             assert!(
-                ok,
-                "request {} ({}): expected {} or 503, got: {}",
+                !response.contains("503"),
+                "request {} ({}): got a 503 from a service with no queue: {}",
+                i,
+                req.split_whitespace().nth(1).unwrap_or("?"),
+                &response[..response.len().min(200)]
+            );
+            assert!(
+                response.contains(expected),
+                "request {} ({}): expected {}, got: {}",
                 i,
                 req.split_whitespace().nth(1).unwrap_or("?"),
                 expected,
-                &last_resp[..last_resp.len().min(200)]
+                &response[..response.len().min(200)]
             );
         });
         handles.push(handle);

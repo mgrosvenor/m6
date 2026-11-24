@@ -1,6 +1,6 @@
 //! m6's own telemetry formats, and how to read them back.
 //!
-//! `/health`, `/perf`, the `periodic stats` log line and the analytics NDJSON
+//! `/health`, the `periodic stats` log line and the analytics NDJSON
 //! stream are all m6 features. Every deployment of m6 emits them and every
 //! deployment therefore has the same problem: turning them back into an answer
 //! about whether a fleet is healthy, fast, and being probed.
@@ -11,10 +11,10 @@
 //!
 //! # The write side has no struct
 //!
-//! `m6-http` emits an analytics row with `tracing::info!(target: "analytics",
-//! node = .., path = .., ..)`, and the JSON is produced by the subscriber's
-//! formatter. So there is no type describing the format, on either side, and
-//! every consumer has re-derived it by looking at a sample. That is how the
+//! `m6-http` emits an analytics row through `m6_core::log`, and the JSON is
+//! produced by the logger's line builder. So there is no type describing the
+//! format, on either side, and every consumer has re-derived it by looking at
+//! a sample. That is how the
 //! field set below came to be read as `ts` and `user_agent` rather than
 //! `timestamp` and `fields.user_agent`, which yields an empty result that
 //! looks exactly like a quiet hour rather than like a bug.
@@ -31,9 +31,9 @@ use serde::{Deserialize, Serialize};
 
 /// One line of the analytics stream.
 ///
-/// The envelope is the tracing subscriber's: a timestamp and level outside, the
-/// event's own fields nested under `fields`. Reading `user_agent` at the top
-/// level finds nothing.
+/// The envelope is the logger's: a timestamp and level outside, the event's own
+/// fields nested under `fields`. Reading `user_agent` at the top level finds
+/// nothing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalyticsRecord {
     pub timestamp: String,
@@ -45,8 +45,8 @@ pub struct AnalyticsRecord {
 /// The event's fields, as emitted by `m6_http::analytics`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AnalyticsFields {
-    /// `"request"` for site traffic, `"monitor"` for a `/health` or `/perf`
-    /// poll. Monitoring is deliberately a different message so that site
+    /// `"request"` for site traffic, `"monitor"` for a `/health` poll.
+    /// Monitoring is deliberately a different message so that site
     /// traffic stays honest while the monitoring itself stays visible; every
     /// consumer that wants traffic must filter on this.
     #[serde(default)]
@@ -85,6 +85,67 @@ impl AnalyticsRecord {
     pub fn user_agent(&self) -> &str {
         self.fields.user_agent.as_deref().unwrap_or("")
     }
+
+    /// The record as the traffic summary reads it, borrowed.
+    pub fn view(&self) -> RequestView<'_> {
+        RequestView {
+            at: Stamp::Text(&self.timestamp),
+            message: &self.fields.message,
+            status: self.fields.status,
+            path: &self.fields.path,
+            client_ip: &self.fields.client_ip,
+            user_agent: self.user_agent(),
+            // A line carries whole values, so nothing parsed from one is cut.
+            truncated: false,
+        }
+    }
+}
+
+/// When a request happened, as the source holds it.
+///
+/// A log line carries the envelope's text, and the traffic window keeps Unix
+/// microseconds. One summary reads one kind, and both order by time: the text
+/// is fixed-width RFC 3339 in UTC, so its order is the time order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Stamp<'a> {
+    Text(&'a str),
+    Micros(u64),
+}
+
+impl Stamp<'_> {
+    /// The time as the logging envelope writes it: UTC, fixed width,
+    /// microsecond precision.
+    pub fn text(self) -> String {
+        match self {
+            Stamp::Text(text) => text.to_string(),
+            Stamp::Micros(at_us) => {
+                let at = i64::try_from(at_us).expect("a Unix time in microseconds fits in i64");
+                chrono::DateTime::from_timestamp_micros(at)
+                    .expect("a Unix time in microseconds is in range")
+                    .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// One request as the traffic summary reads it: the values an analytics line
+/// carries that the summary uses, borrowed from a parsed record or from the
+/// traffic window's slot.
+///
+/// `truncated` says the window cut the path or the user agent. A line carries
+/// whole values, so a parsed record never sets it. The summary has to know,
+/// because a probe marker in the cut part is still a probe marker the request
+/// carried.
+#[derive(Clone, Copy, Debug)]
+pub struct RequestView<'a> {
+    pub at: Stamp<'a>,
+    pub message: &'a str,
+    pub status: u16,
+    pub path: &'a str,
+    pub client_ip: &'a str,
+    pub user_agent: &'a str,
+    pub truncated: bool,
 }
 
 /// Parse an NDJSON stream, keeping records at or after `since`.
@@ -151,13 +212,13 @@ pub fn strip_ansi(s: &str) -> String {
 }
 
 fn field(line: &str, key: &str) -> Option<u64> {
-    let pat = format!("{key}=");
-    let start = line.find(&pat)? + pat.len();
-    let rest = &line[start..];
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-    rest[..end].parse().ok()
+    // A field is a whole whitespace-delimited token `key=value`, so a key must
+    // not be read out of a longer key such as `total_requests`.
+    let prefix = format!("{key}=");
+    let value = line
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix(prefix.as_str()))?;
+    value.parse().ok()
 }
 
 impl PeriodicStats {
@@ -321,22 +382,294 @@ pub const INJECTION_MARKERS: &[&str] = &[
     "benchmark(",
 ];
 
-fn matches_any(haystack: &str, needles: &[&str]) -> bool {
-    let h = haystack.to_ascii_lowercase();
-    needles.iter().any(|n| h.contains(n))
+/// One ASCII-case-insensitive automaton per marker list, built on first use.
+///
+/// The traffic report runs every request of the hour through these, so a
+/// match is one pass over the text with no allocation. Lowercasing the text
+/// and calling `contains` once per marker cost about 1 us a path, which at a
+/// full window was most of a 79 ms report.
+fn markers(needles: &[&str]) -> aho_corasick::AhoCorasick {
+    aho_corasick::AhoCorasick::builder()
+        .ascii_case_insensitive(true)
+        .build(needles)
+        .expect("the marker lists are plain strings")
+}
+
+static BOT: std::sync::LazyLock<aho_corasick::AhoCorasick> =
+    std::sync::LazyLock::new(|| markers(BOT_MARKERS));
+static PROBE: std::sync::LazyLock<aho_corasick::AhoCorasick> =
+    std::sync::LazyLock::new(|| markers(PROBE_MARKERS));
+static INJECTION: std::sync::LazyLock<aho_corasick::AhoCorasick> =
+    std::sync::LazyLock::new(|| markers(INJECTION_MARKERS));
+
+/// Whether `text` matches the automaton as written or, when it carries a
+/// percent escape or a `+`, once decoded by `request::url_decode`.
+fn matches_raw_or_decoded(text: &str, automaton: &aho_corasick::AhoCorasick) -> bool {
+    automaton.is_match(text)
+        || (text.contains(['%', '+'])
+            && automaton.is_match(crate::request::url_decode(text).as_str()))
 }
 
 pub fn claims_to_be_bot(user_agent: &str) -> bool {
-    matches_any(user_agent, BOT_MARKERS)
+    BOT.is_match(user_agent)
+}
+
+// ── Verifying a crawler's claim ───────────────────────────────────────────────
+//
+// **A crawler's documentation URL is not its PTR domain, and assuming it was
+// is a defect this code was written with and corrected before release.**
+//
+// The first version of this took the domain out of the agent's own URL and
+// compared the reverse lookup against it. That
+// marked three genuine crawlers as forgeries:
+//
+//     agent says                     actually resolves to
+//     developer.amazon.com           crawl.amazonbot.amazon
+//     bing.com/bingbot.htm           search.msn.com
+//     google.com/bot.html            googlebot.com
+//
+// A verifier that accuses the real ones is worse than no verifier, because its
+// output gets ignored and then so does a true finding. The expectation has to
+// come from the operator's own documented method, which is what the table
+// below holds.
+//
+// The other half of the correction: **not every operator uses PTR records.**
+// Some publish a list of address ranges instead, and for those a reverse
+// lookup can neither confirm nor deny. That is a third answer, not a failure,
+// and reporting it as a mismatch would be the same mistake again.
+
+/// How a crawler's operator says to check that a request is really theirs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrawlerVerification {
+    /// The operator publishes PTR records, and a genuine address resolves to a
+    /// name under one of these suffixes.
+    Ptr(&'static [&'static str]),
+    /// The operator publishes a list of address ranges rather than PTR
+    /// records. A reverse lookup says nothing either way. The string names
+    /// where the list is published, so a reader knows what would settle it.
+    PublishedRanges(&'static str),
+}
+
+/// A crawler we know how to check, and how.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnownCrawler {
+    /// What to call it in a report.
+    pub name: &'static str,
+    /// Lowercase substring of the user agent that identifies it.
+    pub marker: &'static str,
+    pub verification: CrawlerVerification,
+}
+
+/// Crawlers whose operator documents how to verify them.
+///
+/// Each entry is the operator's own published method. An agent that matches
+/// nothing here is reported as unrecognised rather than guessed at: inventing
+/// an expectation is how the first version of this came to accuse Amazonbot.
+///
+/// Longest markers first where one contains another, so `claude-searchbot`
+/// cannot be swallowed by a shorter `claudebot`.
+pub const KNOWN_CRAWLERS: &[KnownCrawler] = &[
+    // Google documents reverse-then-forward DNS resolving under googlebot.com
+    // or google.com for Googlebot. googleusercontent.com is not accepted: every
+    // cloud customer's virtual machine gets a reverse name under it that also
+    // resolves forward, so it would verify anyone who rents one.
+    KnownCrawler {
+        name: "Googlebot",
+        marker: "googlebot",
+        verification: CrawlerVerification::Ptr(&["googlebot.com", "google.com"]),
+    },
+    KnownCrawler {
+        name: "Google-InspectionTool",
+        marker: "google-inspectiontool",
+        verification: CrawlerVerification::Ptr(&["googlebot.com", "google.com"]),
+    },
+    // Microsoft documents search.msn.com, NOT bing.com, which is what the
+    // agent's own URL names.
+    KnownCrawler {
+        name: "bingbot",
+        marker: "bingbot",
+        verification: CrawlerVerification::Ptr(&["search.msn.com"]),
+    },
+    KnownCrawler {
+        name: "BingPreview",
+        marker: "bingpreview",
+        verification: CrawlerVerification::Ptr(&["search.msn.com"]),
+    },
+    // Amazon documents crawl.amazonbot.amazon, not developer.amazon.com.
+    KnownCrawler {
+        name: "Amazonbot",
+        marker: "amazonbot",
+        verification: CrawlerVerification::Ptr(&["crawl.amazonbot.amazon"]),
+    },
+    KnownCrawler {
+        name: "Applebot",
+        marker: "applebot",
+        verification: CrawlerVerification::Ptr(&["applebot.apple.com"]),
+    },
+    KnownCrawler {
+        name: "YandexBot",
+        marker: "yandex",
+        verification: CrawlerVerification::Ptr(&["yandex.ru", "yandex.net", "yandex.com"]),
+    },
+    KnownCrawler {
+        name: "Baiduspider",
+        marker: "baiduspider",
+        verification: CrawlerVerification::Ptr(&["baidu.com", "baidu.jp"]),
+    },
+    KnownCrawler {
+        name: "PetalBot",
+        marker: "petalbot",
+        verification: CrawlerVerification::Ptr(&["petalsearch.com"]),
+    },
+    // These publish address ranges instead of PTR records, so a reverse
+    // lookup cannot settle them in either direction.
+    KnownCrawler {
+        name: "OAI-SearchBot",
+        marker: "oai-searchbot",
+        verification: CrawlerVerification::PublishedRanges(
+            "openai.com/searchbot.json (published address ranges)",
+        ),
+    },
+    KnownCrawler {
+        name: "GPTBot",
+        marker: "gptbot",
+        verification: CrawlerVerification::PublishedRanges(
+            "openai.com/gptbot.json (published address ranges)",
+        ),
+    },
+    KnownCrawler {
+        name: "ChatGPT-User",
+        marker: "chatgpt-user",
+        verification: CrawlerVerification::PublishedRanges(
+            "openai.com/chatgpt-user.json (published address ranges)",
+        ),
+    },
+    KnownCrawler {
+        name: "ClaudeBot",
+        marker: "claudebot",
+        verification: CrawlerVerification::PublishedRanges(
+            "anthropic.com published address ranges",
+        ),
+    },
+    KnownCrawler {
+        name: "Claude-User",
+        marker: "claude-user",
+        verification: CrawlerVerification::PublishedRanges(
+            "anthropic.com published address ranges",
+        ),
+    },
+];
+
+/// The table entry for a user agent, if there is one.
+pub fn known_crawler(user_agent: &str) -> Option<&'static KnownCrawler> {
+    let ua = user_agent.to_ascii_lowercase();
+    // Longest marker wins, so an agent matching both a specific and a general
+    // marker is checked against the specific one.
+    KNOWN_CRAWLERS
+        .iter()
+        .filter(|k| ua.contains(k.marker))
+        .max_by_key(|k| k.marker.len())
+}
+
+/// What a reverse lookup settled about a crawler's claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CrawlerVerdict {
+    /// The name resolves under a suffix the operator documents.
+    Verified {
+        name: &'static str,
+        resolved: String,
+    },
+    /// The name resolves, and under nothing the operator documents. This is
+    /// the only outcome that calls a claim false, and it names what the
+    /// address actually is.
+    Mismatch {
+        name: &'static str,
+        resolved: String,
+        expected: &'static [&'static str],
+    },
+    /// The operator publishes address ranges rather than PTR records, so this
+    /// method cannot settle it. Not a mismatch and not a pass.
+    NotCheckableByPtr {
+        name: &'static str,
+        how: &'static str,
+        resolved: Option<String>,
+    },
+    /// No entry in the table. The lookup result is reported without a verdict,
+    /// because there is no published expectation to judge it against.
+    Unrecognised { resolved: Option<String> },
+    /// The address has a PTR name, and resolving that name forward completed
+    /// without returning the address. The reverse zone is not the operator's,
+    /// so the claim is false whoever the agent says it is.
+    ForwardMismatch {
+        name: Option<&'static str>,
+        resolved: String,
+    },
+    /// The address has no PTR record.
+    NoPtr { name: Option<&'static str> },
+    /// The lookup did not complete. Says nothing about the address.
+    LookupFailed { name: Option<&'static str> },
+}
+
+/// Settle a crawler's claim against a reverse lookup.
+///
+/// The expectation comes from [`KNOWN_CRAWLERS`], never from the agent's own
+/// string. See the note above the table for what that correction cost.
+pub fn verify_crawler(user_agent: &str, ptr: &crate::resolve::Ptr) -> CrawlerVerdict {
+    use crate::resolve::Ptr;
+
+    let Some(k) = known_crawler(user_agent) else {
+        return match ptr {
+            Ptr::Name(r) => CrawlerVerdict::Unrecognised {
+                resolved: Some(r.clone()),
+            },
+            Ptr::Unconfirmed(r) => CrawlerVerdict::ForwardMismatch {
+                name: None,
+                resolved: r.clone(),
+            },
+            Ptr::None => CrawlerVerdict::NoPtr { name: None },
+            Ptr::Failed => CrawlerVerdict::LookupFailed { name: None },
+        };
+    };
+    let name = Some(k.name);
+    // An operator who publishes ranges tells us nothing by PTR, whether or
+    // not a name came back.
+    let expected = match k.verification {
+        CrawlerVerification::PublishedRanges(how) => {
+            return CrawlerVerdict::NotCheckableByPtr {
+                name: k.name,
+                how,
+                resolved: ptr.name().map(str::to_string),
+            }
+        }
+        CrawlerVerification::Ptr(expected) => expected,
+    };
+    match ptr {
+        Ptr::Name(resolved) if expected.iter().any(|d| ptr.verifies(d)) => {
+            CrawlerVerdict::Verified {
+                name: k.name,
+                resolved: resolved.clone(),
+            }
+        }
+        Ptr::Name(resolved) => CrawlerVerdict::Mismatch {
+            name: k.name,
+            resolved: resolved.clone(),
+            expected,
+        },
+        // A failed forward lookup arrives as `Failed`, so this is a completed
+        // one that did not return the address.
+        Ptr::Unconfirmed(resolved) => CrawlerVerdict::ForwardMismatch {
+            name,
+            resolved: resolved.clone(),
+        },
+        Ptr::None => CrawlerVerdict::NoPtr { name },
+        Ptr::Failed => CrawlerVerdict::LookupFailed { name },
+    }
 }
 
 /// Probe shapes, checked raw and decoded, for the same reason as
 /// [`looks_like_injection`]: `..%2F` is a traversal and `%2E%65nv` is `.env`.
 pub fn looks_like_probe(path: &str) -> bool {
-    if matches_any(path, PROBE_MARKERS) {
-        return true;
-    }
-    matches_any(&crate::request::url_decode(path), PROBE_MARKERS)
+    matches_raw_or_decoded(path, &PROBE)
 }
 
 /// Injection shapes, checked against the decoded path.
@@ -348,11 +681,7 @@ pub fn looks_like_probe(path: &str) -> bool {
 /// `request::url_decode` is the one decoder: it reassembles UTF-8 from bytes
 /// rather than mapping each byte to a code point.
 pub fn looks_like_injection(path: &str) -> bool {
-    if matches_any(path, INJECTION_MARKERS) {
-        return true;
-    }
-    let decoded = crate::request::url_decode(path);
-    matches_any(&decoded, INJECTION_MARKERS)
+    matches_raw_or_decoded(path, &INJECTION)
 }
 
 /// What one client address was doing.
@@ -372,6 +701,12 @@ pub struct ClientSummary {
     pub user_agents: Vec<String>,
     pub status: BTreeMap<u16, u64>,
     pub paths: Vec<(String, u64)>,
+    /// Probe-shaped paths and how many requests showed each one.
+    ///
+    /// A request counts when `looks_like_probe` matches its path, or when its
+    /// record says the traffic window cut its path or user agent. The second
+    /// case is what makes a marker past the window's cap visible: the shown
+    /// path need carry none, because the request may.
     pub probe_paths: Vec<(String, u64)>,
     pub injection_paths: Vec<(String, u64)>,
     pub first_seen: String,
@@ -431,6 +766,16 @@ pub struct CrawlerSighting {
     pub requests: u64,
     pub client_ips: Vec<String>,
     pub paths: Vec<(String, u64)>,
+    /// When the counted requests began and ended, as the timestamps appear in
+    /// the log.
+    ///
+    /// Without these a sighting cannot be placed against anything else in a
+    /// report: a crawler fetching a sitemap means one thing an hour after a
+    /// deploy and another during a burst, and the records being aggregated
+    /// carry the time all along. They span only the addresses that survived
+    /// the forgery check, matching `requests`.
+    pub first_seen: String,
+    pub last_seen: String,
 }
 
 /// An hour of traffic, summarised.
@@ -490,8 +835,22 @@ pub const UA_ROTATION_MIN_REQUESTS: u64 = 20;
 pub const USER_AGENTS_KEPT: usize = 4;
 /// Characters kept per user agent. Real ones run to about 150.
 pub const USER_AGENT_MAX_CHARS: usize = 160;
-/// Marks an agent the cap cut short.
+/// Marks a value a cap cut short.
+///
+/// Without it a report cannot tell a short value from the prefix of a long one,
+/// and a cut path would read as the path the client sent. The user-agent sample
+/// uses it at [`USER_AGENT_MAX_CHARS`], and `m6-http`'s traffic window uses this
+/// same value for a path or user agent it cut, so the two marks cannot drift.
 pub const USER_AGENT_TRUNCATED: &str = "...";
+
+/// Counts by key, busiest first, ties by key, at most `keep` of them, with
+/// each kept key copied once.
+fn top_counts(counts: HashMap<&str, u64>, keep: usize) -> Vec<(String, u64)> {
+    let mut v: Vec<(&str, u64)> = counts.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    v.truncate(keep);
+    v.into_iter().map(|(key, n)| (key.to_string(), n)).collect()
+}
 
 /// A capped, deterministic sample of a client's user agents.
 ///
@@ -502,11 +861,11 @@ pub const USER_AGENT_TRUNCATED: &str = "...";
 ///
 /// Each agent then goes through [`reportable_user_agent`], which is where the
 /// character cap and the escaping live.
-fn sample_user_agents<'a>(uas: impl IntoIterator<Item = &'a String>) -> Vec<String> {
-    let mut v: Vec<&String> = uas.into_iter().collect();
+fn sample_user_agents<'a>(uas: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut v: Vec<&str> = uas.into_iter().collect();
     v.sort_unstable();
     v.truncate(USER_AGENTS_KEPT);
-    v.into_iter().map(|ua| reportable_user_agent(ua)).collect()
+    v.into_iter().map(reportable_user_agent).collect()
 }
 
 /// One user agent as a report may print it: one line, visible characters,
@@ -547,59 +906,92 @@ fn reportable_user_agent(ua: &str) -> String {
 
 impl TrafficSummary {
     pub fn from_records<'a>(records: impl IntoIterator<Item = &'a AnalyticsRecord>) -> Self {
-        struct Acc {
+        Self::from_views(records.into_iter().map(AnalyticsRecord::view))
+    }
+
+    /// Summarise requests as borrowed views. A key is copied into the
+    /// summary once per distinct value, never once per request.
+    pub fn from_views<'a>(records: impl IntoIterator<Item = RequestView<'a>>) -> Self {
+        struct Acc<'a> {
             n: u64,
-            uas: HashSet<String>,
-            paths: HashMap<String, u64>,
+            uas: HashSet<&'a str>,
+            paths: HashMap<&'a str, u64>,
+            /// Probe-shaped requests by the path the report shows, counted when
+            /// the record is read. A record whose path or user agent the
+            /// traffic window cut is probe-shaped, and that fact lives on the
+            /// record, not on the stored path.
+            probe_paths: HashMap<&'a str, u64>,
             status: BTreeMap<u16, u64>,
-            first: String,
-            last: String,
+            first: Stamp<'a>,
+            last: Stamp<'a>,
         }
         /// Per-user-agent accumulator. A struct rather than the
         /// `(u64, HashMap, HashMap)` it used to be: the two maps have the same
         /// type and were read positionally as `e.1` and `e.2`, so nothing at the
         /// use site said which one held addresses and which held paths.
         #[derive(Default)]
-        struct UaAcc {
+        struct UaAcc<'a> {
             n: u64,
-            ips: HashMap<String, u64>,
-            paths: HashMap<String, u64>,
+            ips: HashMap<&'a str, IpAcc<'a>>,
+            paths: HashMap<&'a str, u64>,
         }
-        let mut per_ip: HashMap<String, Acc> = HashMap::new();
-        let mut per_ua: HashMap<String, UaAcc> = HashMap::new();
+        /// One address under one user agent: how many, and when.
+        ///
+        /// Per address rather than per user agent because a sighting counts
+        /// only the addresses that survived the forgery check, and its window
+        /// has to be the window of the requests it counted. Folding the times
+        /// in at the user-agent level would let an address excluded as a
+        /// forger widen the span reported for the genuine ones.
+        struct IpAcc<'a> {
+            n: u64,
+            first: Stamp<'a>,
+            last: Stamp<'a>,
+        }
+        let mut per_ip: HashMap<&'a str, Acc<'a>> = HashMap::new();
+        let mut per_ua: HashMap<&'a str, UaAcc<'a>> = HashMap::new();
         let mut summary = TrafficSummary::default();
 
         for rec in records {
-            if !rec.is_request() {
+            if rec.message != "request" {
                 continue;
             }
-            let f = &rec.fields;
             summary.total_requests += 1;
-            *summary.status.entry(f.status).or_default() += 1;
+            *summary.status.entry(rec.status).or_default() += 1;
 
-            let acc = per_ip.entry(f.client_ip.clone()).or_insert_with(|| Acc {
+            let acc = per_ip.entry(rec.client_ip).or_insert_with(|| Acc {
                 n: 0,
                 uas: HashSet::new(),
                 paths: HashMap::new(),
+                probe_paths: HashMap::new(),
                 status: BTreeMap::new(),
-                first: rec.timestamp.clone(),
-                last: rec.timestamp.clone(),
+                first: rec.at,
+                last: rec.at,
             });
             acc.n += 1;
-            acc.uas.insert(rec.user_agent().to_string());
-            *acc.paths.entry(f.path.clone()).or_default() += 1;
-            *acc.status.entry(f.status).or_default() += 1;
-            if rec.timestamp < acc.first {
-                acc.first = rec.timestamp.clone();
+            acc.uas.insert(rec.user_agent);
+            *acc.paths.entry(rec.path).or_default() += 1;
+            // A cut path or user agent counts as probe-shaped: an honest client
+            // does not send a 512-byte path or a 256-byte agent, and the
+            // marker may be in the part the window did not keep. Decided from
+            // the record's bit, not from the trailing marker.
+            if rec.truncated || looks_like_probe(rec.path) {
+                *acc.probe_paths.entry(rec.path).or_default() += 1;
             }
-            if rec.timestamp > acc.last {
-                acc.last = rec.timestamp.clone();
-            }
+            *acc.status.entry(rec.status).or_default() += 1;
+            acc.first = acc.first.min(rec.at);
+            acc.last = acc.last.max(rec.at);
 
-            let e = per_ua.entry(rec.user_agent().to_string()).or_default();
+            let e = per_ua.entry(rec.user_agent).or_default();
             e.n += 1;
-            *e.ips.entry(f.client_ip.clone()).or_default() += 1;
-            *e.paths.entry(f.path.clone()).or_default() += 1;
+            let ip_acc = e.ips.entry(rec.client_ip).or_insert_with(|| IpAcc {
+                n: 0,
+                first: rec.at,
+                last: rec.at,
+            });
+            ip_acc.n += 1;
+            ip_acc.first = ip_acc.first.min(rec.at);
+            ip_acc.last = ip_acc.last.max(rec.at);
+            *e.paths.entry(rec.path).or_default() += 1;
         }
 
         // Who has disqualified their own claim.
@@ -619,43 +1011,56 @@ impl TrafficSummary {
         // Deliberately NOT part of this: a high error ratio on its own. A
         // genuine crawler re-crawling dead links is mostly 404s and is still
         // a genuine crawler.
-        let forgers: HashSet<String> = per_ip
+        let forgers: HashSet<&str> = per_ip
             .iter()
-            .filter(|(ip, a)| {
+            .filter(|(_, a)| {
                 let rotating =
                     a.uas.len() >= UA_ROTATION_THRESHOLD && a.n >= UA_ROTATION_MIN_REQUESTS;
-                let scanning = a.paths.keys().any(|p| looks_like_probe(p))
-                    || a.paths.keys().any(|p| looks_like_injection(p));
-                let _ = ip;
+                let scanning =
+                    !a.probe_paths.is_empty() || a.paths.keys().any(|p| looks_like_injection(p));
                 rotating || scanning
             })
-            .map(|(ip, _)| ip.clone())
+            .map(|(ip, _)| *ip)
             .collect();
 
         for (ua, UaAcc { n, ips, paths }) in per_ua {
-            if !claims_to_be_bot(&ua) {
+            if !claims_to_be_bot(ua) {
                 continue;
             }
-            let genuine: Vec<(String, u64)> = ips
-                .iter()
-                .filter(|(ip, _)| !forgers.contains(*ip))
-                .map(|(ip, c)| (ip.clone(), *c))
+            let genuine: Vec<(&str, IpAcc)> = ips
+                .into_iter()
+                .filter(|(ip, _)| !forgers.contains(ip))
                 .collect();
-            let genuine_n: u64 = genuine.iter().map(|(_, c)| c).sum();
+            let genuine_n: u64 = genuine.iter().map(|(_, a)| a.n).sum();
             summary.forged_bot_requests += n - genuine_n;
             if genuine_n == 0 {
                 continue;
             }
-            let mut ip_list: Vec<String> = genuine.into_iter().map(|(ip, _)| ip).collect();
+            // The window of the requests actually counted, across the
+            // addresses actually counted.
+            let first_seen = genuine
+                .iter()
+                .map(|(_, a)| a.first)
+                .min()
+                .map(Stamp::text)
+                .unwrap_or_default();
+            let last_seen = genuine
+                .iter()
+                .map(|(_, a)| a.last)
+                .max()
+                .map(Stamp::text)
+                .unwrap_or_default();
+            let mut ip_list: Vec<String> =
+                genuine.into_iter().map(|(ip, _)| ip.to_string()).collect();
             ip_list.sort();
-            let mut p: Vec<(String, u64)> = paths.into_iter().collect();
-            p.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-            p.truncate(8);
+            let p = top_counts(paths, 8);
             summary.crawlers.push(CrawlerSighting {
-                user_agent: ua,
+                user_agent: ua.to_string(),
                 requests: genuine_n,
                 client_ips: ip_list,
                 paths: p,
+                first_seen,
+                last_seen,
             });
         }
         summary.crawlers.sort_by(|a, b| {
@@ -667,33 +1072,30 @@ impl TrafficSummary {
         let mut clients: Vec<(String, ClientSummary)> = per_ip
             .into_iter()
             .map(|(ip, a)| {
-                let mut paths: Vec<(String, u64)> = a.paths.into_iter().collect();
-                paths.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
-                let probe_paths: Vec<(String, u64)> = paths
-                    .iter()
-                    .filter(|(p, _)| looks_like_probe(p))
-                    .cloned()
-                    .collect();
-                let injection_paths: Vec<(String, u64)> = paths
-                    .iter()
-                    .filter(|(p, _)| looks_like_injection(p))
-                    .cloned()
-                    .collect();
+                let injection_paths = top_counts(
+                    a.paths
+                        .iter()
+                        .filter(|(p, _)| looks_like_injection(p))
+                        .map(|(p, n)| (*p, *n))
+                        .collect(),
+                    usize::MAX,
+                );
+                let paths = top_counts(a.paths, 16);
+                let probe_paths = top_counts(a.probe_paths, usize::MAX);
                 let rotating =
                     a.uas.len() >= UA_ROTATION_THRESHOLD && a.n >= UA_ROTATION_MIN_REQUESTS;
-                paths.truncate(16);
                 (
-                    ip,
+                    ip.to_string(),
                     ClientSummary {
                         requests: a.n,
                         distinct_user_agents: a.uas.len(),
-                        user_agents: sample_user_agents(&a.uas),
+                        user_agents: sample_user_agents(a.uas),
                         status: a.status,
                         paths,
                         probe_paths,
                         injection_paths,
-                        first_seen: a.first,
-                        last_seen: a.last,
+                        first_seen: a.first.text(),
+                        last_seen: a.last.text(),
                         is_rotating_user_agents: rotating,
                     },
                 )
@@ -708,7 +1110,7 @@ impl TrafficSummary {
         clients.sort_by(|a, b| b.1.requests.cmp(&a.1.requests).then(a.0.cmp(&b.0)));
         summary.clients = clients;
 
-        let mut f: Vec<String> = forgers.into_iter().collect();
+        let mut f: Vec<String> = forgers.into_iter().map(str::to_string).collect();
         f.sort();
         summary.forgers = f;
         summary
@@ -736,6 +1138,34 @@ impl TrafficSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The host a user agent names in a URL or an address, for the tests that
+    /// show a documentation URL is not a PTR domain.
+    fn claimed_domain(user_agent: &str) -> Option<String> {
+        // A URL first, then an email. Both appear, and an agent carrying both
+        // puts the URL first in every convention seen.
+        const STOP: [char; 5] = ['/', ')', ' ', ';', ','];
+        let host = match user_agent.find("://") {
+            Some(i) => user_agent[i + 3..].split(STOP).next()?,
+            None => {
+                let i = user_agent.find('@')?;
+                user_agent[i + 1..].split(STOP).next()?
+            }
+        };
+        // Strip a port and any credentials a malformed agent might carry.
+        let host = host.rsplit('@').next()?;
+        let host = host.split(':').next()?;
+        let host = host.trim_end_matches('.').trim().to_ascii_lowercase();
+        let host = host.strip_prefix("www.").unwrap_or(&host).to_string();
+        // A domain needs at least one dot. Anything else is not checkable and
+        // saying so is better than returning something a suffix match would
+        // accept too easily.
+        if host.contains('.') && !host.is_empty() {
+            Some(host)
+        } else {
+            None
+        }
+    }
 
     fn rec(ts: &str, ip: &str, path: &str, status: u16, ua: &str) -> AnalyticsRecord {
         AnalyticsRecord {
@@ -779,6 +1209,72 @@ mod tests {
     fn a_torn_last_line_does_not_lose_the_rest() {
         let text = "{\"timestamp\":\"2026-01-01T00:00:00Z\",\"fields\":{\"message\":\"request\"}}\n{\"timestamp\":\"2026-01";
         assert_eq!(parse_analytics(text, "").count(), 1);
+    }
+
+    /// The traffic window's view of a request has to be the view of the line
+    /// m6-http logged for it: the same values, the timestamp in the envelope's
+    /// own text, and so the same summary. One case for each kind of line
+    /// m6-http logs: a request, a monitor poll, and a rate-limited request.
+    #[test]
+    fn a_window_view_matches_the_logged_line() {
+        let at_us = 1_789_106_714_986_903u64;
+        let timestamp = "2026-09-11T06:05:14.986903Z";
+        assert_eq!(Stamp::Micros(at_us).text(), timestamp);
+        // message, status, path, client_ip, user agent
+        let cases: [(&str, u16, &str, &str, Option<&str>); 3] = [
+            (
+                "request",
+                200,
+                "/capabilities",
+                "198.51.100.23",
+                Some("curl/8.7.1"),
+            ),
+            ("monitor", 200, "/health", "192.0.2.9", None),
+            ("request", 429, "/", "203.0.113.5", Some("ExampleBot/1.0")),
+        ];
+        for (message, status, path, client_ip, user_agent) in cases {
+            let ua = match user_agent {
+                Some(ua) => format!(r#","user_agent":"{ua}""#),
+                None => String::new(),
+            };
+            let line = format!(
+                r#"{{"timestamp":"{timestamp}","level":"INFO","fields":{{"message":"{message}","path":"{path}","status":{status},"client_ip":"{client_ip}"{ua}}}}}"#
+            );
+            let parsed = parse_analytics(&line, "").next().expect("one record");
+            let built = RequestView {
+                at: Stamp::Micros(at_us),
+                message,
+                status,
+                path,
+                client_ip,
+                user_agent: user_agent.unwrap_or(""),
+                truncated: false,
+            };
+            assert_eq!(
+                format!("{:?}", TrafficSummary::from_views([built])),
+                format!("{:?}", TrafficSummary::from_records([&parsed])),
+                "{message} {status} {path}"
+            );
+        }
+    }
+
+    /// A cut value counts as probe-shaped, whatever the shown part says.
+    #[test]
+    fn a_cut_path_counts_as_a_probe() {
+        let cut = RequestView {
+            at: Stamp::Micros(1_789_106_714_986_903),
+            message: "request",
+            status: 404,
+            path: "/aaaaaaaa...",
+            client_ip: "192.0.2.1",
+            user_agent: "",
+            truncated: true,
+        };
+        let s = TrafficSummary::from_views([cut]);
+        assert_eq!(
+            s.clients[0].1.probe_paths,
+            [("/aaaaaaaa...".to_string(), 1)]
+        );
     }
 
     #[test]
@@ -833,6 +1329,15 @@ mod tests {
         let s = PeriodicStats::parse(line).unwrap();
         assert_eq!(s.cache_hits, 76);
         assert_eq!(s.hit_p50_ns, 3455);
+    }
+
+    /// `requests` must not be read out of a `total_requests` field on the same
+    /// line: `requests=` is a substring of `total_requests=`.
+    #[test]
+    fn requests_is_not_read_out_of_total_requests() {
+        let line = "periodic stats total_requests=9 requests=3";
+        let s = PeriodicStats::parse(line).unwrap();
+        assert_eq!(s.requests, 3);
     }
 
     /// The 2026-09-11 incident, reduced.
@@ -1084,6 +1589,194 @@ mod tests {
     /// mostly getting 404s, because it is re-crawling links that no longer
     /// exist, is still a genuine crawler. Error ratio is not evidence of
     /// forgery; asking for credentials is.
+    /// The claim a user agent makes about itself, which is half of
+    /// verification. Issue #205.
+    #[test]
+    fn the_domain_a_bot_claims_is_extracted_from_its_own_string() {
+        let d = |ua: &str| claimed_domain(ua);
+        // The URL form, which is the common one, with `www.` stripped because
+        // PTR records sit under the bare domain far more often.
+        assert_eq!(
+            d("Mozilla/5.0 (compatible; ExampleBot/2.1; +http://www.example.com/bot.html)"),
+            Some("example.com".into())
+        );
+        assert_eq!(
+            d("Mozilla/5.0 (compatible; ExampleBot/1.0; +https://example.com/crawler)"),
+            Some("example.com".into())
+        );
+        // The email form.
+        assert_eq!(
+            d("Mozilla/5.0 (compatible; ExampleBot/1.0; +bot@example.com)"),
+            Some("example.com".into())
+        );
+        // A port must not end up in the domain.
+        assert_eq!(
+            d("ExampleBot/1.0 (+http://example.com:8080/bot)"),
+            Some("example.com".into())
+        );
+        // An agent that names nothing checkable says so, rather than
+        // producing something a suffix match would accept.
+        assert_eq!(d("ExampleBot/1.0"), None);
+        assert_eq!(
+            d("Mozilla/5.0 (compatible; ExampleBot/1.0; +http://localhost/)"),
+            None
+        );
+        assert_eq!(d(""), None);
+    }
+
+    /// THE TRAP, pinned so it cannot be walked into twice.
+    ///
+    /// A crawler's documentation URL is not where its operator publishes PTR
+    /// records. This asserts the gap directly, for the user agent strings these
+    /// operators publish and the PTR names they use, so any future attempt to verify by
+    /// comparing the two fails here with the reason attached.
+    #[test]
+    fn a_documentation_url_is_not_a_ptr_domain() {
+        use crate::resolve::Ptr;
+        let cases = [
+            (
+                "Mozilla/5.0 (compatible; Amazonbot/0.1; +https://developer.amazon.com/support/amazonbot)",
+                "192-0-2-1.crawl.amazonbot.amazon",
+            ),
+            (
+                "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
+                "msnbot-192-0-2-2.search.msn.com",
+            ),
+            (
+                "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+                "crawl-192-0-2-3.googlebot.com",
+            ),
+        ];
+        for (ua, ptr_name) in cases {
+            let claimed = claimed_domain(ua).expect("these agents all name a domain");
+            let ptr = Ptr::Name(ptr_name.to_string());
+            assert!(
+                !ptr.verifies(&claimed),
+                "{ptr_name} does NOT live under {claimed}, so verifying against the \
+                 agent's own URL marks this genuine crawler a forgery"
+            );
+            // And the table gets it right, which is the whole point.
+            assert!(
+                matches!(verify_crawler(ua, &ptr), CrawlerVerdict::Verified { .. }),
+                "the operator's documented suffix must verify {ptr_name}"
+            );
+        }
+    }
+
+    /// The table is matched longest-marker-first, so a specific agent is not
+    /// swallowed by a more general one that is a substring of it.
+    #[test]
+    fn the_longest_marker_wins() {
+        assert_eq!(
+            known_crawler("Mozilla/5.0 (compatible; Google-InspectionTool/1.0)").map(|k| k.name),
+            Some("Google-InspectionTool")
+        );
+        assert_eq!(
+            known_crawler("Mozilla/5.0 (compatible; Googlebot/2.1)").map(|k| k.name),
+            Some("Googlebot")
+        );
+        assert_eq!(known_crawler("Mozilla/5.0 (NeverHeardOfItBot/1.0)"), None);
+    }
+
+    /// An operator that publishes ranges is uncheckable by PTR whether or not
+    /// a name came back, and must never read as a mismatch.
+    #[test]
+    fn a_ranges_operator_is_uncheckable_either_way() {
+        use crate::resolve::Ptr;
+        let ua = "Mozilla/5.0 (compatible; ClaudeBot/1.0; +claudebot@anthropic.com)";
+        for ptr in [
+            Ptr::None,
+            Ptr::Failed,
+            Ptr::Name("something.example.net".into()),
+        ] {
+            assert!(
+                matches!(
+                    verify_crawler(ua, &ptr),
+                    CrawlerVerdict::NotCheckableByPtr { .. }
+                ),
+                "{ptr:?} must be uncheckable rather than judged"
+            );
+        }
+    }
+
+    /// A cloud customer's reverse name resolves forward, so it must never
+    /// verify a crawler whose operator publishes its own names.
+    #[test]
+    fn a_cloud_customer_name_does_not_verify_googlebot() {
+        use crate::resolve::Ptr;
+        // A rented virtual machine's reverse name, which resolves forward.
+        let ptr = Ptr::Name("7.2.0.192.bc.googleusercontent.com".into());
+        let g = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+        assert!(!matches!(
+            verify_crawler(g, &ptr),
+            CrawlerVerdict::Verified { .. }
+        ));
+        let real = Ptr::Name("crawl-192-0-2-7.googlebot.com".into());
+        assert!(matches!(
+            verify_crawler(g, &real),
+            CrawlerVerdict::Verified { .. }
+        ));
+    }
+
+    /// A PTR name that does not resolve back to the address is a false claim
+    /// for a PTR-documented operator, and is never a pass. Ranges operators
+    /// stay uncheckable.
+    #[test]
+    fn an_unconfirmed_ptr_is_a_forward_mismatch_not_a_pass() {
+        use crate::resolve::Ptr;
+        let ptr = Ptr::Unconfirmed("crawl-192-0-2-3.googlebot.com".into());
+        let g = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+        assert!(matches!(
+            verify_crawler(g, &ptr),
+            CrawlerVerdict::ForwardMismatch {
+                name: Some("Googlebot"),
+                ..
+            }
+        ));
+        assert!(matches!(
+            verify_crawler("Mozilla/5.0 (NeverHeardOfItBot/1.0)", &ptr),
+            CrawlerVerdict::ForwardMismatch { name: None, .. }
+        ));
+        assert!(matches!(
+            verify_crawler(
+                "Mozilla/5.0 (compatible; ClaudeBot/1.0; +claudebot@anthropic.com)",
+                &ptr
+            ),
+            CrawlerVerdict::NotCheckableByPtr { .. }
+        ));
+    }
+
+    /// A sighting carries the window of the requests it counted, and a forger
+    /// excluded from the count must not widen it. Issue #205.
+    #[test]
+    fn a_sighting_reports_the_window_of_the_requests_it_counted() {
+        let ua = "Mozilla/5.0 (compatible; ExampleBot/1.0; +http://example.com/bot)";
+        let mut records = vec![
+            rec("2026-10-01T09:00:00Z", "198.51.100.11", "/a", 200, ua),
+            rec("2026-10-01T09:05:00Z", "198.51.100.11", "/b", 200, ua),
+        ];
+        // A forger presenting the same agent, later, and also scanning. Its
+        // requests are excluded from the count, so they must also be excluded
+        // from the window.
+        records.push(rec(
+            "2026-10-01T11:00:00Z",
+            "203.0.113.41",
+            "/.aws/credentials",
+            404,
+            ua,
+        ));
+
+        let s = TrafficSummary::from_records(&records);
+        assert_eq!(s.crawlers.len(), 1);
+        let c = &s.crawlers[0];
+        assert_eq!(c.requests, 2, "the forger's request is not counted");
+        assert_eq!(c.first_seen, "2026-10-01T09:00:00Z");
+        assert_eq!(
+            c.last_seen, "2026-10-01T09:05:00Z",
+            "the excluded forger must not widen the reported window"
+        );
+    }
+
     #[test]
     fn a_crawler_hitting_dead_links_is_still_a_crawler() {
         let ua = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
@@ -1294,9 +1987,9 @@ mod tests {
     }
 }
 
-// ── The /perf metrics payload ────────────────────────────────────────────────
+// ── The metrics document ────────────────────────────────────────────────────
 //
-// The wire format of m6's monitoring endpoints. Here rather than in the binary
+// The wire format of the metrics document. Here rather than in the binary
 // that produces it, because anything reading a fleet needs the same types the
 // nodes write, and a consumer holding its own copy of the shape is a consumer
 // that drifts from it. That is the mistake the analytics stream made: no type
@@ -1304,9 +1997,9 @@ mod tests {
 //
 // `version` and `iface` are `String` rather than `&'static str` for the same
 // reason. The producer knows them at compile time; a deserializing client
-// cannot. It costs two short allocations per channel on an endpoint that
-// already sorts a 4096 sample reservoir, and it is on no hot path.
-/// One channel's figures, as reported by `/perf`.
+// cannot. It costs two short allocations per channel when the document is
+// built, and it is on no hot path.
+/// One channel's figures, as carried in the metrics document.
 ///
 /// Cumulative counters, unlike the aggregate percentiles, which are windowed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1385,22 +2078,40 @@ pub struct HandshakeStats {
     pub max_ns: u64,
 }
 
-/// A read-only view of the counters, for the health endpoint.
+/// A read-only view of the counters, for the metrics document.
 ///
 /// Cumulative fields are monotonic for the life of the process, which is what
 /// makes "the request count stopped increasing" a usable liveness signal.
 ///
-/// The percentile fields are **not** cumulative. `maybe_emit` clears the
-/// latency reservoirs every 10 seconds, so these describe the current partial
-/// window only, which may hold very few samples or none. That is why
-/// `hit_samples`/`miss_samples` are reported alongside: a p99 drawn from three
-/// samples is noise, and a consumer that cannot see the sample count has no
-/// way to tell it apart from a real one.
+/// The percentile fields are **not** cumulative. They describe the most recent
+/// samples held in the ring, which on a quiet node can cover hours, and which
+/// may hold very few samples or none. That is why `hit_samples`/`miss_samples`
+/// are reported alongside: a p99 drawn from three samples is noise, and a
+/// consumer that cannot see the sample count has no way to tell it apart from
+/// a real one.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StatsSnapshot {
     pub requests_total: u64,
     pub cache_hits_total: u64,
     pub cache_misses_total: u64,
+    /// The hit/miss pair split into the four facts a cache actually has.
+    ///
+    /// A hit on an entry still inside its freshness lifetime and a hit on one
+    /// past it are different events, and so are a miss answered by a backend
+    /// fetch and a miss answered by this node itself. The two totals above stay
+    /// as they were: `cache_hits_total` is the sum of the two hit fields, and
+    /// `cache_misses_total` the sum of the two miss fields.
+    ///
+    /// `#[serde(default)]` so a node older than these fields reads as 0, the
+    /// same shape `backend_errors_by_name` and `event_loop` use.
+    #[serde(default)]
+    pub cache_hits_valid_total: u64,
+    #[serde(default)]
+    pub cache_hits_invalid_total: u64,
+    #[serde(default)]
+    pub cache_misses_fetched_total: u64,
+    #[serde(default)]
+    pub cache_misses_answered_locally_total: u64,
     pub backend_errors_total: u64,
     /// The same errors, attributed to the backend that produced them.
     ///
@@ -1411,21 +2122,23 @@ pub struct StatsSnapshot {
     /// only here.
     #[serde(default)]
     pub backend_errors_by_name: std::collections::BTreeMap<String, u64>,
-    /// /health and /perf polls. Cumulative, and deliberately excluded from
-    /// `requests_total` so a stalled site is still detectable while a monitor
-    /// keeps polling. Reported rather than discarded so the monitor itself is
-    /// observable: a check that stops, or one that floods, shows up here.
+    /// Every request in the monitor population: a `/health` poll, and any
+    /// request on the TLS or QUIC listener from a private network address.
+    /// Cumulative, and deliberately excluded from `requests_total` so a stalled
+    /// site is still detectable while a monitor keeps polling. Reported rather
+    /// than discarded so the monitor itself is observable: a check that stops,
+    /// or one that floods, shows up here.
     pub monitor_requests_total: u64,
     pub monitor_samples: usize,
     pub monitor_p50_ns: u64,
     pub monitor_p99_ns: u64,
     pub rps_peak: u64,
-    /// Samples backing the hit percentiles in the current window.
+    /// Samples backing the hit percentiles in the ring.
     pub hit_samples: usize,
     pub hit_p50_ns: u64,
     pub hit_p99_ns: u64,
     pub hit_max_ns: u64,
-    /// Samples backing the miss percentiles in the current window.
+    /// Samples backing the miss percentiles in the ring.
     pub miss_samples: usize,
     pub miss_p50_ns: u64,
     pub miss_p99_ns: u64,
@@ -1439,4 +2152,23 @@ pub struct StatsSnapshot {
     /// zeros around the four that matter, and the useful signal here is
     /// exactly which codes appeared.
     pub status_counts: std::collections::BTreeMap<u16, u64>,
+    /// The event loop's own figures: how long it waited against how long it
+    /// worked, per kind of event that woke it, since the last accounting tick.
+    ///
+    /// `#[serde(default)]` so a node older than this field still parses.
+    #[serde(default)]
+    pub event_loop: Vec<LoopTriggerSnapshot>,
+}
+
+/// One trigger's event-loop figures in a [`StatsSnapshot`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LoopTriggerSnapshot {
+    pub name: String,
+    pub count: u64,
+    pub wait_min_ns: u64,
+    pub wait_max_ns: u64,
+    pub wait_mean_ns: u64,
+    pub work_min_ns: u64,
+    pub work_max_ns: u64,
+    pub work_mean_ns: u64,
 }

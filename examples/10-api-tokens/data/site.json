@@ -1,0 +1,9 @@
+{
+  "site_name": "API Token Demo",
+  "site_tagline": "Demonstrating long-lived API tokens with m6-auth.",
+  "nav": [
+    { "label": "Home",      "path": "/" },
+    { "label": "Dashboard", "path": "/dashboard" },
+    { "label": "Login",     "path": "/login" }
+  ]
+}

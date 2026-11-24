@@ -1,0 +1,350 @@
+//! Rendering scenarios for the route and params rules in issues #289 to #292.
+//!
+//! These tests live in their own file with their own fixtures under
+//! `tests/fixtures/route_params/`, so they do not disturb the older
+//! `integration.rs` suite. Each test below starts from one failure scenario:
+//! the route priority rule, params precedence and restart pickup, query keys in
+//! templates with the path-parameter clash, and a route's `status` reaching the
+//! response.
+
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
+use std::io::Write;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+use m6_core::testkit::{binary, Service};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// A running `m6-html`, its socket, and the directory the socket lives in.
+///
+/// Field order is drop order: the service is killed before the socket directory
+/// is removed.
+struct Server {
+    // Held only to keep the child alive; its Drop sends SIGTERM then SIGKILL.
+    _svc: Service,
+    _dir: tempfile::TempDir,
+}
+
+/// The scenario fixture root, separate from the older integration fixtures.
+fn fixtures_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("route_params")
+}
+
+fn config_path(name: &str) -> PathBuf {
+    fixtures_dir().join("configs").join(name)
+}
+
+/// Spawn `m6-html` on a socket of its own and wait until it answers a request.
+///
+/// Readiness is a real answered request, not the socket file existing, for the
+/// same reason the older suite does it that way: `bind` creates the file before
+/// `listen`, so a path check can pass while a connect would still fail.
+fn spawn_server(id: &str, site_dir: &Path, config: &Path) -> (Server, PathBuf) {
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
+    let socket_path = dir.path().join(format!("{id}.sock"));
+
+    let mut svc = Service::spawn(
+        "m6-html",
+        Command::new(binary("m6-html"))
+            .arg(site_dir)
+            .arg(config)
+            .env("M6_SOCKET_OVERRIDE", &socket_path),
+    );
+    svc.wait_for_path(&socket_path, m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_started(m6_core::testkit::STARTUP_BOUND);
+
+    let ready = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
+        !http_request(&socket_path, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").is_empty()
+    });
+    assert!(
+        ready,
+        "m6-html at {} never answered a request\n--- output ---\n{}",
+        socket_path.display(),
+        svc.output()
+    );
+    svc.assert_alive("after the first answered request");
+
+    (
+        Server {
+            _svc: svc,
+            _dir: dir,
+        },
+        socket_path,
+    )
+}
+
+/// Send a raw HTTP/1.1 request and return the full response string.
+///
+/// Returns an empty string on any I/O error so callers can retry rather than
+/// panic, matching the readiness contract above.
+fn http_request(socket_path: &Path, request: &str) -> String {
+    let mut stream = match UnixStream::connect(socket_path) {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    if stream.write_all(request.as_bytes()).is_err() {
+        return String::new();
+    }
+    stream.shutdown(std::net::Shutdown::Write).ok();
+    let response = m6_core::testkit::read_one(&mut stream, request.split(' ').next().unwrap_or(""))
+        .unwrap_or_default();
+    String::from_utf8_lossy(&response).into_owned()
+}
+
+// ---------------------------------------------------------------------------
+// #289: two patterns that can match one path
+// ---------------------------------------------------------------------------
+
+/// Two patterns that can match one path (`/blog/{slug}` then
+/// `/blog/{name}`). The wrong outcome this catches: `m6-html` starts, one route
+/// is silently unreachable, and the operator is never told. The start must
+/// refuse and name both routes.
+#[test]
+fn two_patterns_on_one_path_refuse_to_start_and_name_both_routes() {
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
+    // Spawned, not `output()`: a service that wrongly starts never exits, and
+    // the test must fail on the deadline rather than hang.
+    let mut svc = Service::spawn(
+        "m6-html",
+        Command::new(binary("m6-html"))
+            .arg(fixtures_dir())
+            .arg(config_path("tie.conf"))
+            .env("M6_SOCKET_OVERRIDE", dir.path().join("tie.sock")),
+    );
+    let status = svc.wait_for_exit(Instant::now() + m6_core::testkit::STARTUP_BOUND);
+    let stderr = svc.output();
+
+    assert_eq!(
+        status.and_then(|s| s.code()),
+        Some(2),
+        "the service did not refuse and exit 2: {stderr}"
+    );
+    assert!(
+        stderr.contains("\"/blog/{slug}\"") && stderr.contains("\"/blog/{name}\""),
+        "both routes must be named, got: {stderr}"
+    );
+    assert!(stderr.contains("can both answer GET /blog/x"), "{stderr}");
+}
+
+/// A fixed route declared after a pattern that also matches it. The wrong
+/// outcome: the first declaration answers, so `/blog/about` renders the
+/// parameter page and the fixed page can never be reached.
+#[test]
+fn a_fixed_route_answers_ahead_of_a_pattern_declared_before_it() {
+    let (_guard, socket_path) = spawn_server("fixed", &fixtures_dir(), &config_path("fixed.conf"));
+    let get = |path: &str| {
+        http_request(
+            &socket_path,
+            &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+        )
+    };
+
+    let fixed = get("/blog/about");
+    assert!(
+        fixed.contains("SECOND-ROUTE") && !fixed.contains("FIRST-ROUTE"),
+        "the fixed route must answer /blog/about, got: {}",
+        &fixed[..fixed.len().min(300)]
+    );
+    let pattern = get("/blog/hello");
+    assert!(
+        pattern.contains("FIRST-ROUTE"),
+        "the pattern must answer every other path, got: {}",
+        &pattern[..pattern.len().min(300)]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #290: params precedence and restart pickup
+// ---------------------------------------------------------------------------
+
+/// A route params key beats the same global key. `/brand-one` renders
+/// `RouteFirst` from `route_params/first.json`, while `/brand-global` renders
+/// `Global` from `data/site.json`. The wrong outcome: the global value
+/// overwrites the route value.
+#[test]
+fn route_params_key_beats_global_key() {
+    let (_guard, socket_path) = spawn_server(
+        "params-beats-global",
+        &fixtures_dir(),
+        &config_path("params.conf"),
+    );
+
+    let route_resp = http_request(
+        &socket_path,
+        "GET /brand-one HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(
+        route_resp.contains("200 OK"),
+        "expected 200, got: {}",
+        &route_resp[..route_resp.len().min(300)]
+    );
+    assert!(
+        route_resp.contains("RouteFirst"),
+        "route params should beat the same global key, got: {}",
+        &route_resp[..route_resp.len().min(300)]
+    );
+
+    let global_resp = http_request(
+        &socket_path,
+        "GET /brand-global HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(
+        global_resp.contains("Global"),
+        "expected the global value on the params-less route, got: {}",
+        &global_resp[..global_resp.len().min(300)]
+    );
+}
+
+/// Of three route params files declaring one key, the last declared wins:
+/// `/brand` renders `RouteThird`. The wrong outcome: the merge order reverses so
+/// the first file wins.
+#[test]
+fn last_declared_route_params_file_wins() {
+    let (_guard, socket_path) = spawn_server(
+        "params-last-wins",
+        &fixtures_dir(),
+        &config_path("params.conf"),
+    );
+
+    let resp = http_request(
+        &socket_path,
+        "GET /brand HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(
+        resp.contains("200 OK"),
+        "expected 200, got: {}",
+        &resp[..resp.len().min(300)]
+    );
+    assert!(
+        resp.contains("RouteThird"),
+        "expected the last declared params file to win, got: {}",
+        &resp[..resp.len().min(300)]
+    );
+}
+
+/// A changed global params file is picked up after a restart. `/brand-global`
+/// renders `Global`, then `GlobalUpdated` after the file changes and the service
+/// restarts. The wrong outcome: the stale value survives a restart.
+///
+/// This asserts issue #290's required done-condition rather than an
+/// independently breakable bug. The service reads its global params fresh on
+/// every process start, and a full restart is a new process, so there is no
+/// single-line break that makes the restarted process serve the old value
+/// without adding a disk cache m6 does not have.
+#[test]
+fn global_params_change_picked_up_after_restart() {
+    // Write only the three files this scenario needs into a fresh temp site, so
+    // the global params file can be rewritten without dirtying committed
+    // fixtures. This is the socket_mode.rs shape, not a whole-tree copy.
+    let site = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
+    let config = site.path().join("m6-html.conf");
+    let global = site.path().join("data").join("site.json");
+    std::fs::create_dir_all(site.path().join("templates")).expect("templates dir");
+    std::fs::create_dir_all(site.path().join("data")).expect("data dir");
+    std::fs::write(site.path().join("site.toml"), "").unwrap();
+    std::fs::write(
+        &config,
+        "global_params = [\"data/site.json\"]\n\n[[route]]\npath = \"/brand-global\"\ntemplate = \"templates/params.html.tmpl\"\nparams = []\n",
+    )
+    .expect("write config");
+    std::fs::write(
+        site.path().join("templates").join("params.html.tmpl"),
+        "{{ brand }}",
+    )
+    .expect("write template");
+    std::fs::write(&global, "{\"brand\": \"Global\"}").expect("write global params");
+
+    let (guard, socket_path) = spawn_server("params-restart-1", site.path(), &config);
+    let before = http_request(
+        &socket_path,
+        "GET /brand-global HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(
+        before.contains("Global"),
+        "expected the initial global value, got: {}",
+        &before[..before.len().min(300)]
+    );
+    drop(guard);
+
+    std::fs::write(&global, "{\"brand\": \"GlobalUpdated\"}").expect("rewrite global params");
+
+    let (_guard2, socket_path2) = spawn_server("params-restart-2", site.path(), &config);
+    let after = http_request(
+        &socket_path2,
+        "GET /brand-global HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(
+        after.contains("GlobalUpdated"),
+        "expected the changed global value after a restart, got: {}",
+        &after[..after.len().min(300)]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #291: query keys in templates with the path-parameter clash
+// ---------------------------------------------------------------------------
+
+/// Query keys reach the template, and a key that also names a path parameter
+/// stays out of the top level: `/posts/hello?foo=bar&slug=x` renders
+/// `hello|bar|bar|x`. The wrong outcome: a query key overwrites the path
+/// parameter at the top level, or the `query` map is missing.
+#[test]
+fn query_keys_render_with_path_param_clash() {
+    let (_guard, socket_path) =
+        spawn_server("query-clash", &fixtures_dir(), &config_path("query.conf"));
+
+    let resp = http_request(
+        &socket_path,
+        "GET /posts/hello?foo=bar&slug=x HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(
+        resp.contains("200 OK"),
+        "expected 200, got: {}",
+        &resp[..resp.len().min(300)]
+    );
+    assert!(
+        resp.contains("hello|bar|bar|x"),
+        "expected hello|bar|bar|x, got: {}",
+        &resp[..resp.len().min(300)]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #292: a route's status reaching the response
+// ---------------------------------------------------------------------------
+
+/// A route with `status = 410` answers 410 with its rendered body. The wrong
+/// outcome: the status is dropped at the render call and the page is served 200.
+#[test]
+fn route_status_reaches_the_response() {
+    let (_guard, socket_path) =
+        spawn_server("status-410", &fixtures_dir(), &config_path("status.conf"));
+
+    let resp = http_request(
+        &socket_path,
+        "GET /gone HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    );
+    assert!(
+        resp.starts_with("HTTP/1.1 410"),
+        "expected 410, got: {}",
+        &resp[..resp.len().min(300)]
+    );
+    assert!(
+        resp.contains("GONE-BODY"),
+        "expected the rendered body on the 410, got: {}",
+        &resp[..resp.len().min(300)]
+    );
+}

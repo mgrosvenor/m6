@@ -1,0 +1,22 @@
+[Unit]
+Description=m6-http origin — public TLS + H2C backbone
+After=network.target m6-html.service m6-file.service m6-auth.service render-cms.service
+
+[Service]
+Type=simple
+User=m6
+ExecStart=/usr/local/bin/m6-http \
+    /var/www/my-blog \
+    /etc/m6/origin.toml
+
+LoadCredential=tls-cert.pem:/etc/letsencrypt/live/example.com/fullchain.pem
+LoadCredential=tls-key.pem:/etc/letsencrypt/live/example.com/privkey.pem
+# The source node writes the site's generation ID here
+StateDirectory=m6-http
+StateDirectoryMode=0700
+
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

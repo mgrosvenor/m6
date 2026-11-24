@@ -24,35 +24,25 @@ struct StorageConfig {
 #[derive(Deserialize, Default)]
 struct TokensConfig {
     issuer: Option<String>,
+    audience: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
 struct KeysConfig {
-    private_key: String,
+    /// A path, typed as one, because the key's bytes are never in the config.
+    /// Optional: a check-only config names only `public_key`, and a user or group
+    /// command reads such a config without needing to sign anything.
+    #[serde(default)]
+    private_key: PathBuf,
     public_key: String,
 }
 
 struct ParsedConfig {
     db_path: PathBuf,
     issuer: String,
+    audience: String,
     private_key_path: Option<PathBuf>,
     public_key_path: Option<PathBuf>,
-}
-
-/// Infer the site root from the config file path.
-/// If the config is inside a directory named "configs", the site root is
-/// its parent; otherwise the site root is the config file's directory.
-fn infer_site_dir(config_path: &Path) -> PathBuf {
-    let config_dir = config_path.parent().unwrap_or(Path::new("."));
-    if config_dir
-        .file_name()
-        .map(|n| n == "configs")
-        .unwrap_or(false)
-    {
-        config_dir.parent().unwrap_or(config_dir).to_path_buf()
-    } else {
-        config_dir.to_path_buf()
-    }
 }
 
 fn load_config(config_path: &str) -> Result<ParsedConfig> {
@@ -65,28 +55,36 @@ fn load_config(config_path: &str) -> Result<ParsedConfig> {
     let cfg: Config =
         toml::from_str(&raw).with_context(|| format!("parsing config file: {}", config_path))?;
 
-    let db_path = if cfg.storage.path.is_empty() {
+    if cfg.storage.path.is_empty() {
         bail!("config missing [storage] path");
-    } else {
-        let sp = Path::new(&cfg.storage.path);
-        if sp.is_absolute() {
-            sp.to_path_buf()
-        } else {
-            let dir = p.parent().unwrap_or(Path::new("."));
-            dir.join(sp)
-        }
+    }
+    let db_path = m6_core::config::secret_path("[storage] path", &cfg.storage.path)?;
+
+    // The issuer is the deployment's name and it has no default: a token minted
+    // for one deployment must not verify at another. This tool reads no
+    // site.toml, so the fallback to `[site] domain` is the service's alone and
+    // the config must name the issuer here.
+    let Some(issuer) = cfg.tokens.as_ref().and_then(|t| t.issuer.clone()) else {
+        bail!(
+            "[tokens] issuer: no issuer is set, and this tool reads no site.toml: set [tokens] issuer to the deployment's name"
+        );
     };
-
-    let issuer = cfg
+    let audience = cfg
         .tokens
-        .and_then(|t| t.issuer)
-        .unwrap_or_else(|| "localhost".to_string());
+        .as_ref()
+        .and_then(|t| t.audience.clone())
+        .unwrap_or_else(|| issuer.clone());
 
-    let site_dir = infer_site_dir(p);
     let (private_key_path, public_key_path) = match cfg.keys {
-        Some(k) if !k.private_key.is_empty() => (
-            Some(site_dir.join(&k.private_key)),
-            Some(site_dir.join(&k.public_key)),
+        Some(k) if !k.private_key.as_os_str().is_empty() => (
+            Some(m6_core::config::secret_path(
+                "[keys] private_key",
+                &k.private_key.to_string_lossy(),
+            )?),
+            Some(m6_core::config::secret_path(
+                "[keys] public_key",
+                &k.public_key,
+            )?),
         ),
         _ => (None, None),
     };
@@ -94,6 +92,7 @@ fn load_config(config_path: &str) -> Result<ParsedConfig> {
     Ok(ParsedConfig {
         db_path,
         issuer,
+        audience,
         private_key_path,
         public_key_path,
     })
@@ -156,6 +155,7 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 
 fn print_usage() {
     eprintln!("Usage: m6-auth-cli <config> <entity> <command> [args] [flags]");
+    eprintln!("       m6-auth-cli --version | --version-full");
     eprintln!();
     eprintln!("User commands:");
     eprintln!("  m6-auth-cli <config> user ls [--json]");
@@ -173,13 +173,15 @@ fn print_usage() {
     eprintln!("  m6-auth-cli <config> group member del <group> <username>");
     eprintln!();
     eprintln!("API token commands:");
-    eprintln!("  m6-auth-cli <config> token create <username> [--name <name>] [--ttl-days <days>] [--site-dir <dir>]");
+    eprintln!("  m6-auth-cli <config> token create <username> [--name <name>] [--ttl-days <days>]");
     eprintln!("  m6-auth-cli <config> token ls <username> [--json]");
     eprintln!("  m6-auth-cli <config> token revoke <token-id>");
     eprintln!();
+    eprintln!("Session commands:");
+    eprintln!("  m6-auth-cli <config> sessions revoke-all");
+    eprintln!();
     eprintln!("  Tokens require [keys] private_key and public_key in the config.");
-    eprintln!("  Key paths are resolved relative to the site root (inferred as the parent");
-    eprintln!("  of the 'configs/' directory, or overridden with --site-dir).");
+    eprintln!("  Every path in the config is absolute.");
 }
 
 // ── Argument parsing helpers ──────────────────────────────────────────────────
@@ -464,9 +466,7 @@ fn cmd_group_member_del(db: &Db, args: &[String]) -> Result<()> {
 
 fn cmd_token_create(db: &Db, cfg: &ParsedConfig, args: &[String]) -> Result<()> {
     if args.is_empty() {
-        bail!(
-            "usage: token create <username> [--name <name>] [--ttl-days <days>] [--site-dir <dir>]"
-        );
+        bail!("usage: token create <username> [--name <name>] [--ttl-days <days>]");
     }
     let username = &args[0];
     let name = flag_value(args, "--name").unwrap_or("api-token");
@@ -475,20 +475,7 @@ fn cmd_token_create(db: &Db, cfg: &ParsedConfig, args: &[String]) -> Result<()> 
         .transpose()?
         .unwrap_or(365);
 
-    // Resolve site_dir: --site-dir flag overrides the inferred default.
-    let private_key_path = if let Some(sd) = flag_value(args, "--site-dir") {
-        let site_dir = Path::new(sd);
-        // Re-read the raw key path from config — we already stored the inferred path,
-        // so if site-dir is overridden we need the original relative path. Store both.
-        cfg.private_key_path.as_ref().map(|p| {
-            // Extract the original relative component by stripping the old site_dir prefix.
-            // Simpler: just use the last two components as the relative path heuristic.
-            // Best: require --site-dir to be used only with relative key paths in config.
-            site_dir.join(p.file_name().unwrap_or(p.as_os_str()))
-        })
-    } else {
-        cfg.private_key_path.clone()
-    };
+    let private_key_path = cfg.private_key_path.clone();
 
     let private_key_path = private_key_path
         .ok_or_else(|| anyhow::anyhow!("config missing [keys] section — cannot mint tokens"))?;
@@ -502,8 +489,13 @@ fn cmd_token_create(db: &Db, cfg: &ParsedConfig, args: &[String]) -> Result<()> 
     let public_pem = std::fs::read_to_string(public_key_path)
         .with_context(|| format!("reading public key: {}", public_key_path.display()))?;
 
-    let engine = JwtEngine::new(&private_pem, &public_pem, cfg.issuer.clone())
-        .context("loading JWT keys")?;
+    let engine = JwtEngine::new(
+        &private_pem,
+        &public_pem,
+        cfg.issuer.clone(),
+        cfg.audience.clone(),
+    )
+    .context("loading JWT keys")?;
 
     let user = db
         .user_get(username)?
@@ -515,15 +507,17 @@ fn cmd_token_create(db: &Db, cfg: &ParsedConfig, args: &[String]) -> Result<()> 
 
     let claims = AccessClaims {
         iss: cfg.issuer.clone(),
+        aud: cfg.audience.clone(),
         sub: user.id.clone(),
         exp,
         iat: now,
+        jti: m6_auth::new_token_id(),
         username: user.username.clone(),
         groups: user.groups.clone(),
         roles: user.roles.clone(),
     };
 
-    let token = engine.encode_access(&claims).context("encoding JWT")?;
+    let token = engine.encode_api(&claims).context("encoding JWT")?;
     let token_hash = hash_token(&token);
 
     db.api_token_create(&user.id, &user.username, name, &token_hash, exp)?;
@@ -585,18 +579,21 @@ fn cmd_token_revoke(db: &Db, args: &[String]) -> Result<()> {
     }
 }
 
+fn cmd_sessions_revoke_all(db: &Db) -> Result<()> {
+    let deleted = db.sessions_revoke_all()?;
+    eprintln!("all refresh tokens revoked: {deleted} row(s) deleted");
+    eprintln!(
+        "interim form: the auth generation, the new epoch and list key, and the cache \
+         acknowledgement arrive with the token-rules step, and this version holds no \
+         decision list on any node"
+    );
+    Ok(())
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn run() -> Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
-
-    // Before the argument-count check: `--version` takes no config and no
-    // subcommand. A deploy installs this binary alongside the services, so it
-    // answers too.
-    if raw_args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("m6-auth-cli {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
 
     if raw_args.len() < 4 {
         print_usage();
@@ -674,6 +671,14 @@ fn run() -> Result<()> {
                 process::exit(2);
             }
         },
+        "sessions" => match command.as_str() {
+            "revoke-all" => cmd_sessions_revoke_all(&db)?,
+            other => {
+                eprintln!("error: unknown sessions command: {}", other);
+                print_usage();
+                process::exit(2);
+            }
+        },
         other => {
             eprintln!("error: unknown entity: {}", other);
             print_usage();
@@ -685,6 +690,10 @@ fn run() -> Result<()> {
 }
 
 fn main() {
+    // `--version` and `--version-full` answer before the config, the entity
+    // and the subcommand are required. The auth list includes m6-auth.
+    m6_core::version_flags!(m6_auth::build_info::linked());
+
     match run() {
         Ok(()) => {}
         Err(e) => {

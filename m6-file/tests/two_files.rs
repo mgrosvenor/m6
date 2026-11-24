@@ -1,27 +1,37 @@
-//! Where an App finds `site.toml`.
+//! Where a service finds `site.toml`.
 //!
 //! `docs/m6-site-layout.md` gives each app its own root under `apps/`, with
-//! `site.toml` at the top of the tree. An App used to look only at
+//! `site.toml` at the top of the tree. A service used to look only at
 //! `<site_dir>/site.toml`, so in that layout it read none and the
 //! `[[backend]] compresses` agreement passed without checking. The reserved
 //! config key `site_toml` names the file.
 
 use std::path::Path;
 use std::process::{Command, Output};
+use std::time::Instant;
 
-use m6_core::testkit::binary;
+use m6_core::testkit::{binary, Service};
+
+/// The one route every test's config declares.
+const ROUTE: &str =
+    "[[route]]\npath = \"/assets/{*relpath}\"\nhandler = \"files\"\nroot = \"assets/\"\n";
 
 /// A site tree: `site.toml` at the top, the app root at `apps/file`.
+///
+/// The app root also holds an empty `site.toml`, because every service needs
+/// a readable `<site_dir>/site.toml` even when no key names the one at the
+/// top.
 fn tree(site_toml_body: &str) -> tempfile::TempDir {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).unwrap();
     std::fs::create_dir_all(tmp.path().join("apps/file/assets")).unwrap();
     std::fs::write(tmp.path().join("site.toml"), site_toml_body).unwrap();
+    std::fs::write(tmp.path().join("apps/file/site.toml"), "").unwrap();
     tmp
 }
 
 fn config(app_root: &Path, extra: &str) -> std::path::PathBuf {
     let path = app_root.join("m6-file.conf");
-    std::fs::write(&path, format!("{extra}\n[thread_pool]\nsize = 2\n")).unwrap();
+    std::fs::write(&path, format!("{extra}\n")).unwrap();
     path
 }
 
@@ -80,15 +90,112 @@ fn dump_config_names_the_site_toml() {
         .unwrap_or_else(|| panic!("no site.toml line in:\n{stdout}"));
     assert!(line.ends_with("apps/file/../../site.toml"), "{line}");
 
-    // With no key and no file at the default place, the line says so.
+    // With no key, the default <app_root>/site.toml is read.
     let conf = config(&root, "");
     let out = run(&root, &conf, Some("--dump-config"));
     let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
     let line = stdout
         .lines()
         .find(|l| l.starts_with("site.toml"))
         .unwrap_or_else(|| panic!("no site.toml line in:\n{stdout}"));
-    assert!(line.ends_with("(absent)"), "{line}");
+    assert!(line.ends_with("apps/file/site.toml"), "{line}");
+}
+
+/// The dump prints the resolved server settings, so a deploy that validates
+/// with `--dump-config` reads the drain deadline the start will use. The wrong
+/// outcome: the line is missing or carries the default while the config says
+/// otherwise, and a test that only asserts exit 0 never notices.
+#[test]
+fn dump_config_prints_the_drain_timeout() {
+    let tmp = tree("");
+    let root = tmp.path().join("apps/file");
+    let conf = config(
+        &root,
+        &format!("{ROUTE}\n[server]\ndrain_timeout_s = 7\nread_timeout_s = 11\n"),
+    );
+
+    let out = run(&root, &conf, Some("--dump-config"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with("server "))
+        .unwrap_or_else(|| panic!("no server line in:\n{stdout}"));
+    assert!(
+        line.contains("drain_timeout=7s"),
+        "the dump does not carry the configured drain timeout: {line}"
+    );
+    assert!(
+        line.contains("read_timeout=11s"),
+        "the dump does not carry the configured read timeout: {line}"
+    );
+}
+
+/// A cache larger than the heap reservation is named at start. The wrong
+/// outcome: the service allows a cache larger than the memory it reserved for
+/// the heap, so the hot data falls outside the reservation and the operator is
+/// never told.
+#[test]
+fn a_cache_above_the_heap_reservation_is_named_and_bounded() {
+    let tmp = tree("");
+    let root = tmp.path().join("apps/file");
+    let conf = config(
+        &root,
+        &format!(
+            "{ROUTE}\n[limits.heap_reserve]\nstart = \"16MiB\"\nmax = \"64MiB\"\n\
+             [limits.cache_bytes]\nstart = \"64MiB\"\nmax = \"64MiB\"\n"
+        ),
+    );
+
+    let mut svc = Service::spawn(
+        "m6-file",
+        Command::new(binary("m6-file"))
+            .arg(&root)
+            .arg(&conf)
+            .env("M6_SOCKET_OVERRIDE", root.join("cache.sock")),
+    );
+    let named = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
+        svc.output()
+            .contains("is above [limits.heap_reserve] start")
+    });
+    assert!(
+        named,
+        "the start did not name a cache above the reservation:\n{}",
+        svc.output()
+    );
+    svc.terminate(m6_core::testkit::STARTUP_BOUND);
+}
+
+/// A default cache and a default reservation warn about nothing, and the
+/// reservation covers the cache. The wrong outcome, and the one this
+/// replaces: every default start told the operator to raise a limit they never
+/// set, while the cache was silently a quarter of the max the record printed.
+///
+/// `the_default_reservation_holds_the_default_cache_with_no_warning` in
+/// `m6-core/src/limits.rs` proves the reservation is cache plus headroom, so
+/// the 128 MiB the record prints is the bound the cache really has.
+#[test]
+fn a_default_cache_and_reservation_warn_about_nothing() {
+    let tmp = tree("");
+    let root = tmp.path().join("apps/file");
+    let conf = config(&root, ROUTE);
+    let socket = root.join("default-cache.sock");
+
+    let mut svc = Service::spawn(
+        "m6-file",
+        Command::new(binary("m6-file"))
+            .arg(&root)
+            .arg(&conf)
+            .env("M6_SOCKET_OVERRIDE", &socket),
+    );
+    svc.wait_for_path(&socket, m6_core::testkit::STARTUP_BOUND);
+    let output = svc.output();
+    assert!(
+        !output.contains("is above [limits.heap_reserve] start"),
+        "a default start warned about a cache the default reservation holds:\n{output}"
+    );
+    svc.terminate(m6_core::testkit::STARTUP_BOUND);
 }
 
 #[test]
@@ -112,302 +219,80 @@ fn dump_config_refuses_a_site_toml_the_start_would_refuse() {
     assert!(stderr.contains("not valid TOML"), "{stderr}");
 }
 
-// ── Reload: a change to either file reloads the service ─────────────────────
+/// A second `[[route]]` pattern that matches the same paths as
+/// `/assets/{*relpath}`, so neither could be said to answer them.
+const OVERLAPPING_ROUTE: &str =
+    "[[route]]\npath = \"/assets/{*other}\"\nhandler = \"files\"\nroot = \"assets/\"\n";
 
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
-use std::time::Duration;
-
-use m6_core::testkit::{wait, Service};
-
-const ROUTE: &str =
-    "[[route]]\npath = \"/assets/{*relpath}\"\nhandler = \"files\"\nroot = \"assets/\"\n";
-
-/// A running m6-file: a site tree with `site.toml` at the top, the app root at
-/// `apps/file`, and a config that names the `site.toml` by `site_toml`.
-struct Running {
-    svc: Service,
-    tmp: tempfile::TempDir,
-    socket: std::path::PathBuf,
-}
-
-impl Running {
-    fn root(&self) -> std::path::PathBuf {
-        self.tmp.path().join("apps/file")
+/// Both routes as written, and the reason, so the operator can find the line.
+/// The log is JSON, so quotes arrive escaped; they are unescaped first.
+fn assert_names_the_overlap(output: &str) {
+    let text = &output.replace("\\\"", "\"");
+    for route in ["\"/assets/{*relpath}\"", "\"/assets/{*other}\""] {
+        assert!(text.contains(route), "{route} not named in: {text}");
     }
-    fn site_toml(&self) -> std::path::PathBuf {
-        self.tmp.path().join("site.toml")
-    }
-    fn conf(&self) -> std::path::PathBuf {
-        self.root().join("m6-file.conf")
-    }
-    fn count(&self, needle: &str) -> usize {
-        self.svc.output().matches(needle).count()
-    }
+    assert!(text.contains("can both answer GET /assets/x"), "{text}");
 }
 
-fn conf_body(extra: &str, pool: u32) -> String {
-    format!("site_toml = \"../../site.toml\"\n\n[thread_pool]\nsize = {pool}\n\n{ROUTE}\n{extra}\n")
-}
-
-fn status_of(socket: &Path, path: &str) -> Option<String> {
-    let mut s = UnixStream::connect(socket).ok()?;
-    s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    write!(
-        s,
-        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-    )
-    .ok()?;
-    let mut buf = String::new();
-    s.read_to_string(&mut buf).ok()?;
-    buf.lines().next().map(str::to_string)
-}
-
-fn start(site_toml_body: &str) -> Running {
-    start_with(site_toml_body, &conf_body("", 2))
-}
-
-fn start_with(site_toml_body: &str, conf: &str) -> Running {
-    let tmp = tree(site_toml_body);
-    std::fs::write(tmp.path().join("apps/file/assets/a.txt"), b"asset").unwrap();
+/// Scenario: two patterns that can match one path.
+/// The wrong outcome: the service starts and the second route silently never
+/// answers.
+#[test]
+fn a_start_with_overlapping_routes_exits_2_and_names_both() {
+    let tmp = tree("");
     let root = tmp.path().join("apps/file");
-    std::fs::write(root.join("m6-file.conf"), conf).unwrap();
-    let socket = root.join("reload.sock");
+    let conf = config(&root, &format!("{ROUTE}\n{OVERLAPPING_ROUTE}"));
+
+    // Spawned, not `run`: a service that wrongly starts never exits, and the
+    // test must fail on the deadline rather than hang.
     let mut svc = Service::spawn(
         "m6-file",
         Command::new(binary("m6-file"))
             .arg(&root)
-            .arg(root.join("m6-file.conf"))
-            .env("M6_SOCKET_OVERRIDE", &socket),
+            .arg(&conf)
+            .env("M6_SOCKET_OVERRIDE", root.join("two-files.sock")),
     );
-    svc.wait_for_path(&socket, Duration::from_secs(10));
-    assert!(
-        wait::until(Duration::from_secs(10), || {
-            status_of(&socket, "/assets/a.txt").is_some_and(|s| s.contains("200"))
-        }),
-        "m6-file never answered\n{}",
-        svc.output()
+    let status = svc.wait_for_exit(Instant::now() + m6_core::testkit::STARTUP_BOUND);
+    let text = svc.output();
+    assert_eq!(
+        status.and_then(|s| s.code()),
+        Some(2),
+        "the service did not refuse and exit 2: {text}"
     );
-    Running { svc, tmp, socket }
+    assert_names_the_overlap(&text);
 }
 
-fn wait_for(r: &Running, needle: &str, n: usize) -> bool {
-    wait::until(Duration::from_secs(10), || r.count(needle) >= n)
-}
-
+/// Scenario: a typo in a route's `methods`. The wrong outcome (#336): the route
+/// answers every method and the typo is never reported. The load must refuse it
+/// and name the route and the value.
 #[test]
-fn a_site_toml_change_reloads_the_service() {
-    let r = start("[log]\nlevel = \"info\"\n");
-    // At info, a request leaves no "request complete" line.
-    assert!(status_of(&r.socket, "/assets/a.txt")
-        .unwrap()
-        .contains("200"));
-    assert_eq!(r.count("request complete"), 0, "{}", r.svc.output());
-
-    std::fs::write(r.site_toml(), "[log]\nlevel = \"debug\"\n").unwrap();
-    assert!(
-        wait_for(&r, "Reload complete", 1),
-        "a site.toml change never reloaded\n{}",
-        r.svc.output()
+fn dump_config_refuses_an_unknown_method_in_a_route() {
+    let tmp = tree("");
+    let root = tmp.path().join("apps/file");
+    let conf = config(
+        &root,
+        "[[route]]\npath = \"/assets/{*relpath}\"\nhandler = \"files\"\nroot = \"assets/\"\nmethods = [\"GET\", \"GTE\"]\n",
     );
 
-    // The level moved with it (m6 #198): the same request now logs at debug.
-    assert!(status_of(&r.socket, "/assets/a.txt")
-        .unwrap()
-        .contains("200"));
+    let out = run(&root, &conf, Some("--dump-config"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
     assert!(
-        wait_for(&r, "request complete", 1),
-        "the log level in site.toml was not applied by the reload\n{}",
-        r.svc.output()
-    );
-    let out = r.svc.output();
-    assert!(
-        out.find("Reload complete").unwrap() < out.find("request complete").unwrap(),
-        "{out}"
+        stderr.contains("\"/assets/{*relpath}\"") && stderr.contains("\"GTE\""),
+        "{stderr}"
     );
 }
 
+/// Scenario: a deploy validates with `--dump-config`. The wrong outcome: it
+/// passes a config the start then refuses.
 #[test]
-fn a_compress_disagreement_in_a_new_site_toml_is_refused_and_the_old_routes_serve() {
-    let r = start("");
-    // m6-file compresses by default, so this says the opposite.
-    std::fs::write(
-        r.site_toml(),
-        "[[backend]]\nname = \"m6-file\"\ncompresses = false\n",
-    )
-    .unwrap();
-    assert!(
-        wait_for(&r, "Reload refused", 1),
-        "the disagreement was not refused\n{}",
-        r.svc.output()
-    );
-    assert_eq!(r.count("Reload complete"), 0, "{}", r.svc.output());
-    assert!(status_of(&r.socket, "/assets/a.txt")
-        .unwrap()
-        .contains("200"));
-}
+fn dump_config_refuses_overlapping_routes_as_the_start_does() {
+    let tmp = tree("");
+    let root = tmp.path().join("apps/file");
+    let conf = config(&root, &format!("{ROUTE}\n{OVERLAPPING_ROUTE}"));
 
-#[test]
-fn a_site_toml_that_does_not_parse_keeps_the_previous_state() {
-    let r = start("");
-    std::fs::write(r.site_toml(), "[server\n").unwrap();
-    assert!(
-        wait_for(&r, "Reload refused", 1),
-        "a site.toml that does not parse was not refused\n{}",
-        r.svc.output()
-    );
-    assert_eq!(r.count("Reload complete"), 0, "{}", r.svc.output());
-    assert!(status_of(&r.socket, "/assets/a.txt")
-        .unwrap()
-        .contains("200"));
-}
-
-#[test]
-fn a_thread_pool_change_is_named_as_needing_a_restart() {
-    let r = start("");
-    std::fs::write(r.conf(), conf_body("", 3)).unwrap();
-    assert!(
-        wait_for(&r, "Reload complete", 1),
-        "the config change never reloaded\n{}",
-        r.svc.output()
-    );
-    assert!(
-        r.svc.output().contains("thread_pool.size changed"),
-        "{}",
-        r.svc.output()
-    );
-}
-
-#[test]
-fn a_touch_alone_reloads() {
-    let r = start("");
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(r.conf())
-        .unwrap();
-    f.set_modified(std::time::SystemTime::now()).unwrap();
-    drop(f);
-    assert!(
-        wait_for(&r, "Reload complete", 1),
-        "a touch of the config did not reload\n{}",
-        r.svc.output()
-    );
-    std::thread::sleep(Duration::from_millis(1_500));
-    assert_eq!(r.count("Reload complete"), 1, "{}", r.svc.output());
-}
-
-#[test]
-fn a_burst_of_writes_is_at_most_two_reloads() {
-    let r = start("");
-    for pad in ["", "# a", "# bb"] {
-        std::fs::write(r.conf(), conf_body(pad, 2)).unwrap();
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(wait_for(&r, "Reload complete", 1), "{}", r.svc.output());
-    std::thread::sleep(Duration::from_millis(1_500));
-    let n = r.count("Reload complete");
-    assert!((1..=2).contains(&n), "{n} reloads\n{}", r.svc.output());
-}
-
-#[test]
-fn a_single_write_is_one_reload_with_no_delay() {
-    let r = start("");
-    let t = std::time::Instant::now();
-    // Written beside it and renamed over, as a careful writer does. A plain
-    // `fs::write` truncates first, which is two changes to the file.
-    let tmp = r.root().join("m6-file.conf.new");
-    std::fs::write(&tmp, conf_body("# one", 2)).unwrap();
-    std::fs::rename(&tmp, r.conf()).unwrap();
-    assert!(wait_for(&r, "Reload complete", 1), "{}", r.svc.output());
-    // The first report is not delayed by the settle window.
-    assert!(
-        t.elapsed() < Duration::from_millis(150),
-        "first report took {:?}",
-        t.elapsed()
-    );
-    std::thread::sleep(Duration::from_millis(1_500));
-    assert_eq!(r.count("Reload complete"), 1, "{}", r.svc.output());
-}
-
-#[test]
-fn an_empty_process_config_is_skipped_and_the_next_write_reloads() {
-    let r = start("");
-    std::fs::write(r.conf(), "").unwrap();
-    assert!(
-        wait_for(&r, "Reload skipped", 1),
-        "an empty config was not skipped\n{}",
-        r.svc.output()
-    );
-    assert_eq!(r.count("Reload complete"), 0, "{}", r.svc.output());
-    // Every route would be a 404 if the empty config had been loaded.
-    assert!(status_of(&r.socket, "/assets/a.txt")
-        .unwrap()
-        .contains("200"));
-    std::fs::write(r.conf(), conf_body("# full", 3)).unwrap();
-    assert!(
-        wait_for(&r, "Reload complete", 1),
-        "the full write did not reload\n{}",
-        r.svc.output()
-    );
-}
-
-#[test]
-fn an_empty_site_toml_is_skipped_and_keeps_the_log_level() {
-    let r = start("[log]\nlevel = \"debug\"\n");
-    std::fs::write(r.site_toml(), "").unwrap();
-    assert!(
-        wait_for(&r, "Reload skipped", 1),
-        "an empty site.toml was not skipped\n{}",
-        r.svc.output()
-    );
-    assert_eq!(r.count("Reload complete"), 0, "{}", r.svc.output());
-    // Still debug: a request is logged.
-    assert!(status_of(&r.socket, "/assets/a.txt")
-        .unwrap()
-        .contains("200"));
-    assert!(
-        wait_for(&r, "request complete", 1),
-        "the level was reset\n{}",
-        r.svc.output()
-    );
-    std::fs::write(r.site_toml(), "[log]\nlevel = \"info\"\n").unwrap();
-    assert!(wait_for(&r, "Reload complete", 1), "{}", r.svc.output());
-}
-
-#[test]
-fn a_site_toml_that_does_not_parse_is_refused_when_site_toml_is_not_named() {
-    let conf = "[thread_pool]\nsize = 2\n\n".to_string() + ROUTE;
-    let r = start_with("", &conf);
-    // With no `site_toml` key the file is at the site directory.
-    let at_root = r.root().join("site.toml");
-    std::fs::write(&at_root, "[server\n").unwrap();
-    std::fs::write(r.conf(), format!("{conf}# edit\n")).unwrap();
-    assert!(
-        wait_for(&r, "Reload refused", 1),
-        "a site.toml that does not parse was accepted\n{}",
-        r.svc.output()
-    );
-    assert_eq!(r.count("Reload complete"), 0, "{}", r.svc.output());
-}
-
-#[test]
-fn restart_only_warnings_compare_with_the_running_values() {
-    let r = start("");
-    for pool in [3, 2, 3] {
-        let before = r.count("Reload complete");
-        // Renamed over, so each step is one change and not a truncation and a
-        // write. The pause lets the settle window close before the next step.
-        let tmp = r.root().join("m6-file.conf.new");
-        std::fs::write(&tmp, conf_body("", pool)).unwrap();
-        std::fs::rename(&tmp, r.conf()).unwrap();
-        assert!(
-            wait_for(&r, "Reload complete", before + 1),
-            "{}",
-            r.svc.output()
-        );
-        std::thread::sleep(Duration::from_millis(300));
-    }
-    // Started at 2: the reload to 3 warns, the one back to 2 does not, the
-    // last to 3 warns again.
-    assert_eq!(r.count("thread_pool.size changed"), 2, "{}", r.svc.output());
+    let out = run(&root, &conf, Some("--dump-config"));
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert_names_the_overlap(&text);
 }

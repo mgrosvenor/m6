@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 /// Critical-path benchmarks for m6-render.
 ///
 /// Three tiers:
@@ -10,27 +15,24 @@ use criterion::{black_box, criterion_group, Criterion};
 use serde_json::{Map, Value};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
-use tempfile::TempDir;
 
 // Helper: build an HTML response from outside the crate (template_name is pub(crate)).
 fn html_response(html: String) -> Response {
     let mut r = Response::status(200);
-    r.headers.push((
-        "Content-Type".to_string(),
-        "text/html; charset=utf-8".to_string(),
-    ));
+    r.headers
+        .push(("Content-Type".into(), "text/html; charset=utf-8".into()));
     r.body = m6_core::Body::Bytes(html.into_bytes());
     r
 }
 
-use m6_core::app::{
-    compile_pattern, find_route, match_route, route_specificity, CompiledRoute, RouteMethod,
-};
 use m6_core::compress::{brotli_compress, gzip_compress};
 use m6_core::minify::{minify_css, minify_html, minify_js, minify_json};
 use m6_core::request::{parse_cookies, parse_query_string};
 use m6_core::response::Response;
 use m6_core::server::write_response;
+use m6_core::site::{
+    compile_pattern, find_route, match_route, CompiledRoute, Methods, RouteMethod, RouteTable,
+};
 
 // ── Realistic content fixtures ────────────────────────────────────────────────
 
@@ -132,118 +134,60 @@ const JSON_1KB: &[u8] = b"{
   \"views\": 12483
 }";
 
-const JS_3KB: &[u8] = b"
-// Navigation dropdown
-(function () {
-  'use strict';
-
-  function initNavDropdowns() {
-    var dropdowns = document.querySelectorAll('.nav-dropdown');
-    dropdowns.forEach(function (dropdown) {
-      var toggle = dropdown.querySelector('.nav-dropdown__toggle');
-      var menu   = dropdown.querySelector('.nav-dropdown__menu');
-      if (!toggle || !menu) { return; }
-
-      toggle.addEventListener('click', function (event) {
-        event.preventDefault();
-        event.stopPropagation();
-        var isOpen = dropdown.classList.contains('is-open');
-        closeAllDropdowns();
-        if (!isOpen) {
-          dropdown.classList.add('is-open');
-          menu.setAttribute('aria-expanded', 'true');
-        }
-      });
-    });
-
-    document.addEventListener('click', closeAllDropdowns);
-    document.addEventListener('keydown', function (event) {
-      if (event.key === 'Escape') { closeAllDropdowns(); }
-    });
-  }
-
-  function closeAllDropdowns() {
-    document.querySelectorAll('.nav-dropdown.is-open').forEach(function (el) {
-      el.classList.remove('is-open');
-      var menu = el.querySelector('.nav-dropdown__menu');
-      if (menu) { menu.setAttribute('aria-expanded', 'false'); }
-    });
-  }
-
-  function initThemeToggle() {
-    var btn = document.querySelector('#theme-toggle');
-    if (!btn) { return; }
-    var stored = localStorage.getItem('theme') || 'light';
-    document.documentElement.setAttribute('data-theme', stored);
-    btn.addEventListener('click', function () {
-      var current = document.documentElement.getAttribute('data-theme');
-      var next    = current === 'dark' ? 'light' : 'dark';
-      document.documentElement.setAttribute('data-theme', next);
-      localStorage.setItem('theme', next);
-    });
-  }
-
-  function initCopyButtons() {
-    document.querySelectorAll('pre').forEach(function (pre) {
-      var btn = document.createElement('button');
-      btn.className = 'copy-btn';
-      btn.textContent = 'Copy';
-      btn.addEventListener('click', function () {
-        var code = pre.querySelector('code');
-        if (!code) { return; }
-        navigator.clipboard.writeText(code.textContent).then(function () {
-          btn.textContent = 'Copied!';
-          setTimeout(function () { btn.textContent = 'Copy'; }, 2000);
-        });
-      });
-      pre.style.position = 'relative';
-      pre.appendChild(btn);
-    });
-  }
-
-  document.addEventListener('DOMContentLoaded', function () {
-    initNavDropdowns();
-    initThemeToggle();
-    initCopyButtons();
-  });
-}());";
+/// A realistic third-party script, the same d3 build the JavaScript tests
+/// round-trip. `minify_js`'s cost is the request-path cost the server paid per
+/// request before the minified body was cached per file version.
+const JS_D3: &str = include_str!("../tests/fixtures/d3.v7.9.0.js");
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
 /// Minimal Tera template — one variable substitution.
 const MINIMAL_TEMPLATE: &str = "<!doctype html><html><body><h1>{{ title }}</h1></body></html>";
 
-fn make_routes() -> Vec<CompiledRoute> {
+/// A Tera instance carrying production's autoescaping, for the render benches.
+///
+/// `m6_core::template::new_tera` (`m6-core/src/template.rs:140-142`) is private
+/// to its crate, so the suffixes are repeated here. They must match that list:
+/// without them a template named `page.html.tmpl` does not end in a suffix Tera
+/// knows, renders unescaped, and the bench measures a path production never
+/// runs. Change the two lists together.
+fn production_tera() -> tera::Tera {
+    let mut tera = tera::Tera::default();
+    tera.autoescape_on(vec![".html.tmpl", ".htm.tmpl", ".xml.tmpl"]);
+    tera
+}
+
+fn make_routes() -> RouteTable {
     let patterns = &[
         ("/", RouteMethod::Any),
         ("/about", RouteMethod::Get),
         ("/blog/{stem}", RouteMethod::Get),
         ("/api/v1/posts/{id}", RouteMethod::Any),
     ];
-    let mut routes: Vec<CompiledRoute> = patterns
+    let routes: Vec<CompiledRoute> = patterns
         .iter()
         .map(|(pat, method)| {
             let segs = compile_pattern(pat);
-            let spec = route_specificity(&segs);
             CompiledRoute {
                 pattern: pat.to_string(),
-                method: method.clone(),
+                methods: Methods::from(method),
                 segments: segs,
                 template: None,
                 params_files: vec![],
                 status: 200,
                 cache: "public".to_string(),
+                cache_explicit: false,
                 headers: Vec::new(),
                 last_modified: None,
-                specificity: spec,
+                last_modified_http: None,
+                head: Default::default(),
                 handler: None,
                 settings: std::sync::Arc::new(serde_json::Map::new()),
                 base_dict: std::sync::Arc::new(serde_json::Map::new()),
             }
         })
         .collect();
-    routes.sort_by_key(|r| std::cmp::Reverse(r.specificity));
-    routes
+    RouteTable::new(routes)
 }
 
 // ── Percentile reporter ────────────────────────────────────────────────────────
@@ -318,15 +262,17 @@ fn bench_match_route(c: &mut Criterion) {
     let segs = compile_pattern("/blog/{stem}");
     let route = CompiledRoute {
         pattern: "/blog/{stem}".to_string(),
-        method: RouteMethod::Get,
+        methods: Methods::from(&RouteMethod::Get),
         segments: segs.clone(),
         template: None,
         params_files: vec![],
         status: 200,
         cache: "public".to_string(),
+        cache_explicit: false,
         headers: Vec::new(),
         last_modified: None,
-        specificity: route_specificity(&segs),
+        last_modified_http: None,
+        head: Default::default(),
         handler: None,
         settings: std::sync::Arc::new(serde_json::Map::new()),
         base_dict: std::sync::Arc::new(serde_json::Map::new()),
@@ -374,12 +320,15 @@ fn bench_parse_cookies(c: &mut Criterion) {
 
 /// Tera template rendering: render a minimal template with one variable.
 fn bench_template_render(c: &mut Criterion) {
-    let dir = TempDir::new().unwrap();
-    let tmpl_path = dir.path().join("page.html");
+    let dir = tempfile::Builder::new()
+        .prefix("m6b-")
+        .tempdir_in(m6_core::platform::socket_scratch_root())
+        .unwrap();
+    let tmpl_path = dir.path().join("page.html.tmpl");
     std::fs::write(&tmpl_path, MINIMAL_TEMPLATE).unwrap();
 
-    let mut tera = tera::Tera::default();
-    tera.add_template_file(&tmpl_path, Some("page.html"))
+    let mut tera = production_tera();
+    tera.add_template_file(&tmpl_path, Some("page.html.tmpl"))
         .unwrap();
 
     let mut ctx = tera::Context::new();
@@ -390,7 +339,7 @@ fn bench_template_render(c: &mut Criterion) {
     group.bench_function("template_render", |b| {
         b.iter(|| {
             black_box(
-                tera.render(black_box("page.html"), black_box(&ctx))
+                tera.render(black_box("page.html.tmpl"), black_box(&ctx))
                     .unwrap(),
             )
         })
@@ -407,12 +356,9 @@ fn bench_template_render(c: &mut Criterion) {
 /// meant before -- serialisation only.
 fn response_to_write() -> Response {
     let mut r = Response::status(200);
-    r.headers.push((
-        "Content-Type".to_string(),
-        "text/html; charset=utf-8".to_string(),
-    ));
     r.headers
-        .push(("Cache-Control".to_string(), "public".to_string()));
+        .push(("Content-Type".into(), "text/html; charset=utf-8".into()));
+    r.headers.push(("Cache-Control".into(), "public".into()));
     r.body = m6_core::Body::Bytes(MINIMAL_TEMPLATE.as_bytes().to_vec());
     r
 }
@@ -442,22 +388,21 @@ fn bench_response_write(c: &mut Criterion) {
 /// backend latency that m6-http would observe for a cache-miss forwarded to
 /// m6-render.
 fn bench_socket_round_trip(c: &mut Criterion) {
-    let dir = TempDir::new().unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("m6b-")
+        .tempdir_in(m6_core::platform::socket_scratch_root())
+        .unwrap();
 
     // Write template.
     let tmpl_dir = dir.path().join("templates");
     std::fs::create_dir_all(&tmpl_dir).unwrap();
-    std::fs::write(tmpl_dir.join("page.html"), MINIMAL_TEMPLATE).unwrap();
+    std::fs::write(tmpl_dir.join("page.html.tmpl"), MINIMAL_TEMPLATE).unwrap();
 
     // Write minimal config.
     let cfg_text = r#"
 [[route]]
 path     = "/blog/{stem}"
-template = "templates/page.html"
-
-[thread_pool]
-size       = 1
-queue_size = 64
+template = "templates/page.html.tmpl"
 
 [params_cache]
 size = 64
@@ -474,42 +419,44 @@ size = 64
     let cfg_path2 = cfg_path.clone();
 
     std::thread::spawn(move || {
-        // We can't call run_app() (it reads env args), so we replicate the
-        // minimal setup needed: build FrameworkState, accept on the socket.
-        // Instead, build a raw server using the public server + app modules.
+        // The bench needs a socket to measure, not a service: build the site's
+        // config and routes here and drive the blocking reference loop.
         let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
 
         let config = m6_core::config::load(&cfg_path2, &site_dir).unwrap();
 
-        // Build Tera directly.
-        let tmpl_path = site_dir.join("templates/page.html");
-        let mut tera = tera::Tera::default();
-        tera.add_template_file(&tmpl_path, Some("templates/page.html"))
+        // Build Tera with production's autoescaping.
+        let tmpl_path = site_dir.join("templates/page.html.tmpl");
+        let mut tera = production_tera();
+        tera.add_template_file(&tmpl_path, Some("templates/page.html.tmpl"))
             .unwrap();
 
-        let routes: Vec<CompiledRoute> = config
-            .routes
-            .iter()
-            .map(|rc| {
-                let segs = compile_pattern(&rc.path);
-                let spec = route_specificity(&segs);
-                CompiledRoute {
-                    pattern: rc.path.clone(),
-                    method: RouteMethod::Any,
-                    segments: segs,
-                    template: rc.template.clone(),
-                    params_files: rc.params.clone(),
-                    status: rc.status,
-                    cache: rc.cache.clone(),
-                    headers: Vec::new(),
-                    last_modified: None,
-                    specificity: spec,
-                    handler: None,
-                    settings: std::sync::Arc::new(serde_json::Map::new()),
-                    base_dict: std::sync::Arc::new(serde_json::Map::new()),
-                }
-            })
-            .collect();
+        let routes = RouteTable::new(
+            config
+                .routes
+                .iter()
+                .map(|rc| {
+                    let segs = compile_pattern(&rc.path);
+                    CompiledRoute {
+                        pattern: rc.path.clone(),
+                        methods: Methods::ANY,
+                        segments: segs,
+                        template: rc.template.as_deref().map(std::sync::Arc::<str>::from),
+                        params_files: rc.params.clone(),
+                        status: rc.status,
+                        cache: rc.cache.clone(),
+                        cache_explicit: false,
+                        headers: Vec::new(),
+                        last_modified: None,
+                        last_modified_http: None,
+                        head: Default::default(),
+                        handler: None,
+                        settings: std::sync::Arc::new(serde_json::Map::new()),
+                        base_dict: std::sync::Arc::new(serde_json::Map::new()),
+                    }
+                })
+                .collect(),
+        );
 
         for stream in listener.incoming() {
             let mut stream = match stream {
@@ -622,7 +569,7 @@ fn bench_minify(c: &mut Criterion) {
     let mut group = c.benchmark_group("minify");
     group.sample_size(500);
     group.bench_function("minify_html_2kb", |b| {
-        b.iter(|| black_box(minify_html(black_box(HTML_2KB), false)))
+        b.iter(|| black_box(minify_html(black_box(HTML_2KB))))
     });
     group.bench_function("minify_css_8kb", |b| {
         b.iter(|| black_box(minify_css(black_box(CSS_8KB))))
@@ -630,8 +577,21 @@ fn bench_minify(c: &mut Criterion) {
     group.bench_function("minify_json_1kb", |b| {
         b.iter(|| black_box(minify_json(black_box(JSON_1KB))))
     });
-    group.bench_function("minify_js_3kb", |b| {
-        b.iter(|| black_box(minify_js(black_box(JS_3KB))))
+    group.finish();
+}
+
+/// JavaScript: the uncached parse (the request path before the per-version
+/// cache) against serving the stored body (the cached path). The metric the
+/// owner set is the cached path; a cached body must be a copy, not a parse.
+fn bench_minify_js(c: &mut Criterion) {
+    let mut group = c.benchmark_group("minify_js");
+    group.sample_size(20);
+    group.bench_function("d3_280kb_uncached", |b| {
+        b.iter(|| black_box(minify_js(black_box(JS_D3.as_bytes()))))
+    });
+    let stored = minify_js(JS_D3.as_bytes());
+    group.bench_function("d3_280kb_cached_copy", |b| {
+        b.iter(|| black_box(stored.clone()))
     });
     group.finish();
 }
@@ -643,19 +603,13 @@ fn bench_minify_then_compress(c: &mut Criterion) {
     group.sample_size(200);
     group.bench_function("html_minify_then_brotli6", |b| {
         b.iter(|| {
-            let minified = minify_html(black_box(HTML_2KB), false);
+            let minified = minify_html(black_box(HTML_2KB));
             black_box(brotli_compress(&minified, 6).unwrap())
         })
     });
     group.bench_function("css_minify_then_brotli6", |b| {
         b.iter(|| {
             let minified = minify_css(black_box(CSS_8KB));
-            black_box(brotli_compress(&minified, 6).unwrap())
-        })
-    });
-    group.bench_function("js_minify_then_brotli6", |b| {
-        b.iter(|| {
-            let minified = minify_js(black_box(JS_3KB));
             black_box(brotli_compress(&minified, 6).unwrap())
         })
     });
@@ -674,6 +628,7 @@ criterion_group!(
     bench_socket_round_trip,
     bench_compress,
     bench_minify,
+    bench_minify_js,
     bench_minify_then_compress,
 );
 
@@ -710,15 +665,17 @@ fn main() {
         let segs = compile_pattern("/blog/{stem}");
         let route = CompiledRoute {
             pattern: "/blog/{stem}".to_string(),
-            method: RouteMethod::Get,
+            methods: Methods::from(&RouteMethod::Get),
             segments: segs.clone(),
             template: None,
             params_files: vec![],
             status: 200,
             cache: "public".to_string(),
+            cache_explicit: false,
             headers: Vec::new(),
             last_modified: None,
-            specificity: route_specificity(&segs),
+            last_modified_http: None,
+            head: Default::default(),
             handler: None,
             settings: std::sync::Arc::new(serde_json::Map::new()),
             base_dict: std::sync::Arc::new(serde_json::Map::new()),
@@ -746,17 +703,20 @@ fn main() {
 
     // Template render
     {
-        let dir = TempDir::new().unwrap();
-        let tmpl_path = dir.path().join("page.html");
+        let dir = tempfile::Builder::new()
+            .prefix("m6b-")
+            .tempdir_in(m6_core::platform::socket_scratch_root())
+            .unwrap();
+        let tmpl_path = dir.path().join("page.html.tmpl");
         std::fs::write(&tmpl_path, MINIMAL_TEMPLATE).unwrap();
-        let mut tera = tera::Tera::default();
-        tera.add_template_file(&tmpl_path, Some("page.html"))
+        let mut tera = production_tera();
+        tera.add_template_file(&tmpl_path, Some("page.html.tmpl"))
             .unwrap();
         let mut ctx = tera::Context::new();
         ctx.insert("title", "Hello, World!");
         report_percentiles("template_render", N, || {
             black_box(
-                tera.render(black_box("page.html"), black_box(&ctx))
+                tera.render(black_box("page.html.tmpl"), black_box(&ctx))
                     .unwrap(),
             );
         });
@@ -780,19 +740,18 @@ fn main() {
 
     // Socket round-trip
     {
-        let dir2 = TempDir::new().unwrap();
+        let dir2 = tempfile::Builder::new()
+            .prefix("m6b-")
+            .tempdir_in(m6_core::platform::socket_scratch_root())
+            .unwrap();
         let tmpl_dir2 = dir2.path().join("templates");
         std::fs::create_dir_all(&tmpl_dir2).unwrap();
-        std::fs::write(tmpl_dir2.join("page.html"), MINIMAL_TEMPLATE).unwrap();
+        std::fs::write(tmpl_dir2.join("page.html.tmpl"), MINIMAL_TEMPLATE).unwrap();
 
         let cfg_text2 = r#"
 [[route]]
 path     = "/blog/{stem}"
-template = "templates/page.html"
-
-[thread_pool]
-size       = 1
-queue_size = 64
+template = "templates/page.html.tmpl"
 
 [params_cache]
 size = 64
@@ -807,33 +766,36 @@ size = 64
         std::thread::spawn(move || {
             let listener = std::os::unix::net::UnixListener::bind(&sock_path2).unwrap();
             let config = m6_core::config::load(&cfg_path2, &site_dir2).unwrap();
-            let tmpl_path = site_dir2.join("templates/page.html");
-            let mut tera = tera::Tera::default();
-            tera.add_template_file(&tmpl_path, Some("templates/page.html"))
+            let tmpl_path = site_dir2.join("templates/page.html.tmpl");
+            let mut tera = production_tera();
+            tera.add_template_file(&tmpl_path, Some("templates/page.html.tmpl"))
                 .unwrap();
-            let routes2: Vec<CompiledRoute> = config
-                .routes
-                .iter()
-                .map(|rc| {
-                    let segs = compile_pattern(&rc.path);
-                    let spec = route_specificity(&segs);
-                    CompiledRoute {
-                        pattern: rc.path.clone(),
-                        method: RouteMethod::Any,
-                        segments: segs,
-                        template: rc.template.clone(),
-                        params_files: rc.params.clone(),
-                        status: rc.status,
-                        cache: rc.cache.clone(),
-                        headers: Vec::new(),
-                        last_modified: None,
-                        specificity: spec,
-                        handler: None,
-                        settings: std::sync::Arc::new(serde_json::Map::new()),
-                        base_dict: std::sync::Arc::new(serde_json::Map::new()),
-                    }
-                })
-                .collect();
+            let routes2 = RouteTable::new(
+                config
+                    .routes
+                    .iter()
+                    .map(|rc| {
+                        let segs = compile_pattern(&rc.path);
+                        CompiledRoute {
+                            pattern: rc.path.clone(),
+                            methods: Methods::ANY,
+                            segments: segs,
+                            template: rc.template.as_deref().map(std::sync::Arc::<str>::from),
+                            params_files: rc.params.clone(),
+                            status: rc.status,
+                            cache: rc.cache.clone(),
+                            cache_explicit: false,
+                            headers: Vec::new(),
+                            last_modified: None,
+                            last_modified_http: None,
+                            head: Default::default(),
+                            handler: None,
+                            settings: std::sync::Arc::new(serde_json::Map::new()),
+                            base_dict: std::sync::Arc::new(serde_json::Map::new()),
+                        }
+                    })
+                    .collect(),
+            );
             for stream in listener.incoming() {
                 let mut stream = match stream {
                     Ok(s) => s,
@@ -918,7 +880,7 @@ size = 64
     const N_MIN: usize = 5_000;
     println!("\n── Minification paths (n={N_MIN}) ───────────────────────────────────────────");
     report_percentiles("minify html 2KB", N_MIN, || {
-        black_box(minify_html(black_box(HTML_2KB), false));
+        black_box(minify_html(black_box(HTML_2KB)));
     });
     report_percentiles("minify css 8KB", N_MIN, || {
         black_box(minify_css(black_box(CSS_8KB)));
@@ -926,23 +888,31 @@ size = 64
     report_percentiles("minify json 1KB", N_MIN, || {
         black_box(minify_json(black_box(JSON_1KB)));
     });
-    report_percentiles("minify js 3KB", N_MIN, || {
-        black_box(minify_js(black_box(JS_3KB)));
+    // The cached-path A/B. `uncached` is what rc.1 paid on every request;
+    // `cached_copy` is what rc.2 pays after the first read of a file version.
+    const N_JS: usize = 200;
+    let stored_js = minify_js(JS_D3.as_bytes());
+    println!(
+        "\n── JavaScript minification (d3 7.9.0, {} bytes -> {} bytes) ──────────────",
+        JS_D3.len(),
+        stored_js.len()
+    );
+    report_percentiles("js d3: parse+minify (uncached, rc.1 path)", N_JS, || {
+        black_box(minify_js(black_box(JS_D3.as_bytes())));
+    });
+    report_percentiles("js d3: cached body copy (rc.2 path)", N_MIN, || {
+        black_box(stored_js.clone());
     });
 
     // ── Minify + compress pipeline ────────────────────────────────────────────
     const N_PIPE: usize = 2_000;
     println!("\n── Minify+compress pipeline (n={N_PIPE}) ────────────────────────────────────");
     report_percentiles("html: minify → brotli-6", N_PIPE, || {
-        let m = minify_html(black_box(HTML_2KB), false);
+        let m = minify_html(black_box(HTML_2KB));
         black_box(brotli_compress(&m, 6).unwrap());
     });
     report_percentiles("css:  minify → brotli-6", N_PIPE, || {
         let m = minify_css(black_box(CSS_8KB));
-        black_box(brotli_compress(&m, 6).unwrap());
-    });
-    report_percentiles("js:   minify → brotli-6", N_PIPE, || {
-        let m = minify_js(black_box(JS_3KB));
         black_box(brotli_compress(&m, 6).unwrap());
     });
 

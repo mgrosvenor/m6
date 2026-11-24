@@ -1,0 +1,4 @@
+{
+  "title": "About",
+  "body": "<p>This is a simple static site built with m6.</p><p>m6 is a family of composable Unix processes for serving websites. Each process has one job.</p>"
+}

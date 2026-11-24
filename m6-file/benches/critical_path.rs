@@ -2,12 +2,17 @@
 //!
 //!   1. `serve` with an in-memory writer: route settings → disk read →
 //!      response serialise.
-//!   2. Full Unix socket round-trip through the same `serve_connection` loop
-//!      production runs.
+//!   2. Full Unix socket round-trip through the blocking reference loop
+//!      `m6_core::server::serve_connection`.
 //!
-//! `bench_route_match` was removed when m6-file became an `App` service: the
-//! router it measured was m6-file's own, and there is one router now. Core's
-//! is benchmarked in `m6-core/benches/critical_path.rs`.
+//! `bench_route_match` was removed when m6-file took core's router: the router
+//! it measured was m6-file's own, and there is one router now. Core's is
+//! benchmarked in `m6-core/benches/critical_path.rs`.
+
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
 
 use criterion::{black_box, criterion_group, Criterion};
 use std::io::Write;
@@ -22,7 +27,10 @@ use serde_json::{json, Map};
 const MINIMAL_HTML: &[u8] = b"<!doctype html><html><body><h1>Hello</h1></body></html>";
 
 fn make_site() -> TempDir {
-    let dir = TempDir::new().unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("m6b-")
+        .tempdir_in(m6_core::platform::socket_scratch_root())
+        .unwrap();
     let assets = dir.path().join("assets");
     std::fs::create_dir_all(&assets).unwrap();
     std::fs::write(assets.join("index.html"), MINIMAL_HTML).unwrap();
@@ -125,8 +133,8 @@ fn spawn_server(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .ok();
             let site_dir = site_dir.clone();
-            // The same connection loop production runs, so the round trip
-            // measured here is the one that actually happens.
+            // The blocking reference loop, so the round trip measures the
+            // handler the same way the contract describes.
             let _ = m6_core::server::serve_connection(&mut stream, move |raw, resp| {
                 let relpath = raw.path().trim_start_matches("/assets/").to_string();
                 let mut dict = Map::new();

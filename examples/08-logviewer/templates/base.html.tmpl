@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{{ site_name }}{% endblock %}</title>
+  <link rel="stylesheet" href="/assets/style.css">
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <header>
+    <a href="/" class="brand">{{ site_name }}</a>
+    <nav>
+      {% for item in nav %}
+        <a href="{{ item.href }}">{{ item.label }}</a>
+      {% endfor %}
+    </nav>
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

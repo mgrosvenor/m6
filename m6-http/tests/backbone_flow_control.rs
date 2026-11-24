@@ -27,6 +27,11 @@
 //! client from the broken one; the body-content assertion then catches the
 //! failure mode a naive fix would introduce, which is silent truncation.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
@@ -271,31 +276,32 @@ fn a_backbone_body_respects_the_peers_send_window() {
         headers: vec![("content-length".to_string(), BODY_LEN.to_string())],
         body: sent.clone(),
     };
-    let rx_resp = conn
-        .dispatch(&req, "127.0.0.1", "203.0.113.9", "example.test")
+    let stream_id = conn
+        .dispatch(&req, "127.0.0.1", "203.0.113.9", "example.test", None)
         .expect("dispatch");
 
     // Drive the non-blocking client until the response lands. The whole point
     // is that this takes many iterations: credit arrives over time.
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     let mut response = None;
     while Instant::now() < deadline {
         conn.drive();
-        match rx_resp.try_recv() {
-            Ok(r) => {
-                response = Some(r);
-                break;
-            }
-            Err(mpsc::TryRecvError::Empty) => thread::sleep(Duration::from_millis(1)),
-            Err(mpsc::TryRecvError::Disconnected) => break,
+        if let Some(c) = conn
+            .drain_completions()
+            .into_iter()
+            .find(|c| c.stream_id == stream_id)
+        {
+            response = Some(c.result);
+            break;
         }
+        thread::sleep(Duration::from_millis(1));
         if conn.is_dead {
             break;
         }
     }
 
     let observed = rx
-        .recv_timeout(Duration::from_secs(20))
+        .recv_timeout(m6_core::testkit::STARTUP_BOUND)
         .expect("stub origin reported nothing");
     origin.join().expect("stub origin panicked");
 

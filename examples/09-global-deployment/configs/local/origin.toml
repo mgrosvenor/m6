@@ -1,0 +1,23 @@
+# origin — system config (local dev)
+# bind     — public HTTPS on loopback (direct access + CMS)
+# h2c_bind — H2C on loopback for the 5 simulated cache nodes
+# internal_binds: the h2c listener is the backbone, so forwarded client addresses are trusted on it
+# internal_peers: the cache nodes' backbone addresses. Any other peer is refused
+
+[server]
+bind     = "127.0.0.1:9001"
+tls_cert = "@M6_DEV_HOME@/dev/dev.pem"
+tls_key  = "@M6_DEV_HOME@/dev/dev-key.pem"
+h2c_bind = "127.0.0.1:9000"
+internal_binds = ["127.0.0.1:9000"]
+internal_peers = ["127.0.0.1"]
+
+[auth]
+backend = "m6-auth-check"
+
+[genid]
+read_require  = "role:genid-read"
+write_require = "role:genid-write"
+
+[node]
+name = "origin"

@@ -1,66 +1,16 @@
-/// Backend pool management: socket discovery, least-connections load balancing.
+//! Backend pool management: socket discovery and round-robin member choice.
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use crate::config::BackendConfig;
-use rustls_native_certs;
-use webpki_roots;
-
-/// State of a single backend socket member.
-#[derive(Debug)]
-struct PoolMember {
-    path: PathBuf,
-    /// In-flight connection count.
-    connections: usize,
-    /// If temporarily removed due to failure, when to retry.
-    retry_at: Option<Instant>,
-    /// Number of consecutive failures (for backoff).
-    failure_count: u32,
-}
-
-impl PoolMember {
-    fn new(path: PathBuf) -> Self {
-        PoolMember {
-            path,
-            connections: 0,
-            retry_at: None,
-            failure_count: 0,
-        }
-    }
-
-    fn is_available(&self) -> bool {
-        match self.retry_at {
-            None => true,
-            Some(t) => Instant::now() >= t,
-        }
-    }
-
-    fn backoff_duration(&self) -> Duration {
-        // After failure_count incremented: 1→1s, 2→2s, 3→4s, ... max 30s
-        let secs = if self.failure_count == 0 {
-            1
-        } else {
-            (1u64 << (self.failure_count - 1)).min(30)
-        };
-        Duration::from_secs(secs)
-    }
-
-    fn mark_failed(&mut self) {
-        self.failure_count += 1;
-        self.retry_at = Some(Instant::now() + self.backoff_duration());
-    }
-
-    fn mark_success(&mut self) {
-        self.failure_count = 0;
-        self.retry_at = None;
-    }
-}
 
 /// A pool for a single named backend (socket-based).
 pub struct BackendPool {
     pub name: String,
     pub socket_glob: String,
-    members: Vec<PoolMember>,
+    /// The member sockets, in the order the glob found them.
+    members: Vec<PathBuf>,
+    /// The member the next request takes.
+    next: usize,
 }
 
 impl BackendPool {
@@ -69,164 +19,175 @@ impl BackendPool {
             name,
             socket_glob,
             members: Vec::new(),
+            next: 0,
         }
     }
 
     /// Add a socket path to the pool (if not already present).
     pub fn add_socket(&mut self, path: PathBuf) {
-        if !self.members.iter().any(|m| m.path == path) {
-            tracing::info!(pool = %self.name, socket = %path.display(), "pool: socket added");
-            self.members.push(PoolMember::new(path));
+        if !self.members.iter().any(|m| m == &path) {
+            m6_core::log::info!(pool = %self.name, socket = %path.display(), "pool: socket added");
+            self.members.push(path);
         }
     }
 
-    /// Remove a socket path from the pool.
-    pub fn remove_socket(&mut self, path: &Path) {
-        if let Some(pos) = self.members.iter().position(|m| m.path == path) {
-            tracing::info!(pool = %self.name, socket = %path.display(), "pool: socket removed");
-            self.members.remove(pos);
-        }
+    /// The next member's socket path, in turn, or `None` when the pool is
+    /// empty.
+    ///
+    /// Each call advances the cursor. A request whose connect fails takes the
+    /// member after the one it just tried, so one dead member costs one failed
+    /// connect and the request is still served by the next member.
+    pub fn take_member(&mut self) -> Option<&Path> {
+        let path = self.members.get(self.next)?;
+        self.next = (self.next + 1) % self.members.len();
+        Some(path)
     }
 
-    /// Pick the least-connections available member.
-    /// Returns index into members.
-    fn pick_member(&mut self) -> Option<usize> {
-        let now = Instant::now();
-        let mut best: Option<usize> = None;
-        let mut best_conns = usize::MAX;
-
-        for (i, m) in self.members.iter().enumerate() {
-            let available = match m.retry_at {
-                None => true,
-                Some(t) => now >= t,
-            };
-            if available && m.connections < best_conns {
-                best_conns = m.connections;
-                best = Some(i);
-            }
-        }
-        best
-    }
-
-    /// Synchronous connect used by tests (not async).
-    pub fn connect(&mut self) -> Result<(std::os::unix::net::UnixStream, usize), PoolError> {
-        let idx = self.pick_member().ok_or(PoolError::Empty)?;
-        let path = self.members[idx].path.clone();
-
-        match std::os::unix::net::UnixStream::connect(&path) {
-            Ok(stream) => {
-                self.members[idx].mark_success();
-                self.members[idx].connections += 1;
-                Ok((stream, idx))
-            }
-            Err(e) => {
-                tracing::warn!(
-                    pool = %self.name,
-                    socket = %path.display(),
-                    error = %e,
-                    "pool: connection failed, backing off"
-                );
-                self.members[idx].mark_failed();
-                Err(PoolError::ConnectFailed(e))
-            }
-        }
-    }
-
-    /// Pick the socket path for the best available member (for async callers).
-    /// Returns (socket_path, member_index). Caller must call release() when done.
-    pub fn pick_socket(&mut self) -> Result<(PathBuf, usize), PoolError> {
-        let idx = self.pick_member().ok_or(PoolError::Empty)?;
-        let path = self.members[idx].path.clone();
-        self.members[idx].connections += 1;
-        Ok((path, idx))
-    }
-
-    /// Mark a connection attempt as failed (for async callers).
-    pub fn mark_failed(&mut self, idx: usize) {
-        if let Some(m) = self.members.get_mut(idx) {
-            tracing::warn!(
-                pool = %self.name,
-                socket = %m.path.display(),
-                "pool: connection failed, backing off"
-            );
-            m.connections = m.connections.saturating_sub(1);
-            m.mark_failed();
-        }
-    }
-
-    /// Decrement connection count for a member.
-    pub fn release(&mut self, idx: usize) {
-        if let Some(m) = self.members.get_mut(idx) {
-            if m.connections > 0 {
-                m.connections -= 1;
-            }
-        }
-    }
-
-    /// Check whether the given path matches this pool's socket glob.
-    pub fn matches_glob(&self, path: &Path) -> bool {
-        let path_str = path.to_string_lossy();
-        match glob::Pattern::new(&self.socket_glob) {
-            Ok(pattern) => pattern.matches(&path_str),
-            Err(_) => false,
-        }
-    }
-
-    /// Rescan the glob and sync member list.
-    pub fn rescan(&mut self) {
+    /// Expand the glob once at start and add every matching socket.
+    fn expand_glob(&mut self) {
         let found: Vec<PathBuf> = match glob::glob(&self.socket_glob) {
             Ok(paths) => paths.flatten().collect(),
             Err(_) => return,
         };
 
-        // Remove members no longer present
-        self.members.retain(|m| {
-            if found.contains(&m.path) {
-                true
-            } else {
-                tracing::info!(pool = %self.name, socket = %m.path.display(), "pool: socket gone (rescan)");
-                false
-            }
-        });
-
-        // Add new members
         for p in found {
-            if !self.members.iter().any(|m| m.path == p) {
-                tracing::info!(pool = %self.name, socket = %p.display(), "pool: socket found (rescan)");
-                self.members.push(PoolMember::new(p));
+            if !self.members.iter().any(|m| m == &p) {
+                m6_core::log::info!(pool = %self.name, socket = %p.display(), "pool: socket found");
+                self.members.push(p);
             }
         }
     }
 
-    /// Number of active (available) members.
-    pub fn active_count(&self) -> usize {
-        self.members.iter().filter(|m| m.is_available()).count()
-    }
-
-    /// Total member count (including temporarily unavailable).
+    /// Total member count.
     pub fn total_count(&self) -> usize {
         self.members.len()
     }
-}
 
-#[derive(Debug, thiserror::Error)]
-pub enum PoolError {
-    #[error("pool is empty")]
-    Empty,
-    #[error("connection failed: {0}")]
-    ConnectFailed(std::io::Error),
+    /// Every member socket, in glob order. The start probe visits each one and
+    /// bypasses the round-robin on purpose.
+    pub fn members(&self) -> &[PathBuf] {
+        &self.members
+    }
 }
 
 /// A URL-based backend (remote HTTP/HTTPS upstream).
-struct UrlBackend {
-    name: String,
-    url: String,
-    /// TLS client config built once at startup (avoids per-request cert loading).
-    tls_config: std::sync::Arc<rustls::ClientConfig>,
-    skip_verify: bool,
+pub struct UrlBackend {
+    pub name: String,
+    /// The base URL, kept as the h2 pools' key.
+    pub url: String,
+    /// The authority's host, without the port: the `Host` a forwarded request
+    /// names and the name a TLS connection verifies. Resolved at start.
+    pub host: String,
+    pub scheme: UrlScheme,
+    /// The host's address, resolved once at [`PoolManager::resolve`]. A change
+    /// of address needs a restart.
+    addr: Option<std::net::SocketAddr>,
+    /// The TLS client config and server name for a TLS scheme, built at start.
+    pub tls: Option<m6_core::client::TlsClient>,
+    /// Keys of this backend's slots whose connection is open and registered
+    /// for read, so a peer close is seen and the key removed before a request
+    /// reuses it. A fixed array made at start.
+    pub idle: IdleSlots,
+    /// Skip TLS certificate verification. Test and development only.
+    pub skip_verify: bool,
 }
 
-fn build_tls_client_config_alpn(skip_verify: bool, alpn: &[u8]) -> rustls::ClientConfig {
+impl UrlBackend {
+    /// The address resolved at start. The loop never starts before it is set.
+    pub fn addr(&self) -> std::net::SocketAddr {
+        self.addr.expect("a URL backend is resolved at start")
+    }
+}
+
+/// Which protocol a URL backend speaks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UrlScheme {
+    Http,
+    Https,
+    H2c,
+    H2s,
+}
+
+impl UrlScheme {
+    /// The scheme named by `url`, or `None` for one m6 does not serve.
+    fn of(url: &str) -> Option<UrlScheme> {
+        if url.starts_with("http://") {
+            Some(UrlScheme::Http)
+        } else if url.starts_with("https://") {
+            Some(UrlScheme::Https)
+        } else if url.starts_with("h2c://") {
+            Some(UrlScheme::H2c)
+        } else if url.starts_with("h2s://") {
+            Some(UrlScheme::H2s)
+        } else {
+            None
+        }
+    }
+
+    /// The prefix `parse_host_port` takes, and the scheme's default port.
+    fn prefix_and_port(self) -> (&'static str, u16) {
+        match self {
+            UrlScheme::Http => ("http", 80),
+            UrlScheme::Https => ("https", 443),
+            UrlScheme::H2c => ("h2c", 80),
+            UrlScheme::H2s => ("h2s", 443),
+        }
+    }
+}
+
+/// The most idle connections one URL backend keeps open for reuse.
+const MAX_IDLE_URL_CONNECTIONS: usize = 8;
+
+/// Keys of open idle connections to one URL backend, last in first out.
+///
+/// A key stays only while its connection is open and its descriptor is watched
+/// for a close. `remove` is how a close is taken out of the list.
+pub struct IdleSlots {
+    keys: [usize; MAX_IDLE_URL_CONNECTIONS],
+    len: usize,
+}
+
+impl IdleSlots {
+    fn new() -> IdleSlots {
+        IdleSlots {
+            keys: [0; MAX_IDLE_URL_CONNECTIONS],
+            len: 0,
+        }
+    }
+
+    /// A key whose connection is open, or `None` when none is idle.
+    pub fn take(&mut self) -> Option<usize> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        Some(self.keys[self.len])
+    }
+
+    /// Store `key` for reuse. False when the list is full, so the caller closes
+    /// the connection and frees the slot instead.
+    pub fn push(&mut self, key: usize) -> bool {
+        if self.len == self.keys.len() {
+            return false;
+        }
+        self.keys[self.len] = key;
+        self.len += 1;
+        true
+    }
+
+    /// Take `key` out, because its connection is gone.
+    pub fn remove(&mut self, key: usize) {
+        if let Some(pos) = self.keys[..self.len].iter().position(|k| *k == key) {
+            self.keys.copy_within(pos + 1..self.len, pos);
+            self.len -= 1;
+        }
+    }
+}
+
+fn build_tls_client_config_alpn(
+    skip_verify: bool,
+    alpn: &[u8],
+) -> anyhow::Result<rustls::ClientConfig> {
     if skip_verify {
         // Danger: accept any certificate. Test/dev only.
         let mut cfg = rustls::ClientConfig::builder()
@@ -234,30 +195,43 @@ fn build_tls_client_config_alpn(skip_verify: bool, alpn: &[u8]) -> rustls::Clien
             .with_custom_certificate_verifier(std::sync::Arc::new(SkipVerifier))
             .with_no_client_auth();
         cfg.alpn_protocols = vec![alpn.to_vec()];
-        cfg
+        Ok(cfg)
     } else {
-        let mut root_store = rustls::RootCertStore::empty();
-        let native_roots = rustls_native_certs::load_native_certs();
-        for cert in native_roots.certs {
-            let _ = root_store.add(cert);
-        }
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        // One place loads the host's root store: `client::system_roots` in
+        // m6-core. Its message says what the store held; this one adds the two
+        // ways out for a backend.
+        let root_store = m6_core::client::system_roots().map_err(|e| {
+            anyhow::anyhow!(
+                "{e}: install the host's CA certificates, or set tls_skip_verify on this backend"
+            )
+        })?;
         let mut cfg = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
         cfg.alpn_protocols = vec![alpn.to_vec()];
-        cfg
+        Ok(cfg)
     }
 }
 
-fn build_tls_client_config(skip_verify: bool) -> rustls::ClientConfig {
+fn build_tls_client_config(skip_verify: bool) -> anyhow::Result<rustls::ClientConfig> {
     build_tls_client_config_alpn(skip_verify, b"http/1.1")
 }
 
 /// Build a TLS client config advertising HTTP/2 via ALPN.
 /// Used for `h2s://` backends.
-pub fn build_h2_tls_client_config(skip_verify: bool) -> rustls::ClientConfig {
+pub fn build_h2_tls_client_config(skip_verify: bool) -> anyhow::Result<rustls::ClientConfig> {
     build_tls_client_config_alpn(skip_verify, b"h2")
+}
+
+/// The config and server name a TLS URL backend authenticates with, built once
+/// at start beside its resolved address.
+fn tls_client(
+    host: &str,
+    config: std::sync::Arc<rustls::ClientConfig>,
+) -> anyhow::Result<m6_core::client::TlsClient> {
+    let name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|e| anyhow::anyhow!("invalid server name {host:?}: {e}"))?;
+    Ok(m6_core::client::TlsClient { config, name })
 }
 
 /// A no-op TLS certificate verifier for testing with self-signed certs.
@@ -295,7 +269,7 @@ impl rustls::client::danger::ServerCertVerifier for SkipVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
+        rustls::crypto::aws_lc_rs::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }
@@ -323,29 +297,70 @@ impl PoolManager {
         }
     }
 
-    pub fn from_config(backends: &[BackendConfig]) -> Self {
+    pub fn from_config(backends: &[BackendConfig]) -> anyhow::Result<Self> {
         let mut mgr = PoolManager::new();
         for b in backends {
             if let Some(ref sockets) = b.sockets {
                 let mut pool = BackendPool::new(b.name.clone(), sockets.clone());
-                pool.rescan();
+                pool.expand_glob();
+                if pool.members.is_empty() {
+                    anyhow::bail!(
+                        "[[backend]] {name}: sockets = {glob:?} matches no socket. Start the backends before m6-http (systemd After=)",
+                        name = b.name,
+                        glob = sockets
+                    );
+                }
                 mgr.pools.push((b.name.clone(), pool));
             } else if let Some(ref url) = b.url {
-                // h2s:// backends need ALPN "h2"; all others use "http/1.1".
-                let tls_config = if url.starts_with("h2s://") {
-                    std::sync::Arc::new(build_h2_tls_client_config(b.tls_skip_verify))
-                } else {
-                    std::sync::Arc::new(build_tls_client_config(b.tls_skip_verify))
-                };
+                let scheme = UrlScheme::of(url).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "[[backend]] {name}: url {url:?} must start with http://, https://, h2c:// or h2s://",
+                        name = b.name
+                    )
+                })?;
                 mgr.url_backends.push(UrlBackend {
                     name: b.name.clone(),
                     url: url.clone(),
-                    tls_config,
+                    host: String::new(),
+                    scheme,
+                    addr: None,
+                    tls: None,
+                    idle: IdleSlots::new(),
                     skip_verify: b.tls_skip_verify,
                 });
             }
         }
-        mgr
+        Ok(mgr)
+    }
+
+    /// Resolve every URL backend's host once, and build its TLS client. Start
+    /// only: this blocks in the system resolver, and a name that does not
+    /// resolve stops the service with the backend and host named.
+    pub fn resolve(&mut self) -> anyhow::Result<()> {
+        for b in &mut self.url_backends {
+            let (prefix, default_port) = b.scheme.prefix_and_port();
+            let (host, port) = crate::h2_client::parse_host_port(&b.url, prefix, default_port)
+                .map_err(|e| anyhow::anyhow!("[[backend]] {}: {e}", b.name))?;
+            let addr = m6_core::net::resolve(&host, port).map_err(|e| {
+                anyhow::anyhow!("[[backend]] {}: {host} does not resolve: {e}", b.name)
+            })?;
+            b.addr = Some(addr);
+            let tls_config = match b.scheme {
+                UrlScheme::Https => Some(build_tls_client_config(b.skip_verify)),
+                UrlScheme::H2s => Some(build_h2_tls_client_config(b.skip_verify)),
+                UrlScheme::Http | UrlScheme::H2c => None,
+            };
+            b.tls = match tls_config {
+                Some(config) => {
+                    let config =
+                        config.map_err(|e| anyhow::anyhow!("[[backend]] {}: {e}", b.name))?;
+                    Some(tls_client(&host, std::sync::Arc::new(config))?)
+                }
+                None => None,
+            };
+            b.host = host;
+        }
+        Ok(())
     }
 
     pub fn get_pool_mut(&mut self, name: &str) -> Option<&mut BackendPool> {
@@ -366,56 +381,45 @@ impl PoolManager {
             .map(|b| b.url.as_str())
     }
 
-    /// Returns (url, tls_config, skip_verify) for a URL backend.
-    pub fn get_url_info(
-        &self,
-        name: &str,
-    ) -> Option<(&str, std::sync::Arc<rustls::ClientConfig>, bool)> {
-        self.url_backends
-            .iter()
-            .find(|b| b.name == name)
-            .map(|b| (b.url.as_str(), b.tls_config.clone(), b.skip_verify))
+    /// The URL backend named `name`, or `None` when the name is a socket pool.
+    pub fn find_url(&self, name: &str) -> Option<usize> {
+        self.url_backends.iter().position(|b| b.name == name)
     }
 
-    /// Handle a socket appearing — add to matching pool.
-    pub fn socket_appeared(&mut self, path: &Path) {
-        for (_, pool) in self.pools.iter_mut() {
-            if pool.matches_glob(path) {
-                pool.add_socket(path.to_path_buf());
-            }
-        }
+    pub fn url_backend(&self, idx: usize) -> &UrlBackend {
+        &self.url_backends[idx]
     }
 
-    /// Handle a socket disappearing — remove from matching pool.
-    pub fn socket_disappeared(&mut self, path: &Path) {
-        for (_, pool) in self.pools.iter_mut() {
-            pool.remove_socket(path);
-        }
+    pub fn url_backend_mut(&mut self, idx: usize) -> &mut UrlBackend {
+        &mut self.url_backends[idx]
     }
 
-    /// Rescan all pools.
-    pub fn rescan_all(&mut self) {
-        for (_, pool) in self.pools.iter_mut() {
-            pool.rescan();
-        }
-    }
-
-    /// Total active (non-failed) members across all pools — for stats reporting.
-    pub fn total_active_members(&self) -> usize {
-        self.pools.iter().map(|(_, p)| p.active_count()).sum()
-    }
-
-    /// Per-pool occupancy for the health endpoint.
-    ///
-    /// Deliberately per-pool rather than the summed `total_active_members()`
-    /// above: a node with a healthy m6-html and a dead render-contact sums to
-    /// a non-zero total and looks fine, when one of its backends cannot serve
-    /// at all. The sum answers "is anything alive"; health needs "is
-    /// everything alive".
-    pub fn pool_health(&self) -> Vec<(String, usize, usize)> {
+    /// Every socket member of every pool, in pool order and then in the order
+    /// the glob found them. A change sequence sends one `POST /genid` to each
+    /// of these on its own socket, which is the one place the pool's member
+    /// choice is deliberately bypassed.
+    pub fn socket_members(&self) -> Vec<PathBuf> {
         self.pools
             .iter()
-            .map(|(name, p)| (name.clone(), p.active_count(), p.total_count()))
+            .flat_map(|(_, pool)| pool.members.iter().cloned())
+            .collect()
+    }
+
+    /// Total members across all socket pools, for stats reporting.
+    pub fn total_members(&self) -> usize {
+        self.pools.iter().map(|(_, p)| p.total_count()).sum()
+    }
+
+    /// Per-pool member counts for the metrics document.
+    ///
+    /// This is the count alone: the pool carries no per-member health state,
+    /// so every member stays in rotation. A member whose backend is down is
+    /// found when a request connects to it, and that request takes the next
+    /// member.
+    pub fn pool_health(&self) -> Vec<(String, usize)> {
+        self.pools
+            .iter()
+            .map(|(name, p)| (name.clone(), p.total_count()))
             .collect()
     }
 
@@ -438,71 +442,37 @@ impl PoolManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
 
     #[test]
-    fn test_empty_pool_returns_error() {
-        let mut pool = BackendPool::new("test".to_string(), "/run/m6/*.sock".to_string());
-        assert!(matches!(pool.connect(), Err(PoolError::Empty)));
-    }
-
-    #[test]
-    fn test_add_remove_socket() {
-        let dir = TempDir::new().unwrap();
-        let sock_path = dir.path().join("test.sock");
-        // Create a dummy file (not a real socket, but tests add/remove logic)
-        std::fs::write(&sock_path, "").unwrap();
-
-        let mut pool = BackendPool::new(
-            "test".to_string(),
-            format!("{}/*.sock", dir.path().display()),
+    fn take_member_returns_each_member_in_turn() {
+        let mut pool = BackendPool::new("app".to_string(), "/tmp/*.sock".to_string());
+        let a = PathBuf::from("/tmp/app-a.sock");
+        let b = PathBuf::from("/tmp/app-b.sock");
+        pool.add_socket(a.clone());
+        pool.add_socket(b.clone());
+        let mut order = Vec::new();
+        for _ in 0..4 {
+            order.push(pool.take_member().map(Path::to_path_buf));
+        }
+        assert_eq!(
+            order,
+            vec![Some(a.clone()), Some(b.clone()), Some(a), Some(b)],
+            "the turn must repeat every member in order"
         );
-        pool.add_socket(sock_path.clone());
-        assert_eq!(pool.total_count(), 1);
-
-        pool.remove_socket(&sock_path);
-        assert_eq!(pool.total_count(), 0);
     }
 
     #[test]
-    fn test_socket_not_added_twice() {
+    fn an_empty_pool_has_no_member() {
+        let mut pool = BackendPool::new("test".to_string(), "/run/m6/*.sock".to_string());
+        assert!(pool.take_member().is_none());
+    }
+
+    #[test]
+    fn a_socket_is_not_added_twice() {
         let path = PathBuf::from("/tmp/test.sock");
         let mut pool = BackendPool::new("test".to_string(), "/tmp/*.sock".to_string());
         pool.add_socket(path.clone());
-        pool.add_socket(path.clone());
+        pool.add_socket(path);
         assert_eq!(pool.total_count(), 1);
-    }
-
-    #[test]
-    fn test_matches_glob() {
-        let pool = BackendPool::new("test".to_string(), "/run/m6/m6-html-*.sock".to_string());
-        assert!(pool.matches_glob(Path::new("/run/m6/m6-html-1.sock")));
-        assert!(pool.matches_glob(Path::new("/run/m6/m6-html-worker.sock")));
-        assert!(!pool.matches_glob(Path::new("/run/m6/other.sock")));
-    }
-
-    #[test]
-    fn test_pool_manager_socket_appeared() {
-        let mut mgr = PoolManager::new();
-        mgr.add_pool(BackendPool::new(
-            "m6-html".to_string(),
-            "/run/m6/m6-html-*.sock".to_string(),
-        ));
-
-        let sock = Path::new("/run/m6/m6-html-1.sock");
-        mgr.socket_appeared(sock);
-        assert_eq!(mgr.get_pool("m6-html").unwrap().total_count(), 1);
-    }
-
-    #[test]
-    fn test_pool_manager_socket_disappeared() {
-        let mut mgr = PoolManager::new();
-        let mut pool =
-            BackendPool::new("m6-html".to_string(), "/run/m6/m6-html-*.sock".to_string());
-        pool.add_socket(PathBuf::from("/run/m6/m6-html-1.sock"));
-        mgr.add_pool(pool);
-
-        mgr.socket_disappeared(Path::new("/run/m6/m6-html-1.sock"));
-        assert_eq!(mgr.get_pool("m6-html").unwrap().total_count(), 0);
     }
 }

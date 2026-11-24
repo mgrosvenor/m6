@@ -1,0 +1,43 @@
+[site]
+name   = "My Site"
+domain = "localhost"
+
+[errors]
+mode             = "internal"
+verbose_fallback = true
+
+[log]
+level  = "info"
+
+[[backend]]
+name    = "m6-html"
+sockets = "/tmp/m6/m6-html*.sock"
+
+[[backend]]
+name    = "m6-file"
+sockets = "/tmp/m6/m6-file*.sock"
+
+[[route]]
+path    = "/"
+backend = "m6-html"
+
+[[route]]
+path    = "/about"
+backend = "m6-html"
+
+[[route]]
+path    = "/blog"
+backend = "m6-html"
+
+[[route]]
+path    = "/blog/{stem}"
+backend = "m6-html"
+
+[[route]]
+path    = "/_errors"
+backend = "m6-html"
+
+[[route_group]]
+glob    = "assets/**/*"
+path    = "/assets/{relpath}"
+backend = "m6-file"

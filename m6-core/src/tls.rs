@@ -10,11 +10,11 @@
 //!
 //! Two halves live here. [`not_after_unix`] reads `notAfter` out of a DER
 //! certificate, and [`record_loaded`] stores what the server loaded so the
-//! monitoring endpoints can report it without re-reading a file. The second
+//! metrics document can report it without re-reading a file. The second
 //! half matters as much as the first: a path on disk and the material a running
 //! process is serving are different facts, and reading the file would report
-//! the one nobody asked about. A certificate renewed on disk and never reloaded
-//! is exactly the case an operator needs to see.
+//! the one nobody asked about. A certificate renewed on disk and never
+//! restarted into the server is exactly the case an operator needs to see.
 //!
 //! # Why the parse is written out here
 //!
@@ -31,9 +31,10 @@
 //! `util::iso_date_from`, and it is the reason no date arithmetic is written
 //! here either.
 
+use std::fmt;
 use std::sync::RwLock;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Why a certificate could not be read.
 ///
@@ -63,6 +64,120 @@ pub enum CertificateError {
     BadTime,
 }
 
+/// A certificate's identity: SHA-256 over the DER bytes the node is serving.
+///
+/// **What is hashed is the whole certificate, not its key.** A renewal that
+/// reissues with the same key pair changes the serial number, the validity and
+/// the signature, so the fingerprint moves with all three. Hashing the
+/// `SubjectPublicKeyInfo` would stay the same across that reissue, which
+/// answers "is this the same key" and not "is this the same certificate": two
+/// nodes can hold one key in two certificates with different validity, so a
+/// fleet check built on the SPKI would call them one certificate while a
+/// client sees two. Leaf plus issuer is not used either, because the issuer is
+/// already inside the leaf's DER and the fingerprint is one number per
+/// certificate rather than a number per chain.
+///
+/// SHA-256 for the reason `Cargo.toml` gives: `openssl x509 -fingerprint
+/// -sha256` is the tool an operator compares this number with.
+///
+/// **A node's fingerprint is not proof of anything and not a secret.** Every
+/// client already receives these bytes in the handshake, so a fingerprint
+/// discloses nothing a visitor does not have. It says which certificate a node
+/// loaded, and it cannot say that the node told the truth about it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Fingerprint([u8; 32]);
+
+impl Fingerprint {
+    /// SHA-256 of `der`, the certificate as it is served.
+    ///
+    /// Called once per certificate when a chain is loaded, never per request.
+    pub fn of(der: &[u8]) -> Self {
+        use sha2::{Digest, Sha256};
+        Self(Sha256::digest(der).into())
+    }
+
+    /// Characters in the hex form, which is what the metrics document carries.
+    pub const HEX_LEN: usize = 64;
+
+    /// The digest as lower-case hex, the form the metrics document and
+    /// `openssl` print.
+    pub fn to_hex(self) -> String {
+        String::from_utf8(self.hex().to_vec()).expect("hex digits are ASCII")
+    }
+
+    /// The first twelve hex characters, enough to compare by eye in a report.
+    pub fn short(self) -> String {
+        String::from_utf8(self.hex()[..12].to_vec()).expect("hex digits are ASCII")
+    }
+
+    /// The hex form in a fixed buffer, so serialising one allocates nothing.
+    fn hex(self) -> [u8; Self::HEX_LEN] {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut out = [0u8; Self::HEX_LEN];
+        for (i, byte) in self.0.iter().enumerate() {
+            out[i * 2] = DIGITS[(byte >> 4) as usize];
+            out[i * 2 + 1] = DIGITS[(byte & 0x0f) as usize];
+        }
+        out
+    }
+}
+
+impl fmt::Display for Fingerprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(std::str::from_utf8(&self.hex()).expect("hex digits are ASCII"))
+    }
+}
+
+impl fmt::Debug for Fingerprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Fingerprint({self})")
+    }
+}
+
+impl Serialize for Fingerprint {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(std::str::from_utf8(&self.hex()).expect("hex digits are ASCII"))
+    }
+}
+
+impl<'de> Deserialize<'de> for Fingerprint {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Hex;
+        impl serde::de::Visitor<'_> for Hex {
+            type Value = Fingerprint;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("64 hex characters")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Fingerprint, E> {
+                let bytes = v.as_bytes();
+                if bytes.len() != Fingerprint::HEX_LEN {
+                    return Err(E::invalid_length(bytes.len(), &self));
+                }
+                let bad = || E::invalid_value(serde::de::Unexpected::Str(v), &"64 hex characters");
+                let mut out = [0u8; 32];
+                for (i, byte) in out.iter_mut().enumerate() {
+                    let hi = hex_digit(bytes[i * 2]).ok_or_else(bad)?;
+                    let lo = hex_digit(bytes[i * 2 + 1]).ok_or_else(bad)?;
+                    *byte = (hi << 4) | lo;
+                }
+                Ok(Fingerprint(out))
+            }
+        }
+        deserializer.deserialize_str(Hex)
+    }
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// One certificate out of the chain the server loaded.
 ///
 /// `depth` is the position as loaded, so 0 is the leaf: the certificate a
@@ -81,6 +196,16 @@ pub struct TlsCertificate {
     /// is the difference between a renewal that failed last night and one that
     /// stopped running in March.
     pub expires_in_seconds: i64,
+    /// SHA-256 of this certificate's DER, the identity [`Fingerprint`] carries.
+    ///
+    /// The expiry above cannot tell two certificates apart when they expire on
+    /// the same day, which is the ordinary shape of a renewal that reissues
+    /// twelve hours later or of two ACME clients renewing on one schedule.
+    /// This can. `serde(default)` is what makes a node older than this field
+    /// still parse: its certificates arrive with no fingerprint, which a
+    /// reader must treat as "cannot say" and never as "the same as the others".
+    #[serde(default)]
+    pub fingerprint: Option<Fingerprint>,
 }
 
 /// `notAfter` from a DER certificate, as seconds since the Unix epoch.
@@ -205,30 +330,24 @@ fn element(buf: &[u8]) -> Result<(u8, &[u8], &[u8]), CertificateError> {
     Ok((tag, contents, rest))
 }
 
-/// `notAfter` for each certificate the server has loaded, leaf first.
+/// `notAfter` and the fingerprint for each certificate the server has loaded,
+/// leaf first.
 ///
-/// A `RwLock` rather than a `OnceLock` so a second load can replace the first.
-/// Written once per load and read once per monitoring request, so the lock is
-/// never contended.
+/// Written once at start, when the configuration is installed, and read once
+/// per monitoring request. The `RwLock` keeps the write and read safe.
 ///
-/// **What this holds is the chain every protocol is serving.** A reload writes
-/// it again, and `m6-http`'s `handle_tls_reload` writes it after the new
-/// material is installed on both the rustls listener and the quiche
-/// configuration, so a build that fails leaves the previous chain recorded and
-/// still being served.
+/// **What this holds is the chain every protocol is serving.**
 ///
-/// It was not always so. Until m6 #210 a reload rebuilt the quiche
-/// configuration alone and re-recorded nothing, so after a renewal HTTP/3
-/// served the new certificate, HTTP/1.1 and HTTP/2 served the old one, and the
-/// number here was correct for the second pair and stale for the first.
-/// Each entry is `(depth as loaded, notAfter)`, and an unreadable certificate
-/// leaves a GAP rather than shifting everything after it.
+/// Each entry is `(depth as loaded, notAfter, fingerprint)`, and an unreadable
+/// certificate leaves a GAP rather than shifting everything after it. The
+/// fingerprint is computed in the same pass, from the same bytes, so a
+/// certificate's identity and its expiry cannot describe two different loads.
 ///
 /// A bare `Vec<i64>` re-derived depth from the vector position, so a chain
 /// whose leaf failed to parse reported its intermediate as `depth: 0`, which
 /// every doc here calls the certificate an ACME client renews. An operator
 /// would read a multi-year expiry for the one that actually needed renewing.
-static LOADED: RwLock<Vec<(usize, i64)>> = RwLock::new(Vec::new());
+static LOADED: RwLock<Vec<(usize, i64, Fingerprint)>> = RwLock::new(Vec::new());
 
 /// How many certificates in the loaded chain could not be read.
 ///
@@ -249,26 +368,29 @@ static UNREADABLE: RwLock<usize> = RwLock::new(0);
 /// the caller logs. Reporting nothing for it is also what keeps the monitor's
 /// "cannot say" distinct from a measured number.
 pub fn record_loaded<T: AsRef<[u8]>>(chain: &[T]) -> Vec<(usize, CertificateError)> {
-    let mut not_after = Vec::with_capacity(chain.len());
+    let mut loaded = Vec::with_capacity(chain.len());
     let mut failures = Vec::new();
     for (depth, der) in chain.iter().enumerate() {
-        match not_after_unix(der.as_ref()) {
+        let der = der.as_ref();
+        match not_after_unix(der) {
             // The depth is recorded, not implied by position, so a failure
-            // earlier in the chain cannot renumber what follows it.
-            Ok(secs) => not_after.push((depth, secs)),
+            // earlier in the chain cannot renumber what follows it. The
+            // fingerprint is taken from the same bytes in the same pass, once
+            // per load: nothing per request hashes anything.
+            Ok(secs) => loaded.push((depth, secs, Fingerprint::of(der))),
             Err(e) => failures.push((depth, e)),
         }
     }
     *UNREADABLE.write().unwrap_or_else(|e| e.into_inner()) = failures.len();
     // A poisoned lock means another thread panicked while holding it. The value
-    // behind it is a plain `Vec<i64>` that no panic can leave half written, so
-    // the recovery is to take it anyway rather than to propagate.
+    // behind it is a plain vector that no panic can leave half written, so the
+    // recovery is to take it anyway rather than to propagate.
     let mut slot = LOADED.write().unwrap_or_else(|e| e.into_inner());
-    *slot = not_after;
+    *slot = loaded;
     failures
 }
 
-/// The loaded chain's expiries, measured against `now_unix`.
+/// The loaded chain's expiries and identities, measured against `now_unix`.
 ///
 /// Empty when nothing has been recorded, which is the state of a process
 /// serving no TLS at all. An empty list and a list of expired certificates are
@@ -276,10 +398,11 @@ pub fn record_loaded<T: AsRef<[u8]>>(chain: &[T]) -> Vec<(usize, CertificateErro
 pub fn loaded_at(now_unix: i64) -> Vec<TlsCertificate> {
     let slot = LOADED.read().unwrap_or_else(|e| e.into_inner());
     slot.iter()
-        .map(|&(depth, not_after_unix)| TlsCertificate {
+        .map(|&(depth, not_after_unix, fingerprint)| TlsCertificate {
             depth,
             not_after_unix,
             expires_in_seconds: not_after_unix - now_unix,
+            fingerprint: Some(fingerprint),
         })
         .collect()
 }
@@ -294,9 +417,10 @@ pub fn unreadable() -> usize {
     *UNREADABLE.read().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The loaded chain's expiries, measured against the clock now.
+/// The loaded chain's expiries and identities, measured against the clock now.
 pub fn loaded() -> Vec<TlsCertificate> {
-    loaded_at(chrono::Utc::now().timestamp())
+    let now: chrono::DateTime<chrono::Utc> = crate::platform::wall().into();
+    loaded_at(now.timestamp())
 }
 
 #[cfg(test)]
@@ -308,22 +432,98 @@ mod tests {
     /// Generated rather than checked in as a fixture: a fixture expires, and a
     /// test that starts failing on a date is a test that gets deleted.
     fn certificate(days: i64) -> (Vec<u8>, i64) {
-        let mut params =
-            rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("params");
-        let not_after = time::OffsetDateTime::now_utc() + time::Duration::days(days);
+        let now: chrono::DateTime<chrono::Utc> = crate::platform::wall().into();
+        let now = time::OffsetDateTime::from_unix_timestamp(now.timestamp())
+            .expect("a wall clock reading is a valid timestamp");
+        let not_after = now + time::Duration::days(days);
         // Whole seconds, because that is all notAfter can carry and the
         // comparison below has to be exact rather than within a second.
         let not_after = not_after.replace_nanosecond(0).expect("whole second");
+        (
+            certificate_with_not_after(not_after),
+            not_after.unix_timestamp(),
+        )
+    }
+
+    /// A self-signed certificate for `localhost` with the expiry given.
+    ///
+    /// Separate from `certificate` so a test can issue two certificates into
+    /// the same second on purpose, which is the case a fingerprint has to
+    /// separate and a clock-relative helper cannot guarantee.
+    fn certificate_with_not_after(not_after: time::OffsetDateTime) -> Vec<u8> {
+        let mut params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("params");
         params.not_after = not_after;
         let key = rcgen::KeyPair::generate().expect("key");
-        let cert = params.self_signed(&key).expect("self-signed");
-        (cert.der().to_vec(), not_after.unix_timestamp())
+        params
+            .self_signed(&key)
+            .expect("self-signed")
+            .der()
+            .to_vec()
     }
 
     #[test]
     fn not_after_matches_what_the_certificate_was_issued_with() {
         let (der, expected) = certificate(30);
         assert_eq!(not_after_unix(&der), Ok(expected));
+    }
+
+    /// The wire value is SHA-256, in lower-case hex, of the DER bytes. Pinned
+    /// against the published digests of two known inputs rather than against
+    /// this code's own output, so a change of algorithm or encoding fails here.
+    #[test]
+    fn the_fingerprint_is_the_published_sha256_of_the_bytes() {
+        assert_eq!(
+            Fingerprint::of(b"").to_hex(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            Fingerprint::of(b"abc").to_hex(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // The short form a report prints is the same number, cut.
+        assert_eq!(Fingerprint::of(b"abc").short(), "ba7816bf8f01");
+    }
+
+    /// The value makes the round trip that the metrics document and the
+    /// monitor need: one hex string on the wire, the same bytes on the other
+    /// side, and a node older than the field still parses.
+    #[test]
+    fn a_fingerprint_survives_the_wire_and_an_old_node_still_parses() {
+        let fp = Fingerprint::of(b"a certificate");
+        let json = serde_json::to_string(&fp).expect("serialisable");
+        assert_eq!(json, format!("\"{fp}\""));
+        let back: Fingerprint = serde_json::from_str(&json).expect("parses");
+        assert_eq!(back, fp);
+        assert!(serde_json::from_str::<Fingerprint>("\"not-hex\"").is_err());
+
+        let old = r#"{"depth":0,"not_after_unix":1,"expires_in_seconds":1}"#;
+        let cert: TlsCertificate = serde_json::from_str(old).expect("an old node parses");
+        assert_eq!(
+            cert.fingerprint, None,
+            "no fingerprint is 'cannot say', which is not the same as agreement"
+        );
+    }
+
+    /// **The case the fingerprint exists for.** Two certificates issued into
+    /// one second expire on the same day and are different certificates. The
+    /// expiry cannot tell them apart and the fingerprint can.
+    #[test]
+    fn two_certificates_with_one_expiry_have_different_fingerprints() {
+        let at = time::OffsetDateTime::from_unix_timestamp(1_789_000_000).expect("a date");
+        let a = certificate_with_not_after(at);
+        let b = certificate_with_not_after(at);
+        assert_ne!(a, b, "two issued certificates are two DERs");
+        assert_eq!(
+            not_after_unix(&a),
+            not_after_unix(&b),
+            "the premise of the test is one expiry"
+        );
+        assert_ne!(
+            Fingerprint::of(&a),
+            Fingerprint::of(&b),
+            "one expiry and one fingerprint would make the two indistinguishable"
+        );
     }
 
     /// The case the whole module exists for. An expiry already past must read
@@ -334,7 +534,8 @@ mod tests {
         let (der, expected) = certificate(-5);
         let not_after = not_after_unix(&der).expect("parses");
         assert_eq!(not_after, expected);
-        let now = chrono::Utc::now().timestamp();
+        let now: chrono::DateTime<chrono::Utc> = crate::platform::wall().into();
+        let now = now.timestamp();
         assert!(not_after - now < 0, "expected a negative remainder");
     }
 
@@ -489,6 +690,7 @@ mod tests {
         // Leaf first, and an intermediate on its own much longer cycle.
         let (leaf, leaf_not_after) = certificate(30);
         let (intermediate, intermediate_not_after) = certificate(400);
+        let leaf_fingerprint = Fingerprint::of(&leaf);
         assert!(record_loaded(&[leaf.clone(), intermediate]).is_empty());
 
         let now = leaf_not_after - 86_400;
@@ -497,6 +699,19 @@ mod tests {
         assert_eq!(loaded[0].depth, 0);
         assert_eq!(loaded[0].not_after_unix, leaf_not_after);
         assert_eq!(loaded[0].expires_in_seconds, 86_400);
+        assert_eq!(
+            loaded[0].fingerprint,
+            Some(leaf_fingerprint),
+            "the leaf's identity is the SHA-256 of the DER that was loaded"
+        );
+        // Read twice, as two builds of the metrics document do: the value is a
+        // property of the loaded certificate, so nothing about the clock or
+        // the request can move it.
+        assert_eq!(
+            loaded_at(now + 3_600)[0].fingerprint,
+            loaded[0].fingerprint,
+            "two reads of one load must agree"
+        );
         assert_eq!(loaded[1].depth, 1);
         assert_eq!(loaded[1].not_after_unix, intermediate_not_after);
         assert_eq!(

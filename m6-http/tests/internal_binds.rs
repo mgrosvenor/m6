@@ -6,8 +6,12 @@
 //! a message that names the key, and a declared h2c listener is really internal, shown by whether it
 //! believes a forwarded client address.
 
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use m6_http_lib::forward::HttpRequest;
@@ -19,12 +23,22 @@ use m6_core::testkit;
 fn write_site(dir: &std::path::Path) -> std::path::PathBuf {
     let site = dir.join("site");
     std::fs::create_dir_all(&site).expect("site dir");
+    // A socket file with no process listening: the pool's glob matches it, so
+    // m6-http starts, and a connect is refused. The pool reads its glob once at
+    // start, so the file must exist before the spawn.
+    let sock = dir.join("b-1.sock");
+    let glob = dir.join("b-*.sock");
+    let _ = std::os::unix::net::UnixListener::bind(&sock).expect("placeholder socket");
     std::fs::write(
         site.join("site.toml"),
-        "[site]\nname = \"internal-binds\"\ndomain = \"localhost\"\n\n\
-         [[backend]]\nname = \"b\"\nsockets = \"/nonexistent/b-*.sock\"\n\n\
-         [[route]]\npath = \"/\"\nbackend = \"b\"\n\n\
-         [rate_limit]\nrequests_per_min = 2\n",
+        format!(
+            "[site]\nname = \"internal-binds\"\ndomain = \"localhost\"\n\n\
+             [analytics]\nenabled = false\n\n\
+             [[backend]]\nname = \"b\"\nsockets = \"{}\"\n\n\
+             [[route]]\npath = \"/\"\nbackend = \"b\"\n\n\
+             [rate_limit]\nrequests_per_min = 2\n",
+            glob.display()
+        ),
     )
     .expect("site.toml");
     site
@@ -58,24 +72,21 @@ fn write_system(
 /// Fails the test, after killing the process, if it is still running after
 /// ten seconds: a refusal must be immediate.
 fn run_until_exit(site: &std::path::Path, config: &std::path::Path) -> (Option<i32>, String) {
-    let mut child: Child = Command::new(testkit::binary("m6-http"))
-        .arg(site)
-        .arg(config)
-        .env("RUST_LOG", "info")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn m6-http");
-    let exited = testkit::wait::until(Duration::from_secs(10), || {
-        child.try_wait().expect("try_wait").is_some()
+    let mut child = m6_core::testkit::process::Running::spawn(
+        Command::new(testkit::binary("m6-http"))
+            .arg(site)
+            .arg(config)
+            .env("RUST_LOG", "info"),
+    )
+    .expect("spawn m6-http");
+    let exited = testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
+        child.child().try_wait().expect("try_wait").is_some()
     });
     if !exited {
-        let _ = child.kill();
-        let _ = child.wait();
+        // The guard kills and reaps it while this panic unwinds.
         panic!("m6-http was still running after 10s; it should have refused to start");
     }
-    let out = child.wait_with_output().expect("output");
+    let out = child.take().wait_with_output().expect("output");
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -88,7 +99,7 @@ fn run_until_exit(site: &std::path::Path, config: &std::path::Path) -> (Option<i
 fn an_undeclared_h2c_listener_refuses_to_start() {
     let tls = testkit::claim_port();
     let h2c = testkit::claim_port();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = write_site(dir.path());
     // Empty certificate files: the refusal fires before TLS is read.
     let config = write_system(
@@ -109,7 +120,7 @@ fn an_undeclared_h2c_listener_refuses_to_start() {
 fn a_public_internal_binding_refuses_to_start() {
     let tls = testkit::claim_port();
     let h2c = testkit::claim_port();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = write_site(dir.path());
     let public = format!("0.0.0.0:{}", h2c.port());
     let config = write_system(
@@ -137,7 +148,7 @@ fn a_public_internal_binding_refuses_to_start() {
 fn statuses_over_h2c(declare: bool, n: usize) -> Vec<u16> {
     let tls = testkit::claim_port();
     let h2c = testkit::claim_port();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = write_site(dir.path());
     let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen");
     let declaration = if declare {
@@ -159,8 +170,8 @@ fn statuses_over_h2c(declare: bool, n: usize) -> Vec<u16> {
     let mut cmd = Command::new(testkit::binary("m6-http"));
     cmd.arg(&site).arg(&config).env("RUST_LOG", "info");
     let mut svc = testkit::Service::spawn("m6-http-internal-binds", &mut cmd);
-    svc.wait_for_tcp(tls.port(), Duration::from_secs(10));
-    svc.wait_for_tcp(h2c.port(), Duration::from_secs(10));
+    svc.wait_for_tcp(tls.port(), m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_tcp(h2c.port(), m6_core::testkit::STARTUP_BOUND);
 
     let mut conn = H2cClientConn::connect("127.0.0.1", h2c.port()).expect("connect over h2c");
     let settle = Instant::now() + Duration::from_millis(250);
@@ -179,24 +190,29 @@ fn statuses_over_h2c(declare: bool, n: usize) -> Vec<u16> {
             body: Vec::new(),
         };
         let client = format!("203.0.113.{}", i + 1);
-        let rx = conn
-            .dispatch(&req, "127.0.0.1", &client, "localhost")
+        let stream_id = conn
+            .dispatch(&req, "127.0.0.1", &client, "localhost", None)
             .expect("dispatch");
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
         let resp = loop {
             conn.drive();
-            match rx.try_recv() {
-                Ok(r) => break r.expect("response"),
-                Err(mpsc::TryRecvError::Empty) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Err(e) => panic!("no response: {e:?}\n{}", svc.output()),
+            if let Some(c) = conn
+                .drain_completions()
+                .into_iter()
+                .find(|c| c.stream_id == stream_id)
+            {
+                break c.result.expect("response");
+            }
+            if Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            } else {
+                panic!("no response\n{}", svc.output());
             }
         };
         statuses.push(resp.status);
     }
 
-    let status = svc.terminate(Duration::from_secs(5));
+    let status = svc.terminate(m6_core::testkit::STARTUP_BOUND);
     let output = svc.output();
     assert!(status.success(), "exit {status}\n{output}");
     statuses
@@ -225,7 +241,7 @@ fn an_h2c_listener_declared_public_ignores_the_forwarded_address() {
 fn an_internal_listener_without_internal_peers_refuses_to_start() {
     let tls = testkit::claim_port();
     let h2c = testkit::claim_port();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = write_site(dir.path());
     // Empty certificate files: the refusal fires before TLS is read.
     let config = write_system(
@@ -251,7 +267,7 @@ fn an_internal_listener_without_internal_peers_refuses_to_start() {
 fn an_unlisted_peer_is_refused_at_connect() {
     let tls = testkit::claim_port();
     let h2c = testkit::claim_port();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).expect("tempdir");
     let site = write_site(dir.path());
     let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen");
     let config = write_system(
@@ -268,8 +284,8 @@ fn an_unlisted_peer_is_refused_at_connect() {
     let mut cmd = Command::new(testkit::binary("m6-http"));
     cmd.arg(&site).arg(&config).env("RUST_LOG", "info");
     let mut svc = testkit::Service::spawn("m6-http-internal-peers", &mut cmd);
-    svc.wait_for_tcp(tls.port(), Duration::from_secs(10));
-    svc.wait_for_tcp(h2c.port(), Duration::from_secs(10));
+    svc.wait_for_tcp(tls.port(), m6_core::testkit::STARTUP_BOUND);
+    svc.wait_for_tcp(h2c.port(), m6_core::testkit::STARTUP_BOUND);
 
     // The TCP handshake completes in the kernel, so connect succeeds and the
     // server then closes the socket without reading a byte.
@@ -289,19 +305,26 @@ fn an_unlisted_peer_is_refused_at_connect() {
                 headers: Vec::new(),
                 body: Vec::new(),
             };
-            match conn.dispatch(&req, "127.0.0.1", "203.0.113.1", "localhost") {
+            match conn.dispatch(&req, "127.0.0.1", "203.0.113.1", "localhost", None) {
                 Err(e) => Err(format!("dispatch: {e}")),
-                Ok(rx) => {
-                    let deadline = Instant::now() + Duration::from_secs(10);
+                Ok(stream_id) => {
+                    let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
                     loop {
                         conn.drive();
-                        match rx.try_recv() {
-                            Ok(Ok(r)) => break Ok(r.status),
-                            Ok(Err(e)) => break Err(format!("response: {e}")),
-                            Err(mpsc::TryRecvError::Empty) if Instant::now() < deadline => {
-                                std::thread::sleep(Duration::from_millis(1));
-                            }
-                            Err(e) => break Err(format!("receiver: {e:?}")),
+                        if let Some(c) = conn
+                            .drain_completions()
+                            .into_iter()
+                            .find(|c| c.stream_id == stream_id)
+                        {
+                            break match c.result {
+                                Ok(r) => Ok(r.status),
+                                Err(e) => Err(format!("response: {e}")),
+                            };
+                        }
+                        if Instant::now() < deadline {
+                            std::thread::sleep(Duration::from_millis(1));
+                        } else {
+                            break Err("no response".to_string());
                         }
                     }
                 }
@@ -314,7 +337,7 @@ fn an_unlisted_peer_is_refused_at_connect() {
         svc.output()
     );
 
-    let status = svc.terminate(Duration::from_secs(5));
+    let status = svc.terminate(m6_core::testkit::STARTUP_BOUND);
     let output = svc.output();
     assert!(
         status.success(),

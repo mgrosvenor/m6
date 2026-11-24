@@ -37,7 +37,7 @@ a reproduction any reader can run.
 against a private production instance is **unreproducible by anyone else**, so it
 is not evidence, only an assertion that looks authoritative. "Verified means
 measured against something running" is satisfied without touching anyone's fleet:
-`m6-examples`, example 05's end-to-end suite, h2spec and h3spec against a
+the examples in `examples/`, example 05's end-to-end suite, h2spec and h3spec against a
 loopback instance, and `tools/build-host-tests.sh`. Use those.
 
 **How this was broken, so it is not repeated.** By 2026-09-26 this public
@@ -137,11 +137,14 @@ M6_BUILD_HOST=user@example.com ./tools/build-host-tests.sh
 | unit + integration tests | the whole workspace, zero failures | `cargo test --workspace` |
 | compiler warnings | **zero**, release and test builds, pre-existing included | Linux |
 | clippy | **silent. `-D warnings`, no ceiling**, from 2026-09-13 | `tools/clippy.sh` |
+| rustdoc | **silent. a broken intra-doc link is a warning and `-D warnings` makes it an error**, pre-existing included | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` |
 | h1, h2, h3 conformance | at or above the recorded scores | `tools/conformance.sh` |
-| performance | within margin of the recorded number | `tools/perfcheck.sh` |
+| performance | no consistent slowdown against the base build, interleaved A/B on the build host | `tools/perfcheck.sh` |
 | cargo-deny | advisories, licences and sources | `cargo deny check` |
-| the examples build | zero warnings, clippy silent, their tests pass, every config parses | the `m6-examples` repository |
+| the examples build | zero warnings, clippy silent, their tests pass, every config parses | `examples/`, built from the same commit |
 | the examples work | example 05's end-to-end suite over the whole running stack | `examples/05-cms/test.sh` |
+
+Rustdoc runs a second time with `--all-features`, because `testkit`, `sqlite`, `email`, `multipart` and the allocation counters are off by default and the docs behind them are built by nothing else.
 
 **CI runs all of it on the pull request**, and on every push to `main` and
 `develop` and on release tags, so a merge and a force-push are both built.
@@ -150,11 +153,10 @@ same ground plus the two things a shared runner cannot do: the performance check
 which needs a quiet machine, and conformance against a real h2spec/h3spec install.
 Run it before opening the pull request when the change could touch either.
 
-**The examples are not a courtesy.** `m6-examples` is the only code in the
-checks that uses m6's interfaces, and until 2026-09-14 nothing built it: it had
-stopped compiling entirely, and five more defects were sitting underneath that
-where nobody could see them. A change to m6 lands with the examples building, or
-it does not land.
+**The examples live in `examples/` in this repository.** They are the only code
+in the checks that uses m6's interfaces, and CI builds them from the same commit
+as the crates they use. A change to m6 lands with the examples building, or it
+does not land.
 
 ### Why the build host and not the laptop
 
@@ -255,7 +257,12 @@ service being nearly a no-op on top of core is the result we want, not a smell:
 
 ```rust
 use m6_core::prelude::*;
-fn main() -> anyhow::Result<()> { App::new().run()?; Ok(()) }
+fn main() -> anyhow::Result<()> {
+    let site = Site::load("my-service", &[], &[], &NoTemplates);
+    // The service's own loop follows, as docs/m6-app-anatomy.md section 2 writes it.
+    let _ = site;
+    Ok(())
+}
 ```
 
 ---
@@ -304,6 +311,6 @@ address, node name, artefact hash or deployment state in this repository.
 And note what that rules out, because it is the trap this repository walked into
 19 issues deep: **evidence measured against a private production instance is
 unreproducible by anyone else**, so it is not evidence. "Verified means measured
-against something running" is satisfied by `m6-examples`, example 05's
+against something running" is satisfied by the examples in `examples/`, example 05's
 end-to-end suite, h2spec and h3spec against a loopback instance, and
 `tools/build-host-tests.sh`. Use those.

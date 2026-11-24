@@ -1,0 +1,1462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>m6 Admin</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:     #ffffff;
+      --panel:  #f7f7f8;
+      --border: #e5e5e8;
+      --sk:     #ebebed;   /* skeleton base */
+      --sk-hi:  #f5f5f6;   /* skeleton shimmer */
+      --accent: #2563eb;
+      --ok:     #16a34a;
+      --warn:   #ca8a04;
+      --err:    #dc2626;
+      --text:   #1a1a1e;
+      --muted:  #6b6b7b;
+      font-size: 14px;
+    }
+
+    body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; }
+
+    /* ── skeleton shimmer ── */
+    @keyframes shimmer {
+      0%   { background-position: -400px 0; }
+      100% { background-position:  400px 0; }
+    }
+    .sk {
+      background: linear-gradient(90deg, var(--sk) 25%, var(--sk-hi) 50%, var(--sk) 75%);
+      background-size: 800px 100%;
+      animation: shimmer 1.4s infinite linear;
+      border-radius: 4px;
+    }
+
+    /* ── nav ── */
+    nav {
+      display: flex; align-items: center; gap: 0;
+      border-bottom: 1px solid var(--border);
+      position: sticky; top: 0; background: var(--panel); z-index: 10;
+    }
+    nav button {
+      background: none; border: none; color: var(--muted);
+      padding: .75rem 1.4rem; cursor: pointer; font: inherit;
+      border-bottom: 2px solid transparent; transition: color .15s;
+    }
+    nav button.active  { color: var(--accent); border-bottom-color: var(--accent); }
+    nav button:hover:not(.active) { color: var(--text); }
+    #refresh-label { font-size: .72rem; color: var(--muted); margin-left: auto; padding-right: 1rem; }
+    #refresh-select { font-size: .72rem; color: var(--muted); background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: .25rem .4rem; cursor: pointer; margin-left: auto; margin-right: .75rem; }
+
+    /* ── layout ── */
+    main { max-width: 960px; margin: 0 auto; padding: 1.5rem 1rem; }
+    .tab  { display: none; }
+    .tab.active { display: block; }
+    h2 {
+      font-size: .72rem; color: var(--muted); margin-bottom: 1rem;
+      letter-spacing: .06em; text-transform: uppercase;
+    }
+
+    /* ── metric cards ── */
+    .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: .75rem; margin-bottom: 1.5rem; }
+    .card  { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 1rem; }
+    .card .label { font-size: .72rem; color: var(--muted); margin-bottom: .5rem; }
+    .card .value { font-size: 1.6rem; font-weight: 700; line-height: 1; }
+    .card .unit  { font-size: .72rem; color: var(--muted); margin-left: .2rem; }
+    /* skeleton value block */
+    .card .sk-val { height: 1.8rem; width: 70%; margin-top: .25rem; }
+
+    /* ── table ── */
+    .table-wrap { overflow: auto; max-height: 340px; border: 1px solid var(--border); border-radius: 6px; }
+    table { width: 100%; border-collapse: collapse; font-size: .82rem; }
+    th { position: sticky; top: 0; background: var(--panel); text-align: left; color: var(--muted); padding: .5rem .75rem; border-bottom: 1px solid var(--border); }
+    td { padding: .4rem .75rem; border-bottom: 1px solid var(--border); }
+    /* skeleton rows */
+    .sk-row td { padding: .55rem .75rem; }
+    .sk-row .sk { height: .85rem; }
+
+    /* ── bar chart ── */
+    .bar-row   { display: flex; align-items: center; gap: .6rem; margin-bottom: .5rem; font-size: .82rem; }
+    .bar-label { width: 80px; color: var(--muted); flex-shrink: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .bar-track { flex: 1; background: var(--border); border-radius: 2px; height: 10px; overflow: hidden; }
+    .bar-fill  { height: 100%; border-radius: 2px; transition: width .5s ease; }
+    .bar-val   { width: 140px; text-align: right; color: var(--muted); font-size: .78rem; }
+
+    /* ── log table ── */
+    .lv-wrap  { overflow: auto; max-height: 520px; border: 1px solid var(--border); border-radius: 6px; }
+    .lv-table { width: 100%; border-collapse: collapse; font-size: .74rem; font-family: ui-monospace, 'Menlo', 'Consolas', monospace; }
+    .lv-table thead tr { position: sticky; top: 0; z-index: 1; background: var(--panel); }
+    .lv-table th  { text-align: left; color: var(--muted); padding: .4rem .6rem; border-bottom: 1px solid var(--border); font-weight: 600; white-space: nowrap; }
+    .lv-table td  { padding: .18rem .6rem; border-bottom: 1px solid var(--border); white-space: nowrap; vertical-align: top; }
+    .lv-table td.lv-msg { white-space: pre-wrap; word-break: break-all; }
+    .lv-info  { background: var(--bg); }
+    .lv-debug { background: #eff6ff; }
+    .lv-trace { background: #fafafa; color: #888; }
+    .lv-warn  { background: #fffbeb; }
+    .lv-error { background: #fef2f2; font-weight: 600; }
+    .lv-plain { background: var(--panel); color: var(--muted); font-style: italic; }
+    td.lv-level { font-weight: 700; }
+    .lv-info  td.lv-level { color: #16a34a; }
+    .lv-debug td.lv-level { color: #2563eb; }
+    .lv-warn  td.lv-level { color: #ca8a04; }
+    .lv-error td.lv-level { color: #dc2626; }
+    .lv-trace td.lv-level { color: #9ca3af; }
+    #lv-status { font-size: .72rem; color: var(--muted); }
+
+    /* ── bench ── */
+    #bench-status { font-size: .82rem; color: var(--muted); min-height: 1.4em; margin-bottom: .5rem; }
+    #bench-cdfs   { display: none; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 1rem 0; }
+    #bench-cdfs svg { width: 100%; height: auto; cursor: zoom-in; }
+    #bench-zoom-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 9999; align-items: center; justify-content: center; cursor: zoom-out; }
+    #bench-zoom-overlay.active { display: flex; }
+    #bench-zoom-overlay svg    { max-width: 90vw; max-height: 88vh; width: 900px; height: auto; border-radius: 6px; box-shadow: 0 8px 32px rgba(0,0,0,.4); }
+    #bench-results-tbl { display: none; border-collapse: collapse; width: 100%; font-size: .82rem; margin-top: .5rem; }
+    #bench-results-tbl th, #bench-results-tbl td { padding: .35rem .7rem; border: 1px solid var(--border); text-align: right; }
+    #bench-results-tbl th { background: var(--panel); font-weight: 600; color: var(--muted); }
+    #bench-results-tbl td:first-child, #bench-results-tbl th:first-child { text-align: left; }
+    .ph3 { color: #16a34a; font-weight: 600; }
+    .ph2 { color: #2563eb; font-weight: 600; }
+    .ph1 { color: #ca8a04; font-weight: 600; }
+
+    /* ── log / output pre ── */
+    pre {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+      padding: 1rem; overflow: auto; max-height: 480px;
+      font-size: .78rem; line-height: 1.5; white-space: pre-wrap; word-break: break-all;
+    }
+    /* skeleton log lines */
+    .sk-lines { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 1rem; }
+    .sk-line  { height: .75rem; margin-bottom: .55rem; }
+    .sk-line:nth-child(even) { width: 85%; }
+    .sk-line:nth-child(3n)   { width: 60%; }
+
+    /* ── buttons, inputs ── */
+    .row   { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin-bottom: 1rem; }
+    select, input[type=number] {
+      background: var(--panel); border: 1px solid var(--border); color: var(--text);
+      padding: .35rem .6rem; border-radius: 4px; font: inherit;
+    }
+    button.btn {
+      background: var(--accent); border: none; color: #fff;
+      padding: .35rem 1rem; border-radius: 4px; cursor: pointer; font: inherit;
+      transition: opacity .15s;
+    }
+    button.btn:hover    { opacity: .85; }
+    button.btn.secondary { background: var(--panel); border: 1px solid var(--border); color: var(--text); }
+    button.btn.danger    { background: #7f1d1d; color: var(--err); border: 1px solid #991b1b; }
+
+    .badge { display: inline-block; padding: .1rem .45rem; border-radius: 999px; font-size: .7rem; font-weight: 700; }
+    .badge.ok   { background: #166534; color: var(--ok); }
+    .badge.warn { background: #713f12; color: var(--warn); }
+    .badge.err  { background: #7f1d1d; color: var(--err); }
+    .badge.run  { background: #1e3a5f; color: var(--accent); }
+
+    /* ── config form ── */
+    .cfg-section { margin-bottom: 1.5rem; }
+    .cfg-section h3 { font-size: .72rem; color: var(--muted); letter-spacing: .06em; text-transform: uppercase; margin-bottom: .6rem; padding-bottom: .3rem; border-bottom: 1px solid var(--border); display:flex; align-items:center; gap:.5rem; }
+    .cfg-section h3 .btn { font-size: .65rem; padding: .15rem .5rem; margin-left: auto; letter-spacing: normal; text-transform: none; }
+    .cfg-del { background: none; border: none; color: var(--muted); cursor: pointer; font-size: .95rem; padding: 0 .3rem; line-height: 1; }
+    .cfg-del:hover { color: var(--err); }
+    .cfg-fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: .55rem; }
+    .cfg-field { display: flex; flex-direction: column; gap: .2rem; }
+    .cfg-field > span { font-size: .7rem; color: var(--muted); }
+    .cfg-field input[type=text], .cfg-field select {
+      background: var(--bg); border: 1px solid var(--border); color: var(--text);
+      padding: .32rem .55rem; border-radius: 4px; font: inherit; font-size: .82rem; width: 100%;
+    }
+    .cfg-field input[type=text]:focus, .cfg-field select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+    .cfg-check { display: flex; align-items: center; gap: .4rem; cursor: pointer; font-size: .82rem; padding-top: .3rem; }
+    .cfg-check input[type=checkbox] { width: 14px; height: 14px; cursor: pointer; }
+    .cfg-section table input[type=text] {
+      width: 100%; min-width: 80px;
+      background: var(--bg); border: 1px solid var(--border); color: var(--text);
+      padding: .22rem .4rem; border-radius: 3px; font: inherit; font-size: .78rem;
+    }
+    .msg { padding: .4rem .75rem; border-radius: 4px; font-size: .82rem; margin-bottom: .75rem; }
+    .msg.ok  { background: #dcfce7; color: #15803d; border: 1px solid #bbf7d0; }
+    .msg.err { background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca; }
+
+    /* ── topology ── */
+    #topo-detail .btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .topo-node { cursor: pointer; }
+    .topo-node:hover rect { filter: brightness(1.1); }
+    .detail-cards { display:flex; gap:.75rem; flex-wrap:wrap; margin-bottom:1rem; }
+    .detail-card { background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:.6rem .9rem; min-width:90px; }
+    .detail-card .label { font-size:.7rem; color:var(--muted); }
+    .detail-card .value { font-size:1.1rem; font-weight:600; }
+
+    /* ── login overlay ── */
+    #login-overlay {
+      position: fixed; inset: 0; background: var(--bg);
+      display: flex; align-items: center; justify-content: center; z-index: 100;
+    }
+    #login-box {
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 8px; padding: 2rem; width: 320px;
+    }
+    #login-box h1 { font-size: 1.1rem; margin-bottom: 1.25rem; }
+    #login-box input {
+      display: block; width: 100%; margin-bottom: .75rem;
+      background: var(--bg); border: 1px solid var(--border); color: var(--text);
+      padding: .5rem .75rem; border-radius: 4px; font: inherit;
+    }
+    #login-err { color: var(--err); font-size: .8rem; margin-top: .5rem; min-height: 1.2em; }
+  </style>
+</head>
+<body>
+
+<!-- ── Login overlay ──────────────────────────────────────────────────────── -->
+<div id="login-overlay">
+  <div id="login-box">
+    <h1>m6 Admin</h1>
+    <input id="u" type="text"     placeholder="Username" autocomplete="username">
+    <input id="p" type="password" placeholder="Password" autocomplete="current-password">
+    <button class="btn" id="login-btn" style="width:100%">Sign in</button>
+    <div id="login-err"></div>
+  </div>
+</div>
+
+<!-- ── Nav ───────────────────────────────────────────────────────────────── -->
+<nav>
+  <button class="active" data-tab="perf">Perf</button>
+  <button data-tab="system">System</button>
+  <button data-tab="bench">Bench</button>
+  <button data-tab="logs">Logs</button>
+  <button data-tab="routes">Routes</button>
+  <button data-tab="config">Config</button>
+  <select id="refresh-select">
+    <option value="100">auto-refresh 100 ms</option>
+    <option value="1000">auto-refresh 1 s</option>
+    <option value="10000" selected>auto-refresh 10 s</option>
+  </select>
+</nav>
+
+<main>
+
+<!-- ── Perf tab ───────────────────────────────────────────────────────────── -->
+<section class="tab active" id="tab-perf">
+  <h2>System Topology</h2>
+  <div id="topo-wrap" style="width:100%;border:1px solid var(--border);border-radius:6px;background:var(--panel);margin-bottom:1.5rem"></div>
+
+  <div id="topo-detail" style="position:fixed;top:0;right:0;width:420px;height:100vh;background:var(--bg);border-left:1px solid var(--border);transform:translateX(105%);transition:transform .25s ease;z-index:50;overflow-y:auto;padding:1.25rem">
+    <div style="display:flex;align-items:center;gap:.75rem;margin-bottom:1rem">
+      <button id="topo-close" style="background:none;border:none;font-size:1.2rem;cursor:pointer;color:var(--muted)">&#x2715;</button>
+      <h3 id="topo-detail-title" style="margin:0;font-size:1rem"></h3>
+      <div style="margin-left:auto;display:flex;gap:.5rem">
+        <button class="btn secondary" id="topo-tab-sample" onclick="switchDetailTab('sample')">Sample</button>
+        <button class="btn" id="topo-tab-alltime" onclick="switchDetailTab('alltime')">All-time</button>
+      </div>
+    </div>
+    <div id="topo-detail-body"><!-- rendered by JS --></div>
+  </div>
+</section>
+
+<!-- ── System tab ─────────────────────────────────────────────────────────── -->
+<section class="tab" id="tab-system">
+  <h2>System</h2>
+  <div class="cards">
+    <div class="card"><div class="label">Uptime</div>
+      <div class="value sk-target" id="s-uptime"><span class="sk sk-val"></span></div></div>
+    <div class="card"><div class="label">CPU</div>
+      <div class="value sk-target" id="s-cpu"><span class="sk sk-val"></span></div><span class="unit">%</span></div>
+    <div class="card"><div class="label">RAM used</div>
+      <div class="value sk-target" id="s-ram"><span class="sk sk-val"></span></div></div>
+    <div class="card"><div class="label">RAM total</div>
+      <div class="value sk-target" id="s-ram-t"><span class="sk sk-val"></span></div></div>
+  </div>
+  <h2>Disks</h2>
+  <!-- skeleton disk bars -->
+  <div id="disk-bars">
+    <div class="bar-row"><span class="bar-label"><span class="sk" style="width:50px;display:inline-block;height:.8rem"></span></span><div class="bar-track"><div class="bar-fill sk" style="width:100%"></div></div><span class="bar-val"><span class="sk" style="width:90px;display:inline-block;height:.8rem"></span></span></div>
+    <div class="bar-row"><span class="bar-label"><span class="sk" style="width:50px;display:inline-block;height:.8rem"></span></span><div class="bar-track"><div class="bar-fill sk" style="width:100%"></div></div><span class="bar-val"><span class="sk" style="width:90px;display:inline-block;height:.8rem"></span></span></div>
+  </div>
+</section>
+
+<!-- ── Bench tab ──────────────────────────────────────────────────────────── -->
+<section class="tab" id="tab-bench">
+  <h2>Benchmark</h2>
+  <div class="row">
+    <button class="btn" id="bench-run">Run</button>
+    <button class="btn secondary" id="bench-stop" disabled>Stop</button>
+    <button class="btn secondary" id="bench-export" disabled>Export PDF</button>
+    <label>Iterations&nbsp;<input type="number" id="bench-n" value="200" min="20" step="10" style="width:70px"></label>
+  </div>
+  <div id="bench-status"></div>
+  <div id="bench-cdfs"></div>
+  <div id="bench-zoom-overlay"></div>
+  <table id="bench-results-tbl">
+    <thead><tr>
+      <th>Suite</th><th>Proto</th><th>p50</th><th>p99</th>
+      <th>min</th><th>max</th><th>avg</th><th>n</th>
+    </tr></thead>
+    <tbody id="bench-results-tbody"></tbody>
+  </table>
+  <p style="font-size:.72rem;color:var(--muted);margin-top:.75rem;line-height:1.6">
+    Measures round-trip latency from your browser using <code>fetch(…, {cache:'no-store'})</code>.
+    Timer resolution is auto-detected and a midpoint correction is applied.
+    Protocol detected via the Resource Timing API.
+  </p>
+</section>
+
+<!-- ── Logs tab ───────────────────────────────────────────────────────────── -->
+<section class="tab" id="tab-logs">
+  <h2>Live Logs</h2>
+  <div class="row">
+    <label><input type="checkbox" id="lv-autoscroll" checked>&nbsp;Auto-scroll</label>
+    <select id="lv-filter" style="font-size:.8rem;padding:.25rem .4rem;border:1px solid var(--border);border-radius:4px;background:var(--panel);color:var(--text);cursor:pointer">
+      <option value="">All backends</option>
+    </select>
+    <select id="lv-level" style="font-size:.8rem;padding:.25rem .4rem;border:1px solid var(--border);border-radius:4px;background:var(--panel);color:var(--text);cursor:pointer">
+      <option value="">All levels</option>
+      <option value="ERROR">ERROR</option>
+      <option value="WARN">WARN</option>
+      <option value="INFO">INFO</option>
+      <option value="DEBUG">DEBUG</option>
+      <option value="TRACE">TRACE</option>
+    </select>
+    <button class="btn secondary" id="lv-clear">Clear</button>
+    <span id="lv-status"></span>
+  </div>
+  <div class="lv-wrap" id="lv-wrap">
+    <table class="lv-table">
+      <thead><tr>
+        <th style="width:14rem">Time</th>
+        <th style="width:4rem">Level</th>
+        <th style="width:16rem">Target</th>
+        <th>Message</th>
+      </tr></thead>
+      <tbody id="lv-body"></tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ── Routes tab ────────────────────────────────────────────────────────── -->
+<section class="tab" id="tab-routes">
+  <h2>Route Stats</h2>
+  <!-- summary cards -->
+  <div class="cards">
+    <div class="card">
+      <div class="label">Sample requests</div>
+      <div class="value sk-target" id="rt-sample"><span class="sk sk-val"></span></div>
+    </div>
+    <div class="card">
+      <div class="label">Sample window</div>
+      <div class="value sk-target" id="rt-window"><span class="sk sk-val"></span></div>
+      <span class="unit">s</span>
+    </div>
+  </div>
+  <!-- routes table -->
+  <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th>Path</th>
+        <th>Requests</th>
+        <th>Cache hits</th>
+        <th>Misses</th>
+        <th>Hit rate</th>
+        <th>Avg latency (ns/µs)</th>
+      </tr></thead>
+      <tbody id="routes-table">
+        <tr class="sk-row"><td><span class="sk" style="width:160px;display:block;height:.85rem"></span></td><td><span class="sk" style="width:50px;display:block;height:.85rem"></span></td><td><span class="sk" style="width:50px;display:block;height:.85rem"></span></td><td><span class="sk" style="width:50px;display:block;height:.85rem"></span></td><td><span class="sk" style="width:50px;display:block;height:.85rem"></span></td><td><span class="sk" style="width:60px;display:block;height:.85rem"></span></td></tr>
+        <tr class="sk-row"><td><span class="sk" style="width:120px;display:block;height:.85rem"></span></td><td><span class="sk" style="width:45px;display:block;height:.85rem"></span></td><td><span class="sk" style="width:45px;display:block;height:.85rem"></span></td><td><span class="sk" style="width:45px;display:block;height:.85rem"></span></td><td><span class="sk" style="width:50px;display:block;height:.85rem"></span></td><td><span class="sk" style="width:60px;display:block;height:.85rem"></span></td></tr>
+        <tr class="sk-row"><td><span class="sk" style="width:140px;display:block;height:.85rem"></span></td><td><span class="sk" style="width:40px;display:block;height:.85rem"></span></td><td><span class="sk" style="width:40px;display:block;height:.85rem"></span></td><td><span class="sk" style="width:40px;display:block;height:.85rem"></span></td><td><span class="sk" style="width:50px;display:block;height:.85rem"></span></td><td><span class="sk" style="width:60px;display:block;height:.85rem"></span></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ── Config tab ─────────────────────────────────────────────────────────── -->
+<section class="tab" id="tab-config">
+  <h2>site.toml — live config</h2>
+  <div id="config-msg"></div>
+  <div class="row">
+    <button class="btn secondary" id="cfg-reload">Reload</button>
+    <button class="btn"           id="cfg-save">Save &amp; apply</button>
+    <button class="btn secondary" id="cfg-publish">Publish</button>
+    <button class="btn danger"    id="cfg-flush">Flush cache</button>
+  </div>
+  <p style="font-size:.75rem;color:var(--muted);margin-bottom:.75rem">
+    Edit site.toml settings below. <strong>Save &amp; apply</strong> writes back atomically.
+    <strong>Publish</strong> sends <code>POST /genid</code> to m6-http, which reloads every backend and flushes its cache.
+  </p>
+  <!-- skeleton / config form -->
+  <div id="cfg-wrap">
+    <div class="sk-lines" style="min-height:200px">
+      <div class="sk sk-line" style="width:60%"></div>
+      <div class="sk sk-line" style="width:80%"></div>
+      <div class="sk sk-line" style="width:70%"></div>
+      <div class="sk sk-line" style="width:50%"></div>
+      <div class="sk sk-line" style="width:85%"></div>
+    </div>
+  </div>
+  <h2 style="margin-top:1.5rem">Services</h2>
+  <div id="services-list">
+    <div class="sk" style="height:.85rem;width:240px;margin-bottom:.5rem"></div>
+    <div class="sk" style="height:.85rem;width:200px"></div>
+  </div>
+</section>
+
+</main>
+
+<script>
+// ── State ─────────────────────────────────────────────────────────────────────
+let pollTimer = null;
+let activeTab = 'perf';
+let cfgMtime = 0;
+let topoData = null;
+let openBackend = null;
+let detailMode = 'sample';
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+const $  = id => document.getElementById(id);
+const qs = s  => document.querySelector(s);
+
+const fmt = {
+  bytes(n) {
+    if (n == null) return '—';
+    const u = ['B','KB','MB','GB','TB'];
+    let i = 0; while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return n.toFixed(i ? 1 : 0) + '\u202f' + u[i];
+  },
+  uptime(s) {
+    if (s == null) return '—';
+    const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+    return d ? `${d}d\u202f${h}h` : h ? `${h}h\u202f${m}m` : `${m}m`;
+  },
+  pct(n)  { return n == null ? '—' : n.toFixed(1); },
+  num(n)  { return n == null ? '—' : String(n); },
+  ts(ts)  { return ts ? ts.replace('T',' ').slice(0,19) : ''; },
+  latNs(n) {
+    if (n == null || n === 0) return '—';
+    if (n < 10000) return n + '\u202fns';
+    return (n / 1000).toFixed(1) + '\u202fµs';
+  },
+};
+
+// Replace a skeleton placeholder with real text content.
+function fill(id, text) {
+  const el = $(id);
+  if (!el) return;
+  el.textContent = text;
+}
+
+async function api(method, path, body) {
+  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  if (body !== undefined) opts.body = JSON.stringify(body);
+  const res = await fetch('/api/admin' + path, opts);
+  if (res.status === 401) { logout(); throw new Error('Unauthorized'); }
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+function showMsg(el, text, kind) {
+  el.innerHTML = `<div class="msg ${kind}">${escHtml(text)}</div>`;
+  setTimeout(() => { el.innerHTML = ''; }, 5000);
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── Login / Logout ────────────────────────────────────────────────────────────
+async function logout() {
+  await fetch('/auth/logout', { method: 'POST' }).catch(() => {});
+  $('login-overlay').style.display = 'flex';
+}
+
+async function doLogin() {
+  $('login-err').textContent = '';
+  const u = $('u').value.trim();
+  const p = $('p').value;
+  try {
+    const res = await fetch('/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: `username=${encodeURIComponent(u)}&password=${encodeURIComponent(p)}`,
+      redirect: 'follow',
+    });
+    // m6-auth redirects to / on success, to /login?error=... on failure.
+    if (!res.ok || new URL(res.url).searchParams.has('error')) throw new Error('Invalid credentials');
+    $('login-overlay').style.display = 'none';
+    startDashboard();
+  } catch(e) {
+    $('login-err').textContent = e.message;
+  }
+}
+
+$('login-btn').onclick = doLogin;
+[$('u'), $('p')].forEach(el => el.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); }));
+
+// Start immediately — if the session cookie is valid the data will fill in;
+// any 401 is caught inside refreshTab and shows the login overlay.
+startDashboard();
+
+// ── Tab switching ─────────────────────────────────────────────────────────────
+document.querySelectorAll('nav button[data-tab]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('nav button[data-tab]').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    btn.classList.add('active');
+    activeTab = btn.dataset.tab;
+    $('tab-' + activeTab).classList.add('active');
+    if (activeTab === 'config') loadConfig(true); else refreshTab(activeTab);
+  });
+});
+
+// ── Auto-refresh ──────────────────────────────────────────────────────────────
+function startDashboard() {
+  refreshTab(activeTab);
+  restartPollTimer();
+}
+
+function restartPollTimer() {
+  clearInterval(pollTimer);
+  const ms = parseInt($('refresh-select').value, 10) || 10000;
+  pollTimer = setInterval(() => refreshTab(activeTab), ms);
+}
+
+$('refresh-select').addEventListener('change', restartPollTimer);
+
+function refreshTab(tab) {
+  if (tab === 'perf')   loadTopology();
+  if (tab === 'system') loadSystem();
+  if (tab === 'logs')   lvStartIfNeeded();
+  if (tab === 'routes') loadRoutes();
+  if (tab === 'config') loadConfig();  // re-renders only when mtime changes
+}
+
+// ── Topology ──────────────────────────────────────────────────────────────────
+// CSS variable resolved values for SVG (cannot use var() in SVG attributes)
+const TOPO_COLOR = { ok: '#16a34a', warn: '#ca8a04', err: '#dc2626', muted: '#6b6b7b', panel: '#f7f7f8', text: '#1a1a1e', border: '#e5e5e8' };
+
+function missColor(missRate) {
+  if (missRate == null) return TOPO_COLOR.ok;
+  if (missRate < 0.05)  return TOPO_COLOR.ok;
+  if (missRate < 0.20)  return TOPO_COLOR.warn;
+  return TOPO_COLOR.err;
+}
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+function svgEl(tag, attrs, text) {
+  const el = document.createElementNS(SVG_NS, tag);
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+  if (text != null) el.textContent = text;
+  return el;
+}
+
+function drawTopologySVG(data) {
+  const backends  = (data && data.backends)   || [];
+  const sampleW   = (data && data.sample_window_secs) || 0;
+  const m6s       = (data && data.m6http_stats) || {};  // most recent periodic-stats entry
+
+  const nodeW = 164, rx = 8;
+  const LINE_H = 15, TITLE_Y = 20, FIRST_LINE_Y = 37;
+  // Node height: title + N detail lines + 10px padding
+  function nodeH(nLines) { return FIRST_LINE_Y + nLines * LINE_H + 6; }
+
+  const vbW   = 530;
+  const rowH  = 90;
+  const minVbH = 220;
+  const vbH   = Math.max(minVbH, backends.length * rowH + 60);
+
+  const cxL = 132, cyL = vbH / 2;   // m6-http (left)
+  const cxR = 398;                    // backends column
+
+  function beY(i) {
+    const totalH = backends.length * rowH;
+    return (vbH - totalH) / 2 + rowH / 2 + i * rowH;
+  }
+
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('viewBox', `0 0 ${vbW} ${vbH}`);
+  svg.setAttribute('width',  '100%');
+  svg.setAttribute('style',  'display:block;');
+
+  const defs = svgEl('defs', {});
+  for (const [id, color] of [['arr-ok', TOPO_COLOR.ok], ['arr-warn', TOPO_COLOR.warn], ['arr-err', TOPO_COLOR.err]]) {
+    const marker = svgEl('marker', { id, markerWidth: '7', markerHeight: '7', refX: '6', refY: '3.5', orient: 'auto' });
+    marker.appendChild(svgEl('polygon', { points: '0 0, 7 3.5, 0 7', fill: color }));
+    defs.appendChild(marker);
+  }
+  svg.appendChild(defs);
+
+  // Draw a node with a label and an arbitrary list of detail lines.
+  function drawNode(cx, cy, h, label, lines, borderColor, clickName) {
+    const x = cx - nodeW / 2, y = cy - h / 2;
+    const g = svgEl('g', clickName ? { class: 'topo-node', style: 'cursor:pointer' } : {});
+    g.appendChild(svgEl('rect', { x, y, width: nodeW, height: h, rx, fill: TOPO_COLOR.panel, stroke: borderColor, 'stroke-width': 2 }));
+    g.appendChild(svgEl('text', { x: cx, y: y + TITLE_Y, 'text-anchor': 'middle', 'font-size': 12, 'font-weight': '700', fill: TOPO_COLOR.text }, label));
+    lines.forEach((line, i) => {
+      if (line) g.appendChild(svgEl('text', { x: cx, y: y + FIRST_LINE_Y + i * LINE_H, 'text-anchor': 'middle', 'font-size': 10, fill: TOPO_COLOR.muted }, line));
+    });
+    if (clickName) g.addEventListener('click', () => openBackendDetail(clickName));
+    return g;
+  }
+
+  function drawEdge(x1, y1, x2, y2, color) {
+    const markerId = color === TOPO_COLOR.warn ? 'arr-warn' : color === TOPO_COLOR.err ? 'arr-err' : 'arr-ok';
+    const dx = x2 - x1, dy = y2 - y1, len = Math.sqrt(dx*dx + dy*dy) || 1;
+    return svgEl('line', { x1, y1, x2: x2 - (dx/len)*7, y2: y2 - (dy/len)*7,
+      stroke: color, 'stroke-width': 2, 'marker-end': `url(#${markerId})` });
+  }
+
+  // ── m6-http node — stats from most recent periodic-stats log entry ──────────
+  const httpBind    = (data && data.bind) || '';
+  const rpsAvg      = m6s.rps_avg   != null ? m6s.rps_avg + ' req/s avg' : '— req/s';
+  const rpsPeak     = m6s.rps_peak  != null ? m6s.rps_peak + ' req/s peak' : '';
+  const hitRate     = m6s.cache_hit_rate != null
+    ? (m6s.cache_hit_rate * 100).toFixed(1) + '% hit  '
+      + (m6s.cache_hits  != null ? m6s.cache_hits  + ' hits' : '') : '';
+  const missLine    = m6s.cache_misses != null ? m6s.cache_misses + ' misses' : '';
+  const hitLat      = m6s.hit_p50_ns  != null ? 'hit p50 '  + fmt.latNs(m6s.hit_p50_ns)  : '';
+  const missLat     = m6s.miss_p50_ns != null ? 'miss p50 ' + fmt.latNs(m6s.miss_p50_ns) : '';
+  const latLine     = [hitLat, missLat].filter(Boolean).join('  ');
+
+  const httpLines = [httpBind, rpsAvg, rpsPeak, hitRate, missLine, latLine].filter(Boolean);
+  const hHttp = nodeH(httpLines.length);
+  svg.appendChild(drawNode(cxL, cyL, hHttp, 'm6-http', httpLines, TOPO_COLOR.ok, 'm6-http'));
+
+  // ── Backend nodes + edges — structure from site.toml [[backend]] / [[route]] ─
+  const hBe = nodeH(3);
+  for (let i = 0; i < backends.length; i++) {
+    const be  = backends[i];
+    const cy  = beY(i);
+    const mc  = missColor(be.miss_rate);
+    const rps = sampleW > 0 && be.requests != null
+      ? Math.round(be.requests / sampleW) + ' req/s' : '—';
+    const missStr = be.miss_rate != null ? (be.miss_rate * 100).toFixed(1) + '% miss' : '';
+    const p50str  = be.hit_p50_ns != null ? 'p50 ' + fmt.latNs(be.hit_p50_ns) : '';
+    const beLines = [rps, [missStr, p50str].filter(Boolean).join('  ')].filter(Boolean);
+
+    svg.appendChild(drawNode(cxR, cy, hBe, be.name, beLines, mc, be.name));
+    svg.appendChild(drawEdge(cxL + nodeW/2, cyL, cxR - nodeW/2, cy, mc));
+  }
+
+  return svg;
+}
+
+async function loadTopology() {
+  try {
+    const data = await api('GET', '/backends');
+    topoData = data;
+    if (window.syncLogFilter) syncLogFilter(data.backends);
+    const wrap = $('topo-wrap');
+    wrap.innerHTML = '';
+    const svg = drawTopologySVG(data);
+    wrap.appendChild(svg);
+    // Refresh detail panel if open
+    if (openBackend) {
+      const body = $('topo-detail-body');
+      if (body && body.dataset.loaded === openBackend) {
+        // already fetched — no auto-refresh of detail to avoid disrupting user
+      }
+    }
+  } catch(e) {
+    console.error('topology', e);
+    const wrap = $('topo-wrap');
+    if (wrap) wrap.innerHTML = `<p style="padding:1rem;color:var(--muted);font-size:.85rem">Could not load topology: ${escHtml(e.message)}</p>`;
+  }
+}
+
+function openBackendDetail(name) {
+  openBackend = name;
+  detailMode = 'sample';
+  $('topo-detail-title').textContent = name;
+  $('topo-tab-sample').classList.add('active');
+  $('topo-tab-alltime').classList.remove('active');
+  $('topo-detail').style.transform = 'translateX(0)';
+  fetchAndRenderDetail(name, 'sample');
+}
+
+function closeBackendDetail() {
+  openBackend = null;
+  $('topo-detail').style.transform = 'translateX(105%)';
+}
+
+window.switchDetailTab = function(mode) {
+  detailMode = mode;
+  $('topo-tab-sample').classList.toggle('active', mode === 'sample');
+  $('topo-tab-alltime').classList.toggle('active', mode === 'alltime');
+  if (openBackend) fetchAndRenderDetail(openBackend, mode);
+};
+
+async function fetchAndRenderDetail(name, mode) {
+  const body = $('topo-detail-body');
+  body.innerHTML = '<p style="color:var(--muted);font-size:.85rem;padding:.5rem 0">Loading…</p>';
+  try {
+    const url = name === 'm6-http'
+      ? `/m6http/${mode}`
+      : `/backends/${encodeURIComponent(name)}/${mode}`;
+    const data = await api('GET', url);
+    body.dataset.loaded = name;
+    renderDetailContent(data, mode);
+  } catch(e) {
+    body.innerHTML = `<p style="color:var(--err);font-size:.85rem">Error: ${escHtml(e.message)}</p>`;
+  }
+}
+
+function renderDetailContent(data, mode) {
+  const body = $('topo-detail-body');
+
+  // Stats cards
+  const hitRate  = data.hit_rate  != null ? (data.hit_rate  * 100).toFixed(1) + '%' : '—';
+  const missRate = data.miss_rate != null ? (data.miss_rate * 100).toFixed(1) + '%' : '—';
+  const avgLat   = fmt.latNs(data.avg_latency_ns);
+  const reqs     = fmt.num(data.requests);
+
+  let html = `<div class="detail-cards">
+    <div class="detail-card"><div class="label">Requests</div><div class="value">${reqs}</div></div>
+    <div class="detail-card"><div class="label">Hit rate</div><div class="value" style="color:var(--ok)">${hitRate}</div></div>
+    <div class="detail-card"><div class="label">Miss rate</div><div class="value" style="color:${data.miss_rate >= 0.20 ? 'var(--err)' : data.miss_rate >= 0.05 ? 'var(--warn)' : 'var(--ok)'}">${missRate}</div></div>
+    <div class="detail-card"><div class="label">Avg latency</div><div class="value">${avgLat}</div></div>
+  </div>`;
+
+  // Latency histogram
+  html += '<div style="margin-bottom:1rem">';
+  html += '<div style="font-size:.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:.5rem">Latency distribution</div>';
+  html += buildLatencyHistogram(data);
+  html += '</div>';
+
+  // Routes table
+  const routes = data.routes || [];
+  if (routes.length) {
+    html += `<div style="font-size:.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:.5rem">Routes</div>`;
+    html += `<div class="table-wrap"><table>
+      <thead><tr><th>Path</th><th>Requests</th><th>Hit rate</th><th>Avg latency</th></tr></thead>
+      <tbody>${routes.map(r => {
+        const hr = r.hit_rate != null ? (r.hit_rate * 100).toFixed(1) + '%' : '—';
+        const color = r.hit_rate == null ? '' : r.hit_rate >= 0.9 ? 'color:var(--ok)' : r.hit_rate >= 0.6 ? 'color:var(--warn)' : 'color:var(--err)';
+        return `<tr><td>${escHtml(r.path)}</td><td>${fmt.num(r.requests)}</td><td style="${color}">${hr}</td><td>${fmt.latNs(r.avg_latency_ns)}</td></tr>`;
+      }).join('')}</tbody>
+    </table></div>`;
+  }
+
+  body.innerHTML = html;
+}
+
+function buildLatencyHistogram(data) {
+  const hitPcts  = data.hit_latency_pcts  || [];
+  const missPcts = data.miss_latency_pcts || [];
+  const labels   = data.pct_labels || ['p0','p10','p25','p50','p75','p90','p99','max'];
+
+  const allZeroHit  = hitPcts.every(v => !v);
+  const allZeroMiss = missPcts.every(v => !v);
+
+  if (allZeroHit && allZeroMiss) {
+    return '<p style="color:var(--muted);font-size:.85rem">—</p>';
+  }
+
+  const W = 380, H = 160;
+  const P = { t: 10, r: 10, b: 30, l: 10 };
+  const cW = W - P.l - P.r;
+
+  // Log scale: 10ns to 100ms (10^1 to 10^8 ns)
+  const logMin = Math.log10(10);
+  const logMax = Math.log10(100_000_000);
+  const logR   = logMax - logMin;
+
+  function sx(ns) {
+    if (!ns || ns <= 0) return 0;
+    return Math.max(0, Math.min(1, (Math.log10(ns) - logMin) / logR)) * cW + P.l;
+  }
+
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  svg.setAttribute('width', '100%');
+  svg.setAttribute('style', 'display:block;');
+
+  // Background
+  svg.appendChild(svgEl('rect', { x: 0, y: 0, width: W, height: H, fill: '#fafafa', rx: 4 }));
+
+  // X axis ticks at p50 and p99 positions
+  const tickValues = [100, 1000, 10000, 100000, 1000000, 10000000];
+  const tickLabels = ['100ns','1µs','10µs','100µs','1ms','10ms'];
+  for (let i = 0; i < tickValues.length; i++) {
+    const x = sx(tickValues[i]);
+    svg.appendChild(svgEl('line', { x1: x, y1: P.t, x2: x, y2: H - P.b, stroke: '#e4e4e4', 'stroke-width': 1 }));
+    svg.appendChild(svgEl('text', { x, y: H - P.b + 12, 'text-anchor': 'middle', 'font-size': 8, fill: '#999' }, tickLabels[i]));
+  }
+
+  const barH = 20;
+  const hitY  = P.t + 8;
+  const missY = P.t + 38;
+
+  // Row labels
+  svg.appendChild(svgEl('text', { x: P.l + 2, y: hitY  - 2, 'font-size': 9, fill: '#2a9d8f', 'font-weight': '600' }, 'Hit'));
+  svg.appendChild(svgEl('text', { x: P.l + 2, y: missY - 2, 'font-size': 9, fill: '#e76f51', 'font-weight': '600' }, 'Miss'));
+
+  // Draw segments for hit row
+  if (!allZeroHit && hitPcts.length >= 2) {
+    for (let i = 0; i < hitPcts.length - 1; i++) {
+      const x1 = sx(hitPcts[i]);
+      const x2 = sx(hitPcts[i + 1]);
+      if (x2 > x1) {
+        const alpha = 0.4 + (i / (hitPcts.length - 1)) * 0.6;
+        svg.appendChild(svgEl('rect', { x: x1, y: hitY, width: x2 - x1, height: barH, fill: '#2a9d8f', opacity: alpha.toFixed(2) }));
+      }
+    }
+    // p50 marker (index 3) and p99 (index 6)
+    for (const idx of [3, 6]) {
+      if (hitPcts[idx]) {
+        const x = sx(hitPcts[idx]);
+        svg.appendChild(svgEl('line', { x1: x, y1: hitY, x2: x, y2: hitY + barH, stroke: '#fff', 'stroke-width': 1.5 }));
+        svg.appendChild(svgEl('text', { x, y: hitY + barH + 10, 'text-anchor': 'middle', 'font-size': 8, fill: '#2a9d8f' }, labels[idx]));
+      }
+    }
+  } else if (allZeroHit) {
+    svg.appendChild(svgEl('text', { x: P.l + 30, y: hitY + barH/2 + 4, 'font-size': 9, fill: '#999' }, '—'));
+  }
+
+  // Draw segments for miss row
+  if (!allZeroMiss && missPcts.length >= 2) {
+    for (let i = 0; i < missPcts.length - 1; i++) {
+      const x1 = sx(missPcts[i]);
+      const x2 = sx(missPcts[i + 1]);
+      if (x2 > x1) {
+        const alpha = 0.4 + (i / (missPcts.length - 1)) * 0.6;
+        svg.appendChild(svgEl('rect', { x: x1, y: missY, width: x2 - x1, height: barH, fill: '#e76f51', opacity: alpha.toFixed(2) }));
+      }
+    }
+    for (const idx of [3, 6]) {
+      if (missPcts[idx]) {
+        const x = sx(missPcts[idx]);
+        svg.appendChild(svgEl('line', { x1: x, y1: missY, x2: x, y2: missY + barH, stroke: '#fff', 'stroke-width': 1.5 }));
+        svg.appendChild(svgEl('text', { x, y: missY + barH + 10, 'text-anchor': 'middle', 'font-size': 8, fill: '#e76f51' }, labels[idx]));
+      }
+    }
+  } else if (allZeroMiss) {
+    svg.appendChild(svgEl('text', { x: P.l + 30, y: missY + barH/2 + 4, 'font-size': 9, fill: '#999' }, '—'));
+  }
+
+  // Wrap SVG in a div and return HTML by serializing
+  const container = document.createElement('div');
+  container.appendChild(svg);
+  return container.innerHTML;
+}
+
+// Wire up close button (DOM is already parsed since script is at end of body)
+(function() {
+  const btn = $('topo-close');
+  if (btn) btn.onclick = closeBackendDetail;
+})();
+
+// Escape closes detail panel
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && openBackend) closeBackendDetail();
+});
+
+// ── Perf ──────────────────────────────────────────────────────────────────────
+async function loadPerf() {
+  try {
+    const d = await api('GET', '/perf');
+    const h = d.history || [];
+    const last = h[h.length - 1] || {};
+
+    // For latency/cache: use the most recent window that had actual traffic.
+    // Falls back to last entry (will show 0s) if no active window exists.
+    const active = h.slice().reverse().find(r => (r.rps_avg > 0) || (r.cache_hits > 0) || (r.cache_misses > 0)) || last;
+    const isStale = active !== last && h.length > 0;
+
+    fill('p-total',    fmt.num(last.requests));
+    fill('p-rps-avg',  fmt.num(last.rps_avg));
+    fill('p-rps-peak', fmt.num(last.rps_peak));
+    fill('p-hit-p50',  fmt.latNs(active.hit_p50_ns));
+    fill('p-hit-p99',  fmt.latNs(active.hit_p99_ns));
+    fill('p-miss-p50', fmt.latNs(active.miss_p50_ns));
+    fill('p-miss-p99', fmt.latNs(active.miss_p99_ns));
+    fill('p-cache',    active.cache_hit_rate != null ? (active.cache_hit_rate * 100).toFixed(1) : '—');
+    fill('p-berr',     fmt.num(last.backend_errors));
+
+    // Show "(last active)" hint when displaying data from a past window.
+    const staleLabel = isStale ? '(last active)' : '';
+    $('p-lat-stale').textContent = staleLabel;
+
+    $('perf-table').innerHTML = h.length
+      ? h.slice().reverse().map(r => `<tr>
+          <td>${escHtml(fmt.ts(r.ts))}</td>
+          <td>${fmt.num(r.requests)}</td>
+          <td>${fmt.num(r.rps_avg)}</td>
+          <td>${fmt.num(r.rps_peak)}</td>
+          <td>${fmt.latNs(r.hit_p0_ns)}</td>
+          <td>${fmt.latNs(r.hit_p50_ns)}</td>
+          <td>${fmt.latNs(r.hit_p99_ns)}</td>
+          <td>${fmt.latNs(r.hit_max_ns)}</td>
+          <td>${fmt.latNs(r.miss_p0_ns)}</td>
+          <td>${fmt.latNs(r.miss_p50_ns)}</td>
+          <td>${fmt.latNs(r.miss_p99_ns)}</td>
+          <td>${fmt.latNs(r.miss_max_ns)}</td>
+          <td>${r.cache_hit_rate != null ? (r.cache_hit_rate * 100).toFixed(1) + '%' : '—'}</td>
+          <td>${fmt.num(r.backend_errors)}</td>
+        </tr>`).join('')
+      : '<tr><td colspan="14" style="color:var(--muted);padding:.75rem">No periodic-stats log entries yet</td></tr>';
+  } catch(e) { console.error('perf', e); }
+}
+
+// ── System ────────────────────────────────────────────────────────────────────
+async function loadSystem() {
+  try {
+    const d = await api('GET', '/system');
+    fill('s-uptime', fmt.uptime(d.uptime_secs));
+    fill('s-cpu',    fmt.pct(d.cpu_usage_pct));
+    fill('s-ram',    fmt.bytes(d.memory?.used_bytes));
+    fill('s-ram-t',  fmt.bytes(d.memory?.total_bytes));
+
+    $('disk-bars').innerHTML = (d.disks || []).map(disk => {
+      const pct = disk.used_pct ?? 0;
+      const colour = pct > 90 ? 'var(--err)' : pct > 75 ? 'var(--warn)' : 'var(--ok)';
+      return `<div class="bar-row">
+        <span class="bar-label" title="${escHtml(disk.mount)}">${escHtml(disk.mount)}</span>
+        <div class="bar-track"><div class="bar-fill" style="width:${pct}%;background:${colour}"></div></div>
+        <span class="bar-val">${fmt.bytes(disk.used_bytes)} / ${fmt.bytes(disk.total_bytes)}</span>
+      </div>`;
+    }).join('') || '<p style="color:var(--muted);font-size:.85rem">No disks reported.</p>';
+  } catch(e) { console.error('system', e); }
+}
+
+// ── Bench ─────────────────────────────────────────────────────────────────────
+(function () {
+  const SUITES = [
+    { label: 'Dashboard /  (cache hit)',  url: '/',                warmup: 5 },
+    { label: 'Dashboard /  (cache miss)', url: '/?_nocache',       warmup: 3 },
+    { label: 'API /system  (no cache)',   url: '/api/admin/system', warmup: 3 },
+  ];
+  const COLORS   = ['#2a9d8f', '#e76f51', '#457b9d'];
+  const SVG_NS   = 'http://www.w3.org/2000/svg';
+
+  let abortCtl = null;
+  performance.setResourceTimingBufferSize(5000);
+
+  function svgNode(tag, attrs, text) {
+    const el = document.createElementNS(SVG_NS, tag);
+    for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+    if (text != null) el.textContent = text;
+    return el;
+  }
+  function fmtMs(v) { return (v / 1000).toFixed(2) + 'ms'; }
+  function pctile(sorted, p) { return sorted[Math.min(Math.floor(p / 100 * sorted.length), sorted.length - 1)]; }
+  function calcStats(sorted) {
+    return { min: sorted[0], p50: pctile(sorted,50), p99: pctile(sorted,99), max: sorted[sorted.length-1],
+             avg: sorted.reduce((a,b)=>a+b,0)/sorted.length };
+  }
+  function getProto(url) {
+    const abs = new URL(url, location.href).href;
+    const e = performance.getEntriesByName(abs, 'resource');
+    return (e.length ? e[e.length-1].nextHopProtocol : '') || performance.getEntriesByName(location.href,'navigation')[0]?.nextHopProtocol || '?';
+  }
+  function detectResUs() {
+    const gaps=[]; let prev=performance.now();
+    for (let i=0; i<10000 && gaps.length<30; i++) { const c=performance.now(); if(c>prev){gaps.push((c-prev)*1000);prev=c;} }
+    return gaps.length ? Math.min(...gaps) : 1000;
+  }
+  async function timedFetch(url, signal) {
+    const t0=performance.now();
+    const r=await fetch(url,{cache:'no-store',signal});
+    await r.arrayBuffer();
+    return (performance.now()-t0)*1000;
+  }
+  async function runSuite(suite, n, signal, resUs) {
+    for (let i=0; i<suite.warmup; i++) await timedFetch(suite.url, signal);
+    const raw=[];
+    for (let i=0; i<n; i++) {
+      raw.push(await timedFetch(suite.url, signal));
+      if (i%25===0) { $('bench-status').textContent=`Measuring: ${suite.label} — ${i+1}/${n}…`; await new Promise(r=>setTimeout(r,0)); }
+    }
+    const freq=new Map();
+    for (const v of raw) { const b=Math.round(v/resUs)*resUs; freq.set(b,(freq.get(b)||0)+1); }
+    const lats=raw.map(v=>{
+      const b=Math.round(v/resUs)*resUs, n0=freq.get(b)||0, n1=freq.get(b+resUs)||0;
+      return b+((n0+n1)>0 ? resUs*(n0+2*n1)/(3*(n0+n1)) : resUs/2);
+    });
+    const sorted=lats.slice().sort((a,b)=>a-b);
+    return { label:suite.label, proto:getProto(suite.url), sorted, n, ...calcStats(sorted) };
+  }
+  function renderCDF(result, color) {
+    const W=380, H=220, P={t:26,r:16,b:50,l:56};
+    const cW=W-P.l-P.r, cH=H-P.t-P.b;
+    const { sorted, min, p50, p99, max, proto } = result;
+    const xClip=Math.max(pctile(sorted,99.5)*1.08,1);
+    const lg=v=>Math.log10(Math.max(v,0.1));
+    const lgMin=lg(Math.max(sorted[0],0.1)), lgMax=lg(xClip), lgR=lgMax-lgMin||1;
+    const sx=v=>Math.min(Math.max((lg(v)-lgMin)/lgR,0),1)*cW;
+    const sy=p=>cH-(p/100)*cH;
+    const svg=document.createElementNS(SVG_NS,'svg');
+    svg.setAttribute('viewBox',`0 0 ${W} ${H}`);
+    svg.setAttribute('width',W); svg.setAttribute('height',H);
+    svg.appendChild(svgNode('rect',{x:0,y:0,width:W,height:H,fill:'#fafafa',rx:4}));
+    for (let p=0;p<=100;p+=25) {
+      const y=P.t+sy(p);
+      svg.appendChild(svgNode('line',{x1:P.l,y1:y,x2:P.l+cW,y2:y,stroke:'#e4e4e4','stroke-width':1}));
+      svg.appendChild(svgNode('text',{x:P.l-5,y:y+4,'text-anchor':'end','font-size':9,fill:'#999'},p+'%'));
+    }
+    for (let p=Math.floor(lgMin);p<=Math.ceil(lgMax);p++) {
+      const v=Math.pow(10,p); if(lg(v)<lgMin-0.01||lg(v)>lgMax+0.01) continue;
+      const x=P.l+sx(v);
+      svg.appendChild(svgNode('line',{x1:x,y1:P.t,x2:x,y2:P.t+cH,stroke:'#e4e4e4','stroke-width':1}));
+      svg.appendChild(svgNode('text',{x,y:P.t+cH+13,'text-anchor':'middle','font-size':9,fill:'#999'},fmtMs(v)));
+    }
+    const pts=sorted.map((v,i)=>(P.l+sx(v))+','+(P.t+sy((i+1)/sorted.length*100))).join(' ');
+    svg.appendChild(svgNode('polyline',{points:pts,fill:'none',stroke:color,'stroke-width':2,'stroke-linejoin':'round'}));
+    for (const m of [{v:min,l:'min'},{v:p50,l:'p50'},{v:p99,l:'p99'},{v:max,l:'max'}]) {
+      if (m.v>xClip) continue;
+      const x=P.l+sx(m.v);
+      svg.appendChild(svgNode('line',{x1:x,y1:P.t,x2:x,y2:P.t+cH,stroke:color,'stroke-width':1,'stroke-dasharray':'3,3',opacity:0.65}));
+      svg.appendChild(svgNode('text',{x,y:P.t+cH+27,'text-anchor':'middle','font-size':9,fill:color,'font-weight':'600'},m.l));
+      svg.appendChild(svgNode('text',{x,y:P.t+cH+38,'text-anchor':'middle','font-size':8,fill:'#666'},fmtMs(m.v)));
+    }
+    const pc=proto.includes('3')?'#16a34a':proto.includes('2')?'#2563eb':'#ca8a04';
+    svg.appendChild(svgNode('text',{x:P.l,y:17,'font-size':11,fill:'#222','font-weight':'600'},result.label));
+    svg.appendChild(svgNode('text',{x:W-P.r,y:17,'text-anchor':'end','font-size':10,fill:pc},proto));
+    return svg;
+  }
+
+  const zoomOverlay = $('bench-zoom-overlay');
+  zoomOverlay.addEventListener('click', ()=>{ zoomOverlay.classList.remove('active'); zoomOverlay.innerHTML=''; });
+  document.addEventListener('keydown', e=>{ if(e.key==='Escape'){ zoomOverlay.classList.remove('active'); zoomOverlay.innerHTML=''; }});
+
+  $('bench-run').onclick = async () => {
+    $('bench-run').disabled=true; $('bench-stop').disabled=false; $('bench-export').disabled=true;
+    $('bench-cdfs').style.display='none'; $('bench-results-tbl').style.display='none';
+    $('bench-results-tbody').innerHTML='';
+    abortCtl=new AbortController();
+    const n=Math.max(20,parseInt($('bench-n').value,10)||200);
+    const results=[];
+    $('bench-status').textContent='Detecting timer resolution…';
+    await new Promise(r=>setTimeout(r,0));
+    const resUs=detectResUs();
+    try {
+      for (let i=0;i<SUITES.length;i++) {
+        $('bench-status').textContent=`Warming up: ${SUITES[i].label}…`; await new Promise(r=>setTimeout(r,0));
+        const r=await runSuite(SUITES[i],n,abortCtl.signal,resUs);
+        results.push(r);
+        $('bench-status').textContent=`✓ ${r.label}  p50=${fmtMs(r.p50)}  p99=${fmtMs(r.p99)}  [${r.proto}]`;
+        await new Promise(r=>setTimeout(r,0));
+      }
+      $('bench-cdfs').innerHTML='';
+      for (let i=0;i<results.length;i++) {
+        const svg=renderCDF(results[i],COLORS[i%COLORS.length]);
+        svg.addEventListener('click',()=>{ zoomOverlay.innerHTML=''; zoomOverlay.appendChild(svg.cloneNode(true)); zoomOverlay.classList.add('active'); });
+        $('bench-cdfs').appendChild(svg);
+      }
+      $('bench-cdfs').style.display='grid';
+      $('bench-results-tbody').innerHTML=results.map(r=>{
+        const pc=r.proto.includes('3')?'ph3':r.proto.includes('2')?'ph2':'ph1';
+        return `<tr><td>${escHtml(r.label)}</td><td class="${pc}">${escHtml(r.proto)}</td>`+
+          `<td>${fmtMs(r.p50)}</td><td>${fmtMs(r.p99)}</td>`+
+          `<td>${fmtMs(r.min)}</td><td>${fmtMs(r.max)}</td><td>${fmtMs(r.avg)}</td><td>${r.n}</td></tr>`;
+      }).join('');
+      $('bench-results-tbl').style.display='table';
+      $('bench-export').disabled=false;
+      const protos=[...new Set(results.map(r=>r.proto))].join(', ');
+      $('bench-status').textContent=`Complete — protocol: ${protos}  (timer res ${fmtMs(resUs)}, midpoint-corrected)`;
+    } catch(e) {
+      if (e.name==='AbortError') {
+        $('bench-status').textContent=results.length?`Stopped after ${results.length}/${SUITES.length} suites.`:'Stopped.';
+        if (results.length) { /* render partial */ }
+      } else {
+        $('bench-status').textContent='Error: '+e.message;
+      }
+    } finally {
+      abortCtl=null; $('bench-run').disabled=false; $('bench-stop').disabled=true;
+    }
+  };
+  $('bench-stop').onclick=()=>{ if(abortCtl) abortCtl.abort(); };
+  $('bench-export').onclick=()=>{ window.print(); };
+})();
+
+// ── Logs ──────────────────────────────────────────────────────────────────────
+(function () {
+  const MAX_ROWS  = 1000;
+  let lvOffset    = 0;
+  let lvStarted   = false;
+  let lvPollTimer = null;
+  let lvPolling   = false;
+  let lvErrors    = 0;
+
+  function lvSetStatus(msg) { $('lv-status').textContent = msg; }
+
+  function levelClass(level) {
+    switch ((level||'').toUpperCase()) {
+      case 'ERROR': return 'lv-error';
+      case 'WARN':  return 'lv-warn';
+      case 'DEBUG': return 'lv-debug';
+      case 'TRACE': return 'lv-trace';
+      default:      return 'lv-info';
+    }
+  }
+
+  function appendLines(lines) {
+    const tbody = $('lv-body');
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let tr;
+      try {
+        const e   = JSON.parse(trimmed);
+        const ts  = e.timestamp ? e.timestamp.replace('T',' ').replace(/\.\d+Z$/,'Z') : '—';
+        const lvl = e.level || '?';
+        const tgt = e.target || '—';
+        const msg = (e.fields && e.fields.message) ? e.fields.message : JSON.stringify(e.fields||e);
+        const extras = e.fields ? Object.entries(e.fields).filter(([k])=>k!=='message').map(([k,v])=>k+'='+JSON.stringify(v)).join(' ') : '';
+        const full = extras ? msg + '  ' + extras : msg;
+        tr = document.createElement('tr');
+        tr.className = levelClass(lvl);
+        tr.dataset.backend = (e.fields && e.fields.backend) ? e.fields.backend : (e.target || '');
+        tr.dataset.level = lvl.toUpperCase();
+        tr.innerHTML =
+          '<td>'+escHtml(ts)+'</td>'+
+          '<td class="lv-level">'+escHtml(lvl)+'</td>'+
+          '<td>'+escHtml(tgt)+'</td>'+
+          '<td class="lv-msg">'+escHtml(full)+'</td>';
+      } catch(_) {
+        tr = document.createElement('tr');
+        tr.className = 'lv-plain';
+        tr.dataset.backend = '';
+        tr.dataset.level = '';
+        tr.innerHTML = '<td>—</td><td class="lv-level">—</td><td>—</td><td class="lv-msg">'+escHtml(trimmed)+'</td>';
+      }
+      if (!rowVisible(tr)) tr.style.display = 'none';
+      tbody.appendChild(tr);
+    }
+    const excess = $('lv-body').children.length - MAX_ROWS;
+    for (let i=0; i<excess; i++) $('lv-body').removeChild($('lv-body').firstElementChild);
+    if ($('lv-autoscroll').checked && $('lv-body').lastElementChild) {
+      $('lv-body').lastElementChild.scrollIntoView({ behavior: 'smooth' });
+    }
+  }
+
+  async function lvPoll() {
+    if (lvPolling) return;
+    lvPolling = true;
+    try {
+      const url = lvOffset > 0
+        ? `/api/admin/logs?offset=${lvOffset}`
+        : `/api/admin/logs?n=200`;
+      const res = await fetch(url);
+      if (res.status === 401) { lvPolling=false; return; }
+      if (!res.ok) throw new Error('HTTP '+res.status);
+      lvErrors = 0;
+      const d = await res.json();
+      if (d.end_offset != null) lvOffset = d.end_offset;
+      if (d.lines && d.lines.length) appendLines(d.lines);
+      lvSetStatus('Watching m6-http-admin.log — ' + lvOffset + ' bytes');
+    } catch(e) {
+      lvErrors++;
+      if (lvErrors > 15) { window.location.reload(); return; }
+      lvSetStatus(lvErrors <= 2 ? 'Reconnecting…' : 'Error: '+e.message);
+    }
+    lvPolling = false;
+  }
+
+  function lvSchedule(ms) {
+    if (lvPollTimer) clearTimeout(lvPollTimer);
+    lvPollTimer = setTimeout(async()=>{ lvPollTimer=null; await lvPoll(); if(!lvPollTimer) lvSchedule(1000); }, ms);
+  }
+
+  window.lvStartIfNeeded = function() {
+    if (!lvStarted) { lvStarted=true; lvOffset=0; lvSchedule(0); }
+  };
+
+  // Populate filter dropdown from topology data (called after loadTopology resolves).
+  window.syncLogFilter = function(backends) {
+    const sel = $('lv-filter');
+    const cur = sel.value;
+    // Keep only the "All" option then add one per backend.
+    while (sel.options.length > 1) sel.remove(1);
+    for (const b of (backends || [])) {
+      const opt = document.createElement('option');
+      opt.value = b.name;
+      opt.textContent = b.name;
+      sel.add(opt);
+    }
+    // Restore previous selection if still valid.
+    if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+  };
+
+  function rowVisible(tr) {
+    const bSel = $('lv-filter').value;
+    const lSel = $('lv-level').value;
+    if (bSel && tr.dataset.backend !== bSel) return false;
+    if (lSel && tr.dataset.level !== lSel) return false;
+    return true;
+  }
+
+  function reapplyFilters() {
+    for (const tr of $('lv-body').children) {
+      tr.style.display = rowVisible(tr) ? '' : 'none';
+    }
+  }
+
+  // Re-apply filters when either dropdown changes.
+  $('lv-filter').onchange = reapplyFilters;
+  $('lv-level').onchange  = reapplyFilters;
+
+  $('lv-clear').onclick = () => { $('lv-body').innerHTML=''; };
+})();
+
+// ── Routes ────────────────────────────────────────────────────────────────────
+async function loadRoutes() {
+  try {
+    const d = await api('GET', '/routes');
+    fill('rt-sample', fmt.num(d.sample_requests));
+    fill('rt-window', d.sample_window_secs != null ? fmt.num(d.sample_window_secs) : '—');
+
+    const routes = d.routes || [];
+    $('routes-table').innerHTML = routes.length
+      ? routes.map(r => {
+          const hitPct = r.hit_rate != null ? (r.hit_rate * 100).toFixed(1) + '%' : '—';
+          const lat    = fmt.latNs(r.avg_latency_ns);
+          const colour = r.hit_rate == null ? '' :
+                         r.hit_rate >= 0.9 ? 'color:var(--ok)' :
+                         r.hit_rate >= 0.6 ? 'color:var(--warn)' : 'color:var(--err)';
+          return `<tr>
+            <td>${escHtml(r.path)}</td>
+            <td>${fmt.num(r.requests)}</td>
+            <td>${fmt.num(r.cache_hits)}</td>
+            <td>${fmt.num(r.cache_misses)}</td>
+            <td style="${colour}">${hitPct}</td>
+            <td>${lat}</td>
+          </tr>`;
+        }).join('')
+      : '<tr><td colspan="6" style="color:var(--muted);padding:.75rem">No request-complete log entries yet</td></tr>';
+  } catch(e) { console.error('routes', e); }
+}
+
+// ── Config ────────────────────────────────────────────────────────────────────
+let cfgData = null;
+
+function cfgField(label, path, value) {
+  return `<div class="cfg-field">
+    <span>${escHtml(label)}</span>
+    <input type="text" data-cfgpath="${escHtml(path)}" value="${escHtml(String(value ?? ''))}">
+  </div>`;
+}
+
+function cfgSelect(label, path, value, options) {
+  const opts = options.map(o =>
+    `<option value="${escHtml(o)}"${value === o ? ' selected' : ''}>${escHtml(o)}</option>`
+  ).join('');
+  return `<div class="cfg-field">
+    <span>${escHtml(label)}</span>
+    <select data-cfgpath="${escHtml(path)}">${opts}</select>
+  </div>`;
+}
+
+function cfgCheck(label, path, value) {
+  return `<div class="cfg-field">
+    <label class="cfg-check">
+      <input type="checkbox" data-cfgpath="${escHtml(path)}" ${value ? 'checked' : ''}>
+      ${escHtml(label)}
+    </label>
+  </div>`;
+}
+
+function backendRowHtml(i, b) {
+  return `<tr>
+    <td><input type="text" data-cfgpath="backend.${i}.name"    value="${escHtml(b.name    ?? '')}"></td>
+    <td><input type="text" data-cfgpath="backend.${i}.sockets" value="${escHtml(b.sockets ?? '')}"></td>
+    <td><button class="cfg-del" onclick="delCfgRow(this,'backend')" title="Remove">&#x2715;</button></td>
+  </tr>`;
+}
+
+function routeRowHtml(i, r) {
+  return `<tr>
+    <td><input type="text" data-cfgpath="route.${i}.path"    value="${escHtml(r.path    ?? '')}"></td>
+    <td><input type="text" data-cfgpath="route.${i}.backend" value="${escHtml(r.backend ?? '')}"></td>
+    <td><input type="text" data-cfgpath="route.${i}.require" value="${escHtml(r.require ?? '')}"></td>
+    <td><input type="text" data-cfgpath="route.${i}.cache"   value="${escHtml(r.cache   ?? '')}"></td>
+    <td><button class="cfg-del" onclick="delCfgRow(this,'route')" title="Remove">&#x2715;</button></td>
+  </tr>`;
+}
+
+function reindexCfgTable(type) {
+  const tbody = document.getElementById(`cfg-${type}-body`);
+  if (!tbody) return;
+  [...tbody.children].forEach((tr, i) => {
+    tr.querySelectorAll('[data-cfgpath]').forEach(el => {
+      el.dataset.cfgpath = el.dataset.cfgpath.replace(/^(backend|route)\.\d+\./, `${type}.${i}.`);
+    });
+  });
+}
+
+window.addCfgRow = function(type) {
+  const tbody = document.getElementById(`cfg-${type}-body`);
+  if (!tbody) return;
+  const i = tbody.children.length;
+  const tr = document.createElement('tr');
+  tr.innerHTML = (type === 'backend' ? backendRowHtml : routeRowHtml)(i, {}).replace(/^<tr>|<\/tr>$/g, '');
+  // innerHTML on tr doesn't work cross-browser — insert as table row
+  const tmp = document.createElement('tbody');
+  tmp.innerHTML = type === 'backend' ? backendRowHtml(i, {}) : routeRowHtml(i, {});
+  tbody.appendChild(tmp.firstElementChild);
+};
+
+window.delCfgRow = function(btn, type) {
+  btn.closest('tr').remove();
+  reindexCfgTable(type);
+};
+
+function renderConfigForm(cfg) {
+  const parts = [];
+
+  // ── Site ──
+  if (cfg.site) {
+    parts.push(`<div class="cfg-section"><h3>Site</h3><div class="cfg-fields">
+      ${cfgField('Name',   'site.name',   cfg.site.name)}
+      ${cfgField('Domain', 'site.domain', cfg.site.domain)}
+    </div></div>`);
+  }
+
+  // ── Server ──
+  if (cfg.server) {
+    parts.push(`<div class="cfg-section"><h3>Server</h3><div class="cfg-fields">
+      ${cfgField('Bind address',    'server.bind',     cfg.server.bind)}
+      ${cfgField('TLS certificate', 'server.tls_cert', cfg.server.tls_cert)}
+      ${cfgField('TLS key',         'server.tls_key',  cfg.server.tls_key)}
+    </div></div>`);
+  }
+
+  // ── Auth ──
+  if (cfg.auth) {
+    parts.push(`<div class="cfg-section"><h3>Auth</h3><div class="cfg-fields">
+      ${cfgField('Backend',    'auth.backend',    cfg.auth.backend)}
+      ${cfgField('Public key', 'auth.public_key', cfg.auth.public_key)}
+    </div></div>`);
+  }
+
+  // ── Errors ──
+  if (cfg.errors) {
+    parts.push(`<div class="cfg-section"><h3>Errors</h3><div class="cfg-fields">
+      ${cfgSelect('Mode', 'errors.mode', cfg.errors.mode, ['internal','redirect','custom'])}
+      ${cfgCheck('Verbose fallback', 'errors.verbose_fallback', cfg.errors.verbose_fallback)}
+    </div></div>`);
+  }
+
+  // ── Log ──
+  if (cfg.log) {
+    parts.push(`<div class="cfg-section"><h3>Logging</h3><div class="cfg-fields">
+      ${cfgSelect('Level',  'log.level',  cfg.log.level,        ['trace','debug','info','warn','error'])}
+    </div></div>`);
+  }
+
+  // ── Backends ──
+  const backends = Array.isArray(cfg.backend) ? cfg.backend : [];
+  {
+    const rows = backends.map((b, i) => backendRowHtml(i, b)).join('');
+    parts.push(`<div class="cfg-section">
+      <h3>Backends <button class="btn secondary" onclick="addCfgRow('backend')">+ Add backend</button></h3>
+      <div class="table-wrap" style="max-height:none">
+        <table><thead><tr><th>Name</th><th>Sockets</th><th></th></tr></thead>
+        <tbody id="cfg-backend-body">${rows}</tbody></table>
+      </div>
+    </div>`);
+  }
+
+  // ── Routes ──
+  const routes = Array.isArray(cfg.route) ? cfg.route : [];
+  {
+    const rows = routes.map((r, i) => routeRowHtml(i, r)).join('');
+    parts.push(`<div class="cfg-section">
+      <h3>Routes <button class="btn secondary" onclick="addCfgRow('route')">+ Add route</button></h3>
+      <div class="table-wrap" style="max-height:none">
+        <table><thead><tr><th>Path</th><th>Backend</th><th>Require</th><th>Cache</th><th></th></tr></thead>
+        <tbody id="cfg-route-body">${rows}</tbody></table>
+      </div>
+    </div>`);
+  }
+
+  return parts.join('');
+}
+
+function collectConfigFromForm() {
+  // Start from the loaded config so unknown keys are preserved.
+  const result = JSON.parse(JSON.stringify(cfgData));
+  // Rebuild arrays fresh from form so added/deleted rows are reflected correctly.
+  result.backend = [];
+  result.route   = [];
+
+  document.querySelectorAll('#cfg-wrap [data-cfgpath]').forEach(el => {
+    const parts = el.dataset.cfgpath.split('.');
+    const val   = el.type === 'checkbox' ? el.checked : el.value;
+
+    if (parts[0] === 'backend' || parts[0] === 'route') {
+      const arr = result[parts[0]];
+      const idx = parseInt(parts[1]);
+      if (!arr[idx]) arr[idx] = {};
+      arr[idx][parts[2]] = val;
+    } else {
+      let node = result;
+      for (let i = 0; i < parts.length - 1; i++) {
+        if (node[parts[i]] == null) node[parts[i]] = {};
+        node = node[parts[i]];
+      }
+      node[parts[parts.length - 1]] = val;
+    }
+  });
+  result.backend = result.backend.filter(Boolean);
+  result.route   = result.route.filter(Boolean);
+  return result;
+}
+
+async function loadConfig(force = false) {
+  try {
+    const d = await api('GET', '/config');
+    if (!force && d.mtime && d.mtime === cfgMtime) return; // unchanged
+    cfgMtime = d.mtime || 0;
+    cfgData = d.config;
+    $('cfg-wrap').innerHTML = renderConfigForm(cfgData);
+
+    // Services section — populated from the backends listed in the config.
+    // Managed via a hardcoded list that matches render-admin.conf.
+    const knownServices = ['m6-http', 'render-admin'];
+    $('services-list').innerHTML = knownServices.map(name =>
+      `<div class="row" style="margin-bottom:.4rem">
+        <span style="min-width:120px">${escHtml(name)}</span>
+        <button class="btn danger" onclick="restartService('${escHtml(name)}')">SIGTERM</button>
+      </div>`
+    ).join('');
+  } catch(e) {
+    showMsg($('config-msg'), 'Load failed: ' + e.message, 'err');
+  }
+}
+
+$('cfg-reload').onclick = loadConfig;
+
+$('cfg-save').onclick = async () => {
+  if (!cfgData) return;
+  try {
+    await api('PUT', '/config', collectConfigFromForm());
+    showMsg($('config-msg'), 'Saved and applied.', 'ok');
+  } catch(e) { showMsg($('config-msg'), 'Save failed: ' + e.message, 'err'); }
+};
+
+$('cfg-publish').onclick = async () => {
+  try {
+    await api('POST', '/publish');
+    showMsg($('config-msg'), 'Published: the backends reloaded and the cache is flushed.', 'ok');
+  } catch(e) { showMsg($('config-msg'), 'Publish failed: ' + e.message, 'err'); }
+};
+
+$('cfg-flush').onclick = async () => {
+  if (!confirm('Flush cache? This publishes a new generation: every backend reloads.')) return;
+  try {
+    await api('POST', '/cache/flush');
+    showMsg($('config-msg'), 'Cache flushed.', 'ok');
+  } catch(e) { showMsg($('config-msg'), 'Flush failed: ' + e.message, 'err'); }
+};
+
+async function restartService(name) {
+  if (!confirm(`Send SIGTERM to "${name}"?`)) return;
+  try {
+    const d = await api('POST', `/services/${encodeURIComponent(name)}/restart`);
+    if (d.ok) showMsg($('config-msg'), `${name} sent SIGTERM (PID ${d.pid}).`, 'ok');
+    else showMsg($('config-msg'), 'Restart error: ' + (d.error ?? 'unknown'), 'err');
+  } catch(e) { showMsg($('config-msg'), 'Restart error: ' + e.message, 'err'); }
+}
+</script>
+</body>
+</html>

@@ -13,7 +13,7 @@
 
 // HashMap removed — headers are stored as Vec for small-N linear-scan performance.
 use std::io::Write;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde_json::{Map, Value};
@@ -49,9 +49,9 @@ pub struct Request {
     pub(crate) dict: crate::dict::Dict,
     /// Site directory (absolute).
     ///
-    /// Shared rather than owned: it is the same path for the life of a reload,
-    /// and building a `Request` used to allocate a fresh `PathBuf` for it on
-    /// every request.
+    /// Shared rather than owned: it is the same path for the life of the
+    /// process, and building a `Request` used to allocate a fresh `PathBuf` for
+    /// it on every request.
     pub(crate) site_dir: std::sync::Arc<PathBuf>,
     /// The matched route's pattern, when one matched.
     pub(crate) route_pattern: Option<String>,
@@ -68,6 +68,9 @@ pub struct Request {
     /// rule this codebase settled on: config is a read-only reference
     /// throughout, never a copy.
     pub(crate) config: Option<std::sync::Arc<crate::config::RendererConfig>>,
+    /// When the request path picked the request up, for the completion log's
+    /// `latency_us`. Set by `site::Site::handle_raw`; `now` otherwise.
+    pub(crate) started: std::time::Instant,
 }
 
 impl Request {
@@ -85,13 +88,25 @@ impl Request {
             route_pattern: None,
             route_settings: None,
             config: None,
+            started: crate::platform::now(),
         }
+    }
+
+    /// Record the instant the request path started on, for `latency_us`.
+    pub(crate) fn with_started(mut self, started: std::time::Instant) -> Self {
+        self.started = started;
+        self
+    }
+
+    /// The instant the request path started on.
+    pub(crate) fn started(&self) -> std::time::Instant {
+        self.started
     }
 
     /// Attach route settings directly, without a `CompiledRoute`.
     ///
-    /// For a handler's own tests, which have a route's config but no framework
-    /// state to compile it from.
+    /// For a handler's own tests, which have a route's config but no compiled
+    /// route to read it from.
     pub fn with_route_settings(mut self, settings: std::sync::Arc<Map<String, Value>>) -> Self {
         self.route_settings = Some(settings);
         self
@@ -119,7 +134,7 @@ impl Request {
     /// never route, and because both fields are cheap clones: the pattern is
     /// a short string already cloned with the route, and the settings are an
     /// `Arc`.
-    pub fn with_route(mut self, route: &crate::app::CompiledRoute) -> Self {
+    pub fn with_route(mut self, route: &crate::site::CompiledRoute) -> Self {
         self.route_pattern = Some(route.pattern.clone());
         self.route_settings = Some(std::sync::Arc::clone(&route.settings));
         self
@@ -127,9 +142,9 @@ impl Request {
 
     /// The raw request, borrowed.
     ///
-    /// For a handler that was written against `RawRequest` before its service
-    /// became an `App` service, and for anything that needs the request as the
-    /// wire delivered it rather than through the accessors above.
+    /// For a handler written against `RawRequest`, and for anything that needs
+    /// the request as the wire delivered it rather than through the accessors
+    /// above.
     pub fn raw(&self) -> &RawRequest {
         &self.raw
     }
@@ -156,9 +171,9 @@ impl Request {
     /// A key from the matched route's `[[route]]` table that core does not
     /// define.
     ///
-    /// This is how a handler registered with `App::handler` reads its own
-    /// per-route configuration. Core does not know what `root` means; the
-    /// handler does, and the route says it:
+    /// This is how a service's handler reads its own per-route
+    /// configuration. Core does not know what `root` means; the handler does,
+    /// and the route says it:
     ///
     /// ```toml
     /// [[route]]
@@ -251,21 +266,56 @@ impl Request {
 
     // ---------- file I/O helpers ----------
 
-    /// Resolve a site-relative path to absolute, validating against path traversal.
+    /// Join a site-relative path onto the site directory, **without** checking
+    /// it.
+    ///
+    /// Not the validating helper: it does no traversal or symlink check at all,
+    /// and its one caller passes the empty string. A caller that takes the
+    /// value from a request wants [`crate::path::resolve_within`], which
+    /// resolves the path and refuses one that leaves the site.
     pub fn site_path(&self, rel: &str) -> PathBuf {
         self.site_dir.join(rel)
     }
 
     fn validated_path(&self, rel: &str) -> Result<PathBuf> {
-        let abs = self.site_dir.join(rel);
-        // Ensure the canonicalised path stays within site_dir.
-        // We check for `..` components.
-        for comp in Path::new(rel).components() {
-            if comp == Component::ParentDir {
-                return Err(Error::BadRequest("path traversal not allowed".to_string()));
+        // Resolve first, symlinks and all, then check the resolved path. A
+        // lexical check cannot see a symlinked directory in the middle of the
+        // path, and a write through one lands outside the site.
+        crate::path::resolve_within(&self.site_dir, Path::new(rel))
+            .map_err(|e| Error::BadRequest(e.to_string()))
+    }
+
+    /// The temp name beside a resolved path, resolved in its own right.
+    ///
+    /// `<dest>.tmp` is a name the site can already contain as a link, so the
+    /// temp file would be created outside the site through it and the rename
+    /// would then put the link in place. Resolving the temp name costs one
+    /// canonicalise and closes that.
+    fn temp_path(&self, resolved: &Path) -> Result<PathBuf> {
+        let tmp = resolved.with_extension("tmp");
+        let parent = tmp
+            .parent()
+            .ok_or_else(|| Error::BadRequest("a temp file has no parent directory".to_string()))?;
+        let name = tmp
+            .file_name()
+            .ok_or_else(|| Error::BadRequest("a temp file has no name".to_string()))?;
+        // `resolved` starts with the canonical root, which differs from
+        // `site_dir` when the site is reached through a symlinked parent, so
+        // both sides are compared canonical.
+        let root = self
+            .site_dir
+            .canonicalize()
+            .map_err(|e| Error::BadRequest(format!("the site directory is not readable: {e}")))?;
+        let rel = match parent.strip_prefix(&root) {
+            Ok(inner) => inner.join(name),
+            Err(_) => {
+                return Err(Error::BadRequest(
+                    "a temp file would be written outside the site".to_string(),
+                ))
             }
-        }
-        Ok(abs)
+        };
+        crate::path::resolve_within(&self.site_dir, &rel)
+            .map_err(|e| Error::BadRequest(e.to_string()))
     }
 
     /// Read a JSON file relative to site directory.
@@ -308,7 +358,10 @@ impl Request {
             .map_err(Error::Other)?;
 
         // Write to a temp file in the same directory, then rename.
-        let tmp_path = path.with_extension("tmp");
+        // The temp file is a name derived from the resolved path, and a link
+        // planted at that name is the same escape with one more step: resolve
+        // it before creating anything.
+        let tmp_path = self.temp_path(&path)?;
         {
             let mut f = std::fs::File::create(&tmp_path)
                 .with_context(|| format!("creating temp file {}", tmp_path.display()))
@@ -335,7 +388,18 @@ impl Request {
 
         for entry in entries {
             let entry = entry.context("reading dir entry").map_err(Error::Other)?;
-            let ep = entry.path();
+            // Resolve each entry, not only the directory: an entry that is itself
+            // a symlink out of the site is the same escape one level down, and
+            // resolving the directory is what made it look covered.
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            // The entry is inside the directory being listed, so the path to
+            // resolve is that directory's, with the name appended.
+            let rel_entry = std::path::Path::new(rel).join(&name);
+            let Ok(ep) = crate::path::resolve_within(&self.site_dir, &rel_entry) else {
+                continue;
+            };
             if ep.extension().and_then(|e| e.to_str()) == Some("json") {
                 let data = std::fs::read(&ep)
                     .with_context(|| format!("reading {}", ep.display()))
@@ -347,77 +411,6 @@ impl Request {
             }
         }
         Ok(out)
-    }
-
-    /// The file `touch` acts on. `site.toml` is the file the service reads, which
-    /// `site_toml` may place outside `site_dir`. Any other path is relative to
-    /// `site_dir` and may not climb out of it.
-    fn touch_path(&self, rel: &str) -> Result<PathBuf> {
-        match (rel, &self.config) {
-            ("site.toml", Some(config)) => Ok(config.resolve_site_toml(&self.site_dir)),
-            _ => self.validated_path(rel),
-        }
-    }
-
-    /// Update a file's timestamps so a watching service reloads it.
-    ///
-    /// The documented way for a renderer to invalidate the edge after writing
-    /// new content: write the file, then `touch("site.toml")`. See
-    /// `docs/m6-site-toml.md`.
-    ///
-    /// `touch("site.toml")` touches the file the service reads, which is the one
-    /// the config key `site_toml` names. The file is created when it is missing.
-    ///
-    /// ## Why it opens the file as well as setting the times
-    ///
-    /// This used to be `filetime::set_file_times` alone, which is
-    /// `utimensat(2)` against the path with no open. **On Linux that produced no
-    /// reload at all**, so the mechanism this function exists to provide had
-    /// never worked on the platform that serves production.
-    ///
-    /// `utimensat` reports `IN_ATTRIB` and nothing else. m6-core's watcher asked
-    /// inotify for `IN_CLOSE_WRITE | IN_CREATE | IN_MOVED_TO`, so the event was
-    /// read and discarded, and the mtime fallback that would have caught it runs
-    /// only when there is no watcher fd at all -- which on Linux there always is.
-    ///
-    /// macOS was fine, because kqueue registers the files themselves and reports
-    /// the attribute change. So the CMS example published a post, rebuilt its
-    /// index, reported success, and the post did not appear -- on Linux only,
-    /// which is why it survived: it works on the machine it was written on.
-    ///
-    /// Found by m6's own checks once they started running the examples on Linux,
-    /// and it had been broken since the watcher was rewritten.
-    ///
-    /// The watcher now also accepts `IN_ATTRIB`, so either fix alone is enough.
-    /// Both are here on purpose: the flag makes any external tool's `touch` work,
-    /// and the open makes this function work against a watcher that does not have
-    /// the flag. Opening for write and closing is what `m6-md --touch` has always
-    /// done, which is why blog publishing worked while this did not.
-    ///
-    /// The timestamps are still set, because they are what the mtime-polling
-    /// fallback compares and what `Last-Modified` is derived from. Opening a file
-    /// for writing without writing to it does not move its mtime.
-    pub fn touch(&self, rel: &str) -> Result<()> {
-        let path = self.touch_path(rel)?;
-        if path.exists() {
-            let now = filetime::FileTime::now();
-            filetime::set_file_times(&path, now, now)
-                .with_context(|| format!("touching {}", path.display()))
-                .map_err(Error::Other)?;
-            // Dropped immediately: the close is what produces IN_CLOSE_WRITE.
-            // `truncate(false)`, so the file's contents are untouched.
-            std::fs::OpenOptions::new()
-                .write(true)
-                .truncate(false)
-                .open(&path)
-                .with_context(|| format!("opening {} to signal a change", path.display()))
-                .map_err(Error::Other)?;
-        } else {
-            std::fs::File::create(&path)
-                .with_context(|| format!("creating {}", path.display()))
-                .map_err(Error::Other)?;
-        }
-        Ok(())
     }
 
     /// Index operator for the request dictionary.
@@ -471,7 +464,10 @@ impl Request {
                 .with_context(|| format!("creating dirs for {}", path.display()))
                 .map_err(crate::error::Error::Other)?;
         }
-        let tmp_path = path.with_extension("tmp");
+        // The temp file is a name derived from the resolved path, and a link
+        // planted at that name is the same escape with one more step: resolve
+        // it before creating anything.
+        let tmp_path = self.temp_path(&path)?;
         {
             use std::io::Write;
             let mut f = std::fs::File::create(&tmp_path)
@@ -736,9 +732,9 @@ pub fn validate_path_param(name: &str, value: &str) -> Result<()> {
 /// answering 400 confirms that the attempt was recognised as traversal, which
 /// tells the sender their payload reached the router and is worth varying. A
 /// 404 tells them nothing they did not already know, and is the behaviour
-/// m6-file's own spec documented (§l2, "../ traversal in URL → 404") before it
-/// became an `App` service. A value that is merely malformed -- a space, a
-/// control byte -- discloses nothing by being named as malformed.
+/// m6-file's own spec documented (§l2, "../ traversal in URL → 404") before the
+/// route matcher moved into core. A value that is merely malformed -- a space,
+/// a control byte -- discloses nothing by being named as malformed.
 ///
 /// m6-file used to answer both, inconsistently: 404 for traversal in a
 /// catch-all and 400 for the same `..` in an ordinary parameter, because the
@@ -1023,45 +1019,6 @@ mod tests {
         }
     }
 
-    /// A site.toml named outside `site_dir` by `site_toml` is the file an app's
-    /// edge invalidation must touch, and no file may appear in `site_dir`.
-    #[test]
-    fn touch_site_toml_touches_the_file_the_app_reads() {
-        let root = tempfile::tempdir().unwrap();
-        let site_dir = root.path().join("apps").join("app");
-        std::fs::create_dir_all(&site_dir).unwrap();
-        let real = root.path().join("site.toml");
-        std::fs::write(&real, "[server]\n").unwrap();
-        let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
-        filetime::set_file_times(&real, old, old).unwrap();
-        let cfg_path = site_dir.join("app.toml");
-        std::fs::write(&cfg_path, "site_toml = \"../../site.toml\"\n").unwrap();
-        let config = crate::config::load(&cfg_path, &site_dir).unwrap();
-        let req = Request::new(
-            RawRequest {
-                version: "HTTP/1.1".to_string(),
-                method: "GET".to_string(),
-                path: "/".to_string(),
-                query: None,
-                headers: vec![],
-                body: vec![],
-            },
-            Map::new(),
-            site_dir.clone(),
-        )
-        .with_config(std::sync::Arc::new(config));
-        req.touch("site.toml").unwrap();
-        let after =
-            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&real).unwrap());
-        assert!(after > old, "the named site.toml was not touched");
-        assert!(
-            !site_dir.join("site.toml").exists(),
-            "an empty site.toml was created in site_dir"
-        );
-        // Other paths are still refused when they climb out of site_dir.
-        assert!(req.touch("../site.toml").is_err());
-    }
-
     #[test]
     fn test_write_json_atomic() {
         let dir = tempfile::tempdir().unwrap();
@@ -1081,6 +1038,147 @@ mod tests {
             .unwrap();
         let v = req.read_json("test.json").unwrap();
         assert_eq!(v["key"], "value");
+    }
+
+    /// A request whose site directory is `site_dir`.
+    fn request_at(site_dir: &Path) -> Request {
+        Request::new(
+            RawRequest {
+                version: "HTTP/1.1".to_string(),
+                method: "GET".to_string(),
+                path: "/".to_string(),
+                query: None,
+                headers: vec![],
+                body: vec![],
+            },
+            Map::new(),
+            site_dir.to_path_buf(),
+        )
+    }
+
+    /// The break: `validated_path` checked only the string for `..`, so a
+    /// symlinked directory in the middle of the path was followed and
+    /// `read_json` returned the file outside the site. Restore the lexical
+    /// check and this test reads `{"secret":true}`.
+    #[test]
+    fn read_json_refuses_a_symlinked_directory_that_leaves_the_site() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.json"), br#"{"secret":true}"#).unwrap();
+        let site = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(site.path().join("data")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), site.path().join("data/linked")).unwrap();
+
+        let req = request_at(site.path());
+        let err = req.read_json("data/linked/secret.json").unwrap_err();
+        assert!(
+            matches!(&err, Error::BadRequest(m) if m.contains("escapes")),
+            "expected the escape to be refused by name, got {err:?}"
+        );
+        // The file is there, so the refusal is the check and not a 404.
+        assert!(outside.path().join("secret.json").exists());
+    }
+
+    /// The break: `write_json` called `create_dir_all` on the joined path
+    /// before opening it, so a directory symlink pointing outside let a write
+    /// create `new/dir` and `file.json` outside the site. Restore the lexical
+    /// check and this test finds the file on the outside.
+    #[test]
+    fn write_json_refuses_a_symlinked_directory_before_creating_anything() {
+        let outside = tempfile::tempdir().unwrap();
+        let site = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(site.path().join("data")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), site.path().join("data/linked")).unwrap();
+
+        let req = request_at(site.path());
+        let err = req
+            .write_json("data/linked/new/dir/file.json", &json!({"secret": true}))
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::BadRequest(m) if m.contains("escapes")),
+            "expected the escape to be refused by name, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(outside.path()).unwrap().count(),
+            0,
+            "the refused write created something outside the site"
+        );
+    }
+
+    /// A symlink that stays inside the site is a normal deployment, for reads
+    /// and for writes into a directory that does not exist yet.
+    /// The same escape one level down: the directory resolves inside, and an
+    /// entry in it is a link out.
+    #[test]
+    fn list_json_ignores_an_entry_that_links_outside_the_site() {
+        let site = tempfile::tempdir().expect("site");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("secret.json"), r#"{"secret":true}"#).unwrap();
+        let dir = site.path().join("d");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("mine.json"), r#"{"mine":true}"#).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.json"), dir.join("link.json"))
+            .unwrap();
+
+        let request = request_at(site.path());
+        let listed = request.list_json("d").expect("the directory lists");
+        assert_eq!(listed.len(), 1, "only the entry that stays inside is read");
+        assert_eq!(listed[0]["mine"], serde_json::json!(true));
+    }
+
+    /// A link planted where the atomic write puts its temp file: the temp name
+    /// is derived, and it has to be resolved like any other path.
+    #[test]
+    fn write_json_atomic_refuses_a_planted_temp_symlink() {
+        let site = tempfile::tempdir().expect("site");
+        let outside = tempfile::tempdir().expect("outside");
+        let victim = outside.path().join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        let dir = site.path().join("d");
+        std::fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join("x.tmp")).unwrap();
+
+        let request = request_at(site.path());
+        let err = request
+            .write_json_atomic("d/x.json", &serde_json::json!({"a": 1}))
+            .expect_err("a planted temp link must be refused");
+        assert!(
+            matches!(err, Error::BadRequest(_)),
+            "the refusal names the escape, and it is {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"untouched",
+            "nothing outside the site may be written"
+        );
+    }
+
+    #[test]
+    fn in_site_symlinked_directory_still_reads_and_writes() {
+        let site = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(site.path().join("static/data")).unwrap();
+        std::os::unix::fs::symlink(site.path().join("static/data"), site.path().join("data"))
+            .unwrap();
+
+        let req = request_at(site.path());
+        req.write_json("data/sub/app.json", &json!({"v": 1}))
+            .unwrap();
+        assert!(site.path().join("static/data/sub/app.json").exists());
+        assert_eq!(req.read_json("data/sub/app.json").unwrap()["v"], 1);
+    }
+
+    /// `..` is still refused before any filesystem work.
+    #[test]
+    fn read_json_still_refuses_dotdot() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("secret.json"), b"{}").unwrap();
+        let site = dir.path().join("site");
+        std::fs::create_dir_all(&site).unwrap();
+
+        let err = request_at(&site).read_json("../secret.json").unwrap_err();
+        assert!(
+            matches!(&err, Error::BadRequest(m) if m.contains("traversal")),
+            "expected traversal to be refused by name, got {err:?}"
+        );
     }
 
     #[cfg(feature = "multipart")]

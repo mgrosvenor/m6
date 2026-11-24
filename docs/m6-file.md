@@ -1,7 +1,7 @@
 # m6-file
 
 m6-file serves files from disk.
-It is an *App* (a service built on m6-core's application framework) with one handler, registered under the name `files`.
+It is an m6 service built on `m6-core`: one process, one event loop, and one handler registered under the name `files`.
 Every route it answers comes from its own config, not from m6-http's.
 Until now that was readable only in the source.
 This document covers its two route tables, how it resolves a path, what its handler owns, and how to configure it.
@@ -13,8 +13,9 @@ This document covers its two route tables, how it resolves a path, what its hand
 3. [How a path is resolved](#3-how-a-path-is-resolved)
 4. [What the handler owns](#4-what-the-handler-owns)
 5. [Refusing to serve outside its root](#5-refusing-to-serve-outside-its-root)
-6. [Configuration](#6-configuration)
-7. [Summary](#7-summary)
+6. [What a served root may carry](#6-what-a-served-root-may-carry)
+7. [Configuration](#7-configuration)
+8. [Summary](#8-summary)
 
 ## 1. The shape of a request
 
@@ -49,7 +50,8 @@ Table 1 names the two configs and what each decides. Take from it that omitting 
 | `site.toml` | m6-http | which backend receives the request |
 | `m6-file.conf` | m6-file | which file is returned |
 
-**Table 1: the two route tables serving one static file request.** Each config answers a different question, and neither process reads the other's table.
+**Table 1: the two route tables serving one static file request.**
+Each config answers a different question, and neither process reads the other's table.
 
 A minimal pair looks like this.
 
@@ -82,7 +84,8 @@ Table 2 lists the three parts of a resolved path and where each comes from. Take
 | the route's `root` | `m6-file.conf` |
 | `relpath` or `filename` | the matched route parameter |
 
-**Table 2: the three inputs to a resolved filesystem path.** None of the three is the request URL.
+**Table 2: the three inputs to a resolved filesystem path.**
+None of the three is the request URL.
 
 The three are joined in that order.
 
@@ -130,40 +133,61 @@ Two consequences follow:
 
 m6-file sets `Cache-Control` itself, from the query string alone.
 
-Table 3 gives the header for each case. Take from it that a versioned request is pinned for a year and everything else is not.
+Table 3 gives the header for each case. Take from it that a versioned request is pinned for a year and everything else revalidates on every browser request.
 
 | request | header |
 |---|---|
 | `?v=<hash>` present | `public, max-age=31536000, immutable` |
-| anything else | `public, max-age=60, s-maxage=86400, stale-while-revalidate=60` |
+| anything else | `public, max-age=0, must-revalidate, s-maxage=86400` |
 
-**Table 3: `Cache-Control` by request, decided from the query string alone.** A versioned request is pinned for a year. Everything else is held for 60 seconds by browsers and 86400 seconds by shared caches.
+**Table 3: `Cache-Control` by request, decided from the query string alone.**
+A versioned request is pinned for a year.
+Everything else is stale in the browser at once and held for 86400 seconds by shared caches.
 
 A `?v=` URL addresses one exact version, because changed bytes mean a changed hash and so a different URL.
 That is what makes a year and `immutable` safe, and it also stops a browser revalidating on reload.
 
 For everything else the two audiences are split deliberately:
 
-- `max-age` and `stale-while-revalidate` are honoured by browsers, and no invalidation can reach a browser cache, so they stay short and a deploy is visible promptly.
-- `s-maxage` is honoured only by shared caches, per *RFC* (Request for Comments) 9110 section 5.2.2.10, so it lengthens just the edge copy, which an invalidation can evict.
+- `max-age=0` with `must-revalidate` is honoured by browsers and makes the browser validate on every use (RFC 9111 sections 5.2.2.1 and 5.2.2.2). An unchanged file costs one 304, and a deploy is visible on the next request.
+- `s-maxage=86400` is honoured only by shared caches and overrides `max-age` for them (RFC 9111 section 5.2.2.10), so it lengthens just the edge copy, which an invalidation can evict.
 
-No route can currently override this, and three things that look like they would do not work:
+The handler sends an `ETag` on every file, so that browser validation is a 304 with no body.
+The edge also answers the conditional request from its own copy (RFC 9111 section 4.3.2), without reading the file or contacting m6-file.
 
-Table 4 lists the three ways to override the header and why each fails. Take from it that no route input reaches the decision.
+A route overrides this by naming `cache`, as nginx does per location.
+The route's value replaces the header the handler set, and the reply carries one `Cache-Control`.
 
-| attempt | result |
+Table 4 lists where a route can say so and what each does.
+Take from it that `cache` is the one input, and that `headers` does not replace.
+
+| where | result |
 |---|---|
-| `cache` on the m6-file route | not read for this |
-| `cache` on a `[[route_group]]` in `site.toml` | ignored, with a warning |
-| `headers` on the route | appended, so two `Cache-Control` headers |
+| `cache` on the m6-file route in `m6-file.conf` | replaces the handler's value |
+| `cache` on a `[[route]]` or `[[route_group]]` in `site.toml` | replaces it on the edge, before the edge stores the reply |
+| `headers` on the route | appended, so two `Cache-Control` headers. Use `cache` |
 
-**Table 4: three ways to override `Cache-Control` per route, none of which work.** The handler computes the header itself, and no route input reaches that decision.
+**Table 4: where a route sets `Cache-Control`.**
+Without `cache` the handler's value stands.
 
-That gap matters for anything short-lived served from disk, such as a one-time download or an *ACME* (Automatic Certificate Management Environment) challenge token.
-It is tracked as issue #126.
+An ACME challenge path, a one-time download or a health file takes `cache = "no-store"` on its route.
+Set it in both configs when the file is served through the edge: the edge stops storing the reply, and m6-file stops advertising a day to anything else in front of it.
 
-So the handler decides the bytes, the encoding, the validator and the caching, and a route decides none of them.
+So the handler decides the bytes, the encoding and the validator, and a route can override the caching.
 What a route does bound is which files can be reached at all, which is the next section.
+
+### 4.2. Tail mode
+
+A route with `tail = true` serves a file from a byte offset, which is how a browser follows a growing log.
+`GET <path>?offset=N` returns the bytes from `N` to the end of the file, and `X-Log-End` names the byte where the reply ended, so the client asks next from there.
+`GET <path>?n=N` with no offset returns the last `N` lines, and `X-Log-End` is the end of the file.
+The reply is `Cache-Control: no-store`.
+
+One reply reads at most one page, which is `[limits.tail_read] max`, 512 KiB by default (`m6-app-anatomy.md` §4.2, Table 6).
+A client further behind than a page reads the next page from `X-Log-End`, and loses nothing.
+A last-`N`-lines request scans back from the end of the file in a window that starts at `[limits.tail_read] start`, 64 KiB, and doubles until it holds `N` lines.
+When `N` lines do not fit in one page the reply is 413, and its body and the log line name `[limits.tail_read] max` and the file to raise it in.
+The limit is a top-level `[limits.tail_read]` table in `m6-file.conf`.
 
 ## 5. Refusing to serve outside its root
 
@@ -175,13 +199,58 @@ This is a backstop, not the boundary.
 The boundary is the root the process was started with, so that directory should hold only what this service serves.
 [`m6-site-layout.md`](m6-site-layout.md) covers how to arrange that.
 
-## 6. Configuration
+## 6. What a served root may carry
 
-m6-file accepts two arguments, a root and a config path, and reads its thread pool size and routes from the config.
+m6-file walks every route's `root` once at start and reports what is there.
+The walk happens before the socket is bound, so a refused start leaves no listener behind, and a request pays nothing for it.
+It follows the routes, so a renderer's `target/` beside the app root is not examined when no route reaches it.
+
+Table 5 gives the names and the answer.
+
+| entry | answer | why |
+|---|---|---|
+| `.git` (file or directory) | exit 2 | History, hooks and config are never a served asset |
+| `target/`, `node_modules/` | exit 2 | A build tree or a dependency tree is never a served asset |
+| `logs/` | warning, then serve | A log viewer roots a route there on purpose, and a wildcard route over a wider root would publish it by accident |
+| `*~`, `*.swp`, `*.swo`, `*.rs.bk`, `.#*`, `.DS_Store` | warning, then serve | An editor backup or OS metadata leaks source and is never a served asset |
+
+**Table 5: what a served root may carry.**
+A version-control directory and a build tree stop the start, while a log directory and an editor backup are named and served.
+
+A root that names one file, such as `root = "static/robots.txt"`, makes that file served on purpose, so its name is never a finding.
+A root holding a `{param}` is cut at the first placeholder, because the tree up to that point is the most the route can reach without a request.
+An absolute root and a root that climbs out with `..` are skipped here, and the handler's `resolve_within` refuses them per request.
+
+### 6.1. The size budget
+
+`site_size_budget_mb` is a top-level key in m6-file's config.
+The walk compares the budget with the regular-file bytes every route's root can reach.
+Overlapping roots are counted once, symlinks are not followed, and a file a route names outright counts as one file.
+
+The budget counts bytes, not files.
+Bytes are what fills the disk and what a deploy transfers, and a file count would refuse a legitimate tree of many small thumbnails while one huge video passed.
+The warning also prints the file count so an operator can see a tree that is large in inodes as well as bytes.
+
+The default is 128 MiB.
+The largest tree in m6's own examples is 5.1 MB, so the default leaves two orders of magnitude of room for a legitimate asset tree while still catching a `target/` or a log file that has grown for a year.
+A deployment that serves more raises the key.
+
+The over-budget line names the total, the file count and the setting:
+
+```text
+m6-file: the document root /srv/site holds 131.0 MiB in 1204 files, over site_size_budget_mb = 128: raise site_size_budget_mb in the config, or remove files that should not be deployed
+```
+
+The budget is a warning.
+Content changes without a config edit, and a legitimate large asset must not stop a serving node at 02:00.
+A mistake at start is an error when the mistake is a name that can never be intentional, which is why Table 5 splits the two answers.
+
+## 7. Configuration
+
+m6-file accepts two arguments, a root and a config path, serves from one event loop, and reads its routes from the config.
 
 ```toml
-[thread_pool]
-size = 32
+site_size_budget_mb = 128
 
 [[route]]
 path    = "/assets/{*relpath}"
@@ -191,28 +260,32 @@ root    = "assets/"
 
 Three facts about that config:
 
-- the pool defaults to the *CPU* (Central Processing Unit) count. A page requesting more assets at once than the pool has threads queues the surplus, which surfaces as "pool empty" backend errors.
-- a route naming a handler the binary does not have is fatal, so the service exits 2 at startup and a reload is refused with the previous routes left serving.
-- routes are rebuilt on every config reload, so an asset tree can be added without a restart.
+- a route naming a handler the binary does not have is fatal, so the service exits 2 at startup.
+- routes come from config, read once at start, so an asset tree is added by editing the config and restarting.
+- `site_size_budget_mb` is a top-level key, so it goes before the first `[[route]]` table. TOML puts a key written after that header inside the route.
+
+The process serves every connection from one loop, so more load is more instances, each with its own socket in `site.toml`'s `[[backend]]` glob.
+A `[thread_pool]` table is refused at start for the same reason.
 
 m6-file answers `GET` and `HEAD`, and returns 405 for anything else.
 
 Those two arguments and this one config are the whole interface.
 The summary below collects what they imply.
 
-## 7. Summary
+## 8. Summary
 
 m6-file is a small service with one handler and its own route table.
 The table is the part to remember, because a static file needs a route in `site.toml` to reach m6-file and a route in `m6-file.conf` to reach the disk.
-Its handler owns the whole response, including the ETag and `Cache-Control`, which no route can currently override.
-Its root bounds what it can serve, which is why the layout document treats that root as a security boundary rather than a convenience.
+Its handler owns the whole response, including the ETag and `Cache-Control`, and a route's `cache` replaces that `Cache-Control`.
+Its root bounds what it can serve, which is why the layout document treats that root as a security boundary.
+Every route's root is walked once at start, and section 6 gives the entries that stop the start and the size budget that warns about a tree grown too large.
 
-Related reading:
+Table 6 gives the related reading.
 
 | document | covers |
 |---|---|
 | [`m6-site-layout.md`](m6-site-layout.md) | where m6-file's root belongs relative to other apps |
 | [`m6-site-toml.md`](m6-site-toml.md) | m6-http's route table, including `[[route_group]]` |
-| [`m6-app-anatomy.md`](m6-app-anatomy.md) | writing an App of your own |
+| [`m6-app-anatomy.md`](m6-app-anatomy.md) | writing a service of your own |
 
-**Table 5: further reading, and what each document covers.**
+**Table 6: further reading, and what each document covers.**

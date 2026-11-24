@@ -1,0 +1,85 @@
+[site]
+name   = "My Site"
+domain = "localhost"
+
+[errors]
+mode             = "internal"
+verbose_fallback = true
+
+[log]
+level  = "info"
+
+[[backend]]
+name    = "m6-html"
+sockets = "/tmp/m6/m6-html*.sock"
+
+[[backend]]
+name    = "m6-file"
+sockets = "/tmp/m6/m6-file*.sock"
+
+[[backend]]
+name    = "m6-auth"
+sockets = "/tmp/m6/m6-auth*.sock"
+
+[[backend]]
+name    = "m6-auth-check"
+sockets = "/tmp/m6/check-m6-auth*.sock"
+
+[[backend]]
+name    = "render-contact"
+sockets = "/tmp/m6/render-contact-auth*.sock"
+
+[[route]]
+path    = "/"
+backend = "m6-html"
+
+[[route]]
+path    = "/about"
+backend = "m6-html"
+
+[[route]]
+path    = "/blog"
+backend = "m6-html"
+
+[[route]]
+path    = "/blog/{stem}"
+backend = "m6-html"
+
+[[route]]
+path    = "/contact"
+backend = "render-contact"
+
+[[route]]
+path    = "/login"
+backend = "m6-html"
+
+[[route]]
+path    = "/auth/login"
+backend = "m6-auth"
+
+[[route]]
+path    = "/auth/logout"
+backend = "m6-auth"
+
+[[route]]
+path    = "/auth/refresh"
+backend = "m6-auth"
+
+[[route]]
+path    = "/members"
+backend = "m6-html"
+require = "group:members"
+
+[[route]]
+path    = "/members/{page}"
+backend = "m6-html"
+require = "group:members"
+
+[[route]]
+path    = "/_errors"
+backend = "m6-html"
+
+[[route_group]]
+glob    = "assets/**/*"
+path    = "/assets/{relpath}"
+backend = "m6-file"

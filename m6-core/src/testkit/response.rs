@@ -10,7 +10,29 @@
 //! A test that means "one response" should say so, rather than inferring it
 //! from the server hanging up.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "testkit: the waiter runs beside the service, and a bounded wait blocks the test's own thread"
+)]
+
 use std::io::{self, Read};
+use std::os::unix::net::UnixStream;
+use std::sync::mpsc;
+use std::time::Duration;
+
+use super::Service;
+
+/// The safety bound for one response from a service.
+///
+/// Above the slowest work a login does, two cost-12 bcrypt verifies, which cost
+/// about 1.5 to 2 seconds each on an unoptimised build and more on a loaded
+/// host. The wait is on the response event or the service's exit; this bound
+/// exists so a service that stays alive and silent fails instead of hanging the
+/// suite. A test that asserts a shorter prompt answer passes its own bound.
+pub const RESPONSE_BOUND: Duration = Duration::from_secs(60);
+
+/// How often the waiter checks whether the service has exited.
+const RESPONSE_POLL: Duration = Duration::from_millis(25);
 
 /// Read exactly one HTTP/1.1 response: the head, then the body its
 /// `Content-Length` declares.
@@ -64,4 +86,128 @@ pub fn read_one<R: Read>(r: &mut R, method: &str) -> io::Result<Vec<u8>> {
     r.read_exact(&mut body)?;
     buf.extend_from_slice(&body);
     Ok(buf)
+}
+
+/// Wait for one response on `stream`, without a service to watch.
+///
+/// The wait is on the response event: a reader thread blocks on the socket and
+/// sends the bytes back, while this thread waits on the channel. `within` is a
+/// safety ceiling for a peer that stays silent, not a read deadline. A caller
+/// that has the [`Service`] should prefer [`read_response`], which also fails
+/// at once when the child exits, and names that exit.
+pub fn read_response_event<R: Read + Send + 'static>(
+    mut stream: R,
+    method: &str,
+    within: Duration,
+) -> Result<Vec<u8>, String> {
+    let method = method.to_string();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(read_one(&mut stream, &method));
+    });
+    match rx.recv_timeout(within) {
+        Ok(Ok(resp)) => Ok(resp),
+        Ok(Err(e)) => Err(format!("reading the response: {e}")),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!("no response within {within:?}")),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("the response reader ended without a result".to_string())
+        }
+    }
+}
+
+/// Run a blocking exchange on its own thread and wait for it to finish.
+///
+/// The event is the exchange returning, so this returns the moment the answer
+/// arrives. `within` is a safety net for a peer that stays silent, not a read
+/// deadline: a socket read timeout is the wrong tool for that, because on a
+/// loaded host it fires while the service is healthy and the test reports a
+/// response that never came when it was only slow.
+///
+/// A stream that has to be kept can be moved into `exchange` and moved back out
+/// with the result, which is how a keep-alive client waits on one response
+/// without surrendering its connection.
+pub fn wait_for_event<T: Send + 'static>(
+    within: Duration,
+    exchange: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(exchange());
+    });
+    match rx.recv_timeout(within) {
+        Ok(value) => Ok(value),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(format!("the exchange did not finish within {within:?}"))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("the exchange ended without a result".to_string())
+        }
+    }
+}
+
+/// Wait for one response, or for `svc` to exit, under `within`.
+///
+/// A reader thread blocks on `stream` and sends the response back, while the
+/// test thread checks the child every `RESPONSE_POLL` (private, so named here
+/// in backticks). A complete response
+/// wins as soon as it arrives; a child that exits wins when it happens first
+/// and fails with its output. A partial response, including the empty read at
+/// end of file, is reported as the child's death when the child has exited;
+/// otherwise it is returned for the caller's assertion to name.
+///
+/// The bound is a safety net, not the expected wait: a silent child that stays
+/// alive fails at `within` instead of hanging the suite.
+pub fn read_response(
+    svc: &mut Service,
+    mut stream: UnixStream,
+    method: &str,
+    within: Duration,
+) -> Result<Vec<u8>, String> {
+    let method = method.to_string();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(read_one(&mut stream, &method));
+    });
+
+    let started = crate::platform::now();
+    loop {
+        match rx.recv_timeout(RESPONSE_POLL) {
+            Ok(Ok(resp)) if resp.starts_with(b"HTTP/") => return Ok(resp),
+            Ok(Ok(resp)) => {
+                return Err(match svc.wait_for_exit(crate::platform::now()) {
+                    Some(status) => format!(
+                        "the service exited before answering: {status}\n--- output ---\n{}",
+                        svc.output()
+                    ),
+                    None => return Ok(resp),
+                });
+            }
+            Ok(Err(e)) => {
+                return Err(match svc.wait_for_exit(crate::platform::now()) {
+                    Some(status) => format!(
+                        "the service exited while reading the response: {status}\n--- output ---\n{}",
+                        svc.output()
+                    ),
+                    None => format!("reading the response: {e}"),
+                });
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(status) = svc.wait_for_exit(crate::platform::now()) {
+                    return Err(format!(
+                        "the service exited while waiting for the response: {status}\n--- output ---\n{}",
+                        svc.output()
+                    ));
+                }
+                if started.elapsed() >= within {
+                    return Err(format!(
+                        "no response within {within:?} and the service was still running\n--- output ---\n{}",
+                        svc.output()
+                    ));
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("the response reader ended without a result".to_string());
+            }
+        }
+    }
 }

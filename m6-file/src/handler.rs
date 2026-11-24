@@ -1,10 +1,26 @@
+use std::cell::RefCell;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
+use m6_core::log::{debug, warn};
 use m6_core::{Request, Response, Result};
-use tracing::{debug, warn};
 
 use crate::compress::{choose_encoding, compress_brotli, compress_gzip, Encoding};
+
+/// The entity tag for one file representation.
+///
+/// **Weak on purpose.** The tag is the file's mtime (whole seconds) and size,
+/// two cheap `stat` fields that, unlike a content hash, do not read the body on
+/// every request. It cannot be strong: a same-size edit inside one mtime second,
+/// or an edit that preserves the mtime, leaves both inputs unchanged while the
+/// bytes differ. RFC 9110 8.8.1 requires a strong validator to change whenever
+/// the representation data changes and names clock resolution as a cause of
+/// weakness, so the tag carries `W/`. `Last-Modified` remains, which is what
+/// the date comparison uses.
+fn file_etag(mtime_secs: u64, len: u64, suffix: &str) -> String {
+    format!("W/\"{mtime_secs:x}-{len:x}{suffix}\"")
+}
 
 /// Resolve the file this request addresses, from the route's `root` setting
 /// and the path parameters core captured.
@@ -14,46 +30,60 @@ use crate::compress::{choose_encoding, compress_brotli, compress_gzip, Encoding}
 /// `{*relpath}` wildcard route or `filename` for a two-parameter one; a route
 /// with neither addresses the file `root` names outright, which is how
 /// `/favicon.ico` works.
-fn resolve_fs_path(req: &Request, site_dir: &Path) -> PathBuf {
-    let mut root = req.route_str("root").unwrap_or("").to_string();
-    if root.contains('{') {
-        for (k, v) in req.dict().iter() {
-            if let Some(s) = v.as_str() {
-                root = root.replace(&format!("{{{}}}", k), s);
-            }
-        }
-    }
-    let rel = req
-        .dict()
-        .get("relpath")
-        .or_else(|| req.dict().get("filename"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if rel.is_empty() {
-        site_dir.join(&root)
-    } else {
-        site_dir.join(&root).join(rel)
-    }
-}
-
-/// True if `fs_path` is a symlink resolving outside `site_dir`.
 ///
-/// Only pays the `canonicalize` cost when a symlink is actually present;
-/// regular files return immediately. A path that cannot be resolved at all is
-/// treated as escaping — it will 404 either way.
-fn escapes_site_dir(fs_path: &Path, site_dir: &Path) -> bool {
-    let Ok(meta) = std::fs::symlink_metadata(fs_path) else {
-        return false; // missing file — the normal 404 path handles it
+/// Only names the route's own pattern declares are read: `relpath` from a
+/// `{*relpath}` route, `filename` from a `{filename}` route, and a `root`
+/// placeholder only when the pattern captures it. A query key or form field
+/// with one of those names, on a route that does not declare it, is never
+/// used, so a request cannot choose a file the route's shape does not
+/// address. Each value is then checked with core's path-parameter rule (a
+/// slash only in a `{*name}` capture), and a failure gives `None`, a 404.
+///
+/// A request built without a route (a test, or a caller that never routes)
+/// has no pattern to consult, and reads the dictionary as given.
+///
+/// Returns the path relative to `site_dir`. The caller resolves it with
+/// core's `resolve_within`, which follows every symlink and applies the same
+/// check `Request`'s file helpers use.
+fn resolve_fs_relpath(req: &Request) -> Option<PathBuf> {
+    let pattern = req.route_pattern();
+    // `Some(wildcard)` when the route captures `name`, `None` when it does not.
+    let capture = |name: &str| -> Option<bool> {
+        match pattern {
+            None => Some(true),
+            Some(p) if p.contains(&format!("{{*{name}}}")) => Some(true),
+            Some(p) if p.contains(&format!("{{{name}}}")) => Some(false),
+            Some(_) => None,
+        }
     };
-    if !meta.file_type().is_symlink() {
-        return false;
+    let param = |name: &str| -> Option<Option<&str>> {
+        let Some(wildcard) = capture(name) else {
+            return Some(None);
+        };
+        match req.dict().get(name).and_then(|v| v.as_str()) {
+            Some(v) => {
+                m6_core::validate_path_param(v, wildcard).ok()?;
+                Some(Some(v))
+            }
+            None => Some(None),
+        }
+    };
+
+    let mut root = req.route_str("root").unwrap_or("").to_string();
+    while let Some(open) = root.find('{') {
+        let close = open + root[open..].find('}')?;
+        let name = root[open + 1..close].trim_start_matches('*').to_string();
+        let value = param(&name)??;
+        root.replace_range(open..=close, value);
     }
-    match (
-        std::fs::canonicalize(fs_path),
-        std::fs::canonicalize(site_dir),
-    ) {
-        (Ok(real), Ok(root)) => !real.starts_with(root),
-        _ => true,
+    let rel = match param("relpath")? {
+        Some(v) => v,
+        None => param("filename")?.unwrap_or(""),
+    };
+    if rel.is_empty() {
+        Some(PathBuf::from(&root))
+    } else {
+        Some(PathBuf::from(&root).join(rel))
     }
 }
 
@@ -70,27 +100,38 @@ fn escapes_site_dir(fs_path: &Path, site_dir: &Path) -> bool {
 /// hash and therefore a different URL — so it can be pinned for a year and
 /// marked `immutable`, which also stops a browser revalidating it on reload.
 ///
-/// Everything else splits the two audiences deliberately:
-/// - `max-age=60` / `stale-while-revalidate=60` are honoured by BROWSERS, and
-///   no invalidation can reach a browser cache. They stay short so a deploy is
-///   visible promptly. Raising either one strands visitors on the old file.
-/// - `s-maxage=86400` is honoured ONLY by shared caches (RFC 9111 5.2.2.10).
-///   A browser ignores it. It lengthens just the edge's copy, which
-///   `invalidate-cache.sh` evicts on every deploy.
+/// Everything else uses the browser-caching pattern: the browser revalidates
+/// on every request, the shared cache keeps the response for a day.
+///
+/// - `max-age=0` makes the browser's copy stale immediately, and
+///   `must-revalidate` forbids serving it once stale (RFC 9111 5.2.2.1 and
+///   5.2.2.2). A deploy is therefore visible on the next request, and an
+///   unchanged file costs one conditional request and a 304.
+/// - `s-maxage=86400` is honoured ONLY by shared caches, and it overrides
+///   `max-age` for them (RFC 9111 5.2.2.10). The edge keeps its copy for a day
+///   and answers the browser's `If-None-Match` itself, without the backend.
+/// - `public` is what makes the response storable by a shared cache.
+///
+/// `no-cache` is deliberately absent. It has the same browser behaviour as
+/// `max-age=0, must-revalidate`, but it also forces the shared cache to
+/// revalidate, which is the latency `s-maxage` exists to remove (RFC 9111
+/// 5.2.2.4). `stale-while-revalidate` is deliberately absent too: it would let
+/// the browser serve the stale copy while revalidating, which is what the
+/// pattern forbids.
 fn cache_control_for(query: &str) -> &'static str {
     let versioned = query.split('&').any(|p| p.starts_with("v=") && p.len() > 2);
     if versioned {
         "public, max-age=31536000, immutable"
     } else {
-        "public, max-age=60, s-maxage=86400, stale-while-revalidate=60"
+        "public, max-age=0, must-revalidate, s-maxage=86400"
     }
 }
 
 /// Serve one static file.
 ///
-/// Registered with `App::handler("files", serve)`; the route that reaches it,
-/// and the directory it serves from, are config. Core routes, validates the
-/// path parameters and applies the route's extra headers; everything from the
+/// Registered in code under the name `files`; the route that reaches it, and
+/// the directory it serves from, are config. Core routes, validates the path
+/// parameters and applies the route's extra headers; everything from the
 /// filesystem down is here.
 ///
 /// **This handler owns its own representation.** It negotiates the content
@@ -104,17 +145,18 @@ pub fn serve(req: &Request) -> Result<Response> {
     }
 
     let site_dir = req.site_path("");
-    let fs_path = resolve_fs_path(req, &site_dir);
-
-    // Fast symlink check: if the path is (or contains) a symlink that escapes
-    // site_dir, return 404.  Regular files skip canonicalize entirely.
-    //
-    // Runs before the `tail` dispatch below — tail routes read the same
-    // filesystem through the same resolver, so exempting them just moved the
-    // escape one route type over.
-    if escapes_site_dir(&fs_path, &site_dir) {
+    let Some(rel) = resolve_fs_relpath(req) else {
         return Ok(Response::not_found());
-    }
+    };
+
+    // Resolve the path with every symlink followed, then check the result
+    // against the resolved site root and use that same resolved path below.
+    // The old check ran only on the name the request supplied, so a symlinked
+    // directory in the middle passed it. Runs before the `tail` dispatch: tail
+    // routes read the same filesystem through the same resolver.
+    let Ok(fs_path) = m6_core::path::resolve_within(&site_dir, &rel) else {
+        return Ok(Response::not_found());
+    };
 
     if req.route_bool("tail", false) {
         return serve_tail(req, &fs_path);
@@ -169,7 +211,7 @@ pub fn serve(req: &Request) -> Result<Response> {
         Encoding::Brotli => "-br",
         Encoding::Gzip => "-gz",
     };
-    let mut etag = format!("\"{:x}-{:x}{}\"", mtime_secs, metadata.len(), etag_suffix);
+    let mut etag = file_etag(mtime_secs, metadata.len(), etag_suffix);
 
     // Preconditions come from m6-core, which implements all four steps of
     // RFC 9110 13.2.2 in the required order. What was here did steps 3 and 4
@@ -179,7 +221,8 @@ pub fn serve(req: &Request) -> Result<Response> {
         ("ETag".to_string(), etag.clone()),
         ("Last-Modified".to_string(), last_modified.clone()),
     ];
-    let precondition = m6_core::evaluate_preconditions(&validators, req.headers(), req.method());
+    let precondition =
+        m6_core::evaluate_preconditions(200, &validators[..], req.headers(), req.method());
 
     let cache_control = cache_control_for(req.query());
 
@@ -210,11 +253,10 @@ pub fn serve(req: &Request) -> Result<Response> {
     // already its length. That is also the common case for the assets worth
     // caring about, since images are neither compressed nor minified here.
     //
-    // `is_file` is load-bearing and was missing in the first version of this.
     // `std::fs::metadata` succeeds on a directory and reports its size, so
-    // `HEAD /assets/css` answered `200` with `Content-Length: 128` while the
-    // GET beside it answered 404. The read this block skips is also what used
-    // to reject a non-file, by failing.
+    // without `is_file` a directory takes this branch. A `HEAD` then reports a
+    // 200 with that size as `Content-Length`, and a `GET` sends the same head
+    // before the read fails on the directory.
     let minify_this = minification
         .map(|m| m.is_enabled(&mime_base))
         .unwrap_or(false);
@@ -237,37 +279,76 @@ pub fn serve(req: &Request) -> Result<Response> {
             debug!(path = %fs_path.display(), "file not found");
             return Ok(Response::not_found());
         };
-        // `lute.min.js` is 3.6MB that used to be read into a `Vec` on every
-        // cache miss to be copied straight out again. A file that changed
-        // between the `stat` and the `open` is handled by the responder rather
-        // than here: short reads fail and overruns are capped, because
-        // `Content-Length` is already on the wire by then.
+        // A file that changed between the `stat` and the `open` is handled by
+        // the responder rather than here: short reads fail and overruns are
+        // capped, because `Content-Length` is already on the wire by then.
         let mut streamed = Response::stream(200, metadata.len(), file);
         streamed.headers = base.headers;
         return Ok(streamed);
     }
 
-    let Ok(data) = std::fs::read(&fs_path) else {
-        debug!(path = %fs_path.display(), "file not found");
-        return Ok(Response::not_found());
-    };
-
     // Minification is applied BEFORE compression, gated by content-type and
     // config, mirroring core's pipeline so a static asset gets the same
     // treatment here as it would through the render path.
+    //
+    // It is done once per file version, not once per request. A cached entry
+    // is keyed by path, size and mtime, so a GET after the first, and every
+    // HEAD, costs a lookup; a changed file has a new key and is parsed again.
+    // A body that cannot be minified is stored as "serve the file as written"
+    // (the outer `None`), so the fallback is attempted and logged once for
+    // that version too.
+    let budget = match req.config() {
+        Some(c) => m6_core::minify::ParseBudget::from_limits(&c.limits),
+        None => m6_core::minify::ParseBudget::builtin(),
+    };
+    // The minified body has to fit the response buffer the render path uses
+    // the same limit for. A file over it is served as written; the site path
+    // has to refuse instead, because it has no file to fall back to.
+    let output_limit = match req.config() {
+        Some(c) => c.limits.get(&m6_core::limits::MINIFY_OUTPUT).clone(),
+        None => m6_core::limits::Limit::builtin(&m6_core::limits::MINIFY_OUTPUT),
+    };
+    let version = VersionKey::new(&fs_path, metadata.len(), mtime);
     let data = if minify_this {
-        match mime_base.as_str() {
-            "text/html" => m6_core::minify::minify_html(
-                &data,
-                minification.map(|m| m.inline_js).unwrap_or(false),
-            ),
-            "text/css" => m6_core::minify::minify_css(&data),
-            "application/json" => m6_core::minify::minify_json(&data),
-            "application/javascript" | "text/javascript" => m6_core::minify::minify_js(&data),
-            _ => data,
+        match cached_body(&version) {
+            Some(Some(body)) => body,
+            Some(None) => match read_asset(&fs_path) {
+                Some(data) => data,
+                None => return Ok(Response::not_found()),
+            },
+            None => {
+                let Some(data) = read_asset(&fs_path) else {
+                    return Ok(Response::not_found());
+                };
+                let kind = m6_core::minify::JsKind::for_path(&fs_path);
+                let inline_js = minification.is_some_and(|m| m.inline_js);
+                if data.len() > output_limit.max() {
+                    warn!(
+                        "m6-file: {}",
+                        output_limit.exceeded(data.len(), &format!("asset {}", fs_path.display()))
+                    );
+                    store_body(version, None);
+                    data
+                } else {
+                    match minify_representation(&mime_base, kind, &data, inline_js, budget) {
+                        Ok(body) => {
+                            store_body(version.clone(), Some(body.clone()));
+                            body
+                        }
+                        Err(fallback) => {
+                            m6_core::minify::warn_unminified(&version_subject(&version), &fallback);
+                            store_body(version, None);
+                            data
+                        }
+                    }
+                }
+            }
         }
     } else {
-        data
+        match read_asset(&fs_path) {
+            Some(data) => data,
+            None => return Ok(Response::not_found()),
+        }
     };
 
     // On a compression failure this used to keep the `Content-Encoding: br`
@@ -281,7 +362,7 @@ pub fn serve(req: &Request) -> Result<Response> {
             Ok(compressed) => (compressed, Some("br")),
             Err(e) => {
                 warn!(path = %fs_path.display(), error = %e, "brotli compression failed, serving identity");
-                etag = format!("\"{:x}-{:x}\"", mtime_secs, metadata.len());
+                etag = file_etag(mtime_secs, metadata.len(), "");
                 (data, None)
             }
         },
@@ -289,7 +370,7 @@ pub fn serve(req: &Request) -> Result<Response> {
             Ok(compressed) => (compressed, Some("gzip")),
             Err(e) => {
                 warn!(path = %fs_path.display(), error = %e, "gzip compression failed, serving identity");
-                etag = format!("\"{:x}-{:x}\"", mtime_secs, metadata.len());
+                etag = file_etag(mtime_secs, metadata.len(), "");
                 (data, None)
             }
         },
@@ -308,14 +389,215 @@ pub fn serve(req: &Request) -> Result<Response> {
     Ok(resp)
 }
 
-/// Lookback window used to locate the last N lines when `?n=N&offset=0`.
-/// 64 KiB covers several hundred typical JSON log lines; enlarge if very
-/// long lines are common.
-const TAIL_LOOKBACK: u64 = 64 * 1024;
+/// Read one asset, or `None` when it vanished between the `stat` and the read.
+fn read_asset(path: &Path) -> Option<Vec<u8>> {
+    match std::fs::read(path) {
+        Ok(data) => Some(data),
+        Err(_) => {
+            debug!(path = %path.display(), "file not found");
+            None
+        }
+    }
+}
 
-/// Hard cap on bytes returned per incremental chunk (`offset > 0` path).
-/// Prevents blocking the event loop for more than a few milliseconds.
-const MAX_TAIL_BYTES: u64 = 512 * 1024;
+/// One file version a minified body belongs to.
+///
+/// The path is part of the key because two routes can serve the same bytes;
+/// the size and mtime are what make a changed file a new version. A same-size
+/// edit inside one filesystem timestamp tick is the one case this cannot see,
+/// which is the same weakness the weak ETag documents.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VersionKey {
+    path: PathBuf,
+    len: u64,
+    mtime: SystemTime,
+}
+
+impl VersionKey {
+    fn new(path: &Path, len: u64, mtime: SystemTime) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            len,
+            mtime,
+        }
+    }
+}
+
+/// The identifier the fallback line names, so a changed file logs again and an
+/// unchanged one does not.
+fn version_subject(key: &VersionKey) -> String {
+    let nanos = key
+        .mtime
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!("{}:{}:{}", key.path.display(), key.len, nanos)
+}
+
+/// One cached file version. `None` means the file is served as written.
+struct CachedBody {
+    key: VersionKey,
+    body: Option<Vec<u8>>,
+    used: u64,
+}
+
+/// The minified bodies one service has produced, bounded by `[limits.cache_bytes]`
+/// and by a count.
+///
+/// One loop is one thread, so this is a thread-local rather than a lock. The
+/// count is what keeps a site with thousands of small scripts from growing the
+/// table; the byte bound is what keeps a few large bundles in it.
+struct MinifyCache {
+    entries: Vec<CachedBody>,
+    bytes: usize,
+    clock: u64,
+}
+
+/// The most file versions the table holds, whatever their size.
+const MINIFIED_ENTRIES: usize = 256;
+
+static MINIFY_CACHE_LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Set the byte limit the minified-body cache follows. Start only.
+///
+/// The caller passes the smaller of `[limits.cache_bytes]` max and
+/// `[limits.heap_reserve]` start, so the cache is inside the reservation this
+/// service takes from the OS.
+pub fn set_minify_cache_limit(max_bytes: usize) {
+    let _ = MINIFY_CACHE_LIMIT.set(max_bytes);
+}
+
+fn minify_cache_limit() -> usize {
+    MINIFY_CACHE_LIMIT
+        .get()
+        .copied()
+        .unwrap_or(m6_core::limits::MINIFY_PARSE.max)
+}
+
+thread_local! {
+    static MINIFY_CACHE: RefCell<MinifyCache> = RefCell::new(MinifyCache::new());
+}
+
+impl MinifyCache {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            bytes: 0,
+            clock: 0,
+        }
+    }
+
+    /// The body for `key`, or `None` when this version has not been minified.
+    /// The outer `Option` is a hit; the inner one says whether the version is
+    /// minified (`Some`) or served as written (`None`).
+    fn get(&mut self, key: &VersionKey) -> Option<Option<Vec<u8>>> {
+        self.clock += 1;
+        let clock = self.clock;
+        let entry = self.entries.iter_mut().find(|entry| &entry.key == key)?;
+        entry.used = clock;
+        Some(entry.body.clone())
+    }
+
+    fn insert(&mut self, key: VersionKey, body: Option<Vec<u8>>) {
+        let size = body.as_ref().map_or(0, Vec::len);
+        // An entry for the same version replaces the old one rather than
+        // growing the table. This happens only if a file is rewritten with the
+        // same key, which the key exists to make impossible.
+        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
+            let old = self.entries.remove(index);
+            self.bytes = self
+                .bytes
+                .saturating_sub(old.body.as_ref().map_or(0, Vec::len));
+        }
+        if size > minify_cache_limit() {
+            return;
+        }
+        while !self.entries.is_empty()
+            && (self.entries.len() >= MINIFIED_ENTRIES || self.bytes + size > minify_cache_limit())
+        {
+            self.evict_one();
+        }
+        self.clock += 1;
+        self.bytes += size;
+        self.entries.push(CachedBody {
+            key,
+            body,
+            used: self.clock,
+        });
+    }
+
+    fn evict_one(&mut self) {
+        let Some((index, _)) = self
+            .entries
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, entry)| entry.used)
+        else {
+            return;
+        };
+        let old = self.entries.remove(index);
+        self.bytes = self
+            .bytes
+            .saturating_sub(old.body.as_ref().map_or(0, Vec::len));
+    }
+}
+
+fn cached_body(key: &VersionKey) -> Option<Option<Vec<u8>>> {
+    MINIFY_CACHE.with(|cache| cache.borrow_mut().get(key))
+}
+
+fn store_body(key: VersionKey, body: Option<Vec<u8>>) {
+    MINIFY_CACHE.with(|cache| cache.borrow_mut().insert(key, body));
+}
+
+/// Minify one representation, or say why the whole file must be served as
+/// written. Only JavaScript can fall back; the other minifiers return bytes.
+fn minify_representation(
+    mime: &str,
+    kind: m6_core::minify::JsKind,
+    data: &[u8],
+    inline_js: bool,
+    budget: m6_core::minify::ParseBudget,
+) -> std::result::Result<Vec<u8>, m6_core::minify::JsFallback> {
+    use m6_core::minify;
+    match mime {
+        "text/html" => Ok(minify::minify_html_with_budget(data, inline_js, budget)),
+        "text/css" => Ok(minify::minify_css(data)),
+        "application/json" => Ok(minify::minify_json(data)),
+        "application/javascript" | "text/javascript" => {
+            minify::try_minify_js_with(kind, data, budget)
+        }
+        _ => Ok(data.to_vec()),
+    }
+}
+
+static TAIL_LIMIT: std::sync::OnceLock<m6_core::limits::Limit> = std::sync::OnceLock::new();
+
+/// Set the `tail_read` limit tail requests follow. Start only, once.
+pub fn set_tail_limit(limit: &m6_core::limits::Limit) {
+    let _ = TAIL_LIMIT.set(limit.clone());
+}
+
+/// The limit on the bytes one tail response reads: `start` is the first window
+/// a last-N-lines request scans, `max` the most any tail response reads.
+fn tail_limit() -> &'static m6_core::limits::Limit {
+    TAIL_LIMIT.get_or_init(|| m6_core::limits::Limit::builtin(&m6_core::limits::TAIL_READ))
+}
+
+/// The answer for a last-N-lines request whose lines do not fit in one page of
+/// `tail_read` max bytes: a 413 whose body and log line name the limit, the
+/// size needed and the key to raise. Nothing is cut and no partial chunk is
+/// sent.
+fn tail_too_large(needed: u64) -> Response {
+    let needed = usize::try_from(needed).unwrap_or(usize::MAX);
+    let message = tail_limit()
+        .exceeded(needed, "this tail response")
+        .to_string();
+    m6_core::log::error!("m6-file: {message}");
+    Response::status(413)
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .header("Cache-Control", "no-store")
+        .body(format!("{message}\n").into_bytes())
+}
 
 /// Serve a file from a byte offset (tail mode), for a route with `tail = true`.
 ///
@@ -323,7 +605,11 @@ const MAX_TAIL_BYTES: u64 = 512 * 1024;
 ///   `offset=N` – start byte (default 0).
 ///   `n=N`      – when `offset=0`, return the **last N lines** of the file
 ///                (like `tail -n N`).  When `offset>0` or `n` is absent,
-///                read up to `MAX_TAIL_BYTES` bytes from `offset`.
+///                read from `offset`, at most one page of `tail_read` max bytes.
+///
+/// `X-Log-End` is where the page ended: a client behind by more than one page
+/// asks again from there. Only a last-N-lines request whose N lines do not
+/// fit in one page is refused, with a 413 that names the key.
 ///
 /// Always responds with `Cache-Control: no-store` and an `X-Log-End` header
 /// containing the end byte of the returned slice so the caller can request
@@ -353,39 +639,64 @@ fn serve_tail(req: &Request, fs_path: &Path) -> Result<Response> {
 
     let (body, end_offset) = if offset == 0 && n > 0 {
         // ── tail -n N mode ────────────────────────────────────────────────────
-        // Scan the last TAIL_LOOKBACK bytes for the start of the last N lines.
-        let lookback = TAIL_LOOKBACK.min(file_size);
-        let scan_start = file_size - lookback;
-        file.seek(SeekFrom::Start(scan_start))
-            .map_err(|e| m6_core::Error::Other(e.into()))?;
-        let mut buf = Vec::new();
-        Read::by_ref(&mut file)
-            .take(lookback)
-            .read_to_end(&mut buf)
-            .map_err(|e| m6_core::Error::Other(e.into()))?;
+        // Scan a window at the end of the file for the start of the last N
+        // lines. The window starts at the limit's `start` and doubles until
+        // it holds N lines or the whole file, and past the maximum the
+        // request is refused.
+        let limit = tail_limit();
+        let mut lookback = (limit.start() as u64).min(file_size);
+        let (buf, cut) = loop {
+            let scan_start = file_size - lookback;
+            file.seek(SeekFrom::Start(scan_start))
+                .map_err(|e| m6_core::Error::Other(e.into()))?;
+            let mut buf = Vec::new();
+            Read::by_ref(&mut file)
+                .take(lookback)
+                .read_to_end(&mut buf)
+                .map_err(|e| m6_core::Error::Other(e.into()))?;
 
-        // Walk backwards through buf counting newlines; `cut` becomes the
-        // index of the first byte of the last-N-lines slice.
-        //
-        // Most log files end with '\n'.  That final newline is the terminator
-        // of the last line — not the start of a new empty line — so we skip it
-        // before counting to get the right N-line boundary.
-        let mut found = 0u64;
-        let mut cut = 0; // default: return everything when file has fewer than N lines
-        let scan_end = if buf.last() == Some(&b'\n') {
-            buf.len() - 1
-        } else {
-            buf.len()
-        };
-        for i in (0..scan_end).rev() {
-            if buf[i] == b'\n' {
-                found += 1;
-                if found >= n {
-                    cut = i + 1;
-                    break;
+            // Walk backwards through buf counting newlines; `cut` becomes the
+            // index of the first byte of the last-N-lines slice.
+            //
+            // Most log files end with '\n'.  That final newline is the
+            // terminator of the last line, not the start of a new empty line,
+            // so it is skipped before counting to get the right N-line
+            // boundary.
+            let mut found = 0u64;
+            let mut cut = None;
+            let scan_end = if buf.last() == Some(&b'\n') {
+                buf.len() - 1
+            } else {
+                buf.len()
+            };
+            for i in (0..scan_end).rev() {
+                if buf[i] == b'\n' {
+                    found += 1;
+                    if found >= n {
+                        cut = Some(i + 1);
+                        break;
+                    }
                 }
             }
-        }
+            match cut {
+                Some(cut) => break (buf, cut),
+                // The whole file has fewer than N lines: return it all.
+                None if lookback == file_size => break (buf, 0),
+                None => {
+                    let needed = usize::try_from(lookback)
+                        .unwrap_or(usize::MAX)
+                        .saturating_add(1);
+                    match limit.grown(lookback as usize, needed) {
+                        Some(next) => {
+                            let from = lookback as usize;
+                            lookback = (next as u64).min(file_size);
+                            limit.log_growth(from, next, "a tail read");
+                        }
+                        None => return Ok(tail_too_large(lookback + 1)),
+                    }
+                }
+            }
+        };
         let body: Vec<u8> = buf[cut..].to_vec();
         // Always advance the caller to the current EOF so the next
         // incremental poll picks up only new content.
@@ -395,9 +706,24 @@ fn serve_tail(req: &Request, fs_path: &Path) -> Result<Response> {
         let read_from = offset.min(file_size);
         file.seek(SeekFrom::Start(read_from))
             .map_err(|e| m6_core::Error::Other(e.into()))?;
-        let mut body = Vec::new();
+        // One response is one page of at most `tail_read` max bytes. A client
+        // further behind than that reads the next page from `X-Log-End`, so
+        // nothing is lost: paging splits a stream the client asks for, it does
+        // not cut a buffer. The page buffer starts at the limit's `start` and
+        // grows by doubling to the page.
+        let limit = tail_limit();
+        let owed = (file_size - read_from).min(limit.max() as u64);
+        let mut body = Vec::with_capacity(limit.start().min(owed as usize));
+        if owed as usize > body.capacity() {
+            let size = limit
+                .grown(body.capacity(), owed as usize)
+                .unwrap_or(owed as usize);
+            let from = body.capacity();
+            body.reserve_exact(size);
+            limit.log_growth(from, size, "a tail read");
+        }
         Read::by_ref(&mut file)
-            .take(MAX_TAIL_BYTES)
+            .take(owed)
             .read_to_end(&mut body)
             .map_err(|e| m6_core::Error::Other(e.into()))?;
         let end_offset = read_from + body.len() as u64;
@@ -504,6 +830,59 @@ mod tests {
         )
     }
 
+    /// A client further behind than one page reads it all in pages of at most
+    /// `tail_read` max bytes, each ending at its `X-Log-End`, and nothing is
+    /// lost or repeated.
+    #[test]
+    fn a_client_two_mib_behind_reads_it_all_in_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let data: Vec<u8> = (0..2 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.path().join("big.log"), &data).unwrap();
+        let page = tail_limit().max();
+        let mut got = Vec::new();
+        let mut offset = 0usize;
+        let mut pages = 0;
+        while offset < data.len() {
+            let (status, headers, body) = wire(&tail_req(
+                dir.path(),
+                "big.log",
+                &format!("offset={offset}"),
+            ));
+            assert_eq!(status, 200);
+            assert!(body.len() <= page, "a page is at most {page} bytes");
+            let end: usize = header(&headers, "x-log-end").unwrap().parse().unwrap();
+            assert_eq!(
+                end,
+                offset + body.len(),
+                "X-Log-End is where the page ended"
+            );
+            got.extend_from_slice(&body);
+            offset = end;
+            pages += 1;
+        }
+        assert_eq!(got, data, "every byte arrived once, in order");
+        assert_eq!(pages, data.len().div_ceil(page));
+    }
+
+    /// A last-N-lines window starts at the limit's `start` and doubles until it
+    /// holds N lines, and past the maximum the request is refused.
+    #[test]
+    fn the_last_n_lines_window_grows_and_is_refused_past_the_maximum() {
+        let dir = tempfile::tempdir().unwrap();
+        // Lines of 100 KiB: three of them need more than the 64 KiB start.
+        let line = format!("{}\n", "y".repeat(100 * 1024 - 1));
+        std::fs::write(dir.path().join("long.log"), line.repeat(10)).unwrap();
+        let (status, _, body) = wire(&tail_req(dir.path(), "long.log", "offset=0&n=3"));
+        assert_eq!((status, body.len()), (200, 3 * 100 * 1024));
+
+        // Ten of them are 1000 KiB, over the 512 KiB maximum.
+        let (status, _, body) = wire(&tail_req(dir.path(), "long.log", "offset=0&n=10"));
+        assert_eq!(status, 413);
+        assert!(String::from_utf8(body)
+            .unwrap()
+            .contains("[limits.tail_read] max = 512 KiB"));
+    }
+
     #[test]
     fn tail_from_zero_returns_full_content() {
         let dir = tempfile::tempdir().unwrap();
@@ -597,6 +976,272 @@ mod tests {
         req
     }
 
+    /// A script is minified on the wire, and the string that used to be
+    /// corrupted keeps its characters. The old minifier re-emitted it as a
+    /// template literal with doubled escapes, so `"didn't \u2014 tab\there"`
+    /// was served as `` `didn't \\u2014 tab\\there` ``. The default config
+    /// is the path a site with no `[minification]` table takes.
+    #[test]
+    fn a_script_is_minified_and_the_string_keeps_its_escape() {
+        let script = "var m = \"That didn't verify \u{2014} \\u2014 tab\\there.\";\n";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("assets/app.js"), script).unwrap();
+        let mut conf = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut conf, b"").unwrap();
+        let cfg = m6_core::config::load(conf.path(), dir.path()).unwrap();
+        let req = asset_req(dir.path(), "app.js", None, &[]).with_config(std::sync::Arc::new(cfg));
+        let (status, _, body) = wire(&req);
+        assert_eq!(status, 200);
+        let served = String::from_utf8_lossy(&body);
+        assert!(
+            body.len() < script.len(),
+            "the script must shrink: {served}"
+        );
+        assert!(served.contains("didn't"), "the string changed: {served}");
+        assert!(
+            !served.contains("\\\\u2014"),
+            "the escape was doubled: {served}"
+        );
+    }
+
+    /// A JavaScript file is parsed once per file version. A second GET and a
+    /// HEAD cost a lookup, and a changed file is parsed again. The wrong
+    /// outcome is the defect: every request parses, so one client looping on a
+    /// module URL makes the loop serve nothing else.
+    #[test]
+    fn a_script_is_parsed_once_per_file_version() {
+        use m6_core::minify::parse_count;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        let path = dir.path().join("assets/app.mjs");
+        let module = "import x from \"y\";\n// a comment the minifier removes\nfunction add(a, b) {\n    return a + b;\n}\n\nexport default add(x);\n";
+        std::fs::write(&path, module).unwrap();
+        let mut conf = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut conf, b"").unwrap();
+        let cfg = std::sync::Arc::new(m6_core::config::load(conf.path(), dir.path()).unwrap());
+
+        let before = parse_count();
+        let get = asset_req(dir.path(), "app.mjs", None, &[]).with_config(cfg.clone());
+        let (status, _, first) = wire(&get);
+        assert_eq!(status, 200);
+        assert!(
+            first.len() < module.len(),
+            "a module must minify: {} against {}",
+            first.len(),
+            module.len()
+        );
+        assert_eq!(parse_count(), before + 1, "the first GET parses");
+
+        let (status, _, second) = wire(&get);
+        assert_eq!(status, 200);
+        assert_eq!(second, first, "the served bytes do not change");
+        assert_eq!(parse_count(), before + 1, "the second GET is a lookup");
+
+        let head = request(
+            "HEAD",
+            "/assets/app.mjs",
+            None,
+            &[],
+            dir.path(),
+            json!({"root": "assets/"}),
+            &[("relpath", "app.mjs")],
+        )
+        .with_config(cfg);
+        let (status, headers, body) = wire(&head);
+        assert_eq!(status, 200);
+        assert!(body.is_empty(), "a HEAD has no body");
+        assert_eq!(
+            header(&headers, "content-length").unwrap(),
+            first.len().to_string(),
+            "a HEAD reports the minified length"
+        );
+        assert_eq!(parse_count(), before + 1, "a HEAD is a lookup");
+
+        // A changed file has a new version key, so it is parsed again. The
+        // changed body is deliberately a different length, so the key moves
+        // even on a filesystem whose mtime tick is coarse.
+        let changed = "import x from \"z\";\n// another comment\nfunction twice(v) {\n    return v + v;\n}\n\nexport default twice(x);\n";
+        std::fs::write(&path, changed).unwrap();
+        let (status, _, third) = wire(&get);
+        assert_eq!(status, 200);
+        assert_ne!(
+            third, first,
+            "the changed file is served from a new version"
+        );
+        assert_eq!(parse_count(), before + 2, "a changed file is parsed again");
+    }
+
+    /// A same-length replacement with a changed mtime is a new version and is
+    /// served. The wrong outcome: the cache key ignores mtime, so a `cp -p`, a
+    /// tar extract or a reproducible build that replaces a file with one of
+    /// the same length serves the old minified bytes until the service
+    /// restarts.
+    #[test]
+    fn a_same_length_replacement_with_a_new_mtime_is_served() {
+        use m6_core::minify::parse_count;
+        use std::fs::FileTimes;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        let path = dir.path().join("assets/app.js");
+        let first_body = "var aaaa = 'one';\n";
+        let second_body = "var bbbb = 'two';\n";
+        assert_eq!(
+            first_body.len(),
+            second_body.len(),
+            "the replacement must keep the length, so only mtime can move the key"
+        );
+        std::fs::write(&path, first_body).unwrap();
+        let first_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let mut conf = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut conf, b"").unwrap();
+        let cfg = std::sync::Arc::new(m6_core::config::load(conf.path(), dir.path()).unwrap());
+
+        let before = parse_count();
+        let get = asset_req(dir.path(), "app.js", None, &[]).with_config(cfg);
+        let (status, _, first) = wire(&get);
+        assert_eq!(status, 200);
+        let first_text = String::from_utf8_lossy(&first).into_owned();
+        assert!(
+            first_text.contains("aaaa"),
+            "the first body was not minified: {first_text}"
+        );
+        assert_eq!(parse_count(), before + 1, "the first GET parses");
+
+        // Same length, different bytes, and a mtime moved forward explicitly.
+        // The length half of the key is unchanged, so only mtime can make this
+        // a new version.
+        std::fs::write(&path, second_body).unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_times(FileTimes::new().set_modified(first_mtime + Duration::from_secs(7)))
+            .unwrap();
+        drop(file);
+
+        let (status, _, second) = wire(&get);
+        assert_eq!(status, 200);
+        let second_text = String::from_utf8_lossy(&second).into_owned();
+        assert!(
+            second_text.contains("bbbb") && !second_text.contains("aaaa"),
+            "the replacement was served from the old version: {second_text}"
+        );
+        assert_eq!(
+            parse_count(),
+            before + 2,
+            "the same-length replacement is parsed again"
+        );
+    }
+
+    /// A file over `[limits.minify_output]` max is served as written, and the
+    /// parser never runs on it. The check is before the parse, so a body the
+    /// response buffer cannot hold is never handed to the parser.
+    #[test]
+    fn a_file_over_the_minify_output_limit_is_served_as_written_unparsed() {
+        use m6_core::minify::parse_count;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        let script = "var answer = 1 + 2 + 3 + 4;\n";
+        std::fs::write(dir.path().join("assets/app.js"), script).unwrap();
+        let mut conf = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(
+            &mut conf,
+            b"[limits.minify_output]\nstart = \"16B\"\nmax = \"16B\"\n",
+        )
+        .unwrap();
+        let cfg = std::sync::Arc::new(m6_core::config::load(conf.path(), dir.path()).unwrap());
+
+        let before = parse_count();
+        let get = asset_req(dir.path(), "app.js", None, &[]).with_config(cfg);
+        let (status, _, body) = wire(&get);
+        assert_eq!(status, 200);
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            script,
+            "a body over the output limit is served byte for byte"
+        );
+        assert_eq!(
+            parse_count(),
+            before,
+            "the parser was never run on a body over the output limit"
+        );
+    }
+
+    /// A script over the parse budget is served as written and attempted once
+    /// per version. The wrong outcome: the parser runs on a body the loop
+    /// cannot afford, on every request.
+    #[test]
+    fn a_script_over_the_parse_budget_is_served_as_written_once() {
+        use m6_core::minify::parse_count;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        let script = "function large() { return 1 + 2 + 3 + 4; }\n";
+        std::fs::write(dir.path().join("assets/app.js"), script).unwrap();
+        let mut conf = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(
+            &mut conf,
+            b"[limits.minify_parse]\nstart = \"16B\"\nmax = \"16B\"\n",
+        )
+        .unwrap();
+        let cfg = std::sync::Arc::new(m6_core::config::load(conf.path(), dir.path()).unwrap());
+
+        let before = parse_count();
+        let get = asset_req(dir.path(), "app.js", None, &[]).with_config(cfg);
+        let (status, _, body) = wire(&get);
+        assert_eq!(status, 200);
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            script,
+            "a body over the budget is served byte for byte"
+        );
+        assert_eq!(parse_count(), before, "the parser was never run");
+
+        let (status, _, again) = wire(&get);
+        assert_eq!(status, 200);
+        assert_eq!(again, body);
+        assert_eq!(parse_count(), before, "the fallback is cached per version");
+    }
+
+    /// A config that switches the JavaScript key off serves the file as it is,
+    /// and one that leaves it on is the default above.
+    #[test]
+    fn a_script_is_served_unminified_when_its_key_is_off() {
+        let script = "var m = \"That didn't verify \\u2014 tab\\there.\";\n";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("assets/app.js"), script).unwrap();
+        let mut conf = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut conf, b"[minification]\n\"text/javascript\" = false\n")
+            .unwrap();
+        let cfg = m6_core::config::load(conf.path(), dir.path()).unwrap();
+        let req = asset_req(dir.path(), "app.js", None, &[]).with_config(std::sync::Arc::new(cfg));
+        let (status, _, body) = wire(&req);
+        assert_eq!(status, 200);
+        assert_eq!(String::from_utf8_lossy(&body), script);
+    }
+
+    /// A script the minifier cannot parse is served as the bytes on disk, with
+    /// a warning, rather than as a corrupted or failed response.
+    #[test]
+    fn a_script_that_does_not_parse_is_served_byte_identical() {
+        let script = "function ( { this is not javascript\n";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("assets/app.js"), script).unwrap();
+        let mut conf = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut conf, b"").unwrap();
+        let cfg = m6_core::config::load(conf.path(), dir.path()).unwrap();
+        let req = asset_req(dir.path(), "app.js", None, &[]).with_config(std::sync::Arc::new(cfg));
+        let (status, _, body) = wire(&req);
+        assert_eq!(status, 200);
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            script,
+            "the fallback must serve the original bytes"
+        );
+    }
+
     /// A file with enough redundancy that brotli and gzip both actually
     /// compress it, and compress it to different sizes.
     fn compressible_css() -> Vec<u8> {
@@ -669,6 +1314,48 @@ mod tests {
         assert_eq!(
             fetch(dir.path(), Some("br")).0,
             fetch(dir.path(), Some("br")).0
+        );
+    }
+
+    /// RFC 9110 8.8.1: a strong validator has to change whenever the
+    /// representation data changes. mtime-seconds plus size cannot promise
+    /// that, so the tag must be weak or a same-second, same-size edit would
+    /// leave it validating bytes that no longer exist.
+    #[test]
+    fn the_file_etag_is_weak() {
+        let dir = css_dir();
+        let (etag, _, _) = fetch(dir.path(), None);
+        assert!(
+            etag.starts_with("W/\""),
+            "the mtime-and-size ETag must be weak: {etag}"
+        );
+    }
+
+    /// And the weak tag still moves when both of its inputs move: a rewrite
+    /// with a different length and a different whole-second mtime must not
+    /// leave the old validator in place.
+    #[test]
+    fn an_etag_changes_when_the_file_changes() {
+        let dir = css_dir();
+        let path = dir.path().join("assets/style.css");
+        let (before, _, _) = fetch(dir.path(), None);
+
+        let mut changed = compressible_css();
+        changed.extend_from_slice(b"\n.extra { color: red; }\n");
+        std::fs::write(&path, &changed).unwrap();
+        let when =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+
+        let (after, _, _) = fetch(dir.path(), None);
+        assert_ne!(
+            before, after,
+            "the ETag survived a different mtime and length"
         );
     }
 
@@ -798,7 +1485,6 @@ mod tests {
 
     /// A symlink pointing outside the site directory is a 404, not a file.
     #[test]
-    #[cfg(unix)]
     fn a_symlink_escaping_the_site_dir_is_404() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("assets")).unwrap();
@@ -810,6 +1496,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(wire(&asset_req(dir.path(), "escape", None, &[])).0, 404);
+    }
+
+    /// The break: `escapes_site_dir` looked only at the last component, so a
+    /// symlinked directory in the middle of the path was followed and the
+    /// outside file was served. Restore that check and this test gets 200 with
+    /// `ESCAPED SECRET` in the body.
+    #[test]
+    fn a_symlinked_directory_inside_the_site_is_refused() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.css"), b"ESCAPED SECRET").unwrap();
+        let site = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(site.path().join("assets")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), site.path().join("assets/linked")).unwrap();
+
+        let (status, _, body) = wire(&asset_req(site.path(), "linked/secret.css", None, &[]));
+        assert_eq!(
+            status, 404,
+            "a symlinked directory leaving the site was served"
+        );
+        assert!(body.is_empty(), "the response carried the outside file");
+    }
+
+    /// A symlink that stays inside the site is a normal deployment and is
+    /// served, so the fix refuses escapes rather than every symlink.
+    #[test]
+    fn a_symlinked_directory_inside_the_site_is_served() {
+        let site = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(site.path().join("static/assets")).unwrap();
+        std::fs::write(site.path().join("static/assets/app.css"), b"body{}").unwrap();
+        std::os::unix::fs::symlink(
+            site.path().join("static/assets"),
+            site.path().join("assets"),
+        )
+        .unwrap();
+
+        let (status, _, body) = wire(&asset_req(site.path(), "app.css", None, &[]));
+        assert_eq!(status, 200, "an in-site directory symlink was refused");
+        assert_eq!(body, b"body{}");
+    }
+
+    /// A `relpath` that climbs out of the root is a 404 even when it reaches
+    /// the handler without core's path check, and a regular file on the
+    /// other side does not change that.
+    #[test]
+    fn a_dotdot_relpath_in_the_dictionary_is_404() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+        std::fs::write(dir.path().join("secret"), b"secret").unwrap();
+        assert_eq!(wire(&asset_req(dir.path(), "../secret", None, &[])).0, 404);
     }
 }
 
@@ -846,12 +1581,12 @@ mod cache_control_tests {
         }
     }
 
-    /// Everything else keeps the short window. The webfont matters most here:
-    /// it is requested unversioned from @font-face inside style.css, and
+    /// Everything else takes the revalidating branch. The webfont matters most
+    /// here: it is requested unversioned from @font-face inside style.css, and
     /// pinning it for a year would strand clients on an old file that no
     /// server-side invalidation can reach.
     #[test]
-    fn unversioned_and_malformed_urls_keep_the_short_window() {
+    fn unversioned_and_malformed_urls_are_not_versioned() {
         for url in [
             "/assets/fonts/montserrat-normal.woff2",
             "/assets/css/style.css",
@@ -877,30 +1612,46 @@ mod cache_control_tests {
         );
         assert_eq!(
             cache_control_for(&query_of("/assets/fonts/montserrat-normal.woff2")),
-            "public, max-age=60, s-maxage=86400, stale-while-revalidate=60"
+            "public, max-age=0, must-revalidate, s-maxage=86400"
         );
     }
 
-    /// The load-bearing property of the unversioned directive, stated as its
-    /// own test so the reason survives.
+    /// The property that holds the unversioned directive together, stated as
+    /// its own test so the reason survives.
     ///
-    /// An edge cache can be emptied on deploy; a browser cache cannot be
-    /// reached at all. So the long window may only ever appear on `s-maxage`,
-    /// which browsers ignore. Raising `max-age` or `stale-while-revalidate` to
-    /// buy the same hit rate would instead strand every visitor on the previous
-    /// file for a day -- that was tried once and rolled back.
+    /// A browser cache cannot be reached at all, so its copy must be stale
+    /// immediately and unusable without a successful validation. An edge cache
+    /// can be emptied on deploy, so it may keep the same response for a day.
+    /// The long window may therefore appear only on `s-maxage`, the one
+    /// directive browsers ignore.
     #[test]
     fn unversioned_lengthens_only_the_edge_never_the_browser() {
         let cc = cache_control_for(&query_of("/assets/css/style.css"));
 
+        // The edge keeps it, and keeps it for a day.
         assert!(
             cc.contains("s-maxage=86400"),
             "edge must hold it long: {cc}"
         );
-        assert!(cc.contains("max-age=60"), "browser must stay short: {cc}");
+
+        // The browser revalidates on every use: zero freshness plus an
+        // obligation to validate once stale.
         assert!(
-            cc.contains("stale-while-revalidate=60"),
-            "browser-visible stale window must stay short: {cc}"
+            cc.contains("max-age=0"),
+            "the browser's copy must be stale at once: {cc}"
+        );
+        assert!(
+            cc.contains("must-revalidate"),
+            "the browser must not serve a stale copy without validating: {cc}"
+        );
+
+        // `no-cache` would make the edge revalidate too, and
+        // `stale-while-revalidate` would let the browser serve stale while it
+        // revalidates asynchronously. Neither belongs in the pattern.
+        assert!(!cc.contains("no-cache"), "no-cache reaches the edge: {cc}");
+        assert!(
+            !cc.contains("stale-while-revalidate"),
+            "the browser may not serve stale while revalidating: {cc}"
         );
 
         // The directive browsers obey must never carry the long value. Checked

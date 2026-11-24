@@ -1,7 +1,7 @@
 /// Route table and request matching.
-use std::collections::HashMap;
 use std::path::Path;
 
+use m6_core::site::{check_route_conflicts, Methods, RouteDecl};
 use matchit::Router as MatchitRouter;
 
 use crate::config::Config;
@@ -78,12 +78,19 @@ pub struct RouteEntry {
     pub path: String,
     pub backend: String,
     pub require: Option<String>,
+    /// The `Cache-Control` this route sets on every backend reply, replacing the
+    /// backend's own. `None` leaves the backend's header alone.
+    pub cache: Option<String>,
+    /// The methods this route answers, fixed at load. `Methods::ANY` when the
+    /// route lists none, which is the behaviour every route had before the key
+    /// existed.
+    pub methods: Methods,
 }
 
 /// Built route table.
 pub struct RouteTable {
     router: MatchitRouter<RouteEntry>,
-    /// Ordered entries for specificity-based selection.
+    /// The explicit routes and expanded route groups, in the order added.
     entries: Vec<RouteEntry>,
     /// Whether *any* route declares `require`.
     ///
@@ -92,6 +99,12 @@ pub struct RouteTable {
     /// answer without a route lookup, keeping the cache-hit path free of the
     /// extra `matchit` traversal.
     has_protected_routes: bool,
+    /// Whether *any* route lists `methods`.
+    ///
+    /// The method check runs before every cache lookup. When no route is
+    /// restricted — the common case — it answers from this flag with no route
+    /// lookup at all.
+    has_restricted_routes: bool,
 }
 
 impl RouteTable {
@@ -100,12 +113,35 @@ impl RouteTable {
         let mut router = MatchitRouter::new();
         let mut entries = Vec::new();
 
+        // The rule m6-core applies to a service's routes, so the edge and the
+        // services refuse the same configs.
+        //
+        // Every edge route is declared with `Methods::ANY` here on purpose:
+        // the path table holds one route per path, and `matchit` refuses a
+        // second insert on the same path whatever methods it lists. So two
+        // `[[route]]` entries with one path are a config error, which is the
+        // pre-existing behaviour, and the conflict rule keeps saying so.
+        let declared: Vec<_> = config
+            .routes
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                RouteDecl::new(format!("[[route]] number {}", i + 1), &r.path, Methods::ANY)
+            })
+            .collect();
+        check_route_conflicts(&declared)?;
+
         // Add explicit routes
-        for route in &config.routes {
+        for (i, route) in config.routes.iter().enumerate() {
             let entry = RouteEntry {
                 path: route.path.clone(),
                 backend: route.backend.clone(),
                 require: route.require.clone(),
+                cache: route.cache.clone(),
+                methods: crate::config::route_methods(
+                    route.methods.as_deref(),
+                    &format!("route \"{}\" ([[route]] number {})", route.path, i + 1),
+                )?,
             };
             // matchit returns error on duplicate; we already validate in config
             if let Err(e) = router.insert(route.path.clone(), entry.clone()) {
@@ -119,7 +155,15 @@ impl RouteTable {
         }
 
         // Expand route_groups
-        for rg in &config.route_groups {
+        for (i, rg) in config.route_groups.iter().enumerate() {
+            let methods = crate::config::route_methods(
+                rg.methods.as_deref(),
+                &format!(
+                    "route_group \"{}\" ([[route_group]] number {})",
+                    rg.path,
+                    i + 1
+                ),
+            )?;
             let glob_pattern = if std::path::Path::new(&rg.glob).is_absolute() {
                 rg.glob.clone()
             } else {
@@ -133,7 +177,7 @@ impl RouteTable {
             let paths = match glob::glob(&glob_pattern) {
                 Ok(paths) => paths,
                 Err(e) => {
-                    tracing::warn!(pattern = %glob_pattern, error = %e, "route_group glob error");
+                    m6_core::log::warn!(pattern = %glob_pattern, error = %e, "route_group glob error");
                     continue;
                 }
             };
@@ -142,7 +186,7 @@ impl RouteTable {
                 let file_path = match path_result {
                     Ok(p) => p,
                     Err(e) => {
-                        tracing::warn!(error = %e, "route_group glob entry error");
+                        m6_core::log::warn!(error = %e, "route_group glob entry error");
                         continue;
                     }
                 };
@@ -153,6 +197,8 @@ impl RouteTable {
                     path: url_path.clone(),
                     backend: rg.backend.clone(),
                     require: rg.require.clone(),
+                    cache: rg.cache.clone(),
+                    methods,
                 };
 
                 // Skip if already added (explicit route takes precedence)
@@ -162,7 +208,7 @@ impl RouteTable {
                 }
 
                 if let Err(e) = router.insert(url_path.clone(), entry.clone()) {
-                    tracing::warn!(path = %url_path, error = %e, "route_group insert error");
+                    m6_core::log::warn!(path = %url_path, error = %e, "route_group insert error");
                     continue;
                 }
                 entries.push(entry);
@@ -170,11 +216,30 @@ impl RouteTable {
         }
 
         let has_protected_routes = entries.iter().any(|e| e.require.is_some());
+        let has_restricted_routes = entries.iter().any(|e| e.methods != Methods::ANY);
         Ok(RouteTable {
             router,
             entries,
             has_protected_routes,
+            has_restricted_routes,
         })
+    }
+
+    /// The methods a matched route answers, when it does not answer `method`.
+    ///
+    /// `None` means the route is absent or answers the method. The flag makes
+    /// the common case — no route lists `methods` — one comparison and no
+    /// route lookup, so the cache-hit path keeps its existing traversals.
+    ///
+    /// The refusal is a property of the target resource, so it belongs before
+    /// the cache lookup and any backend contact (RFC 9110 15.5.6). `HEAD`
+    /// belongs to `GET`'s set, per `Methods`.
+    pub fn refused_method(&self, path: &str, method: &str) -> Option<Methods> {
+        if !self.has_restricted_routes {
+            return None;
+        }
+        let route = self.at(path)?;
+        (!route.methods.contains(method)).then_some(route.methods)
     }
 
     /// Match a request path. Returns the matched RouteEntry if found.
@@ -228,6 +293,8 @@ impl RouteTable {
                 path: path.to_string(),
                 backend: "bench".to_string(),
                 require: require.map(str::to_string),
+                cache: None,
+                methods: Methods::ANY,
             };
             router
                 .insert(path.to_string(), entry.clone())
@@ -239,6 +306,7 @@ impl RouteTable {
             router,
             entries,
             has_protected_routes,
+            has_restricted_routes: false,
         }
     }
 
@@ -254,165 +322,21 @@ impl RouteTable {
     }
 }
 
-/// Build invalidation map from two sources:
-///
-/// 1. `[[route_group]]` globs: `file_path → [url_path, ...]`
-/// 2. Renderer config `params` declarations: `params_file → [url_path, ...]`
-///
-/// The map key is the filesystem path (or glob pattern for templated params).
-/// The map value is the list of URL paths that should be evicted when that
-/// file changes.
-pub fn build_invalidation_map(config: &Config) -> HashMap<String, Vec<String>> {
-    let mut map: HashMap<String, Vec<String>> = HashMap::new();
-
-    // ── Source 1: [[route_group]] globs ──────────────────────────────────────
-    for rg in &config.route_groups {
-        let glob_pattern = if std::path::Path::new(&rg.glob).is_absolute() {
-            rg.glob.clone()
-        } else {
-            config
-                .site_dir
-                .join(&rg.glob)
-                .to_string_lossy()
-                .into_owned()
-        };
-
-        let paths = match glob::glob(&glob_pattern) {
-            Ok(paths) => paths,
-            Err(_) => continue,
-        };
-
-        for path_result in paths.flatten() {
-            let url_path = expand_glob_vars(&rg.path, &path_result, &glob_pattern);
-            map.entry(path_result.to_string_lossy().into_owned())
-                .or_default()
-                .push(url_path);
-        }
-    }
-
-    // ── Source 2: renderer config `params` declarations ───────────────────────
-    // For each socket-based backend, look for a renderer config at
-    // `<site_dir>/configs/<backend_name>.conf` and parse its [[route]] entries.
-    for backend in &config.backends {
-        if backend.sockets.is_none() {
-            continue; // URL backends don't have renderer configs
-        }
-        let conf_path = config
-            .site_dir
-            .join("configs")
-            .join(format!("{}.conf", backend.name));
-        if !conf_path.exists() {
-            continue;
-        }
-        add_renderer_params_to_map(&conf_path, &config.site_dir, &mut map);
-    }
-
-    map
-}
-
-/// Parse a renderer config file and add `params_file → url_paths` entries to `map`.
-///
-/// For static params files (no `{stem}` template in either the params path or
-/// the route path) the exact resolved file path is mapped to the exact URL path.
-///
-/// For templated params files (path contains `{stem}`) the glob pattern
-/// (e.g. `content/posts/*.json`) is used as the map key and the route path
-/// template (e.g. `/blog/{stem}`) is stored as the value with the note that
-/// the caller must expand it on eviction.  For simplicity we store the pattern
-/// as-is and the eviction code uses glob-prefix matching.
-fn add_renderer_params_to_map(
-    conf_path: &Path,
-    site_dir: &Path,
-    map: &mut HashMap<String, Vec<String>>,
-) {
-    let raw = match std::fs::read_to_string(conf_path) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(
-                config = %conf_path.display(),
-                error = %e,
-                "invalidation map: could not read renderer config"
-            );
-            return;
-        }
-    };
-
-    let tv: toml::Value = match toml::from_str(&raw) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(
-                config = %conf_path.display(),
-                error = %e,
-                "invalidation map: could not parse renderer config"
-            );
-            return;
-        }
-    };
-
-    let routes = match tv.get("route").and_then(|v| v.as_array()) {
-        Some(arr) => arr,
-        None => return,
-    };
-
-    for route_val in routes {
-        let url_path = match route_val.get("path").and_then(|v| v.as_str()) {
-            Some(p) => p.to_string(),
-            None => continue,
-        };
-
-        let params: Vec<String> = route_val
-            .get("params")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        for params_path_tmpl in &params {
-            // Is the params path templated (contains `{stem}`)?
-            if params_path_tmpl.contains('{') {
-                // Replace `{stem}` (and similar) with `*` to get a glob pattern.
-                let params_glob = params_path_tmpl
-                    .replace("{stem}", "*")
-                    .replace("{filename}", "*")
-                    .replace("{relpath}", "**/*")
-                    .replace("{dir}", "*");
-                // Resolve relative to site_dir.
-                let resolved_glob = if std::path::Path::new(&params_glob).is_absolute() {
-                    params_glob.clone()
-                } else {
-                    site_dir.join(&params_glob).to_string_lossy().into_owned()
-                };
-                map.entry(resolved_glob).or_default().push(url_path.clone());
-            } else {
-                // Static params file — resolve relative to site_dir.
-                let resolved = if std::path::Path::new(params_path_tmpl).is_absolute() {
-                    params_path_tmpl.clone()
-                } else {
-                    site_dir
-                        .join(params_path_tmpl)
-                        .to_string_lossy()
-                        .into_owned()
-                };
-                map.entry(resolved).or_default().push(url_path.clone());
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{
         AnalyticsConfig, BackendConfig, Config, ErrorsConfig, LogConfig, NodeConfig,
-        RateLimitConfig, RouteConfig, SecurityConfig, ServerConfig, SiteConfig,
+        RateLimitConfig, RouteConfig, SecurityConfig, ServerConfig, SiteConfig, StatsConfig,
     };
     use std::path::PathBuf;
 
     fn make_config(routes: Vec<RouteConfig>, backends: Vec<BackendConfig>) -> Config {
         Config {
+            genid: None,
+            cache_dir: None,
+            limits: Default::default(),
+            stats: StatsConfig::default(),
             site: SiteConfig {
                 name: "Test".to_string(),
                 domain: "test.example.com".to_string(),
@@ -424,11 +348,19 @@ mod tests {
                 tls_cert: Some("/tmp/cert.pem".to_string()),
                 tls_key: Some("/tmp/key.pem".to_string()),
                 backend_timeout_secs: 30,
+                max_requests_per_connection: 100,
+                reuse_port: false,
+                reuse_port_processes: None,
+                process_index: None,
+                status_bind: None,
                 h2c_bind: None,
                 internal_binds: Vec::new(),
                 internal_peers: Vec::new(),
                 redirect_bind: None,
+                served_hosts: Vec::new(),
+                redirect_unmatched_to: None,
                 warm_on_start: false,
+                lock_memory: false,
                 allowed_methods: vec!["GET".into(), "HEAD".into(), "POST".into()],
             },
             log: LogConfig::default(),
@@ -464,6 +396,7 @@ mod tests {
             backend: backend.to_string(),
             require: None,
             cache: None,
+            methods: None,
         }
     }
 
@@ -489,6 +422,41 @@ mod tests {
         assert!(table.at("/admin/dashboard").is_some());
         assert!(table.at("/admin/settings").is_some());
         assert!(table.at("/other").is_none());
+    }
+
+    fn conflict(paths: &[&str]) -> Option<String> {
+        let routes = paths.iter().map(|p| make_route(p, "b")).collect();
+        let config = make_config(routes, vec![make_backend("b")]);
+        RouteTable::from_config(&config)
+            .err()
+            .map(|e| e.to_string())
+    }
+
+    /// The edge applies m6-core's rule, so a `site.toml` the services would
+    /// refuse is refused here too. The wrong outcome: the edge starts with two
+    /// patterns that can match one path and answers from whichever `matchit`
+    /// prefers, while a service with the same pair refuses to start.
+    #[test]
+    fn test_patterns_that_can_match_one_path_fail_to_build() {
+        let e = conflict(&["/blog/{slug}", "/blog/{name}"]).expect("must refuse");
+        assert!(
+            e.contains("\"/blog/{slug}\" ([[route]] number 1)")
+                && e.contains("\"/blog/{name}\" ([[route]] number 2)")
+                && e.contains("can both answer GET /blog/x"),
+            "{e}"
+        );
+        // Pairs `matchit` would accept and that still share a path.
+        assert!(conflict(&["/{lang}/about", "/blog/{slug}"]).is_some());
+        assert!(conflict(&["/blog/{slug}", "/blog/{*rest}"]).is_some());
+    }
+
+    /// A fixed path beside a pattern, and patterns that share no path, build.
+    /// The wrong outcome: the check refuses the layout every site has.
+    #[test]
+    fn test_fixed_beside_pattern_and_disjoint_patterns_build() {
+        assert_eq!(conflict(&["/blog/latest", "/blog/{slug}"]), None);
+        assert_eq!(conflict(&["/blog/{slug}", "/news/{slug}"]), None);
+        assert_eq!(conflict(&["/a/{x}", "/a/{x}/{y}"]), None);
     }
 
     #[test]
@@ -541,229 +509,87 @@ mod tests {
         assert_eq!(result, "/files/css/main.css");
     }
 
-    // ── Invalidation map second source (renderer config params) ──────────────
-
-    #[test]
-    fn test_invalidation_map_renderer_config_static_params() {
-        use tempfile::TempDir;
-
-        let dir = TempDir::new().unwrap();
-        let site_dir = dir.path();
-
-        // Create configs/ directory and renderer config
-        std::fs::create_dir_all(site_dir.join("configs")).unwrap();
-        let conf_content = r#"
-[[route]]
-path = "/about"
-template = "templates/about.html"
-params = ["data/about.json"]
-
-[[route]]
-path = "/home"
-template = "templates/home.html"
-params = ["data/home.json", "data/shared.json"]
-"#;
-        std::fs::write(site_dir.join("configs").join("m6-html.conf"), conf_content).unwrap();
-
-        // Create dummy TLS files
-        std::fs::write(site_dir.join("cert.pem"), "dummy").unwrap();
-        std::fs::write(site_dir.join("key.pem"), "dummy").unwrap();
-
-        let config = Config {
-            site: SiteConfig {
-                name: "Test".to_string(),
-                domain: "test.example.com".to_string(),
-                redirect_www: true,
-                describedby: String::new(),
-            },
-            server: ServerConfig {
-                bind: "127.0.0.1:8443".to_string(),
-                tls_cert: Some(site_dir.join("cert.pem").to_string_lossy().into_owned()),
-                tls_key: Some(site_dir.join("key.pem").to_string_lossy().into_owned()),
-                backend_timeout_secs: 30,
-                h2c_bind: None,
-                internal_binds: Vec::new(),
-                internal_peers: Vec::new(),
-                redirect_bind: None,
-                warm_on_start: false,
-                allowed_methods: vec!["GET".into(), "HEAD".into(), "POST".into()],
-            },
-            log: LogConfig::default(),
-            analytics: AnalyticsConfig::default(),
-            health: Default::default(),
-            node: NodeConfig {
-                name: "test-node".to_string(),
-            },
-            rate_limit: RateLimitConfig::default(),
-            errors: ErrorsConfig::default(),
-            security: SecurityConfig::default(),
-            auth: None,
-            backends: vec![BackendConfig {
-                name: "m6-html".to_string(),
-                sockets: Some("/run/m6/m6-html-*.sock".to_string()),
-                url: None,
-                tls_skip_verify: false,
-                compresses: true,
-            }],
-            routes: vec![],
-            route_groups: vec![],
-            site_dir: site_dir.to_path_buf(),
-        };
-
-        let map = build_invalidation_map(&config);
-
-        // data/about.json → ["/about"]
-        let about_key = site_dir
-            .join("data/about.json")
-            .to_string_lossy()
-            .into_owned();
-        assert!(map.contains_key(&about_key), "about.json key missing");
-        assert!(map[&about_key].contains(&"/about".to_string()));
-
-        // data/home.json → ["/home"]
-        let home_key = site_dir
-            .join("data/home.json")
-            .to_string_lossy()
-            .into_owned();
-        assert!(map.contains_key(&home_key), "home.json key missing");
-        assert!(map[&home_key].contains(&"/home".to_string()));
-
-        // data/shared.json → ["/home"]
-        let shared_key = site_dir
-            .join("data/shared.json")
-            .to_string_lossy()
-            .into_owned();
-        assert!(map.contains_key(&shared_key), "shared.json key missing");
-        assert!(map[&shared_key].contains(&"/home".to_string()));
+    fn make_restricted_route(path: &str, backend: &str, methods: &[&str]) -> RouteConfig {
+        RouteConfig {
+            path: path.to_string(),
+            backend: backend.to_string(),
+            require: None,
+            cache: None,
+            methods: Some(methods.iter().map(|m| m.to_string()).collect()),
+        }
     }
 
+    /// A route that lists POST refuses GET and names POST; GET and HEAD share
+    /// one bit, so HEAD is refused on a POST-only route and allowed on a GET
+    /// one.
     #[test]
-    fn test_invalidation_map_renderer_config_templated_params() {
-        use tempfile::TempDir;
-
-        let dir = TempDir::new().unwrap();
-        let site_dir = dir.path();
-
-        std::fs::create_dir_all(site_dir.join("configs")).unwrap();
-        let conf_content = r#"
-[[route]]
-path = "/blog/{stem}"
-template = "templates/post.html"
-params = ["content/posts/{stem}.json"]
-"#;
-        std::fs::write(site_dir.join("configs").join("m6-html.conf"), conf_content).unwrap();
-        std::fs::write(site_dir.join("cert.pem"), "dummy").unwrap();
-        std::fs::write(site_dir.join("key.pem"), "dummy").unwrap();
-
-        let config = Config {
-            site: SiteConfig {
-                name: "Test".to_string(),
-                domain: "test.example.com".to_string(),
-                redirect_www: true,
-                describedby: String::new(),
-            },
-            server: ServerConfig {
-                bind: "127.0.0.1:8443".to_string(),
-                tls_cert: Some(site_dir.join("cert.pem").to_string_lossy().into_owned()),
-                tls_key: Some(site_dir.join("key.pem").to_string_lossy().into_owned()),
-                backend_timeout_secs: 30,
-                h2c_bind: None,
-                internal_binds: Vec::new(),
-                internal_peers: Vec::new(),
-                redirect_bind: None,
-                warm_on_start: false,
-                allowed_methods: vec!["GET".into(), "HEAD".into(), "POST".into()],
-            },
-            log: LogConfig::default(),
-            analytics: AnalyticsConfig::default(),
-            health: Default::default(),
-            node: NodeConfig {
-                name: "test-node".to_string(),
-            },
-            rate_limit: RateLimitConfig::default(),
-            errors: ErrorsConfig::default(),
-            security: SecurityConfig::default(),
-            auth: None,
-            backends: vec![BackendConfig {
-                name: "m6-html".to_string(),
-                sockets: Some("/run/m6/m6-html-*.sock".to_string()),
-                url: None,
-                tls_skip_verify: false,
-                compresses: true,
-            }],
-            routes: vec![],
-            route_groups: vec![],
-            site_dir: site_dir.to_path_buf(),
-        };
-
-        let map = build_invalidation_map(&config);
-
-        // Templated params: key is a glob pattern with `*` substituted for `{stem}`
-        let glob_key = site_dir
-            .join("content/posts/*.json")
-            .to_string_lossy()
-            .into_owned();
-        assert!(
-            map.contains_key(&glob_key),
-            "templated glob key missing: {}",
-            glob_key
+    fn a_route_refuses_a_method_it_does_not_list() {
+        let config = make_config(
+            vec![make_restricted_route("/submit", "b", &["POST"])],
+            vec![make_backend("b")],
         );
-        assert!(map[&glob_key].contains(&"/blog/{stem}".to_string()));
+        let table = RouteTable::from_config(&config).unwrap();
+        assert_eq!(
+            table
+                .refused_method("/submit", "GET")
+                .map(Methods::allow_value)
+                .as_deref(),
+            Some("POST")
+        );
+        assert_eq!(
+            table
+                .refused_method("/submit", "HEAD")
+                .map(Methods::allow_value)
+                .as_deref(),
+            Some("POST")
+        );
+        assert_eq!(
+            table
+                .refused_method("/submit", "OPTIONS")
+                .map(Methods::allow_value)
+                .as_deref(),
+            Some("POST")
+        );
+        assert_eq!(table.refused_method("/submit", "POST"), None);
+        assert_eq!(table.refused_method("/none", "GET"), None);
     }
 
+    /// Names are trimmed and upper-cased at load, so a lower-case spelling in
+    /// the config is the same method and the hot path compares fixed strings.
     #[test]
-    fn test_invalidation_map_url_backend_skipped() {
-        use tempfile::TempDir;
+    fn route_method_names_are_normalised_at_load() {
+        let config = make_config(
+            vec![make_restricted_route("/x", "b", &[" get ", "Post"])],
+            vec![make_backend("b")],
+        );
+        let table = RouteTable::from_config(&config).unwrap();
+        assert_eq!(table.refused_method("/x", "GET"), None);
+        assert_eq!(table.refused_method("/x", "POST"), None);
+        assert_eq!(
+            table
+                .refused_method("/x", "PUT")
+                .map(Methods::allow_value)
+                .as_deref(),
+            Some("GET, HEAD, POST")
+        );
+    }
 
-        let dir = TempDir::new().unwrap();
-        let site_dir = dir.path();
-        // No configs/ directory created — URL backends should be silently skipped
-        std::fs::write(site_dir.join("cert.pem"), "dummy").unwrap();
-        std::fs::write(site_dir.join("key.pem"), "dummy").unwrap();
-
-        let config = Config {
-            site: SiteConfig {
-                name: "Test".to_string(),
-                domain: "test.example.com".to_string(),
-                redirect_www: true,
-                describedby: String::new(),
-            },
-            server: ServerConfig {
-                bind: "127.0.0.1:8443".to_string(),
-                tls_cert: Some(site_dir.join("cert.pem").to_string_lossy().into_owned()),
-                tls_key: Some(site_dir.join("key.pem").to_string_lossy().into_owned()),
-                backend_timeout_secs: 30,
-                h2c_bind: None,
-                internal_binds: Vec::new(),
-                internal_peers: Vec::new(),
-                redirect_bind: None,
-                warm_on_start: false,
-                allowed_methods: vec!["GET".into(), "HEAD".into(), "POST".into()],
-            },
-            log: LogConfig::default(),
-            analytics: AnalyticsConfig::default(),
-            health: Default::default(),
-            node: NodeConfig {
-                name: "test-node".to_string(),
-            },
-            rate_limit: RateLimitConfig::default(),
-            errors: ErrorsConfig::default(),
-            security: SecurityConfig::default(),
-            auth: None,
-            backends: vec![BackendConfig {
-                name: "external".to_string(),
-                sockets: None,
-                url: Some("https://api.example.com".to_string()),
-                tls_skip_verify: false,
-                compresses: true,
-            }],
-            routes: vec![],
-            route_groups: vec![],
-            site_dir: site_dir.to_path_buf(),
+    /// A name outside the fixed set is an error when the table is built, so
+    /// the start exits 2 instead of every request becoming a 405.
+    #[test]
+    fn an_unknown_route_method_is_a_load_error() {
+        let config = make_config(
+            vec![make_restricted_route("/x", "b", &["GET", "BREW"])],
+            vec![make_backend("b")],
+        );
+        let err = match RouteTable::from_config(&config) {
+            Ok(_) => panic!("an unknown method must fail the load"),
+            Err(e) => e.to_string(),
         };
-
-        // Should not panic or error — URL backends are simply skipped
-        let map = build_invalidation_map(&config);
-        assert!(map.is_empty());
+        assert!(
+            err.contains("BREW"),
+            "the error must name the method: {err}"
+        );
+        assert!(err.contains("/x"), "the error must name the route: {err}");
     }
 }

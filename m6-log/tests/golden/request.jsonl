@@ -1,0 +1,1 @@
+{"timestamp":"2026-11-13T16:55:49.489591Z","level":"INFO","fields":{"message":"request","node":"dev","path":"/missing","status":404,"cache_state":"MISS","client_ip":"192.0.2.1","session_id":"0f1e2d3c4b5a69788796a5b4c3d2e1f0","session_new":true,"user_agent":"curl/8.7.1","latency_ns":342834},"type":"access"}

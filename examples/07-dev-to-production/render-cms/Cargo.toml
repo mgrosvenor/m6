@@ -1,0 +1,12 @@
+[package]
+name    = "render-cms-prod"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+m6-core    = { path = "../../../m6-core" }
+genid-publisher = { path = "../../common/genid-publisher" }
+serde_json = "1"
+
+[build-dependencies]
+m6-platform = { path = "../../../m6-platform" }

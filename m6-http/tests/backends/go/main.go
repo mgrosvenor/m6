@@ -46,6 +46,19 @@ func main() {
 		os.Exit(2)
 	}
 
+	// Shutdown, spec §8.2: stop accepting, finish what is in flight, remove the
+	// socket, exit 0. Second signal exits immediately.
+	//
+	// The notification is registered BEFORE the listener is created. The
+	// socket's existence is how a caller knows the backend is ready (spec §8.1),
+	// so a caller that waits for it and then sends SIGTERM must find a handler
+	// installed. Registering after the bind leaves a window in which the socket
+	// exists and SIGTERM still has its default disposition, so the process is
+	// killed instead of shutting down. A signal arriving before the goroutine
+	// below starts is held in this buffered channel.
+	sigs := make(chan os.Signal, 2)
+	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
+
 	listener, err := listen(sockPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cannot listen on %s: %v\n", sockPath, err)
@@ -59,10 +72,6 @@ func main() {
 	// explicit rather than a consequence of what the proxy happens to send.
 	srv.SetKeepAlivesEnabled(false)
 
-	// Shutdown, spec §8.2: stop accepting, finish what is in flight, remove the
-	// socket, exit 0. Second signal exits immediately.
-	sigs := make(chan os.Signal, 2)
-	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		<-sigs
 		go func() {
@@ -102,9 +111,10 @@ func listen(path string) (net.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 3. chmod 0666. The proxy runs as a different user and cannot connect
-	//    otherwise. The spec calls this the single most common cause of a
-	//    backend that starts cleanly and is never contacted.
+	// 3. chmod 0666: a test convention. The example runs as its own user, so
+	//    this lets the proxy's user connect. Protocol §1.2 step 3 sets the rule, and
+	//    0666 in a 0755 directory lets any local user connect. A deployment uses
+	//    0660 with a trusted group.
 	if err := os.Chmod(path, 0o666); err != nil {
 		_ = l.Close()
 		return nil, err

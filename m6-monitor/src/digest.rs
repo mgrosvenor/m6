@@ -5,9 +5,10 @@
 //! live here, because what counts as too full or too hot is a property of a
 //! deployment rather than of m6.
 
+use m6_core::tls::Fingerprint;
 use serde::Serialize;
 
-use crate::poll::NodeReading;
+use crate::poll::{HeaderCheckResult, NodeReading};
 
 /// Thresholds. Deliberately a value rather than constants, so a deployment can
 /// set its own without patching the binary.
@@ -34,6 +35,30 @@ pub struct Thresholds {
     /// and an ignored warning is the same as no warning. A deployment renewing
     /// on a different schedule sets its own.
     pub cert_expiry_days: i64,
+    /// Whether the deployment declares that the fleet serves one certificate.
+    /// Read from `[monitor] one_certificate`, default false.
+    ///
+    /// Off by default because m6 is a generic web engine and a fleet may
+    /// legitimately run one certificate per node: the user guide documents
+    /// per-node renewal, and an origin and a cache node need not share a
+    /// certificate. With it off, the monitor warns only for the shape a missed
+    /// renewal leaves behind, which is some nodes agreeing and one that does
+    /// not. That inference is silent for a two-node fleet, which is a real
+    /// fleet shape, and for a node that reissued into the same expiry as the
+    /// others, which the fingerprint now catches when the deployment says the
+    /// certificate is shared.
+    ///
+    /// Setting it says the fleet is meant to carry one certificate, so a node
+    /// whose leaf fingerprint differs is a fault and not a question.
+    ///
+    /// Three inferred rules were considered and rejected. A majority calls the
+    /// stale half correct when two nodes agree and the renewed one does not,
+    /// which is the case the check exists for. The first-seen value lets one
+    /// poll's timing decide forever which node is right, so a node that
+    /// answered first after a restart becomes the reference. A quorum has no
+    /// answer for a two-node fleet, which is the fleet where the inference is
+    /// already silent. The deployment knows which it is, so it says.
+    pub one_certificate: bool,
     /// Seconds since a peer's latest WireGuard handshake above which the
     /// tunnel is a fault. Read from `[monitor] tunnel_handshake_max_age_s`.
     ///
@@ -46,17 +71,27 @@ pub struct Thresholds {
     /// inside the 180 seconds. The time is the last SUCCESSFUL handshake, so it
     /// is the slow signal and the probe is the fast one.
     pub tunnel_handshake_age_s: u64,
-    /// Seconds since a node last reopened its log file above which the monitor
-    /// reports a fault. Read from `[monitor] log_reopen_max_age_s`.
+    /// Seconds since a node last answered `/health` with 200 above which the
+    /// check flags it. Read from `[monitor] health_last_ok_max_age_s`, which
+    /// defaults to three poll intervals.
     ///
-    /// `None` means no limit: the age is shown and never judged. There is no
-    /// default, because analytics logging is on by default and a deployment
-    /// that does not rotate would otherwise fault two hours after every start.
-    pub log_reopen_age_s: Option<u64>,
+    /// The age itself comes from the history, so a service with no history
+    /// file cannot judge it and shows the absence instead. The digest already
+    /// faults a node that is degraded or unreachable, and the check adds the
+    /// age as its own fault when it passes the limit, so the verdict says how
+    /// long the node has been in that state.
+    pub health_last_ok_age_s: u64,
 }
 
 /// The default for `Thresholds::tunnel_handshake_age_s`, in seconds.
 pub const DEFAULT_TUNNEL_HANDSHAKE_AGE_S: u64 = 600;
+
+/// How many poll intervals a node's last 200 may be old by default.
+///
+/// One number describes the cadence: a deployment that changes
+/// `poll_interval_s` gets a limit that follows it, without a second setting to
+/// keep in step.
+pub const HEALTH_LAST_OK_POLLS: u64 = 3;
 
 impl Default for Thresholds {
     fn default() -> Self {
@@ -66,8 +101,9 @@ impl Default for Thresholds {
             load_per_cpu: 2.0,
             thermal_celsius: 80.0,
             cert_expiry_days: 21,
+            one_certificate: false,
             tunnel_handshake_age_s: DEFAULT_TUNNEL_HANDSHAKE_AGE_S,
-            log_reopen_age_s: None,
+            health_last_ok_age_s: crate::DEFAULT_POLL_SECS.saturating_mul(HEALTH_LAST_OK_POLLS),
         }
     }
 }
@@ -86,6 +122,18 @@ pub struct Finding {
     pub text: String,
 }
 
+/// Why a node reports itself degraded.
+///
+/// `/health` answers 503 `degraded` for one cause: a dependency this node needs
+/// is failing, which today is an edge's origin. The body names the node and no
+/// dependency, because `/health` is public and unsecured. The node's own log
+/// names the dependency in the warn line it writes on the change, so this
+/// reason names the cause the monitor can know and points at the log for which
+/// one. It names no mechanism of its own: a second reason string here would
+/// claim knowledge the monitor does not have.
+pub(crate) const DEGRADED_REASON: &str =
+    "a dependency is not answering, see the node's log for which one";
+
 /// The whole fleet, summarised.
 #[derive(Debug, Clone, Serialize)]
 pub struct Digest {
@@ -100,6 +148,86 @@ pub struct Digest {
     pub handshake_file_age_s: Option<u64>,
     /// The state of the poll history. `None` under `--check`, which keeps none.
     pub history: Option<crate::history::HistoryDigest>,
+    /// One entry per node polled as several processes (`processes` in the
+    /// fleet config), empty otherwise and then absent from the JSON.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub process_groups: Vec<ProcessGroup>,
+    /// The start-up record of each node and app, with the deploy's expected
+    /// values beside it. Filled by `startup::judge` after this build, so the
+    /// two readers of the journal cannot disagree about what a record says.
+    pub startup: crate::startup::StartupDigest,
+    /// One entry per configured event series, filled after this build by
+    /// `events::findings`. Absent from the JSON when the deployment declares
+    /// none, so a monitor that was never asked about a series says nothing
+    /// rather than reporting a zero.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<crate::events::EventSeries>,
+}
+
+/// One node's processes added together: the node's real traffic, where one
+/// process's reading is only its share.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProcessGroup {
+    pub node: String,
+    /// How many processes the config lists.
+    pub processes: usize,
+    /// Those that answered `/health` as their own index.
+    pub up: usize,
+    /// The names of the ones that did not, as `<node>/<index>`.
+    pub down: Vec<String>,
+    /// How many of the processes had a metrics document in the journal, which
+    /// the sums cover.
+    pub reporting: usize,
+    pub requests_total: u64,
+    pub cache_hits_total: u64,
+    pub cache_misses_total: u64,
+}
+
+/// A reading's node name and process index, when its name is `<node>/<index>`.
+fn process_of(name: &str) -> Option<(&str, u32)> {
+    let (node, index) = name.rsplit_once('/')?;
+    Some((node, index.parse().ok()?))
+}
+
+/// Add each multi-process node's readings together. Nodes keep the order they
+/// first appear in, and a node polled as one address makes no group.
+pub fn process_groups(readings: &[NodeReading]) -> Vec<ProcessGroup> {
+    let mut groups: Vec<ProcessGroup> = Vec::new();
+    for r in readings {
+        let Some((node, _)) = process_of(&r.name) else {
+            continue;
+        };
+        let at = match groups.iter().position(|g| g.node == node) {
+            Some(i) => i,
+            None => {
+                groups.push(ProcessGroup {
+                    node: node.to_string(),
+                    processes: 0,
+                    up: 0,
+                    down: Vec::new(),
+                    reporting: 0,
+                    requests_total: 0,
+                    cache_hits_total: 0,
+                    cache_misses_total: 0,
+                });
+                groups.len() - 1
+            }
+        };
+        let g = &mut groups[at];
+        g.processes += 1;
+        if r.is_up() {
+            g.up += 1;
+        } else {
+            g.down.push(r.name.clone());
+        }
+        if let Some(p) = &r.perf {
+            g.reporting += 1;
+            g.requests_total += p.metrics.requests_total;
+            g.cache_hits_total += p.metrics.cache_hits_total;
+            g.cache_misses_total += p.metrics.cache_misses_total;
+        }
+    }
+    groups
 }
 
 impl Digest {
@@ -129,23 +257,19 @@ pub struct NodeDigest {
     /// relabelled.
     pub reported_node: Option<String>,
     pub rtt_ms: Option<f64>,
-    /// The m6 release the node is running, from `/perf`. `None` when the node
-    /// predates the field, which reads as "cannot say" and never as agreement:
-    /// a fleet where one node is silent about its version is exactly the case the
-    /// drift check must not call uniform.
+    /// The m6 release the node is running, as the full SemVer string from the
+    /// metrics document, for example `1.16.0-rc.1+abc123def456`. The build
+    /// metadata after the `+` is the commit, which is what the release tag
+    /// cannot say: Rust is not byte-reproducible, so one tag built twice gives
+    /// two binaries reporting one release, and the commit tells them apart.
+    /// [`commit`] reads it. `None` when
+    /// the node predates the field, which reads as "cannot say" and never as
+    /// agreement: a fleet where one node is silent about its version is
+    /// exactly the case the drift check must not call uniform.
     pub version: Option<String>,
-    /// Which binary reported the version, from `/perf`. A node runs several and
-    /// "the node is on 1.10.0" has never been one fact.
+    /// Which binary reported the version, from the metrics document. A node
+    /// runs several and "the node is on 1.10.0" has never been one fact.
     pub binary: Option<String>,
-    /// The hash of the build actually running, from `/perf`.
-    ///
-    /// This is what the version cannot say. Rust is not byte-reproducible, so
-    /// one tag built twice gives two binaries reporting one version: on
-    /// 2026-09-20 staging ran one build of `v1.10.0` and production another, and
-    /// every reading available to an operator said the fleet agreed. `None` on a
-    /// node too old to say, which counts as drift rather than agreement for the
-    /// same reason the version does.
-    pub hash: Option<String>,
     pub uptime_s: Option<u64>,
     pub host_uptime_s: Option<u64>,
     pub requests_total: Option<u64>,
@@ -164,7 +288,8 @@ pub struct NodeDigest {
     /// exactly like a p50 over a thousand.
     pub hit_samples: Option<usize>,
     pub backend_errors: Option<u64>,
-    pub pools: Vec<(String, usize, usize)>,
+    /// Each socket pool and how many members it holds.
+    pub pools: Vec<(String, usize)>,
     pub load_one: Option<f64>,
     pub cpus: Option<usize>,
     pub memory_used: Option<f64>,
@@ -173,14 +298,14 @@ pub struct NodeDigest {
     pub disk_total_bytes: Option<u64>,
     pub thermal_max_c: Option<f32>,
     /// Seconds left on the soonest-expiring certificate the node is serving,
-    /// from `/perf`.
+    /// from the metrics document.
     ///
     /// The soonest rather than the leaf's, because a chain is only good until
     /// its first expiry and an operator wants one number per node. Negative on
     /// a certificate that has already expired. `None` when the node reported no
     /// certificate at all, which reads as "cannot say" and never as "plenty of
     /// time": a node silent about its expiry is the exact case this check must
-    /// not call healthy, for the reason `version` and `hash` give above.
+    /// not call healthy, for the reason `version` gives above.
     pub cert_expires_in_seconds: Option<i64>,
     /// `notAfter` of the soonest-expiring certificate the node is serving, as
     /// an absolute time.
@@ -193,57 +318,35 @@ pub struct NodeDigest {
     /// comparing it ACROSS nodes is exact, and that comparison is the only way
     /// to see a fleet whose nodes have stopped agreeing about what they serve.
     pub cert_not_after_unix: Option<i64>,
+    /// SHA-256 of the leaf certificate this node is serving, from the metrics
+    /// document.
+    ///
+    /// This is the identity the expiry cannot give. Two certificates can
+    /// expire on the same day, and then `cert_not_after_unix` above cannot
+    /// tell them apart while a client sees two different certificates. The
+    /// fleet comparison groups on this value and not on the expiry.
+    ///
+    /// The leaf only: `depth` 0 is the certificate a client validates and the
+    /// one an *ACME* client renews, and a shared certificate is one leaf.
+    /// `None` when the node reported no fingerprint, which covers a node older
+    /// than the field and a chain with an unreadable member. `None` reads as
+    /// "cannot say" and is never counted as agreeing with the others.
+    pub cert_fingerprint: Option<Fingerprint>,
     pub perf_error: Option<String>,
     /// The WireGuard tunnel from the monitor host to this node, if configured.
     pub tunnel: Option<TunnelDigest>,
-    /// When the node last reopened its log file, from `/perf`.
-    pub log_reopen: LogReopenDigest,
-}
-
-/// When a node last reopened its log file, as figures and a state.
-///
-/// `state` is `ok` when it has reopened since start, `never` when it has not,
-/// `no_log_file` when the process writes none and `unknown` when the node did
-/// not say, with `detail` giving the reason.
-#[derive(Debug, Clone, Serialize)]
-pub struct LogReopenDigest {
-    pub state: &'static str,
-    pub age_s: Option<u64>,
-    pub last_unix: Option<u64>,
-    pub reopens: Option<u64>,
-    pub failures: Option<u64>,
-    pub last_failure_age_s: Option<u64>,
-    pub detail: Option<String>,
-}
-
-impl LogReopenDigest {
-    fn unknown(detail: &str) -> Self {
-        Self {
-            state: "unknown",
-            age_s: None,
-            last_unix: None,
-            reopens: None,
-            failures: None,
-            last_failure_age_s: None,
-            detail: Some(detail.to_string()),
-        }
-    }
-
-    fn from_health(h: &m6_core::monitoring::LogReopenHealth) -> Self {
-        Self {
-            state: if h.seconds_since_last_reopen.is_some() {
-                "ok"
-            } else {
-                "never"
-            },
-            age_s: h.seconds_since_last_reopen,
-            last_unix: h.last_reopen_unix,
-            reopens: Some(h.reopens_total),
-            failures: Some(h.failures_total),
-            last_failure_age_s: h.seconds_since_last_failure,
-            detail: None,
-        }
-    }
+    /// This node's traffic and security summary, from the traffic document.
+    ///
+    /// The check prints these facts in sections D and E. The digest carried
+    /// none of them until #220, so a consumer of `/digest` was told less about
+    /// a node's traffic than a reader of `/check`. `None` when the journal held
+    /// no traffic line for the node, which is why `traffic_error` sits beside
+    /// it.
+    pub traffic: Option<TrafficDigest>,
+    /// Why `traffic` is absent, when it is. Two silences read differently: a
+    /// node with no traffic summary and a node whose summary is empty must not
+    /// look the same, the rule `perf_error` already follows.
+    pub traffic_error: Option<String>,
 }
 
 /// One node's tunnel, as figures and states.
@@ -294,8 +397,6 @@ pub enum HandshakeState {
     NoPublicKey,
     /// Tunnels are configured but `wg_handshakes_file` is not set.
     NoHandshakesFile,
-    /// Not read, for a reason reported by another finding.
-    Unknown,
     FileMissing,
     FileError,
     /// The handshakes file is older than the limit, so no age is judged.
@@ -311,7 +412,6 @@ impl HandshakeState {
             Self::PeerAbsent => "peer_absent",
             Self::NoPublicKey => "no_public_key",
             Self::NoHandshakesFile => "no_handshakes_file",
-            Self::Unknown => "unknown",
             Self::FileMissing => "file_missing",
             Self::FileError => "file_error",
             Self::FileStale => "file_stale",
@@ -347,10 +447,6 @@ impl TunnelDigest {
             HandshakeState::PeerAbsent => "peer not on this host's interface".to_string(),
             HandshakeState::NoPublicKey => "unknown (no public_key)".to_string(),
             HandshakeState::NoHandshakesFile => "unknown (no wg_handshakes_file)".to_string(),
-            HandshakeState::Unknown => format!(
-                "unknown ({})",
-                self.handshake_detail.as_deref().unwrap_or("-")
-            ),
             HandshakeState::FileMissing => "file missing".to_string(),
             HandshakeState::FileError => "file unreadable".to_string(),
             HandshakeState::FileStale => "unknown (handshakes file is stale)".to_string(),
@@ -375,7 +471,6 @@ fn tunnel_digest(t: &crate::tunnel::TunnelReading) -> TunnelDigest {
     let (handshake, handshake_age_s, handshake_detail) = match &t.handshake {
         Handshake::NoPublicKey => (HandshakeState::NoPublicKey, None, None),
         Handshake::NoHandshakesFile => (HandshakeState::NoHandshakesFile, None, None),
-        Handshake::Unknown(why) => (HandshakeState::Unknown, None, Some((*why).to_string())),
         Handshake::FileMissing(p) => (HandshakeState::FileMissing, None, Some(p.clone())),
         Handshake::FileError(e) => (HandshakeState::FileError, None, Some(e.clone())),
         Handshake::FileStale { path, .. } => (HandshakeState::FileStale, None, Some(path.clone())),
@@ -399,48 +494,269 @@ fn pct(v: f64) -> String {
     format!("{:.0}%", v * 100.0)
 }
 
-/// The faults for one node's log reopen, when a limit is set.
-fn log_reopen_findings(
-    node: &str,
-    uptime_s: u64,
-    l: &LogReopenDigest,
-    max: u64,
-    findings: &mut Vec<Finding>,
-) {
-    let mut fault = |text: String| {
-        findings.push(Finding {
-            level: Level::Fault,
-            node: node.to_string(),
-            text,
-        });
+/// How many notable clients one node's digest carries.
+///
+/// The check prints every notable client. A digest is one JSON body per
+/// request, so it carries this many and the true count in `notable_total`:
+/// bounded, and a consumer can still see that the list was cut.
+pub const NOTABLE_KEPT: usize = 32;
+
+/// How many crawler sightings one node's digest carries, and the same rule as
+/// [`NOTABLE_KEPT`]: `crawlers_total` carries the true count.
+pub const CRAWLERS_KEPT: usize = 32;
+
+/// How many forged-bot addresses, and how many single probes, one node's
+/// digest carries. Both are lists of addresses from a node's own JSON, and
+/// neither has a producer-side cap.
+pub const FORGERS_KEPT: usize = 32;
+pub const PROBE_NOISE_KEPT: usize = 32;
+
+/// How many firing firewall blocks one node's digest carries. The check prints
+/// five, so the digest carries the same five and `hit_total` for the rest.
+pub const FIREWALL_HITS_KEPT: usize = 5;
+
+/// How many probe and injection paths one notable client's digest carries. The
+/// check prints eight and four, and the digest keeps those sizes.
+pub const NOTABLE_PROBE_PATHS_KEPT: usize = 8;
+pub const NOTABLE_INJECTION_PATHS_KEPT: usize = 4;
+
+/// One node's traffic and security summary, from the traffic document.
+///
+/// This is the digest's copy of what the check prints in section D, "SECURITY
+/// AND TRAFFIC", and section E, "CRAWLERS". The field names are the wire's
+/// (`m6_core::monitoring::TrafficReport`), and every list that can grow with
+/// traffic is cut to a named constant with its true count beside it, so one
+/// request cannot make the digest unbounded.
+///
+/// It carries client addresses, user agents and the firewall's blocked
+/// addresses. It carries no token, no key and no fingerprint. See the module
+/// documentation of `/digest`'s access control in `main.rs`: the endpoint
+/// answers on the monitor's unix socket, and these are the facts the node
+/// already sent over the backbone to get here.
+#[derive(Debug, Clone, Serialize)]
+pub struct TrafficDigest {
+    /// The window summarised, in minutes.
+    pub window_minutes: u64,
+    /// Events the window overwrote while still inside it. Non-zero means the
+    /// totals below are short by that many requests.
+    pub events_dropped: u64,
+    pub total_requests: u64,
+    /// Responses by status code, as the node counted them.
+    pub status: std::collections::BTreeMap<u16, u64>,
+    pub logging: LoggingDigest,
+    /// The loudest clients, whatever they are. The node reports at most eight.
+    pub heavy_hitters: Vec<HeavyHitterDigest>,
+    /// Clients the node graded worth attention. At most [`NOTABLE_KEPT`].
+    pub notable: Vec<NotableDigest>,
+    /// How many notable clients the node reported, before the cut.
+    pub notable_total: usize,
+    /// Genuine crawler traffic. At most [`CRAWLERS_KEPT`].
+    pub crawlers: Vec<CrawlerDigest>,
+    /// How many crawler sightings the node reported, before the cut.
+    pub crawlers_total: usize,
+    /// Bot-shaped requests the node discarded as forged.
+    pub forged_bot_requests: u64,
+    /// The addresses that sent them, at most [`FORGERS_KEPT`].
+    pub forgers: Vec<String>,
+    /// How many forging addresses the node reported, before the cut.
+    pub forgers_total: usize,
+    /// Single refused probes, at most [`PROBE_NOISE_KEPT`].
+    pub probe_noise: Vec<String>,
+    /// How many single probes the node reported, before the cut.
+    pub probe_noise_total: usize,
+    /// The node's deliberate firewall blocks. `None` means no collector is
+    /// installed there, which the check prints as "no data" rather than as
+    /// "no blocks".
+    pub firewall: Option<FirewallDigest>,
+}
+
+/// Whether a node's main log is still emitting, as figures and the state the
+/// check prints.
+///
+/// `state` is `ok` while it emits, `quiet` when the last event is older than
+/// [`m6_core::monitoring::LoggingHealth::QUIET_SECONDS`], and `never` when
+/// nothing has been logged at all.
+#[derive(Debug, Clone, Serialize)]
+pub struct LoggingDigest {
+    pub state: &'static str,
+    pub events_total: u64,
+    /// `None` means nothing has ever been emitted.
+    pub seconds_since_last: Option<u64>,
+}
+
+/// One loud client, as section D's `top:` line prints it.
+#[derive(Debug, Clone, Serialize)]
+pub struct HeavyHitterDigest {
+    pub ip: String,
+    pub requests: u64,
+    pub top_path: String,
+    /// The wire calls this `user_agents`; the digest names the fact, because
+    /// it is a count and not a sample of agents.
+    pub distinct_user_agents: usize,
+    /// Share of responses that were 4xx or 5xx, which is the figure the check
+    /// prints as a percentage.
+    pub error_ratio: f64,
+}
+
+/// One client the node graded as notable, with the evidence section D prints.
+#[derive(Debug, Clone, Serialize)]
+pub struct NotableDigest {
+    pub ip: String,
+    pub requests: u64,
+    pub distinct_user_agents: usize,
+    pub rotating_user_agents: bool,
+    /// A sample, at most `m6_core::telemetry::USER_AGENTS_KEPT`.
+    pub user_agents: Vec<String>,
+    /// At most [`NOTABLE_PROBE_PATHS_KEPT`].
+    pub probe_paths: Vec<String>,
+    /// At most [`NOTABLE_INJECTION_PATHS_KEPT`].
+    pub injection_paths: Vec<String>,
+    pub first_seen: String,
+    pub last_seen: String,
+}
+
+/// One genuine crawler sighting, as section E prints it.
+#[derive(Debug, Clone, Serialize)]
+pub struct CrawlerDigest {
+    pub user_agent: String,
+    pub requests: u64,
+    /// At most the three the check prints, with the true count beside them.
+    pub client_ips: Vec<String>,
+    pub client_ips_total: usize,
+    /// The paths it asked for, at most the eight the node reports.
+    pub paths: Vec<String>,
+    pub first_seen: String,
+    pub last_seen: String,
+}
+
+/// One node's firewall state, as section D prints it.
+#[derive(Debug, Clone, Serialize)]
+pub struct FirewallDigest {
+    /// Deliberate per-address blocks installed on the node.
+    pub blocks: usize,
+    /// Rules carrying a counter, of any kind.
+    pub total_rules: usize,
+    /// Blocks that have dropped at least one packet, at most
+    /// [`FIREWALL_HITS_KEPT`].
+    pub hit: Vec<FirewallHitDigest>,
+    /// How many blocks have dropped something, before the cut.
+    pub hit_total: usize,
+}
+
+/// One block that is still being hit.
+#[derive(Debug, Clone, Serialize)]
+pub struct FirewallHitDigest {
+    pub address: String,
+    pub packets: u64,
+    pub bytes: u64,
+}
+
+fn traffic_digest(t: &m6_core::monitoring::TrafficReport) -> TrafficDigest {
+    let logging_state = match t.logging.seconds_since_last {
+        None => "never",
+        Some(_) if t.logging.is_blind() => "quiet",
+        Some(_) => "ok",
     };
-    match l.state {
-        "unknown" => fault(
-            "cannot say when it last reopened its log file: the node is too old to report it"
-                .to_string(),
-        ),
-        "never" if uptime_s > max => fault(format!(
-            "has never reopened its log file in {uptime_s}s since start, over the {max}s limit: \
-             is log rotation installed and signalling it?"
-        )),
-        "ok" if l.age_s.is_some_and(|age| age > max) => fault(format!(
-            "last reopened its log file {}s ago, over the {max}s limit: log rotation has stopped",
-            l.age_s.unwrap_or(0)
-        )),
-        _ => {}
-    }
-    if let Some(f) = l.last_failure_age_s {
-        if l.age_s.is_none_or(|ok| f < ok) {
-            fault(format!(
-                "its last log reopen failed {f}s ago and none has succeeded since, \
-                 so it is still writing to the previous file"
-            ));
-        }
+    TrafficDigest {
+        window_minutes: t.window_minutes,
+        events_dropped: t.events_dropped,
+        total_requests: t.total_requests,
+        status: t.status.clone(),
+        logging: LoggingDigest {
+            state: logging_state,
+            events_total: t.logging.events_total,
+            seconds_since_last: t.logging.seconds_since_last,
+        },
+        heavy_hitters: t
+            .heavy_hitters
+            .iter()
+            .map(|h| HeavyHitterDigest {
+                ip: h.ip.clone(),
+                requests: h.requests,
+                top_path: h.top_path.clone(),
+                distinct_user_agents: h.distinct_user_agents,
+                error_ratio: h.error_ratio,
+            })
+            .collect(),
+        notable: t
+            .notable
+            .iter()
+            .take(NOTABLE_KEPT)
+            .map(|c| NotableDigest {
+                ip: c.ip.clone(),
+                requests: c.requests,
+                distinct_user_agents: c.distinct_user_agents,
+                rotating_user_agents: c.rotating_user_agents,
+                user_agents: c
+                    .user_agents
+                    .iter()
+                    .take(m6_core::telemetry::USER_AGENTS_KEPT)
+                    .cloned()
+                    .collect(),
+                probe_paths: c
+                    .probe_paths
+                    .iter()
+                    .take(NOTABLE_PROBE_PATHS_KEPT)
+                    .cloned()
+                    .collect(),
+                injection_paths: c
+                    .injection_paths
+                    .iter()
+                    .take(NOTABLE_INJECTION_PATHS_KEPT)
+                    .cloned()
+                    .collect(),
+                first_seen: c.first_seen.clone(),
+                last_seen: c.last_seen.clone(),
+            })
+            .collect(),
+        notable_total: t.notable.len(),
+        crawlers: t
+            .crawlers
+            .iter()
+            .take(CRAWLERS_KEPT)
+            .map(|c| CrawlerDigest {
+                user_agent: c.user_agent.clone(),
+                requests: c.requests,
+                client_ips: c.client_ips.iter().take(3).cloned().collect(),
+                client_ips_total: c.client_ips.len(),
+                paths: c.paths.clone(),
+                first_seen: c.first_seen.clone(),
+                last_seen: c.last_seen.clone(),
+            })
+            .collect(),
+        crawlers_total: t.crawlers.len(),
+        forged_bot_requests: t.forged_bot_requests,
+        forgers: t.forgers.iter().take(FORGERS_KEPT).cloned().collect(),
+        forgers_total: t.forgers.len(),
+        probe_noise: t
+            .probe_noise
+            .iter()
+            .take(PROBE_NOISE_KEPT)
+            .cloned()
+            .collect(),
+        probe_noise_total: t.probe_noise.len(),
+        firewall: t.firewall.as_ref().map(|fw| {
+            let hit: Vec<&m6_core::firewall::Block> = fw.active().collect();
+            FirewallDigest {
+                blocks: fw.blocks.len(),
+                total_rules: fw.total_rules,
+                hit: hit
+                    .iter()
+                    .take(FIREWALL_HITS_KEPT)
+                    .map(|b| FirewallHitDigest {
+                        address: b.address.clone(),
+                        packets: b.packets,
+                        bytes: b.bytes,
+                    })
+                    .collect(),
+                hit_total: hit.len(),
+            }
+        }),
     }
 }
 
-/// The fault text for a main log that has gone quiet, from `/traffic`, or
-/// `None` while it is emitting.
+/// The fault text for a main log that has gone quiet, from the traffic
+/// document, or `None` while it is emitting.
 ///
 /// Section A of the check prints this text and the verdict counts it as a
 /// finding, so both say the same thing.
@@ -463,6 +779,119 @@ fn quiet_log_findings(node: &str, l: &m6_core::monitoring::LoggingHealth) -> Opt
     })
 }
 
+/// The fault sentence for one failing header check, in the wording both the
+/// digest finding and the check's F section print.
+///
+/// Absent and wrong read differently: a missing header is usually a route that
+/// lost its policy, a wrong one a policy that changed.
+pub(crate) fn header_check_text(hc: &HeaderCheckResult) -> String {
+    if let Some(e) = &hc.error {
+        format!("{} could not be fetched: {e}", hc.path)
+    } else {
+        let got = hc
+            .actual
+            .clone()
+            .unwrap_or_else(|| "<header absent>".to_string());
+        format!(
+            "{} {} is {:?}, expected {:?}",
+            hc.path, hc.header, got, hc.expected
+        )
+    }
+}
+
+/// The fault finding for one failing header check, shared by the digest and the
+/// check render so a wrong cache policy reaches the verdict in both.
+///
+/// The `text` names the path and the two values but not the node: `Finding.node`
+/// carries that, and every verdict prints it as `- {node}: {text}`.
+pub(crate) fn header_check_finding(node: &str, hc: &HeaderCheckResult) -> Finding {
+    Finding {
+        level: Level::Fault,
+        node: node.to_string(),
+        text: header_check_text(hc),
+    }
+}
+
+/// Seconds of uptime as "Nd Nh Nm", the one wording the page and the check
+/// share. Minutes only when there are whole minutes, so a node up 42 minutes
+/// reads "42m" and never "0h".
+pub(crate) fn fmt_uptime(secs: u64) -> String {
+    let d = secs / 86_400;
+    let h = (secs % 86_400) / 3_600;
+    let m = (secs % 3_600) / 60;
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else {
+        format!("{m}m")
+    }
+}
+
+/// The release part of a SemVer string: the version and its pre-release, with
+/// the `+` build metadata dropped.
+///
+/// The string is parsed with the `semver` crate and the release is what the
+/// parser writes without its build metadata, so a reader never has to know
+/// where the `+` is. A string that does not parse is returned whole, because
+/// there is no release in it to name.
+///
+/// Version drift compares this, because SemVer 2.0.0 gives build metadata no
+/// precedence. `1.16.0-rc.1+aaaa` and `1.16.0-rc.1+bbbb` are one release built
+/// twice, which is build drift and not version drift.
+pub fn release(version: &str) -> String {
+    match semver::Version::parse(version) {
+        Ok(mut v) => {
+            v.build = semver::BuildMetadata::EMPTY;
+            v.to_string()
+        }
+        Err(_) => version.to_string(),
+    }
+}
+
+/// The build metadata of a SemVer string, which is the commit the node's
+/// binary was built from, with its optional `.dirty` suffix.
+///
+/// `None` when the string does not parse or carries no metadata, which reads
+/// as "cannot say" and counts as drift rather than agreement.
+pub fn build_metadata(version: &str) -> Option<String> {
+    let parsed = semver::Version::parse(version).ok()?;
+    let metadata = parsed.build.as_str();
+    (!metadata.is_empty()).then(|| metadata.to_string())
+}
+
+/// The commit and the dirty flag the build metadata names.
+///
+/// [`m6_core::build_info`] writes the commit and appends `.dirty` when the tree
+/// had uncommitted changes, so `abc123def456.dirty` is a different build from
+/// `abc123def456`: same source, different bytes. The commit is the metadata
+/// before the `.dirty`, and any other metadata is kept whole as the commit so
+/// nothing is silently dropped.
+pub fn commit_and_dirty(version: &str) -> Option<(String, bool)> {
+    let metadata = build_metadata(version)?;
+    Some(match metadata.split_once('.') {
+        Some((commit, "dirty")) => (commit.to_string(), true),
+        _ => (metadata, false),
+    })
+}
+
+/// The commit a node's binary was built from: the build metadata of its
+/// version, without the `.dirty` suffix. `None` on a node whose version carries
+/// none, which counts as drift rather than agreement for the same reason a
+/// missing version does.
+pub fn commit(n: &NodeDigest) -> Option<String> {
+    n.version
+        .as_deref()
+        .and_then(commit_and_dirty)
+        .map(|(c, _)| c)
+}
+
+/// The `(commit, dirty)` pair a node's version names. `None` when it names no
+/// commit, which counts as drift rather than agreement.
+pub fn build_id(n: &NodeDigest) -> Option<(String, bool)> {
+    n.version.as_deref().and_then(commit_and_dirty)
+}
+
 pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
     let mut findings = Vec::new();
     let mut nodes = Vec::new();
@@ -480,7 +909,6 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             rtt_ms: r.rtt.map(|d| d.as_secs_f64() * 1000.0),
             version: None,
             binary: None,
-            hash: None,
             uptime_s: None,
             host_uptime_s: None,
             requests_total: None,
@@ -499,9 +927,11 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             thermal_max_c: None,
             cert_expires_in_seconds: None,
             cert_not_after_unix: None,
+            cert_fingerprint: None,
             perf_error: r.perf_error.clone(),
             tunnel: r.tunnel.as_ref().map(tunnel_digest),
-            log_reopen: LogReopenDigest::unknown("no /perf reading"),
+            traffic: r.traffic.as_ref().map(traffic_digest),
+            traffic_error: r.traffic_error.clone(),
         };
 
         // Before the unreachable `continue` below: a node whose HTTPS poll
@@ -579,8 +1009,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
                 HandshakeState::NoHandshakesFile
                 | HandshakeState::FileStale
                 | HandshakeState::FileMissing
-                | HandshakeState::FileError
-                | HandshakeState::Unknown => {}
+                | HandshakeState::FileError => {}
             }
         }
 
@@ -598,20 +1027,26 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             continue;
         }
 
-        if r.status() == "degraded" {
-            findings.push(Finding {
+        match r.status() {
+            "ok" => {}
+            "degraded" => findings.push(Finding {
                 level: Level::Fault,
                 node: r.name.clone(),
-                text: "reports degraded: a configured socket pool has no live member".to_string(),
-            });
+                text: format!("reports degraded: {DEGRADED_REASON}"),
+            }),
+            other => findings.push(Finding {
+                level: Level::Fault,
+                node: r.name.clone(),
+                text: format!("reports health status {other}"),
+            }),
         }
 
         if let Some(p) = &r.perf {
             // Empty rather than absent on a node older than the field, so each
             // part is reported as unknown instead of as an empty string. The
             // three are taken separately on purpose: a node can legitimately
-            // know its version and not its hash, because the hash is read from
-            // the executable at startup and confinement can refuse that.
+            // know its release and not its commit, because the build metadata
+            // is absent on a build made without git.
             let empty_to_none = |s: &String| {
                 if s.is_empty() {
                     None
@@ -621,21 +1056,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             };
             d.version = empty_to_none(&p.build.version);
             d.binary = empty_to_none(&p.build.name);
-            d.hash = empty_to_none(&p.build.hash);
             d.uptime_s = Some(p.uptime_s);
-            d.log_reopen = match &p.logging {
-                None => LogReopenDigest::unknown("node too old to report log reopening"),
-                Some(l) => match &l.reopen {
-                    None => LogReopenDigest {
-                        state: "no_log_file",
-                        ..LogReopenDigest::unknown("")
-                    },
-                    Some(h) => LogReopenDigest::from_health(h),
-                },
-            };
-            if let Some(max) = t.log_reopen_age_s {
-                log_reopen_findings(&r.name, p.uptime_s, &d.log_reopen, max, &mut findings);
-            }
             // The soonest expiry in the chain. `min` over an empty list is
             // `None`, which is the answer for a node too old to report the
             // field and is left to say "cannot say" rather than collapsing to
@@ -657,6 +1078,21 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             // certificates.
             d.cert_not_after_unix = if p.tls_unreadable == 0 {
                 p.tls.iter().map(|c| c.not_after_unix).min()
+            } else {
+                None
+            };
+            // The LEAF's identity, under the same guard as the two figures
+            // above. The guard is not about the min this time: it keeps one
+            // rule for the tuple the fleet comparison reads, where a node
+            // either reports its certificate completely or says nothing. An
+            // incomplete chain already warns per node, and a fingerprint
+            // taken from it would let the comparison treat a node whose leaf
+            // is unaccounted for as one that carries a certificate.
+            d.cert_fingerprint = if p.tls_unreadable == 0 {
+                p.tls
+                    .iter()
+                    .find(|c| c.depth == 0)
+                    .and_then(|c| c.fingerprint)
             } else {
                 None
             };
@@ -683,21 +1119,8 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             d.hit_samples = Some(p.metrics.hit_samples);
             d.hit_p50_ns = sampled.then_some(p.metrics.hit_p50_ns);
             d.hit_p99_ns = sampled.then_some(p.metrics.hit_p99_ns);
-            d.pools = p
-                .pools
-                .iter()
-                .map(|x| (x.name.clone(), x.active, x.total))
-                .collect();
+            d.pools = p.pools.iter().map(|x| (x.name.clone(), x.total)).collect();
 
-            for pool in &p.pools {
-                if pool.active == 0 {
-                    findings.push(Finding {
-                        level: Level::Fault,
-                        node: r.name.clone(),
-                        text: format!("pool {} has 0 of {} members live", pool.name, pool.total),
-                    });
-                }
-            }
             if p.metrics.backend_errors_total > 0 {
                 // NAME the backend. "3 backend errors since start" left the
                 // operator to guess which service, and the guess that matters is
@@ -706,7 +1129,8 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
                 // difference between seeing silent mail loss and not.
                 //
                 // Falls back to the bare total against a node older than 1.3.0,
-                // whose /perf carries no attribution, rather than reporting nothing.
+                // whose metrics document carries no attribution, rather than
+                // reporting nothing.
                 let text = if p.metrics.backend_errors_by_name.is_empty() {
                     format!(
                         "{} backend errors since start (node too old to attribute them)",
@@ -868,7 +1292,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
                 level: Level::Warn,
                 node: r.name.clone(),
                 text: format!(
-                    "no /perf: {}. Health is known, everything else is not.",
+                    "metrics unavailable: {}. Health is known, everything else is not.",
                     r.perf_error.as_deref().unwrap_or("")
                 ),
             });
@@ -876,6 +1300,12 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
 
         if let Some(t) = &r.traffic {
             findings.extend(quiet_log_findings(&r.name, &t.logging));
+        }
+
+        for hc in &r.header_checks {
+            if !hc.passed() {
+                findings.push(header_check_finding(&r.name, hc));
+            }
         }
 
         nodes.push(d);
@@ -897,13 +1327,18 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
     // agreeing while the third is silent is not a uniform fleet, it is an unknown
     // one, and reporting it as uniform is the failure mode this whole change
     // exists to remove.
-    // uptime_s is set exactly when /perf was read, so it is the marker for "this
-    // node answered" without needing a second flag that could disagree with it.
+    //
+    // Build metadata is excluded from this comparison. SemVer 2.0.0 gives it no
+    // precedence, so two nodes on one tag with different commits are one release
+    // and the check below reports the difference.
+    // uptime_s is set exactly when the metrics document was built, so it is
+    // the marker for "this node answered" without needing a second flag that
+    // could disagree with it.
     let reporting: Vec<&NodeDigest> = nodes.iter().filter(|n| n.uptime_s.is_some()).collect();
     if reporting.len() > 1 {
-        let mut seen: Vec<&str> = reporting
+        let mut seen: Vec<String> = reporting
             .iter()
-            .map(|n| n.version.as_deref().unwrap_or("unknown"))
+            .map(|n| release(n.version.as_deref().unwrap_or("unknown")))
             .collect();
         seen.sort_unstable();
         seen.dedup();
@@ -930,32 +1365,43 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
         //
         // Version drift means somebody deployed different releases. Build drift
         // means one release was BUILT TWICE and the fleet holds both: same
-        // source, same tag, different bytes, because Rust is not
+        // source, same tag, different commit, because Rust is not
         // byte-reproducible. That is not a hypothetical and it is not rare. It
-        // happened on 2026-09-20, it was invisible to every reading an operator
-        // had, and it took `md5sum` on four machines to find. The whole reason
-        // the hash is on the wire is so that this check can exist.
+        // happened on 2026-09-20 with two byte builds of one tag, it was
+        // invisible to every reading an operator had, and it took `md5sum` on
+        // four machines to find. The build metadata in the version string is
+        // what makes this check possible without that file read.
         //
-        // Reported only when the versions agree. When they do not, the version
-        // finding above already says the fleet is not uniform and the hashes
+        // The dirty flag is part of the compared pair. A tree built with
+        // uncommitted changes is a different binary from a clean build of the
+        // same commit, so comparing the commit alone would call the two one
+        // build and miss exactly the case an operator needs named.
+        //
+        // Reported only when the releases agree. When they do not, the version
+        // finding above already says the fleet is not uniform and the commits
         // differing is a consequence of it, not a second fault.
         let versions_agree = seen.len() == 1;
-        let mut hashes: Vec<&str> = reporting
+        let mut builds: Vec<(String, bool)> = reporting
             .iter()
-            .map(|n| n.hash.as_deref().unwrap_or("unknown"))
+            .map(|n| build_id(n).unwrap_or_else(|| ("unknown".to_string(), false)))
             .collect();
-        hashes.sort_unstable();
-        hashes.dedup();
-        if versions_agree && hashes.len() > 1 {
+        builds.sort_unstable();
+        builds.dedup();
+        if versions_agree && builds.len() > 1 {
             let detail = reporting
                 .iter()
                 .map(|n| {
-                    // Twelve characters, which is what an operator reading a
-                    // handover or an estate file is looking at. The full value
-                    // is in the JSON digest for anything that wants to compare
-                    // exactly.
-                    let h = n.hash.as_deref().unwrap_or("unknown");
-                    format!("{} {}", n.name, &h[..h.len().min(12)])
+                    // Twelve characters, which is the commit an operator
+                    // reading their own notes is looking at. The full build
+                    // metadata is in the JSON digest for anything that wants to
+                    // compare exactly.
+                    let (c, dirty) = build_id(n).unwrap_or_else(|| ("unknown".to_string(), false));
+                    let short: String = c.chars().take(12).collect();
+                    if dirty {
+                        format!("{} {} (dirty)", n.name, short)
+                    } else {
+                        format!("{} {}", n.name, short)
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -965,7 +1411,8 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
                 text: format!(
                     "build drift across the fleet, all reporting the same version: {detail}. \
                      One release built more than once, so the fleet is running different \
-                     binaries from identical source. The version cannot see this."
+                     binaries from identical source. The build metadata in the version \
+                     string is what shows this."
                 ),
             });
         }
@@ -990,24 +1437,43 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
         // about its chain is already a finding of its own above, and counting
         // it again here would report one silence as two faults and name the
         // cause in neither.
-        // Both figures or neither, so there is no half-answer to describe. An
+        // All three or none, so there is no half-answer to describe. An
         // earlier version admitted a node on `cert_not_after_unix.is_some()`
         // and then matched on `cert_expires_in_seconds`, with an `unknown` arm
         // that could not be reached: the two are set together under one
         // `tls_unreadable == 0` guard. A reader had to prove that invariant to
-        // know the arm was dead, so the tuple now requires both and the
-        // impossible case cannot be written.
-        let certified: Vec<(&str, i64, i64)> = reporting
+        // know the arm was dead, so the tuple requires the certificate's
+        // identity and both expiry figures, and the impossible case cannot be
+        // written.
+        //
+        // ── IDENTITY IS THE FINGERPRINT, NOT THE EXPIRY ──────────────────────
+        //
+        // Grouping on `notAfter` was the first version, and issue #275 names
+        // what it misses: two certificates can expire on the same day. A
+        // renewal reissued twelve hours later, or two ACME clients that ran on
+        // one schedule, differ in the DER and agree in the expiry, so the
+        // expiry comparison called them one certificate while a client
+        // validating against them receives two. The fingerprint separates
+        // them, and it is the same value the metrics document carries, so the
+        // fleet comparison reads one fact rather than deriving a second.
+        struct Certified<'a> {
+            name: &'a str,
+            fingerprint: Fingerprint,
+            not_after_unix: i64,
+            expires_in_seconds: i64,
+        }
+        let certified: Vec<Certified<'_>> = reporting
             .iter()
             .filter_map(|n| {
-                Some((
-                    n.name.as_str(),
-                    n.cert_not_after_unix?,
-                    n.cert_expires_in_seconds?,
-                ))
+                Some(Certified {
+                    name: n.name.as_str(),
+                    fingerprint: n.cert_fingerprint?,
+                    not_after_unix: n.cert_not_after_unix?,
+                    expires_in_seconds: n.cert_expires_in_seconds?,
+                })
             })
             .collect();
-        // ── PARTIAL agreement is the signal, not disagreement ────────────────
+        // ── PARTIAL agreement is the signal when nothing was declared ────────
         //
         // The first version of this warned whenever the certified nodes did not
         // all agree, which is wrong for any fleet that does not share one
@@ -1018,10 +1484,9 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
         // construction, so that version warned on every poll, forever, and a
         // permanent warning in an hourly check is the same as no warning.
         //
-        // The distinguishing shape is not "they differ", it is "some of them
-        // AGREE and one does not". Nodes sharing a `notAfter` are serving one
-        // certificate, which is a fact about the fleet rather than an
-        // assumption about it, and a node outside that group has been left
+        // The distinguishing shape is "some of them AGREE and one does not".
+        // Nodes with one fingerprint are serving one certificate, which is a
+        // fact about the fleet, and a node outside that group has been left
         // behind by the renewal the others got.
         //
         //   every node distinct          per-node certificates. Silent
@@ -1029,62 +1494,128 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
         //   two or more equal, one not   one certificate, one node behind. WARN
         //
         // What this cannot see is a TWO-node fleet sharing one certificate
-        // where one node lags: two distinct values, no group of two, so it
-        // stays silent. That is the honest cost of deriving the expectation
-        // from the data instead of being told it, and it fails quiet rather
-        // than crying wolf.
-        let mut by_expiry: std::collections::BTreeMap<i64, Vec<&str>> =
+        // where one node lags: two distinct fingerprints, no group of two, so
+        // it stays silent. It also cannot see a node that reissued into the
+        // same expiry as the others, because the expiry is no longer the
+        // group. `[monitor] one_certificate` answers both: the deployment
+        // states that the fleet is meant to carry one certificate, and any
+        // difference is then a fault rather than a question.
+        let mut by_fingerprint: std::collections::BTreeMap<Fingerprint, Vec<&Certified<'_>>> =
             std::collections::BTreeMap::new();
-        for &(name, at, _) in &certified {
-            by_expiry.entry(at).or_default().push(name);
+        for c in &certified {
+            by_fingerprint.entry(c.fingerprint).or_default().push(c);
         }
-        let largest = by_expiry.values().map(|v| v.len()).max().unwrap_or(0);
-        if by_expiry.len() > 1 && largest > 1 {
-            // ── The NEWEST certificate is the right one, not the commonest ───
-            //
-            // An earlier version named the majority as correct and everything
-            // else as behind, which is backwards for the case this check
-            // exists for. When an origin renews and two cache nodes are not
-            // told, the majority is the STALE pair and the single renewed node
-            // is the one that is right. Naming the renewed node as the problem
-            // would send an operator to fix the only node that did not need
-            // fixing.
-            //
-            // A renewal moves `notAfter` forward and nothing moves it back, so
-            // the latest expiry is the certificate that was installed and
-            // anything earlier has been left behind. Group size decides only
-            // whether to look at all, above.
-            let newest = by_expiry
-                .keys()
-                .next_back()
-                .copied()
-                .expect("by_expiry is not empty");
-            let behind: Vec<String> = certified
+        let largest = by_fingerprint.values().map(Vec::len).max().unwrap_or(0);
+
+        // ── Which of them is the certificate that was installed ──────────────
+        //
+        // The NEWEST is the right one, not the commonest. When an origin renews
+        // and two cache nodes are not told, the majority is the STALE pair and
+        // the single renewed node is the one that is right. Naming the renewed
+        // node as the problem would send an operator to fix the only node that
+        // did not need fixing.
+        //
+        // A renewal moves `notAfter` forward and nothing moves it back, so the
+        // group with the latest expiry holds the certificate that was
+        // installed. Group size breaks an expiry tie and the fingerprint
+        // breaks that tie, so the answer cannot depend on map order.
+        let newest_of = |group: &Vec<&Certified<'_>>| {
+            group
                 .iter()
-                .filter(|&&(_, at, _)| at < newest)
-                .map(|&(name, at, left)| {
-                    // Days, because that is the unit an operator decides in,
-                    // AND `notAfter` itself, because days alone cannot show
-                    // the disagreement this finding reports. Two certificates
-                    // issued twelve hours apart have the same number of whole
-                    // days left, so a line reading "origin 89d, edge-a 89d"
-                    // under a claim they differ tells an operator nothing and
-                    // reads as a defect in the check.
-                    format!("{name} {}d (notAfter {at})", left / 86_400)
-                })
+                .map(|c| c.not_after_unix)
+                .max()
+                .unwrap_or(i64::MIN)
+        };
+        let installed = by_fingerprint
+            .iter()
+            .max_by_key(|(fp, group)| (newest_of(group), group.len(), **fp));
+        let installed_fingerprint = installed.map(|(fp, _)| *fp);
+        let installed_not_after = installed.map(|(_, group)| newest_of(group));
+
+        // Days, because that is the unit an operator decides in, AND
+        // `notAfter` and the fingerprint, because days alone cannot show the
+        // disagreement this finding reports. Two certificates issued twelve
+        // hours apart have the same number of whole days left, and two issued
+        // together have the same expiry and a different DER, which is the
+        // case issue #275 was filed for.
+        let describe = |c: &Certified<'_>| {
+            format!(
+                "{} {}d (notAfter {}, fingerprint {})",
+                c.name,
+                c.expires_in_seconds / 86_400,
+                c.not_after_unix,
+                c.fingerprint.short()
+            )
+        };
+
+        if let (Some(fingerprint), Some(expires_at)) = (installed_fingerprint, installed_not_after)
+        {
+            if by_fingerprint.len() > 1 {
+                let differing: Vec<String> = certified
+                    .iter()
+                    .filter(|c| c.fingerprint != fingerprint)
+                    .map(describe)
+                    .collect();
+                if t.one_certificate {
+                    findings.push(Finding {
+                        level: Level::Fault,
+                        node: "fleet".to_string(),
+                        text: format!(
+                            "{} node(s) do not carry the certificate the fleet is declared to \
+                             share ([monitor] one_certificate): {}. The certificate the \
+                             declaration expects is {fingerprint} and expires at {expires_at}. \
+                             Two certificates can expire on the same day and differ, so this \
+                             compares identities and not expiries. Remove the key from \
+                             [monitor] if this fleet runs one certificate per node.",
+                            differing.len(),
+                            differing.join(", ")
+                        ),
+                    });
+                } else if largest > 1 {
+                    findings.push(Finding {
+                        level: Level::Warn,
+                        node: "fleet".to_string(),
+                        text: format!(
+                            "{} node(s) are behind the newest certificate on the fleet, which \
+                             expires at {expires_at}: {}. A node left behind by a renewal \
+                             serves a valid certificate that a client still trusts, and no \
+                             per-node threshold can see that it is not the one the fleet \
+                             installed. The fingerprint and not the expiry is what separates \
+                             them, so two certificates that expire on one day are still two \
+                             certificates.",
+                            differing.len(),
+                            differing.join(", ")
+                        ),
+                    });
+                }
+            }
+        }
+
+        // A node that reports an expiry but no fingerprint cannot be checked
+        // against the declaration, and silence would read as agreement. It is
+        // the state of a node older than the fingerprint field, or of a chain
+        // that did not fully parse, and both are "cannot say" rather than
+        // "the same as the others".
+        if t.one_certificate {
+            let unverifiable: Vec<&str> = reporting
+                .iter()
+                .filter(|n| n.cert_not_after_unix.is_some() && n.cert_fingerprint.is_none())
+                .map(|n| n.name.as_str())
                 .collect();
-            findings.push(Finding {
-                level: Level::Warn,
-                node: "fleet".to_string(),
-                text: format!(
-                    "{} node(s) are behind the newest certificate on the fleet, which \
-                     expires at {newest}: {}. A node left behind by a renewal serves a \
-                     valid certificate that expires sooner than the one that was \
-                     installed, and no per-node threshold can see it.",
-                    behind.len(),
-                    behind.join(", ")
-                ),
-            });
+            if !unverifiable.is_empty() {
+                findings.push(Finding {
+                    level: Level::Warn,
+                    node: "fleet".to_string(),
+                    text: format!(
+                        "{} node(s) report a certificate expiry but no fingerprint, so \
+                         [monitor] one_certificate cannot check them: {}. A node older than \
+                         the fingerprint field, or one whose chain did not fully parse, is not \
+                         evidence that the fleet serves one certificate.",
+                        unverifiable.len(),
+                        unverifiable.join(", ")
+                    ),
+                });
+            }
         }
     }
 
@@ -1109,24 +1640,27 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             .filter_map(|r| r.tunnel.as_ref()?.file_age_s)
             .next(),
         history: None,
+        process_groups: process_groups(readings),
+        startup: crate::startup::StartupDigest::default(),
+        events: Vec::new(),
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use m6_core::host::{Disk, HostSnapshot, LoadAverage, Memory, MemorySource};
     use m6_core::monitoring::{HealthReport, PerfReport, PoolHealth};
+    use m6_core::platform::host::{Disk, HostSnapshot, LoadAverage, Memory, MemorySource};
     use m6_core::telemetry::StatsSnapshot;
 
     pub(crate) fn perf(host: HostSnapshot, pools: Vec<PoolHealth>) -> PerfReport {
         PerfReport {
+            process_index: None,
             logging: None,
             node: "origin".into(),
             build: m6_core::monitoring::BuildId {
                 name: "m6-http".into(),
-                version: "1.4.0".into(),
-                hash: "0".repeat(32),
+                version: "1.4.0+0123456789ab".into(),
             },
             uptime_s: 100,
             pools,
@@ -1154,6 +1688,23 @@ pub(crate) mod tests {
     const CHAIN_BASE_UNIX: i64 = 1_789_000_000;
 
     fn tls_reading(name: &str, days: Option<i64>) -> NodeReading {
+        // The default identity is derived from the expiry, so two nodes that
+        // report the same days are reporting the same DER, which is what a
+        // fleet serving one certificate does. A test that needs two
+        // certificates with one expiry overrides it.
+        let identity = days.map(|d| Fingerprint::of(format!("certificate/{d}").as_bytes()));
+        tls_reading_with(name, days, identity)
+    }
+
+    /// A reading whose leaf fingerprint is given rather than derived.
+    ///
+    /// `Some(days)` with `None` is a node that reports an expiry and no
+    /// fingerprint, which is what a node older than the field sends.
+    fn tls_reading_with(
+        name: &str,
+        days: Option<i64>,
+        identity: Option<Fingerprint>,
+    ) -> NodeReading {
         let mut p = perf(plain_host(), vec![]);
         p.tls = days
             .map(|d| {
@@ -1165,11 +1716,13 @@ pub(crate) mod tests {
                         depth: 0,
                         not_after_unix: CHAIN_BASE_UNIX + expires_in_seconds,
                         expires_in_seconds,
+                        fingerprint: identity,
                     },
                     m6_core::tls::TlsCertificate {
                         depth: 1,
                         not_after_unix: CHAIN_BASE_UNIX + expires_in_seconds + 10_000 * 86_400,
                         expires_in_seconds: expires_in_seconds + 10_000 * 86_400,
+                        fingerprint: None,
                     },
                 ]
             })
@@ -1185,6 +1738,7 @@ pub(crate) mod tests {
             role: "origin".into(),
             url: "http://origin.example.com".into(),
             health: Some(HealthReport {
+                process_index: None,
                 status: status.into(),
                 node: "origin".into(),
             }),
@@ -1198,6 +1752,57 @@ pub(crate) mod tests {
             unreachable: None,
             tunnel: None,
         }
+    }
+
+    /// A node polled as processes is added up, and the one that is down is
+    /// named. Break: the sum counts one process, or the group hides the
+    /// missing index.
+    #[test]
+    fn process_readings_add_up_to_their_node_and_name_the_one_that_is_down() {
+        let mut a = perf(m6_core::platform::host::HostSnapshot::default(), vec![]);
+        a.metrics.requests_total = 10;
+        a.metrics.cache_hits_total = 6;
+        a.metrics.cache_misses_total = 4;
+        let mut b = a.clone();
+        b.metrics.requests_total = 5;
+        b.metrics.cache_hits_total = 5;
+        b.metrics.cache_misses_total = 0;
+        let mut down = reading("edge/2", "unreachable", None);
+        down.unreachable = Some("refused".into());
+        let readings = vec![
+            reading("edge/0", "ok", Some(a)),
+            reading("edge/1", "ok", Some(b)),
+            down,
+            reading("origin", "ok", None),
+        ];
+        let groups = process_groups(&readings);
+        assert_eq!(
+            groups,
+            [ProcessGroup {
+                node: "edge".into(),
+                processes: 3,
+                up: 2,
+                down: vec!["edge/2".into()],
+                reporting: 2,
+                requests_total: 15,
+                cache_hits_total: 11,
+                cache_misses_total: 4,
+            }]
+        );
+    }
+
+    /// A fleet with no processes has no groups, and the JSON has no such key,
+    /// so a node polled as one address reads as it always did.
+    #[test]
+    fn a_fleet_without_processes_has_no_group_in_the_digest() {
+        let d = build(
+            &[reading("origin", "ok", None), reading("edge-a", "ok", None)],
+            &Thresholds::default(),
+            now(),
+        );
+        assert!(d.process_groups.is_empty());
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(!json.contains("process_groups"), "{json}");
     }
 
     fn now() -> String {
@@ -1219,12 +1824,12 @@ pub(crate) mod tests {
         p
     }
 
-    /// Same version, a build hash of the caller's choosing. This is the shape
-    /// the 2026-09-20 drift had and the shape a version comparison cannot see.
-    fn perf_built(version: &str, hash: &str) -> PerfReport {
+    /// One release tag, with build metadata of the caller's choosing. This is
+    /// the shape the 2026-09-20 drift had: `1.10.0+aaaaaaaaaaaa` and
+    /// `1.10.0+bbbbbbbbbbbb` are one release tag built twice.
+    fn perf_built(full: &str) -> PerfReport {
         let mut p = perf(plain_host(), vec![]);
-        p.build.version = version.into();
-        p.build.hash = hash.into();
+        p.build.version = full.into();
         p
     }
 
@@ -1253,24 +1858,24 @@ pub(crate) mod tests {
         assert!(drift[0].text.contains("edge-a 1.3.0"), "{}", drift[0].text);
     }
 
-    /// **The case this whole change exists for.** Same version on every node,
-    /// different builds, which is what a fleet looks like when one release has
-    /// been built twice. Rust is not byte-reproducible, so this is the ordinary
-    /// consequence of rebuilding rather than promoting.
+    /// **The case this whole change exists for.** Same release tag on every
+    /// node, different build metadata, which is what a fleet looks like when
+    /// one release has been built twice. Rust is not byte-reproducible, so this
+    /// is the ordinary consequence of rebuilding rather than promoting.
     ///
-    /// On 2026-09-20 staging ran one build of `v1.10.0` and production another.
-    /// Every reading an operator had said the fleet agreed, and it was found by
-    /// running `md5sum` on four machines. This test is the thing that would have
-    /// said so.
+    /// Two hosts can run `1.10.0+aaaaaaaaaaaa` and `1.10.0+bbbbbbbbbbbb` while
+    /// every reading an operator has says the fleet agrees on `1.10.0`. The
+    /// commit in the version string's build metadata is what tells them apart.
     ///
-    /// Verified red before being trusted, per the standing rule: with the hash
-    /// comparison removed it reports nothing at all, because the versions match.
+    /// Verified red before being trusted, per the standing rule: on the code
+    /// that compared whole version strings and had no metadata split, the two
+    /// strings differed and this reported version drift instead of build drift.
     #[test]
     fn one_version_across_two_builds_is_reported_as_build_drift() {
         let d = build(
             &[
-                reading("origin", "ok", Some(perf_built("1.10.0", &"a".repeat(32)))),
-                reading("edge-a", "ok", Some(perf_built("1.10.0", &"b".repeat(32)))),
+                reading("origin", "ok", Some(perf_built("1.10.0+aaaaaaaaaaaa"))),
+                reading("edge-a", "ok", Some(perf_built("1.10.0+bbbbbbbbbbbb"))),
             ],
             &Thresholds::default(),
             now(),
@@ -1278,7 +1883,7 @@ pub(crate) mod tests {
 
         assert!(
             !d.findings.iter().any(|f| f.text.contains("version drift")),
-            "the versions agree, so the VERSION finding must stay quiet: {:?}",
+            "the release tags agree, so the VERSION finding must stay quiet: {:?}",
             d.findings
         );
 
@@ -1301,17 +1906,61 @@ pub(crate) mod tests {
         );
     }
 
-    /// A node too old to report a hash counts as drift, not as agreement. Two
-    /// nodes agreeing while a third is silent is an unknown fleet, not a uniform
-    /// one, and the version check already takes this position.
+    /// A dirty build is a build of its own: one release, one commit, and a
+    /// tree that had uncommitted changes, so the two binaries can differ. The
+    /// comparison uses the `(commit, dirty)` pair, so this is build drift and
+    /// the release tags agree.
+    #[test]
+    fn a_dirty_build_beside_a_clean_one_is_build_drift_not_version_drift() {
+        let d = build(
+            &[
+                reading("origin", "ok", Some(perf_built("1.10.0+aaaaaaaaaaaa"))),
+                reading(
+                    "edge-a",
+                    "ok",
+                    Some(perf_built("1.10.0+aaaaaaaaaaaa.dirty")),
+                ),
+            ],
+            &Thresholds::default(),
+            now(),
+        );
+
+        assert!(
+            !d.findings.iter().any(|f| f.text.contains("version drift")),
+            "the release tags agree, so the VERSION finding must stay quiet: {:?}",
+            d.findings
+        );
+
+        let drift: Vec<_> = d
+            .findings
+            .iter()
+            .filter(|f| f.text.contains("build drift"))
+            .collect();
+        assert_eq!(drift.len(), 1, "{:?}", d.findings);
+        assert_eq!(drift[0].level, Level::Warn);
+        assert!(
+            drift[0].text.contains("origin aaaaaaaaaaaa"),
+            "{}",
+            drift[0].text
+        );
+        assert!(
+            drift[0].text.contains("edge-a aaaaaaaaaaaa (dirty)"),
+            "{}",
+            drift[0].text
+        );
+    }
+
+    /// A node that reports no build metadata counts as drift, not as agreement.
+    /// Two nodes agreeing while a third is silent is an unknown fleet, not a
+    /// uniform one, and the version check already takes this position.
     #[test]
     fn a_node_that_cannot_say_its_build_is_drift_not_agreement() {
         let d = build(
             &[
-                reading("origin", "ok", Some(perf_built("1.10.0", &"a".repeat(32)))),
-                // Empty hash: a node older than the field, or one whose
-                // confinement refused it the read.
-                reading("edge-a", "ok", Some(perf_built("1.10.0", ""))),
+                reading("origin", "ok", Some(perf_built("1.10.0+aaaaaaaaaaaa"))),
+                // No build metadata: a node older than the field, or a build
+                // made without git.
+                reading("edge-a", "ok", Some(perf_built("1.10.0"))),
             ],
             &Thresholds::default(),
             now(),
@@ -1324,15 +1973,15 @@ pub(crate) mod tests {
     }
 
     /// Version drift is reported ONCE, not twice. Different releases have
-    /// different binaries by construction, so reporting build drift beside it
+    /// different commits by construction, so reporting build drift beside it
     /// would name a consequence as a second fault and tell an operator to look
     /// in two places for one problem.
     #[test]
     fn version_drift_does_not_also_report_build_drift() {
         let d = build(
             &[
-                reading("origin", "ok", Some(perf_built("1.10.0", &"a".repeat(32)))),
-                reading("edge-a", "ok", Some(perf_built("1.9.0", &"b".repeat(32)))),
+                reading("origin", "ok", Some(perf_built("1.10.0+aaaaaaaaaaaa"))),
+                reading("edge-a", "ok", Some(perf_built("1.9.0+bbbbbbbbbbbb"))),
             ],
             &Thresholds::default(),
             now(),
@@ -1348,7 +1997,7 @@ pub(crate) mod tests {
         );
         assert!(
             !d.findings.iter().any(|f| f.text.contains("build drift")),
-            "the hashes differ because the versions do; that is one fault: {:?}",
+            "the commits differ because the releases do; that is one fault: {:?}",
             d.findings
         );
     }
@@ -1478,34 +2127,6 @@ pub(crate) mod tests {
         assert!(busy.findings[0].text.contains("per cpu"));
     }
 
-    #[test]
-    fn an_empty_pool_is_a_fault_and_so_is_the_degraded_verdict() {
-        let pools = vec![
-            PoolHealth {
-                name: "m6-html".into(),
-                active: 1,
-                total: 1,
-            },
-            PoolHealth {
-                name: "render-contact".into(),
-                active: 0,
-                total: 2,
-            },
-        ];
-        let d = build(
-            &[reading(
-                "origin",
-                "degraded",
-                Some(perf(HostSnapshot::default(), pools)),
-            )],
-            &Thresholds::default(),
-            now(),
-        );
-        assert_eq!(d.level, Level::Fault);
-        assert_eq!(d.findings.len(), 2);
-        assert!(d.findings.iter().any(|f| f.text.contains("render-contact")));
-    }
-
     /// Backend errors name the backend, worst first.
     ///
     /// The message content IS the feature. "3 backend errors since start" was
@@ -1564,6 +2185,57 @@ pub(crate) mod tests {
         assert!(f.text.contains("too old"), "{}", f.text);
     }
 
+    /// A failing header check is a digest fault, so the page, the JSON digest
+    /// and the history all carry the same verdict as the text check.
+    #[test]
+    fn a_failing_header_check_is_a_digest_fault() {
+        let mut r = reading("origin", "ok", Some(perf(plain_host(), vec![])));
+        r.header_checks.push(HeaderCheckResult {
+            path: "/capabilities".into(),
+            header: "cache-control".into(),
+            expected: "public, max-age=60".into(),
+            actual: Some("no-store".into()),
+            status: Some(200),
+            error: None,
+        });
+        let d = build(&[r], &Thresholds::default(), now());
+        assert_eq!(d.level, Level::Fault, "{:?}", d.findings);
+        let f = d
+            .findings
+            .iter()
+            .find(|f| f.node == "origin")
+            .expect("a header-check finding");
+        assert!(f.text.contains("expected"), "{}", f.text);
+    }
+
+    /// A passing header check adds no finding, so a declared and satisfied
+    /// assertion stays silent.
+    #[test]
+    fn a_passing_header_check_adds_no_finding() {
+        let mut r = reading("origin", "ok", Some(perf(plain_host(), vec![])));
+        r.header_checks.push(HeaderCheckResult {
+            path: "/capabilities".into(),
+            header: "cache-control".into(),
+            expected: "public, max-age=60".into(),
+            actual: Some("public, max-age=60".into()),
+            status: Some(200),
+            error: None,
+        });
+        let d = build(&[r], &Thresholds::default(), now());
+        assert_eq!(d.level, Level::Ok, "{:?}", d.findings);
+        assert!(d.findings.is_empty(), "{:?}", d.findings);
+    }
+
+    /// One wording for both views: whole days and hours, then minutes only when
+    /// they are the largest remaining unit.
+    #[test]
+    fn uptime_formatting_uses_days_hours_and_minutes() {
+        assert_eq!(fmt_uptime(0), "0m");
+        assert_eq!(fmt_uptime(42 * 60), "42m");
+        assert_eq!(fmt_uptime(2 * 3_600 + 60), "2h 1m");
+        assert_eq!(fmt_uptime(86_400 + 3_600), "1d 1h");
+    }
+
     /// A node that did not answer must not be reported as healthy, and must
     /// not be quietly missing from the report either.
     #[test]
@@ -1576,15 +2248,16 @@ pub(crate) mod tests {
         assert_eq!(d.nodes[0].status, "unreachable");
     }
 
-    /// A node we can reach but cannot read /perf from is a warning, not a
-    /// silent blank: "no numbers" and "good numbers" must not look alike.
+    /// A node we can reach but cannot read a metrics document for is a
+    /// warning, not a silent blank: "no numbers" and "good numbers" must not
+    /// look alike.
     #[test]
-    fn a_node_without_perf_says_so() {
+    fn a_node_without_a_metrics_document_says_so() {
         let mut r = reading("edge-a", "ok", None);
-        r.perf_error = Some("401: token rejected by this node".into());
+        r.perf_error = Some("no metrics line in the journal for this node".into());
         let d = build(&[r], &Thresholds::default(), now());
         assert_eq!(d.level, Level::Warn);
-        assert!(d.findings[0].text.contains("401"));
+        assert!(d.findings[0].text.contains("no metrics line"));
         assert!(d.nodes[0].hit_rate.is_none());
     }
 
@@ -1705,6 +2378,7 @@ pub(crate) mod tests {
             depth: 1,
             not_after_unix: 0,
             expires_in_seconds: 900 * 86_400,
+            fingerprint: None,
         }];
         p.tls_unreadable = 1;
         let mut r = reading("origin", "ok", Some(p));
@@ -1734,6 +2408,7 @@ pub(crate) mod tests {
             depth: 0,
             not_after_unix: 0,
             expires_in_seconds: 3 * 86_400,
+            fingerprint: None,
         }];
         let r = reading("origin", "ok", Some(p)); // url is http://origin.example.com
         let d = build(&[r], &Thresholds::default(), now());
@@ -1869,6 +2544,176 @@ pub(crate) mod tests {
             "a two-node fleet has no majority, so this must stay silent: {:?}",
             d.findings
         );
+    }
+
+    /// **Issue #275, first half.** Two nodes can serve two certificates that
+    /// expire on the same day, and the expiry alone cannot tell them apart.
+    /// Grouping on the leaf's fingerprint can, in the same partial-agreement
+    /// shape a renewal leaves behind.
+    #[test]
+    fn two_certificates_with_one_expiry_are_told_apart() {
+        let d = build(
+            &[
+                tls_reading("origin", Some(60)),
+                tls_reading("edge-a", Some(60)),
+                tls_reading_with(
+                    "edge-b",
+                    Some(60),
+                    Some(Fingerprint::of(b"a different certificate, one expiry")),
+                ),
+            ],
+            &Thresholds::default(),
+            now(),
+        );
+        let drift: Vec<_> = d
+            .findings
+            .iter()
+            .filter(|f| f.text.contains("are behind the newest"))
+            .collect();
+        assert_eq!(
+            drift.len(),
+            1,
+            "one expiry is not one certificate: {:?}",
+            d.findings
+        );
+        assert_eq!(drift[0].level, Level::Warn);
+        assert!(drift[0].text.contains("edge-b"), "{}", drift[0].text);
+        assert!(
+            drift[0].text.contains("fingerprint"),
+            "the finding has to show the identity that differs, not only the day: {}",
+            drift[0].text
+        );
+        assert!(
+            !drift[0].text.contains("origin"),
+            "the two nodes that agree need nothing done to them: {}",
+            drift[0].text
+        );
+    }
+
+    /// **Issue #275, second half.** The inference above cannot read a two-node
+    /// fleet. A deployment that declares the certificate is shared can, and
+    /// then a difference is a fault.
+    #[test]
+    fn a_declared_shared_certificate_makes_a_two_node_difference_a_fault() {
+        let readings = [
+            tls_reading("origin", Some(89)),
+            tls_reading_with(
+                "edge-a",
+                Some(30),
+                Some(Fingerprint::of(b"a different certificate")),
+            ),
+        ];
+        let quiet = build(&readings, &Thresholds::default(), now());
+        assert!(
+            !quiet
+                .findings
+                .iter()
+                .any(|f| f.text.contains("certificate")),
+            "without the declaration the inference stays silent: {:?}",
+            quiet.findings
+        );
+        let declared = Thresholds {
+            one_certificate: true,
+            ..Thresholds::default()
+        };
+        let d = build(&readings, &declared, now());
+        assert_eq!(d.level, Level::Fault, "{:?}", d.findings);
+        let fault: Vec<_> = d
+            .findings
+            .iter()
+            .filter(|f| f.text.contains("declared to share"))
+            .collect();
+        assert_eq!(fault.len(), 1, "{:?}", d.findings);
+        assert_eq!(fault[0].node, "fleet");
+        assert!(fault[0].text.contains("edge-a"), "{}", fault[0].text);
+        assert!(
+            !fault[0].text.contains("origin"),
+            "the newer certificate is the one the declaration expects: {}",
+            fault[0].text
+        );
+    }
+
+    /// The same declaration with two certificates that meet issue #275's
+    /// shape: one expiry, two identities. The group of two is the certificate
+    /// the declaration expects and the odd node is named at a fault.
+    #[test]
+    fn a_declared_shared_certificate_tells_two_identities_with_one_expiry_apart() {
+        let declared = Thresholds {
+            one_certificate: true,
+            ..Thresholds::default()
+        };
+        let d = build(
+            &[
+                tls_reading("origin", Some(60)),
+                tls_reading("edge-a", Some(60)),
+                tls_reading_with(
+                    "edge-b",
+                    Some(60),
+                    Some(Fingerprint::of(b"a different certificate, one expiry")),
+                ),
+            ],
+            &declared,
+            now(),
+        );
+        assert_eq!(d.level, Level::Fault, "{:?}", d.findings);
+        let fault: Vec<_> = d
+            .findings
+            .iter()
+            .filter(|f| f.text.contains("declared to share"))
+            .collect();
+        assert_eq!(fault.len(), 1, "{:?}", d.findings);
+        assert!(fault[0].text.contains("edge-b"), "{}", fault[0].text);
+    }
+
+    /// A declaration that every node honours says nothing, which is the quiet
+    /// half of the signal: an operator who sets the key does not get a finding
+    /// for a correct fleet.
+    #[test]
+    fn a_declared_shared_certificate_is_quiet_when_all_agree() {
+        let declared = Thresholds {
+            one_certificate: true,
+            ..Thresholds::default()
+        };
+        let d = build(
+            &[
+                tls_reading("origin", Some(60)),
+                tls_reading("edge-a", Some(60)),
+                tls_reading("edge-b", Some(60)),
+            ],
+            &declared,
+            now(),
+        );
+        assert!(d.findings.is_empty(), "{:?}", d.findings);
+        assert_eq!(d.level, Level::Ok, "{:?}", d.findings);
+    }
+
+    /// A node that reports an expiry and no fingerprint cannot be checked
+    /// against the declaration. Reading that silence as agreement would make
+    /// the key say the fleet is uniform when one node never answered the
+    /// question.
+    #[test]
+    fn a_declared_shared_certificate_warns_when_a_node_cannot_say_its_fingerprint() {
+        let declared = Thresholds {
+            one_certificate: true,
+            ..Thresholds::default()
+        };
+        let d = build(
+            &[
+                tls_reading("origin", Some(60)),
+                tls_reading("edge-a", Some(60)),
+                tls_reading_with("edge-b", Some(60), None),
+            ],
+            &declared,
+            now(),
+        );
+        assert_eq!(d.level, Level::Warn, "{:?}", d.findings);
+        let gap: Vec<_> = d
+            .findings
+            .iter()
+            .filter(|f| f.text.contains("no fingerprint"))
+            .collect();
+        assert_eq!(gap.len(), 1, "{:?}", d.findings);
+        assert!(gap[0].text.contains("edge-b"), "{}", gap[0].text);
     }
 
     /// A fleet that renewed everywhere says nothing. The countdowns are
@@ -2244,146 +3089,13 @@ pub(crate) mod tests {
         assert_eq!(v["thresholds"]["tunnel_handshake_age_s"], 600);
     }
 
-    // ── log reopen ───────────────────────────────────────────────────────────
-
-    use m6_core::monitoring::{LogReopenHealth, LoggingHealth};
-
-    fn reopen_health(age: Option<u64>, reopens: u64, failure_age: Option<u64>) -> LogReopenHealth {
-        LogReopenHealth {
-            reopens_total: reopens,
-            failures_total: u64::from(failure_age.is_some()),
-            seconds_since_last_reopen: age,
-            last_reopen_unix: age.map(|a| 1_789_000_000 - a),
-            seconds_since_last_failure: failure_age,
-        }
-    }
-
-    fn with_reopen(uptime_s: u64, logging: Option<Option<LogReopenHealth>>) -> NodeReading {
-        let mut p = perf(plain_host(), vec![]);
-        p.uptime_s = uptime_s;
-        p.logging = logging.map(|reopen| LoggingHealth {
-            events_total: 10,
-            seconds_since_last: Some(1),
-            reopen,
-        });
-        reading("origin", "ok", Some(p))
-    }
-
-    fn limit(max: Option<u64>) -> Thresholds {
-        Thresholds {
-            log_reopen_age_s: max,
-            ..Default::default()
-        }
-    }
-
-    fn reopen_findings(d: &Digest) -> Vec<&Finding> {
-        d.findings
-            .iter()
-            .filter(|f| f.text.contains("reopen"))
-            .collect()
-    }
-
-    #[test]
-    fn a_recent_log_reopen_raises_nothing_and_reports_its_age() {
-        let r = with_reopen(9000, Some(Some(reopen_health(Some(60), 3, None))));
-        let d = build(&[r], &limit(Some(7200)), now());
-        assert!(reopen_findings(&d).is_empty(), "{:?}", d.findings);
-        let l = &d.nodes[0].log_reopen;
-        assert_eq!(l.state, "ok");
-        assert_eq!(l.age_s, Some(60));
-        assert_eq!(l.reopens, Some(3));
-    }
-
-    #[test]
-    fn a_log_reopen_older_than_the_limit_faults() {
-        let over = with_reopen(99_999, Some(Some(reopen_health(Some(7201), 3, None))));
-        let d = build(&[over], &limit(Some(7200)), now());
-        let f = reopen_findings(&d);
-        assert_eq!(f.len(), 1, "{:?}", d.findings);
-        assert_eq!(f[0].level, Level::Fault);
-        assert!(f[0].text.contains("rotation has stopped"), "{}", f[0].text);
-        let at = with_reopen(99_999, Some(Some(reopen_health(Some(7200), 3, None))));
-        let d = build(&[at], &limit(Some(7200)), now());
-        assert!(reopen_findings(&d).is_empty(), "{:?}", d.findings);
-    }
-
-    #[test]
-    fn never_reopened_is_its_own_state_and_faults_only_past_the_limit() {
-        let young = with_reopen(100, Some(Some(reopen_health(None, 0, None))));
-        let d = build(&[young], &limit(Some(7200)), now());
-        assert_eq!(d.nodes[0].log_reopen.state, "never");
-        assert!(reopen_findings(&d).is_empty(), "{:?}", d.findings);
-        let old = with_reopen(7201, Some(Some(reopen_health(None, 0, None))));
-        let d = build(&[old], &limit(Some(7200)), now());
-        let f = reopen_findings(&d);
-        assert_eq!(f.len(), 1, "{:?}", d.findings);
-        assert!(f[0].text.contains("never reopened"), "{}", f[0].text);
-    }
-
-    #[test]
-    fn no_limit_configured_judges_nothing() {
-        let r = with_reopen(99_999, Some(Some(reopen_health(Some(1_000_000), 1, None))));
-        let d = build(&[r], &limit(None), now());
-        assert!(reopen_findings(&d).is_empty(), "{:?}", d.findings);
-        assert_eq!(d.nodes[0].log_reopen.state, "ok");
-        let r = with_reopen(99_999, None);
-        let d = build(&[r], &limit(None), now());
-        assert!(reopen_findings(&d).is_empty(), "{:?}", d.findings);
-    }
-
-    #[test]
-    fn a_node_that_writes_no_log_file_is_not_faulted() {
-        let r = with_reopen(99_999, Some(None));
-        let d = build(&[r], &limit(Some(7200)), now());
-        assert_eq!(d.nodes[0].log_reopen.state, "no_log_file");
-        assert!(reopen_findings(&d).is_empty(), "{:?}", d.findings);
-    }
-
-    #[test]
-    fn a_node_too_old_to_report_reopens_faults_when_a_limit_is_set() {
-        let r = with_reopen(100, None);
-        let d = build(&[r], &limit(Some(7200)), now());
-        assert_eq!(d.nodes[0].log_reopen.state, "unknown");
-        let f = reopen_findings(&d);
-        assert_eq!(f.len(), 1, "{:?}", d.findings);
-        assert!(f[0].text.contains("too old"), "{}", f[0].text);
-        assert_eq!(f[0].level, Level::Fault);
-    }
-
-    #[test]
-    fn a_failed_reopen_newer_than_the_last_success_faults() {
-        let r = with_reopen(99_999, Some(Some(reopen_health(Some(3000), 2, Some(10)))));
-        let d = build(&[r], &limit(Some(7200)), now());
-        let f = reopen_findings(&d);
-        assert_eq!(f.len(), 1, "{:?}", d.findings);
-        assert!(
-            f[0].text.contains("still writing to the previous file"),
-            "{}",
-            f[0].text
-        );
-        // An old failure followed by a success is history, not a fault.
-        let r = with_reopen(99_999, Some(Some(reopen_health(Some(10), 2, Some(3000)))));
-        let d = build(&[r], &limit(Some(7200)), now());
-        assert!(reopen_findings(&d).is_empty(), "{:?}", d.findings);
-    }
-
-    #[test]
-    fn the_json_digest_carries_the_log_reopen_state() {
-        let r = with_reopen(99_999, Some(Some(reopen_health(Some(60), 3, None))));
-        let d = build(&[r], &limit(Some(7200)), now());
-        let v = serde_json::to_value(&d).unwrap();
-        assert_eq!(v["nodes"][0]["log_reopen"]["state"], "ok");
-        assert_eq!(v["nodes"][0]["log_reopen"]["age_s"], 60);
-        assert!(v["nodes"][0]["log_reopen"]["last_unix"].is_u64());
-        assert_eq!(v["thresholds"]["log_reopen_age_s"], 7200);
-    }
-
     #[test]
     fn a_silent_main_log_is_a_digest_finding_so_the_verdict_counts_it() {
         let mut r = reading("origin", "ok", Some(perf(plain_host(), vec![])));
         let t = m6_core::monitoring::TrafficReport {
             node: "origin".into(),
             window_minutes: 60,
+            events_dropped: 0,
             total_requests: 0,
             status: Default::default(),
             notable: vec![],
@@ -2392,10 +3104,9 @@ pub(crate) mod tests {
             forged_bot_requests: 0,
             forgers: vec![],
             probe_noise: vec![],
-            logging: LoggingHealth {
+            logging: m6_core::monitoring::LoggingHealth {
                 events_total: 5000,
                 seconds_since_last: Some(600),
-                reopen: None,
             },
             firewall: None,
         };
@@ -2408,6 +3119,272 @@ pub(crate) mod tests {
             "{:?}",
             d.findings
         );
+    }
+
+    // ── traffic and security, from the traffic document ─────────────────────
+
+    /// The fixture section D and E print, with one of everything they can show.
+    fn traffic_fixture() -> m6_core::monitoring::TrafficReport {
+        use m6_core::firewall::{Block, FirewallState};
+        use m6_core::monitoring::{CrawlerReport, HeavyHitter, NotableClient, TrafficReport};
+        let mut status = std::collections::BTreeMap::new();
+        status.insert(200, 1200);
+        status.insert(404, 40);
+        TrafficReport {
+            node: "origin".into(),
+            window_minutes: 60,
+            events_dropped: 7,
+            total_requests: 1234,
+            status,
+            notable: vec![NotableClient {
+                ip: "203.0.113.9".into(),
+                requests: 7,
+                distinct_user_agents: 526,
+                user_agents: vec!["curl/8.4.0".into(), "GPTBot/1.0".into()],
+                status: Default::default(),
+                probe_paths: vec!["/.env".into(), "/.git/config".into()],
+                injection_paths: vec!["/wp-admin/setup.php".into()],
+                rotating_user_agents: true,
+                first_seen: "2026-10-04T01:20:54Z".into(),
+                last_seen: "2026-10-04T01:20:58Z".into(),
+            }],
+            heavy_hitters: vec![HeavyHitter {
+                ip: "203.0.113.7".into(),
+                requests: 900,
+                top_path: "/".into(),
+                distinct_user_agents: 3,
+                error_ratio: 0.5,
+            }],
+            crawlers: vec![CrawlerReport {
+                user_agent: "GPTBot/1.0".into(),
+                requests: 12,
+                client_ips: vec![
+                    "203.0.113.20".into(),
+                    "203.0.113.21".into(),
+                    "203.0.113.22".into(),
+                    "203.0.113.23".into(),
+                ],
+                paths: vec!["/".into(), "/robots.txt".into()],
+                first_seen: "2026-10-04T01:00:00Z".into(),
+                last_seen: "2026-10-04T01:50:00Z".into(),
+            }],
+            forged_bot_requests: 12,
+            forgers: vec!["203.0.113.66".into()],
+            probe_noise: vec!["203.0.113.5 /.git/config".into()],
+            logging: m6_core::monitoring::LoggingHealth {
+                events_total: 9000,
+                seconds_since_last: Some(600),
+            },
+            firewall: Some(FirewallState {
+                blocks: vec![
+                    Block {
+                        address: "203.0.113.4".into(),
+                        packets: 1215,
+                        bytes: 72900,
+                        comment: None,
+                        chain: "INPUT".into(),
+                    },
+                    Block {
+                        address: "203.0.113.6".into(),
+                        packets: 0,
+                        bytes: 0,
+                        comment: None,
+                        chain: "INPUT".into(),
+                    },
+                ],
+                total_rules: 217,
+            }),
+        }
+    }
+
+    /// The JSON carries every fact sections D and E print, under the same
+    /// names the node's traffic document uses.
+    #[test]
+    fn the_json_digest_carries_the_traffic_and_security_section() {
+        let mut r = reading("origin", "ok", Some(perf(plain_host(), vec![])));
+        r.traffic = Some(traffic_fixture());
+        let d = build(&[r], &Thresholds::default(), now());
+        let v = serde_json::to_value(&d).unwrap();
+        let t = &v["nodes"][0]["traffic"];
+
+        assert_eq!(t["window_minutes"], 60);
+        assert_eq!(t["events_dropped"], 7);
+        assert_eq!(t["total_requests"], 1234);
+        assert_eq!(t["status"]["200"], 1200);
+        assert_eq!(t["status"]["404"], 40);
+        assert_eq!(t["logging"]["state"], "quiet");
+        assert_eq!(t["logging"]["events_total"], 9000);
+        assert_eq!(t["logging"]["seconds_since_last"], 600);
+
+        assert_eq!(t["heavy_hitters"][0]["ip"], "203.0.113.7");
+        assert_eq!(t["heavy_hitters"][0]["requests"], 900);
+        assert_eq!(t["heavy_hitters"][0]["top_path"], "/");
+        assert_eq!(t["heavy_hitters"][0]["distinct_user_agents"], 3);
+        assert_eq!(t["heavy_hitters"][0]["error_ratio"], 0.5);
+
+        assert_eq!(t["notable"][0]["ip"], "203.0.113.9");
+        assert_eq!(t["notable"][0]["requests"], 7);
+        assert_eq!(t["notable"][0]["distinct_user_agents"], 526);
+        assert_eq!(t["notable"][0]["rotating_user_agents"], true);
+        assert_eq!(t["notable"][0]["user_agents"][0], "curl/8.4.0");
+        assert_eq!(t["notable"][0]["probe_paths"][0], "/.env");
+        assert_eq!(t["notable"][0]["injection_paths"][0], "/wp-admin/setup.php");
+        assert_eq!(t["notable_total"], 1);
+
+        assert_eq!(t["crawlers"][0]["user_agent"], "GPTBot/1.0");
+        assert_eq!(t["crawlers"][0]["requests"], 12);
+        assert_eq!(t["crawlers"][0]["client_ips"][0], "203.0.113.20");
+        assert_eq!(t["crawlers"][0]["client_ips_total"], 4);
+        assert_eq!(t["crawlers"][0]["paths"][1], "/robots.txt");
+        assert_eq!(t["crawlers_total"], 1);
+
+        assert_eq!(t["forged_bot_requests"], 12);
+        assert_eq!(t["forgers"][0], "203.0.113.66");
+        assert_eq!(t["forgers_total"], 1);
+        assert_eq!(t["probe_noise"][0], "203.0.113.5 /.git/config");
+        assert_eq!(t["probe_noise_total"], 1);
+
+        assert_eq!(t["firewall"]["blocks"], 2);
+        assert_eq!(t["firewall"]["total_rules"], 217);
+        assert_eq!(t["firewall"]["hit_total"], 1);
+        assert_eq!(t["firewall"]["hit"][0]["address"], "203.0.113.4");
+        assert_eq!(t["firewall"]["hit"][0]["packets"], 1215);
+        assert_eq!(t["firewall"]["hit"][0]["bytes"], 72900);
+    }
+
+    /// A node with no traffic line is a null section plus the reason, which is
+    /// what the check's "unknown <reason>" line prints. Absence must never
+    /// read as an empty traffic report.
+    #[test]
+    fn a_missing_traffic_report_says_why_in_the_digest() {
+        let mut r = reading("origin", "ok", Some(perf(plain_host(), vec![])));
+        r.traffic_error = Some("no traffic line in the journal for this node".into());
+        let d = build(&[r], &Thresholds::default(), now());
+        let v = serde_json::to_value(&d).unwrap();
+        assert!(v["nodes"][0]["traffic"].is_null());
+        assert_eq!(
+            v["nodes"][0]["traffic_error"],
+            "no traffic line in the journal for this node"
+        );
+    }
+
+    /// The lists a node's traffic can grow without bound are cut in the
+    /// digest, and the cut is visible because the true count is beside it.
+    #[test]
+    fn the_traffic_lists_are_capped_with_their_totals() {
+        let mut t = traffic_fixture();
+        let notable = t.notable[0].clone();
+        t.notable = (0..NOTABLE_KEPT + 8)
+            .map(|i| {
+                let mut c = notable.clone();
+                c.ip = format!("203.0.113.{i}");
+                c
+            })
+            .collect();
+        let crawler = t.crawlers[0].clone();
+        t.crawlers = (0..CRAWLERS_KEPT + 4)
+            .map(|i| {
+                let mut c = crawler.clone();
+                c.user_agent = format!("TestBot/{i}");
+                c
+            })
+            .collect();
+        t.forgers = (0..FORGERS_KEPT + 3)
+            .map(|i| format!("198.51.100.{i}"))
+            .collect();
+        t.probe_noise = (0..PROBE_NOISE_KEPT + 3)
+            .map(|i| format!("198.51.100.{i} /.env"))
+            .collect();
+        let mut r = reading("origin", "ok", Some(perf(plain_host(), vec![])));
+        r.traffic = Some(t);
+        let d = build(&[r], &Thresholds::default(), now());
+        let t = &serde_json::to_value(&d).unwrap()["nodes"][0]["traffic"];
+
+        assert_eq!(t["notable"].as_array().unwrap().len(), NOTABLE_KEPT);
+        assert_eq!(t["notable_total"], NOTABLE_KEPT + 8);
+        assert_eq!(t["crawlers"].as_array().unwrap().len(), CRAWLERS_KEPT);
+        assert_eq!(t["crawlers_total"], CRAWLERS_KEPT + 4);
+        assert_eq!(t["forgers"].as_array().unwrap().len(), FORGERS_KEPT);
+        assert_eq!(t["forgers_total"], FORGERS_KEPT + 3);
+        assert_eq!(t["probe_noise"].as_array().unwrap().len(), PROBE_NOISE_KEPT);
+        assert_eq!(t["probe_noise_total"], PROBE_NOISE_KEPT + 3);
+    }
+
+    /// The serialised digest before and after this change, for one fleet. The
+    /// "before" removes the two fields #220 added, so it is the shape
+    /// `/digest` had at 024ec86 for the same readings.
+    fn digest_sizes(readings: &[NodeReading]) -> (usize, usize) {
+        let d = build(readings, &Thresholds::default(), now());
+        let v = serde_json::to_value(&d).unwrap();
+        let after = serde_json::to_vec(&v).unwrap().len();
+        let mut before_v = v.clone();
+        for n in before_v["nodes"].as_array_mut().unwrap() {
+            let o = n.as_object_mut().unwrap();
+            o.remove("traffic");
+            o.remove("traffic_error");
+        }
+        (serde_json::to_vec(&before_v).unwrap().len(), after)
+    }
+
+    /// A three-node fleet's digest has a known ceiling. This is the guard
+    /// against the traffic section making `/digest` grow with a node's traffic:
+    /// the fixture is filled to every cap, and the serialised body must stay
+    /// under 128 KiB. The measured sizes are printed so a change in them is
+    /// visible in the test output.
+    #[test]
+    fn a_fleet_sized_digest_stays_bounded() {
+        // A realistic three-node window first: one of everything the check
+        // prints, which is what a fleet's quiet hour looks like.
+        let realistic: Vec<NodeReading> = ["origin", "edge-a", "edge-b"]
+            .iter()
+            .map(|name| {
+                let mut r = reading(name, "ok", Some(perf(plain_host(), vec![])));
+                r.traffic = Some(traffic_fixture());
+                r
+            })
+            .collect();
+        let (before, after) = digest_sizes(&realistic);
+        eprintln!("realistic three-node digest: {before} bytes before, {after} bytes after");
+
+        let mut maxed = traffic_fixture();
+        let notable = maxed.notable[0].clone();
+        maxed.notable = (0..NOTABLE_KEPT)
+            .map(|i| {
+                let mut c = notable.clone();
+                c.ip = format!("203.0.113.{i}");
+                c
+            })
+            .collect();
+        let crawler = maxed.crawlers[0].clone();
+        maxed.crawlers = (0..CRAWLERS_KEPT)
+            .map(|i| {
+                let mut c = crawler.clone();
+                c.user_agent = format!("TestBot/{i}");
+                c
+            })
+            .collect();
+        maxed.forgers = (0..FORGERS_KEPT)
+            .map(|i| format!("198.51.100.{i}"))
+            .collect();
+        maxed.probe_noise = (0..PROBE_NOISE_KEPT)
+            .map(|i| format!("198.51.100.{i} /.env"))
+            .collect();
+
+        let rs: Vec<NodeReading> = ["origin", "edge-a", "edge-b"]
+            .iter()
+            .map(|name| {
+                let mut r = reading(name, "ok", Some(perf(plain_host(), vec![])));
+                r.traffic = Some(maxed.clone());
+                r
+            })
+            .collect();
+        let (before, after) = digest_sizes(&rs);
+        eprintln!("capped three-node digest: {before} bytes before, {after} bytes after");
+        assert!(
+            after < 128 * 1024,
+            "the traffic section must not grow without bound: {after} bytes"
+        );
+        assert!(after > before, "the fixture must actually add a section");
     }
 }
 
@@ -2459,6 +3436,7 @@ mod history_tests {
             dropped: 3,
             pruned: 0,
             last_error: None,
+            last_ok: None,
         });
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["history"]["state"], "behind");

@@ -1,0 +1,4 @@
+# Deliberately empty. clippy reads the nearest clippy.toml above a crate, and the
+# repository root one holds the rules for m6 itself (the event-loop rule on
+# blocking sockets and sleeps). The examples are separate programs whose tests
+# drive real servers with plain sockets, so they are held to the default lints.

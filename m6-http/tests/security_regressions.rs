@@ -11,6 +11,11 @@
 //! The doc comment on each test describes the original defect, so the reason
 //! the test exists survives the fix.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test code: threads, sleeps and blocking clients drive the service from outside"
+)]
+
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
@@ -69,11 +74,58 @@ fn header_values(raw: &str, name: &str) -> Vec<String> {
 
 /// Forward `req` to a throwaway backend and return the raw bytes it received.
 fn forward_and_capture(req: &HttpRequest, client_ip: &str) -> String {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(m6_core::testkit::socket_scratch_root()).unwrap();
     let sock = dir.path().join("backend.sock");
     let handle = capture_backend(&sock);
-    forward::forward_request(&sock, req, client_ip, "example.com").expect("forward");
+    drive_and_capture(&sock, req, client_ip);
     String::from_utf8(handle.join().unwrap()).expect("utf8 request")
+}
+
+/// Drive one request over a Unix socket until it completes, blocking with a
+/// `platform::Poll` (tests may block). The reply is discarded: the caller wants the
+/// request bytes the backend captured.
+fn drive_and_capture(sock: &Path, req: &HttpRequest, client_ip: &str) {
+    use m6_core::platform::{Events, Poll, Token};
+
+    let mut up = m6_core::client::Upstream::new(64 * 1024, 16 * 1024);
+    forward::encode_request(up.request_buf(), req, client_ip, "example.com", None).expect("encode");
+    let deadline = std::time::Instant::now() + m6_core::testkit::STARTUP_BOUND;
+    up.start(
+        &m6_core::client::Addr::Unix(sock.to_path_buf()),
+        None,
+        false,
+        deadline,
+    )
+    .expect("start");
+
+    let mut poll = Poll::new().expect("poll");
+    let mut events = Events::with_capacity(8);
+    let token = Token(0);
+    let mut registered = up.interest();
+    poll.registry()
+        .register_fd(up.fd(), token, registered)
+        .expect("register");
+    loop {
+        poll.poll(&mut events, Some(std::time::Duration::from_millis(100)))
+            .expect("poll");
+        if events.iter().any(|ev| ev.token() == token) {
+            if up.drive().expect("drive") {
+                return;
+            }
+            // Drive first: under epoll edge-triggering, interest registered
+            // before the drive waits for an edge that never comes.
+            let interest = up.interest();
+            if interest != registered {
+                poll.registry()
+                    .reregister_fd(up.fd(), token, interest)
+                    .expect("reregister");
+                registered = interest;
+            }
+        }
+        if std::time::Instant::now() >= up.deadline() {
+            panic!("backend timed out");
+        }
+    }
 }
 
 fn get_request(path: &str, headers: Vec<(String, String)>) -> HttpRequest {
@@ -121,7 +173,10 @@ fn finding_2_forged_x_auth_claims_must_not_survive_ingress() {
         http11::ParseResult::Complete(r) => r,
         _ => panic!("expected a complete parse of:\n{raw}"),
     };
-    m6_http_lib::forward::strip_untrusted_inbound(&mut req.headers);
+    m6_http_lib::forward::strip_untrusted_inbound(
+        &mut req.headers,
+        m6_http_lib::forward::ForwardedTrust::Never,
+    );
 
     assert!(
         !req.headers
@@ -153,7 +208,10 @@ fn finding_2b_all_proxy_owned_headers_stripped_at_ingress() {
         http11::ParseResult::Complete(r) => r,
         _ => panic!("expected a complete parse"),
     };
-    m6_http_lib::forward::strip_untrusted_inbound(&mut req.headers);
+    m6_http_lib::forward::strip_untrusted_inbound(
+        &mut req.headers,
+        m6_http_lib::forward::ForwardedTrust::Never,
+    );
 
     for banned in forward::UNTRUSTED_INBOUND {
         assert!(
@@ -212,14 +270,18 @@ fn finding_5_distinct_query_strings_must_not_share_a_cache_entry() {
     cache.insert(
         CacheKey::new("/search", Some("q=attacker"), ""),
         CachedResponse {
+            genid: 0,
             status: 200,
-            headers: std::sync::Arc::new(vec![("cache-control".to_string(), "public".to_string())]),
+            headers: m6_http_lib::cache::HeaderBlock::from_pairs(vec![(
+                "cache-control".to_string(),
+                "public".to_string(),
+            )]),
             body: bytes::Bytes::from_static(b"ATTACKER CONTROLLED"),
         },
     );
 
     // Victim asks for a different query.
-    let mut buf = [0u8; 512];
+    let mut buf = String::with_capacity(512);
     let victim_key = make_lookup_key("/search", Some("q=victim"), "", &mut buf);
 
     assert!(
@@ -336,7 +398,7 @@ fn finding_7b_ambiguous_framing_must_be_rejected_at_ingress() {
         assert!(
             matches!(
                 http11::parse_request(raw.as_bytes()),
-                http11::ParseResult::Error
+                http11::ParseResult::Error(_)
             ),
             "{label}: should be rejected, but parsed"
         );

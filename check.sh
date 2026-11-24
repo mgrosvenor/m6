@@ -7,11 +7,13 @@
 #   ./check.sh --save-baseline  # run benches and save as the comparison baseline
 #
 # Order of operations:
-#   1. Build (release)
+#   1. Build (dev binaries)
 #   2. Clippy minimum-score check — BLOCKS the push
 #   3. Unit + integration tests
-#   4. Conformance minimum-score check (h1spec / h2spec / h3spec) — BLOCKS the push
-#   5. Benchmarks (informational — prints criterion output; never blocks the push)
+#   4. The targets `cargo test --workspace` omits, then the rustdoc build — BLOCK the push
+#   5. Conformance minimum-score check (h1spec / h2spec / h3spec) — BLOCKS the push
+#   6. Benchmarks: their numbers are informational and never block the push, but
+#      the bench targets must compile, and a build failure blocks it like any other
 #
 # Why benches don't gate:
 #   Sub-microsecond criterion benchmarks on a development machine have ±5-15%
@@ -25,6 +27,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
+
+# ── Locks on a shared build host ──────────────────────────────────────────────
+# tools/host-lock.sh holds the protocol (#344): this run holds the host shared,
+# takes the port lock only around the steps that bind ports, and has the host to
+# itself for the benchmarks.
+# shellcheck source=tools/host-lock.sh
+. "$SCRIPT_DIR/tools/host-lock.sh"
+host_enter_shared
 
 # ── Args ──────────────────────────────────────────────────────────────────────
 RUN_BENCH=true
@@ -65,10 +75,52 @@ fail() { echo -e "${RED}FAIL${RESET} $1"; exit 1; }
 info() { echo -e "${YELLOW}----${RESET} $1"; }
 warn() { echo -e "${YELLOW}WARN${RESET} $1"; }
 
+# ── RLIMIT_MEMLOCK ────────────────────────────────────────────────────────────
+# m6-http pins its pages as they are faulted (`[server] lock_memory`, on by
+# default), and an ordinary account's RLIMIT_MEMLOCK is a finite number of
+# bytes. CI raises the limit in every job that starts m6-http. The gate did not,
+# so 32 m6-http test targets failed here on 2026-11-23 while every CI job
+# passed. Raise it once, for this shell and every child it starts.
+if [[ "$(uname -s)" == "Linux" ]]; then
+  if command -v prlimit >/dev/null 2>&1 &&
+     sudo -n prlimit --pid $$ --memlock=unlimited:unlimited 2>/dev/null; then
+    pass "RLIMIT_MEMLOCK raised for the tests"
+  else
+    warn "RLIMIT_MEMLOCK was not raised; m6-http tests that pin memory will fail"
+  fi
+fi
+
 # ── 1. Build ──────────────────────────────────────────────────────────────────
-info "Building (release)..."
-cargo build --workspace --release --quiet
+# The dev profile is the tests' profile. The suites run the binaries cargo built
+# here, and testkit::binary never runs cargo, so this build is what puts them
+# where the tests look for them.
+info "Building (dev)..."
+cargo build --workspace --bins --quiet
 pass "Build"
+
+# ── 1b. Lean core build ───────────────────────────────────────────────────────
+# A workspace build unifies features, so it never compiles m6-core with its
+# default `templates` and `minify` off. A call to either gated module from
+# outside its gate compiles green there and fails for a user who depends on
+# core with `default-features = false`. This is the only build that asks the
+# lean question, and it must be silent as well as compile.
+info "Checking the lean m6-core build (no default features)..."
+LEAN_LOG="$(mktemp)"
+if cargo check -p m6-core --no-default-features >"$LEAN_LOG" 2>&1; then
+  LEAN_WARNINGS="$(grep -c '^warning' "$LEAN_LOG" || true)"
+  if [[ "$LEAN_WARNINGS" -eq 0 ]]; then
+    pass "Lean m6-core build (no default features, zero warnings)"
+  else
+    cat "$LEAN_LOG"
+    rm -f "$LEAN_LOG"
+    fail "Lean m6-core build: $LEAN_WARNINGS warning(s)"
+  fi
+else
+  cat "$LEAN_LOG"
+  rm -f "$LEAN_LOG"
+  fail "Lean m6-core build failed — a gated module is used outside its gate"
+fi
+rm -f "$LEAN_LOG"
 
 # ── 2. Clippy ─────────────────────────────────────────────────────────────────
 # A minimum-score check, not `-D warnings`: the count may fall and may never rise. See
@@ -82,17 +134,67 @@ else
 fi
 
 # ── 3. Correctness: unit + integration tests ──────────────────────────────────
-# --test-threads=1: several integration suites (m6-http's edge_proxy.rs,
-# security_e2e.rs, analytics_e2e.rs) spawn real m6-http/m6-html/m6-file
-# processes bound to fixed loopback ports. Run concurrently with each other,
-# their #[test] fns race for those ports and fail with spurious 502s that
-# have nothing to do with the code under test.
+# The harness claims a free loopback port for each service, so the suite runs on
+# the harness's default threads. A suite that binds a fixed port, or two test
+# runs at once on one host, still races for ports and names.
 info "Running correctness tests..."
-if cargo test --workspace --quiet -- --test-threads=1 2>&1; then
+# The test build binds nothing, so it runs before the port lock is taken.
+if ! cargo test --workspace --no-run --quiet 2>&1; then
+  fail "Test build failed: the tests do not compile"
+fi
+if with_port_lock cargo test --workspace --quiet --no-fail-fast 2>&1; then
   pass "Unit + integration tests (HTTP/1.1 ✓  HTTP/3 ✓)"
 else
   fail "Test suite failed — fix correctness issues before performance check"
 fi
+
+# ── 3b. The targets `cargo test --workspace` does not build ──────────────────
+# `cargo test --workspace` builds only the targets whose `required-features` the
+# workspace turns on, and omits every other one: not run, not failed, invisible.
+#
+# THAT IS THE DEFECT THAT LET TWO RED CI RUNS THROUGH. `h1_tls_miss_insert` sits
+# behind `required-features = ["count-allocations"]`, so this gate ran 2,641
+# tests, 0 failed, and never built the one CI failed on, on all three of its
+# machines. The set is now one script that CI, this gate and the build host all
+# call, so the three cannot run different suites again.
+#
+# It runs under the port lock like the suite above: these tests start real
+# services on claimed loopback ports.
+info "Running feature-gated tests (the targets the workspace suite omits)..."
+if with_port_lock ./tools/feature-gated-tests.sh 2>&1; then
+  pass "Feature-gated tests (allocation budgets included)"
+else
+  fail "Feature-gated tests failed — one of the targets the workspace suite omits"
+fi
+
+# ── 3c. Rustdoc ───────────────────────────────────────────────────────────────
+# A broken intra-doc link is a rustdoc warning, and the zero-warnings rule counts
+# pre-existing warnings, so `-D warnings` makes one fail the push. CI has run this
+# since 2026-11-17 and the build host since the same commit. THIS GATE DID NOT,
+# and on 2026-11-23 a whole-workspace run found ten links across three files that
+# had been failing the doc build since they were written, while every local run
+# here ended on "All checks passed."
+#
+# `--all-features` second, because `testkit`, m6-core's `sqlite`, `email` and
+# `multipart` and m6-http's allocation counters are off by default, so the first
+# command never compiles their docs.
+info "Checking documentation (rustdoc)..."
+RUSTDOC_LOG="$(mktemp)"
+if RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps >"$RUSTDOC_LOG" 2>&1; then
+  pass "Rustdoc, default features, silent"
+else
+  cat "$RUSTDOC_LOG"
+  rm -f "$RUSTDOC_LOG"
+  fail "Rustdoc: a broken intra-doc link (default features)"
+fi
+if RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features >"$RUSTDOC_LOG" 2>&1; then
+  pass "Rustdoc, --all-features, silent"
+else
+  cat "$RUSTDOC_LOG"
+  rm -f "$RUSTDOC_LOG"
+  fail "Rustdoc: a broken intra-doc link (--all-features)"
+fi
+rm -f "$RUSTDOC_LOG"
 
 # ── 4. Conformance: HTTP/1.1, HTTP/2, HTTP/3 ─────────────────────────────────
 # A minimum score against independent testers (h1spec, h2spec, h3spec). Floors live
@@ -140,9 +242,13 @@ fi
 # so. The exit code stays 0 on a laptop, deliberately: a developer's run is still
 # useful and still not a gate.
 INCOMPLETE=""
+# conformance.sh runs target/release directly and refuses to start without a
+# release build, so this step still needs one. The tests above used the dev profile.
+info "Building release binaries for conformance..."
+cargo build --workspace --release --quiet
 info "Running conformance (h1spec / h2spec / h3spec)..."
 CONF_OUT="$(mktemp)"
-if ./tools/conformance.sh --allow-missing-tools 2>&1 | tee "$CONF_OUT"; then
+if with_port_lock ./tools/conformance.sh --allow-missing-tools 2>&1 | tee "$CONF_OUT"; then
   if grep -q 'NOT TESTED' "$CONF_OUT"; then
     NOT_TESTED="$(grep -o 'NOT TESTED:.*' "$CONF_OUT" | tail -1)"
     warn "Conformance INCOMPLETE — ${NOT_TESTED:-a tester was absent}"
@@ -155,6 +261,35 @@ else
 fi
 rm -f "$CONF_OUT"
 
+# ── 4b. The examples (a separate workspace) ────────────────────────────────
+# The examples are examples/ in this repository, their own Cargo workspace, and
+# the `cargo test --workspace` above never builds them. That gap let a red
+# examples job through a green local gate on 2026-11-23. This runs the same
+# workspace commands CI's examples job runs: the build, the format check, clippy
+# and the tests, against the release binaries built above. The three dev.sh
+# stacks stay in CI and on the build host, because they take minutes and bind
+# 8443, and a gate that binds a fixed port cannot run beside another.
+info "Examples (the separate workspace)..."
+EG_LOG="$(mktemp)"
+EG_STATUS=0
+(
+  cd examples
+  ./dev-keys.sh
+  cargo build --release
+  cargo fmt --all --check
+  cargo clippy --workspace --all-targets --release
+  with_port_lock cargo test --workspace
+) >"$EG_LOG" 2>&1 || EG_STATUS=$?
+EG_WARNINGS="$(grep -c '^warning' "$EG_LOG" || true)"
+if [[ "$EG_STATUS" -ne 0 || "$EG_WARNINGS" -ne 0 ]]; then
+  cat "$EG_LOG"
+  rm -f "$EG_LOG"
+  [[ "$EG_STATUS" -eq 0 ]] || fail "The examples workspace failed (build, fmt, clippy or tests)"
+  fail "The examples workspace produced $EG_WARNINGS warning(s)"
+fi
+rm -f "$EG_LOG"
+pass "Examples (build, fmt, clippy and tests, zero warnings)"
+
 # ── 5. Performance (informational) ────────────────────────────────────────────
 if [[ "$RUN_BENCH" == "false" ]]; then
   info "Skipping benchmarks (--no-bench)"
@@ -162,9 +297,21 @@ if [[ "$RUN_BENCH" == "false" ]]; then
   exit 0
 fi
 
+# A benchmark, and a baseline saved from one, is a measurement: it waits for the
+# host to be idle and holds it so (see the locks at the top). The bench binaries
+# are compiled first, so the host is held for measuring and nothing else.
+if ! cargo bench "${CRITERION_BENCHES[@]}" --no-run --quiet 2>&1; then
+  fail "Benchmark build failed"
+fi
+if ! host_alone; then
+  INCOMPLETE="benchmarks (the host was never idle, so nothing was measured)"
+  summary
+  exit 2
+fi
+
 if [[ "$SAVE_BASELINE" == "true" ]]; then
   info "Saving benchmark baseline '$BASELINE_NAME'..."
-  if cargo bench "${CRITERION_BENCHES[@]}" --quiet -- --save-baseline "$BASELINE_NAME" 2>&1; then
+  if cargo bench "${CRITERION_BENCHES[@]}" --quiet -- --save-baseline "$BASELINE_NAME" 2>&1 6<&- 8<&-; then
     pass "Baseline '$BASELINE_NAME' saved"
   else
     fail "Benchmark run failed during baseline save"
@@ -207,7 +354,7 @@ fi
 
 BENCH_OUT="$(mktemp)"
 # Run benchmarks; capture output but do not fail on non-zero exit.
-cargo bench "${CRITERION_BENCHES[@]}" --quiet $BENCH_ARGS 2>&1 | tee "$BENCH_OUT" || true
+cargo bench "${CRITERION_BENCHES[@]}" --quiet $BENCH_ARGS 2>&1 6<&- 8<&- | tee "$BENCH_OUT" || true
 
 # Surface any criterion-detected regressions as warnings (not failures).
 REGRESSIONS=$(grep "Performance has regressed\." "$BENCH_OUT" | wc -l | tr -d ' ')

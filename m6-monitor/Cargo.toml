@@ -9,17 +9,38 @@ repository.workspace   = true
 [[bin]]
 name = "m6-monitor"
 
+[features]
+# Builds the counting allocator in, as m6-http does for its allocation guard: the client
+# path's no-allocation proof needs a binary that counts. Off by default, so a
+# release build links no test harness.
+count-allocations = ["m6-core/testkit"]
+
+[[test]]
+name = "client_allocs"
+required-features = ["count-allocations"]
+
 [dependencies]
 # One crate. That is the point of it.
-m6-core    = { path = "../m6-core", features = ["http-client", "sqlite"] }
+m6-core    = { path = "../m6-core", default-features = false, features = ["sqlite"] }
 anyhow     = "1"
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
-tracing    = "0.1"
+# Version comparison for the start-up record's checks: a pre-release, a dirty
+# build and a version that differs from the deploy's record are parsed, never
+# compared as strings.
+semver     = "1"
 
 toml       = "0.8"
-ureq       = { version = "2", features = ["json"] }
+# The monitor's own outgoing TLS client: it builds one ClientConfig at start
+# from `client::system_roots`. Same declaration as m6-core and m6-http, so the
+# workspace builds one rustls. aws-lc-rs is rustls's default provider and the
+# only one this tree names; see m6-http/Cargo.toml for the measurement.
+rustls     = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
+
+[build-dependencies]
+m6-platform = { path = "../m6-platform" }
 
 [dev-dependencies]
-m6-core  = { path = "../m6-core", features = ["testkit"] }
+m6-core  = { path = "../m6-core", default-features = false, features = ["testkit"] }
 tempfile = "3"
+# The macOS thread count reads libproc; m6-html's tests do the same.

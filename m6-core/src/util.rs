@@ -14,7 +14,8 @@ pub fn slugify(s: &str) -> String {
 
 /// Current date in ISO 8601 format: "2024-01-15"
 pub fn today_iso8601() -> String {
-    chrono::Utc::now().format("%Y-%m-%d").to_string()
+    let now: chrono::DateTime<chrono::Utc> = crate::platform::wall().into();
+    now.format("%Y-%m-%d").to_string()
 }
 
 /// A `SystemTime` as an ISO 8601 date: "2024-01-15".
@@ -51,8 +52,13 @@ pub fn html_escape(s: &str) -> String {
 }
 
 /// Current datetime in ISO 8601 format: "2024-01-15T10:30:00Z"
+///
+/// The reading is the layer's wall clock and chrono only formats it, so the
+/// one place that knows how to ask the OS what time it is stays in
+/// `m6-platform`.
 pub fn now_iso8601() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    let now: chrono::DateTime<chrono::Utc> = crate::platform::wall().into();
+    now.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 /// A UTC timestamp `minutes` ago, as an ISO 8601 prefix.
@@ -66,7 +72,8 @@ pub fn now_iso8601() -> String {
 /// after `.`, so `"...T08:00:00Z" < "...T08:00:00.123456Z"` is false and the
 /// first fraction of a second of the window would be dropped.
 pub fn iso8601_minutes_ago(minutes: u64) -> String {
-    let t = chrono::Utc::now() - chrono::Duration::minutes(minutes as i64);
+    let now: chrono::DateTime<chrono::Utc> = crate::platform::wall().into();
+    let t = now - chrono::Duration::minutes(minutes as i64);
     t.format("%Y-%m-%dT%H:%M:%S").to_string()
 }
 
@@ -88,7 +95,7 @@ mod tests {
         assert_eq!(slugify("Rust is great!"), "rust-is-great");
     }
 
-    /// The missing `Z` is load-bearing. A log timestamp carries sub-second
+    /// The missing `Z` matters. A log timestamp carries sub-second
     /// precision, and `Z` sorts after `.` in ASCII, so a cutoff ending in `Z`
     /// would compare as later than any timestamp in the same second and drop
     /// the first fraction of a second of the window.

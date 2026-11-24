@@ -1,0 +1,33 @@
+[Unit]
+Description=render-cms custom renderer
+After=network.target
+
+[Service]
+Type=simple
+User=m6
+Group=m6
+RuntimeDirectory=m6
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+
+ExecStart=/var/www/my-blog/bin/render-cms \
+    /var/www/my-blog \
+    /etc/m6/render-cms.conf
+
+# The token that lets render-cms publish with POST /genid. It arrives as
+# /run/credentials/render-cms.service/genid-write.token
+LoadCredential=genid-write.token:/etc/m6/genid-write.token
+
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=render-cms
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/m6 /var/www/my-blog/content
+ReadOnlyPaths=/var/www/my-blog /etc/m6
+
+[Install]
+WantedBy=multi-user.target

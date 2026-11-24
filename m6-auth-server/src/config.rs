@@ -21,11 +21,15 @@ struct TokensConfig {
     access_ttl: Option<u64>,
     refresh_ttl: Option<u64>,
     issuer: Option<String>,
+    audience: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct KeysConfig {
-    private_key: String,
+    /// Required only by a process that serves the login routes, which sign.
+    /// The check side reads the public key and never this one. A path, typed
+    /// as one, because the key's bytes are never in the config.
+    private_key: Option<PathBuf>,
     public_key: String,
 }
 
@@ -41,35 +45,22 @@ struct RateLimitConfig {
 }
 
 /// Parsed and validated auth server configuration.
-/// `[log]` is deliberately absent.
-///
-/// It used to be parsed here as well, into a `LogConfig` this service then
-/// resolved against `site.toml` by hand. `m6_core::app` does that for every
-/// service, from the same file, with the same precedence: site.toml, then the
-/// service config's `[log]`, then `--log-level`. Two parsers for one section
+/// `[log]` is deliberately absent: `m6_core::site` resolves it for every
+/// service, from the same file, with the same precedence (site.toml, then the
+/// service config's `[log]`, then `--log-level`). Two parsers for one section
 /// is how they drift.
 pub struct AuthConfig {
-    /// Resolved against the CONFIG FILE's directory, not the site root.
-    ///
-    /// This comment used to say "relative to site_dir", which is what the two
-    /// key paths below do and what every other service in m6 does with a
-    /// relative path. It was simply wrong, and being wrong cost something:
-    /// three of the examples grew three different workarounds for it. 05-cms
-    /// looked for `<site>/data/auth.db` and never found the database, so it
-    /// re-created the admin user on every run and died; 11-admin-dashboard
-    /// wrote `path = "../data/auth.db"` to climb back out of `configs/`; two
-    /// others check both locations.
-    ///
-    /// m6-auth-cli resolves it the same way, so the server and the tool do
-    /// agree and no deployment is broken by this. Whether the behaviour should
-    /// change to match `[keys]` is a separate decision, because it moves a
-    /// running deployment's database.
+    /// Absolute: see m6_core::config::secret_path.
     pub db_path: PathBuf,
     pub access_ttl: u64,  // seconds
     pub refresh_ttl: u64, // seconds
     pub issuer: String,
-    /// Both key paths are resolved against `site_dir`. See `db_path`.
-    pub private_key_path: PathBuf,
+    /// The deployment the tokens are minted for, and the `aud` every token
+    /// carries. The issuer when the config names no audience.
+    pub audience: String,
+    /// Absolute, as db_path is. `None` when the config names no private key,
+    /// which only the check side may do.
+    pub private_key_path: Option<PathBuf>,
     pub public_key_path: PathBuf,
     /// Failed logins allowed per IP per `rate_limit_window_secs`.
     pub rate_limit_max_attempts: u32,
@@ -77,15 +68,14 @@ pub struct AuthConfig {
 }
 
 impl AuthConfig {
-    pub fn load(site_dir: &Path, config_path: &Path, site_toml: &Path) -> Result<Self> {
+    /// Every path in the file is absolute.
+    pub fn load(config_path: &Path, site_toml: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(config_path)
             .with_context(|| format!("reading config: {}", config_path.display()))?;
 
         let raw: RawConfig = toml::from_str(&text)
             .with_context(|| format!("parsing TOML: {}", config_path.display()))?;
 
-        // Validate db path — resolve relative to the config file's directory
-        // (matching m6-auth-cli behaviour).
         let db_path_str = raw
             .storage
             .path
@@ -93,33 +83,44 @@ impl AuthConfig {
         if db_path_str.is_empty() {
             return Err(anyhow!("[storage] path must not be empty"));
         }
-        let db_path = {
-            let p = PathBuf::from(&db_path_str);
-            if p.is_absolute() {
-                p
-            } else {
-                let config_dir = config_path.parent().unwrap_or(Path::new("."));
-                config_dir.join(&p)
-            }
-        };
+        let db_path = m6_core::config::secret_path("[storage] path", &db_path_str)?;
 
         let tokens = raw.tokens.unwrap_or(TokensConfig {
             access_ttl: None,
             refresh_ttl: None,
             issuer: None,
+            audience: None,
         });
 
         let access_ttl = tokens.access_ttl.unwrap_or(900);
         let refresh_ttl = tokens.refresh_ttl.unwrap_or(2_592_000);
 
-        // Issuer: from config, or try to derive from site.toml
-        let issuer = tokens.issuer.unwrap_or_else(|| {
-            // Try reading the site's site.toml, wherever `site_toml` puts it.
-            try_issuer_from_site_toml(site_toml).unwrap_or_else(|| "localhost".to_string())
-        });
+        // The issuer is the deployment's name, taken from `[tokens] issuer`
+        // and then from `[site] domain` in the site's `site.toml`. A config
+        // that names neither stops the start: a token minted for one deployment
+        // must not verify at another, and a default would name every deployment
+        // the same thing.
+        let issuer = match tokens.issuer {
+            Some(issuer) => issuer,
+            None => try_issuer_from_site_toml(site_toml).ok_or_else(|| {
+                anyhow!(
+                    "[tokens] issuer: no issuer is set and {} has no [site] domain: set [tokens] issuer to the deployment's name, or set [site] domain in that file",
+                    site_toml.display()
+                )
+            })?,
+        };
+        // The audience is the deployment's own name, and the issuer is that name
+        // when the config names no separate one.
+        let audience = tokens.audience.unwrap_or_else(|| issuer.clone());
 
-        let private_key_path = site_dir.join(&raw.keys.private_key);
-        let public_key_path = site_dir.join(&raw.keys.public_key);
+        let private_key_path = raw
+            .keys
+            .private_key
+            .as_deref()
+            .map(|path| m6_core::config::secret_path("[keys] private_key", &path.to_string_lossy()))
+            .transpose()?;
+        let public_key_path =
+            m6_core::config::secret_path("[keys] public_key", &raw.keys.public_key)?;
 
         let rl = raw.rate_limit.unwrap_or(RateLimitConfig {
             max_attempts: None,
@@ -137,6 +138,7 @@ impl AuthConfig {
             access_ttl,
             refresh_ttl,
             issuer,
+            audience,
             private_key_path,
             public_key_path,
             rate_limit_max_attempts,

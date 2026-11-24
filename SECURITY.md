@@ -1,60 +1,93 @@
 # Security
 
-## Reporting
+This is m6's security policy.
+It names the reporting route, the scope, the supported versions, and the defences m6 already runs.
+Sections 1 and 2 are the ones a reporter reads first.
 
-Report security issues privately, **not** through the public issue tracker.
+1. [Reporting a vulnerability](#1-reporting-a-vulnerability)
+2. [What is in scope](#2-what-is-in-scope)
+3. [What is out of scope](#3-what-is-out-of-scope)
+4. [Supported versions](#4-supported-versions)
+5. [How m6 defends itself](#5-how-m6-defends-itself)
+6. [Summary](#6-summary)
 
-Use GitHub [private vulnerability
-reporting](https://github.com/mgrosvenor/m6/security/advisories/new). It is
-private, it threads, and it takes attachments.
+## 1. Reporting a vulnerability
 
-No address is published here, deliberately, and no second channel either. An
-address in a file GitHub renders on the repository's front page is an address
-scrapers read. A link to a contact form stood here until 2026-09-26 and was
-removed for a related reason: m6 is a generic web system, and that form belongs
-to one particular site, so the link published which site the maintainer runs.
+Report a vulnerability through GitHub private vulnerability reporting.
+The route is `https://github.com/mgrosvenor/m6/security/advisories/new`.
+Do not file a vulnerability in the public issue tracker.
+No email address is published.
 
-Please include what you did, what you observed, and anything that helps
-reproduce it: a request, a packet capture, a log line with its timestamp. If you
-have a proof of concept, say so and hold it until we have talked.
+Include what you did, what you observed, and anything that reproduces it.
+A request, a packet capture, or a log line with its timestamp is worth more than a description.
+If you have a proof of concept, say so and hold the details until the maintainer asks.
 
-You will get an acknowledgement. This is a one-person project, so please allow
-a reasonable window before disclosing publicly.
+GitHub private vulnerability reporting is the only route.
 
-## What is in scope
+## 2. What is in scope
 
-The m6 workspace: `m6-http` (the edge: TLS, HTTP/1.1, HTTP/2, HTTP/3, the
-cache, proxying), `m6-core`, and the services built on it (`m6-file`,
-`m6-html`, `m6-auth-server`, `m6-md`, `m6-monitor`).
+Everything in the m6 workspace is in scope.
 
-Particularly interesting:
+| crate | role |
+|---|---|
+| `m6-http` | the edge: *TLS* (Transport Layer Security) termination, HTTP/1.1, HTTP/2 and HTTP/3, the cache, proxying |
+| `m6-core` | the runtime library every service links |
+| `m6-auth` | the authentication library |
+| `m6-auth-server` | the authentication service |
+| `m6-auth-cli` | the command-line tool for authentication |
+| `m6-file` | the static file service |
+| `m6-html` | the renderer service |
+| `m6-md` | the Markdown processor |
+| `m6-monitor` | the monitor |
+
+**Table 1: the m6 workspace crates and their roles.**
+Take from it that the edge and the authentication service sit on the request path, while the rest are services built on m6-core.
+
+Five areas are of particular interest:
 
 - request smuggling and response splitting across the three protocols
-- cache poisoning, and any way to get one client's response to another
+- cache poisoning, and any way to send one client's response to another
 - path traversal out of a site directory
-- anything that lets an unauthenticated request reach authenticated state
-- denial of service that a single peer can cause cheaply
+- any way an unauthenticated request reaches authenticated state
+- a denial of service that a single peer can cause cheaply
 
-## What is not
+A report outside these five areas is still read.
 
-- Volumetric denial of service. A flood from a botnet is not a finding.
-- Missing hardening headers on a page with no secrets on it.
-- Findings from an automated scanner with no working demonstration.
+## 3. What is out of scope
 
-## Supported versions
+Three things are out of scope:
 
-The newest release on `main`. This project does not currently backport fixes.
+- Volumetric denial of service.
+  A flood from a botnet is not a finding.
+- Missing hardening headers on a page with no secrets.
+- A scanner finding with no working demonstration.
 
-## How the project tries to prevent these
+These three are excluded because each is cheap to produce and rarely actionable.
+A reproducible defect outside them is in scope, whatever it is.
 
-Stated so a reporter knows what has already been looked at:
+## 4. Supported versions
 
-- Differential testing against independent implementations: h1spec, h2spec and
-  h3spec run on every push, with recorded minimum scores that may not fall.
-- Path parameters go through one validator, and traversal is refused in one
-  place rather than in each service.
-- Conditional requests, content negotiation and cookie handling each have a
-  single implementation in `m6-core`, because the defects that reached
-  production were consistently the second copy of something.
-- `cargo deny` checks advisories, licences and duplicate dependencies on every
-  push.
+Only the newest release on `main` is supported.
+
+## 5. How m6 defends itself
+
+m6 already runs defences, so a reporter knows what is covered.
+
+| defence | where it runs |
+|---|---|
+| conformance testing against h1spec, h2spec and h3spec, with recorded floors that may not fall | *CI* (continuous integration) |
+| one path-parameter validator in `m6-core`, which refuses traversal in one place | inside every service |
+| one implementation each for conditional requests, content negotiation and cookies, in `m6-core` | inside every service |
+| `cargo deny`, checking known advisories, licence problems, duplicated crates and dependency sources | *CI* |
+
+**Table 2: the defences m6 runs, and where each one runs.**
+Take from it that the protocol and dependency checks run in CI, while the request-path validations run inside every service.
+
+The two CI checks run on every pull request and every push to `main` or `develop`, and on every release tag.
+The conformance floors are recorded in `tools/conformance-scores.txt`, and a run below a floor fails.
+
+## 6. Summary
+
+Report a vulnerability through GitHub private vulnerability reporting, and do not use the public issue tracker.
+The m6 workspace, listed in Table 1, is in scope, and the newest release on `main` is the supported version.
+Table 2 lists the defences already running, so a report that defeats one of them is a new finding.
