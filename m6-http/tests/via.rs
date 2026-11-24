@@ -72,28 +72,41 @@ impl Capture {
             while !flag.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        stream
-                            .set_read_timeout(Some(Duration::from_secs(5)))
-                            .expect("read timeout");
-                        let mut raw = Vec::new();
-                        let mut buf = [0u8; 4096];
-                        while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
-                            match stream.read(&mut buf) {
-                                Ok(0) | Err(_) => break,
-                                Ok(n) => raw.extend_from_slice(&buf[..n]),
+                        // The listener is non-blocking so the accept loop can
+                        // notice `stop`. On macOS (and the other BSDs) an
+                        // accepted socket inherits O_NONBLOCK from its listener,
+                        // where Linux clears it. Left as inherited, the first
+                        // `read` below returns `WouldBlock` whenever this thread
+                        // runs before m6-http has written the request, and the
+                        // `Err(_)` arm then closes the connection: m6-http reads
+                        // EOF before any headers and answers 502 for a request
+                        // the backend never saw. The stream is made blocking so
+                        // the read waits, bounded by the timeout.
+                        stream.set_nonblocking(false).expect("blocking connection");
+                        // One thread per connection, and a response only after a
+                        // full request head: m6-http keeps pooled connections
+                        // open, and a backend that answered an idle connection
+                        // handed m6-http a reply to a request it had not yet
+                        // sent, so the test saw 200 and the backend saw nothing.
+                        let tx = tx.clone();
+                        std::thread::spawn(move || {
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(30)))
+                                .expect("read timeout");
+                            let mut raw = Vec::new();
+                            let mut buf = [0u8; 4096];
+                            while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                                match stream.read(&mut buf) {
+                                    Ok(0) | Err(_) => return,
+                                    Ok(n) => raw.extend_from_slice(&buf[..n]),
+                                }
                             }
-                        }
-                        // A connection that carried no request head is not a
-                        // forwarded request: a readiness probe or a pool
-                        // check can open and close one, and the test wants
-                        // the request that followed.
-                        if raw.windows(4).any(|w| w == b"\r\n\r\n") {
                             let _ = tx.send(String::from_utf8_lossy(&raw).into_owned());
-                        }
-                        let _ = stream.write_all(
-                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
-                        );
-                        let _ = stream.flush();
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                            );
+                            let _ = stream.flush();
+                        });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(2));
@@ -171,10 +184,22 @@ struct Node {
     port: u16,
     cert_der: Vec<u8>,
     /// Held so the process lives as long as the node does, then dropped so it
-    /// stops. Never read.
+    /// stops. Read only for its output when a test fails.
     _service: Service,
-    _port: PortClaim,
+    /// Every port the node listens on. A claim released while its service
+    /// still listens waits for the port to come free and never sees it.
+    _ports: Vec<PortClaim>,
     _dir: tempfile::TempDir,
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        // What the node logged is the only record of why it answered as it
+        // did, and a failed assertion is the only time anyone wants it.
+        if std::thread::panicking() {
+            eprintln!("--- node output ---\n{}", self._service.output());
+        }
+    }
 }
 
 /// One certificate for both the TLS listener and the clients here.
@@ -469,7 +494,7 @@ fn public_node(root: &Path, capture: &Capture) -> Node {
         port: port.port(),
         cert_der,
         _service: service,
-        _port: port,
+        _ports: vec![port],
         _dir: dir,
     }
 }
@@ -506,16 +531,20 @@ fn h2c_node(root: &Path, capture: &Capture, internal: bool) -> (Node, u16) {
     };
     let config = dir.path().join("system.toml");
     write_system(&config, &tls.addr(), "origin", &listener, dir.path());
-    let service = spawn("m6-http-via-h2c", &site, &config, tls.port());
+    let mut service = spawn("m6-http-via-h2c", &site, &config, tls.port());
+    // `spawn` waits for the TLS port only. The h2c listener binds separately, so
+    // the test also waits for it before `h2c_send` connects.
+    service.wait_for_tcp(h2c.port(), m6_core::testkit::STARTUP_BOUND);
+    let h2c_port = h2c.port();
     (
         Node {
             port: tls.port(),
             cert_der: der,
             _service: service,
-            _port: tls,
+            _ports: vec![tls, h2c],
             _dir: dir,
         },
-        h2c.port(),
+        h2c_port,
     )
 }
 
@@ -545,12 +574,22 @@ fn h2c_send(port: u16, path: &str, via: &str, host: &str) {
     let deadline = Instant::now() + m6_core::testkit::STARTUP_BOUND;
     loop {
         conn.drive();
-        if conn
+        if let Some(done) = conn
             .drain_completions()
             .into_iter()
-            .any(|c| c.stream_id == stream_id)
+            .find(|c| c.stream_id == stream_id)
         {
-            return;
+            // The backend can only have seen the request if m6-http forwarded
+            // it, so anything but a 200 is the failure, named here.
+            match done.result {
+                Ok(resp) if resp.status == 200 => return,
+                Ok(resp) => panic!(
+                    "h2c answered {} without reaching the backend: {}",
+                    resp.status,
+                    String::from_utf8_lossy(&resp.body)
+                ),
+                Err(e) => panic!("h2c request failed: {e}"),
+            }
         }
         assert!(Instant::now() < deadline, "no response over h2c");
         std::thread::sleep(Duration::from_millis(1));
@@ -632,6 +671,7 @@ fn cache_to_origin_carries_both_names_in_path_order() {
     std::fs::write(origin_dir.path().join("key.pem"), &key_pem).expect("key");
     let origin_tls = claim_port();
     let origin_h2c = claim_port();
+    let origin_h2c_port = origin_h2c.port();
     let origin_config = origin_dir.path().join("system.toml");
     write_system(
         &origin_config,
@@ -654,7 +694,7 @@ fn cache_to_origin_carries_both_names_in_path_order() {
         port: origin_tls.port(),
         cert_der: origin_der,
         _service: origin,
-        _port: origin_tls,
+        _ports: vec![origin_tls, origin_h2c],
         _dir: origin_dir,
     };
 
@@ -666,7 +706,7 @@ fn cache_to_origin_carries_both_names_in_path_order() {
         &format!(
             "[[backend]]\nname = \"origin\"\nurl = \"h2c://127.0.0.1:{}\"\n\n\
              [[route]]\npath = \"/capture/{{*rest}}\"\nbackend = \"origin\"\n",
-            origin_h2c.port()
+            origin_h2c_port
         ),
     );
     let (cache_cert, cache_key, cache_der) = cert();
@@ -691,7 +731,7 @@ fn cache_to_origin_carries_both_names_in_path_order() {
         port: cache_tls.port(),
         cert_der: cache_der,
         _service: cache,
-        _port: cache_tls,
+        _ports: vec![cache_tls],
         _dir: cache_dir,
     };
 
