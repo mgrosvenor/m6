@@ -144,7 +144,7 @@ rustls         = { version = "0.23", default-features = false, features = ["aws_
 # naming a dependency the tree already had rather than adding one.
 rustls-pki-types = "1"
 rustls-native-certs = "0.8"
-rand           = "0.8"
+rand           = "0.10"
 httpdate       = "1"
 # Decimal formatting without allocation on the response hot path: the cached
 # hit writes status, age and content-length through itoa's stack buffer.
