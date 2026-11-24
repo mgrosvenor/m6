@@ -13,9 +13,7 @@ The heading is the version, and a number would break the pattern `tag.sh` and CI
 
 The released versions, newest first:
 
-- [1.17.0-rc.2, 2026-11-24](#1170-rc2-2026-11-24)
-- [1.17.0-rc.1, 2026-11-23](#1170-rc1-2026-11-23)
-- [1.16.0-rc.1, 2026-11-18](#1160-rc1-2026-11-18)
+- [1.17.0, 2026-11-24](#1170-2026-11-24)
 - [1.15.0, 2026-10-29](#1150-2026-10-29)
 - [1.14.0, 2026-10-27](#1140-2026-10-27)
 - [1.13.0, 2026-10-02](#1130-2026-10-02)
@@ -39,7 +37,12 @@ The released versions, newest first:
 - [1.0.0, 2026-09-14](#100-2026-09-14)
 - [0.2.0 and earlier, 2026-03-15 and before](#020-and-earlier-2026-03-15-and-before)
 
-## 1.17.0-rc.2, 2026-11-24
+## 1.17.0, 2026-11-24
+
+**The 1.17 line restores JavaScript minification and the shutdown drain, refuses a connection the process has no descriptor for, names every node in `Via`, renames every example template to `*.html.tmpl`, and adds the monitor, journal, analytics and release-guard work recorded below.**
+This is the first release since 1.15.0. `1.16.0-rc.1` was a develop build and was never released, so its notes are part of this release. The candidate sections are kept in full, newest first, and every change they record is published with `1.17.0`.
+
+### 1.17.0-rc.2, 2026-11-24
 
 **JavaScript minification drops comments and line breaks.**
 The code generator now runs with comments disabled instead of keeping normal, JSDoc and annotation comments. Legal comments (`//!`, `/*!`, `@license` and `@preserve`) stay inline, because a licence notice is a requirement on a served file.
@@ -47,7 +50,7 @@ Verified by `comments_are_dropped_and_only_a_legal_notice_stays` in `m6-core/tes
 
 ---
 
-## 1.17.0-rc.1, 2026-11-23
+### 1.17.0-rc.1, 2026-11-23
 
 **This release restores JavaScript minification and the shutdown drain, refuses a connection the process has no descriptor for, names every node in `Via`, and renames every example template to `*.html.tmpl`.**
 It also batches the HTTP/3 send and receive paths, and adds a monitor series that counts a service's accepted and refused events and raises a fault when the service's own configuration caused the refusal.
@@ -197,7 +200,7 @@ Verified by `a_default_cache_and_reservation_warn_about_nothing` in `m6-file/tes
 `examples/own.sh` decided whether a backend was listening by matching an exact `lsof -F n` line. On Linux that line ends with ` type=STREAM`, so no socket ever matched, every `dev.sh` waited in `own_wait_sockets` while all of its backends were alive, and the examples job that starts the 05, 03 and 04 stacks ran for its default six hours. The wait now asks `lsof -t` for the pids that hold the path, which has no suffix to parse and reads the same on macOS and Linux. The 11-admin-dashboard test driver retries `poll` after `EINTR` instead of panicking, the example sources are formatted with the rest of the tree, and the two Rust end-to-end tests turn memory pinning off in the system config they generate, so an ordinary `cargo test` needs no raised `RLIMIT_MEMLOCK`. The examples job has `timeout-minutes: 20`, and `check.sh` runs the examples workspace, so a local gate can no longer pass while `examples/` fails.
 Verified by `./dev-keys.sh && cargo test --workspace` in `examples/` with no raised limit, the 05, 03 and 04 end-to-end stacks, and 30 consecutive runs of the render-admin suite.
 
-### Migration
+#### Migration
 
 An operator makes three changes.
 
@@ -205,7 +208,7 @@ An operator makes three changes.
 2. A config that sets `[server] drain_timeout_s` sets the wait, a config that does not gets 30 s, and a config that sets `0` keeps the stop-at-once behaviour. `ThreadPool::drain`, `ThreadPool::in_flight` and the `on_destroy` shutdown hook stay removed with `App`, whose place the per-service loops took. A service's teardown runs after its loop leaves, which is after the drain.
 3. A build uses Rust 1.98 or newer, which the JavaScript minifier requires. `[minification]` accepts `application/javascript`, `text/javascript` and `inline_js` again, all on by default.
 
-### Verified
+#### Verified
 
 - `a_template_in_a_subfolder_is_found`, `a_file_without_the_tmpl_suffix_is_not_a_template` and `an_include_across_folders_renders` in `m6-core/src/template.rs`.
 - `build_tera_from_paths_loads_the_whole_root_and_only_tmpl_files` and `autoescaping_follows_the_output_part_of_the_name`, which fails if the autoescape suffixes are left at Tera's defaults.
@@ -214,7 +217,7 @@ An operator makes three changes.
 
 ---
 
-## 1.16.0-rc.1, 2026-11-18
+### 1.16.0-rc.1, 2026-11-18
 
 **m6 keeps one log stream, and the monitoring endpoints and their credentials are gone.**
 Every log line carries a `type`, and under systemd each line is one datagram on journald's native socket.
@@ -250,7 +253,7 @@ One more test had the same hazard and it failed silently.
 It now takes the same directory.
 A sweep of the workspace found every other place that writes or copies a binary into a temporary directory and executes it, and each one already runs from an executable directory.
 
-### Migration
+#### Migration
 
 An operator makes nine changes.
 
@@ -374,7 +377,7 @@ Every m6 service refuses an unknown log level (in `site.toml`, its own config or
 
 **`[monitor] one_certificate` is new and optional, default false.** A deployment whose fleet is meant to carry one certificate sets it to true to turn a differing node into a fault in `/check` and `/digest`. Leave it unset where each node renews its own certificate. `m6-monitor` ignores a `[monitor]` key it does not know, so an older monitor starts against a config that has this key and simply does not check it. No other setting changes.
 
-### Added
+#### Added
 
 **`bench.sh --mixed` measures hot-hit p50 and p99 while new full TLS handshakes arrive at a set rate.**
 `./bench.sh --mixed [--mixed-rates 0,50,100,200,500] [--mixed-seconds 10]` reuses `m6-bench`'s existing hit client (one kept-alive HTTP/1.1 connection, the same timer and `percentile` rule) and puts a second load generator beside it: one new TCP connection and one fresh full handshake per arrival, scheduled against absolute deadlines (`start + i/rate`), not a sleep between calls.
@@ -628,7 +631,7 @@ Verified on 2026-11-16 on a macOS sandbox: `tls_reload` and the new unit tests p
 - **`/check` gains a STARTUP section and `/digest` a `startup` object.** Each gives every node's and app's current run: the version, the run id, the start time the record states, and the sha256 of every config file it read, with the shutdown line when there is one.
 
 
-### Changed
+#### Changed
 
 **Every credential gate in m6-http now asks m6-auth-server's `POST /check`, and `[auth] public_key` is removed.**
 A source node's `GET` and `POST /genid` join route `require` on the one checker, under the same 50 ms deadline.
@@ -884,7 +887,7 @@ The sync used to delete the file the build host wrote, so the history never ente
 - **The traffic line costs m6-http's event loop 13.4 ms a minute, from 78.6 ms**, for a full window of 32,768 events across 2,000 clients (release, M4). Each marker list is one case-insensitive aho-corasick automaton, and the summary reads the window's slots in place, with no record built per event.
 - **The metrics turn makes no host read and one write, from 141 system calls.** The host block, a dozen `/proc` and `/sys` files, was read whole inside the turn that writes the metrics line, and every request arriving meanwhile waited for it. `platform::host::HostReader` now reads the facts fixed for the process once at start (CPU count, descriptor limits, the cgroup memory limit, the thermal zone list) and then one source per one-second accounting tick: one file, opened, read and closed in 4 system calls on Linux. The document is serialised straight into the log buffer with no `serde_json::Value` tree, and the percentiles are found by selection instead of a full sort. On a 4-vCPU Linux build host (release), the turn fell from about 850 us to about 165 us and the costliest host step is 101 us. Table 22 of `docs/PERFORMANCE.md` has the M4 figures, and `loop_never_waits.rs` holds the longest turn of an idle node under 2 ms.
 
-### Fixed
+#### Fixed
 
 **A script is served as written: m6 no longer minifies JavaScript.**
 The minifier re-emitted a string that held an apostrophe as a template literal, and it doubled the string's escapes.
@@ -1108,7 +1111,7 @@ When the thread's signal mask cannot be read, a service now refuses to start ins
 - **`loop_never_waits` sets its accounting tick in `[stats]`.** The idle-wake test shortened the tick only through `M6_TEST_STATS_INTERVAL_SECS`, which a release build does not read. A release run therefore measured a 10 s report against a 2 s bound and failed, while the loop woke once a second as designed. The fixture now writes `interval_s = 2` and `traffic_interval_s = 2` into its `site.toml`, which both profiles read.
 - **The test kit's fake `/check` writes each answer in one write.** It wrote the head in pieces and the body after it. m6-http's start probe reads to the end of the head and closes, so a fast release build could close between the two writes, and the fake's body write failed with `EPIPE`. A 100 ms pause between head and body reproduced it every time. One buffer and one `write_all` leave no gap.
 
-### Docs
+#### Docs
 
 **`docs/PERFORMANCE.md` now carries a measured breakdown of a TLS 1.3 handshake, with the crypto, kernel and m6 shares, the loopback price, the cipher-suite and provider comparison, the hit distribution under handshake load, and the system-call cost.**
 
@@ -1177,7 +1180,7 @@ Comments only.
 
 **The user guide's admin dashboard section says the bench targets come from the system config's `[server].bind`, as example 11 now has it (#305).**
 
-### Removed
+#### Removed
 
 **`/perf` and `/traffic` are removed on every node, and `/health` is the only built-in monitoring endpoint.** `[server] status_bind` answers `/health` alone, the traffic cache behind the old answer goes with it, and `m6-http/tests/metrics_access.rs` is deleted.
 **The five `[health]` monitoring keys are removed: `metrics_require`, `metrics_peers`, `perf_path`, `traffic_path` and `traffic_cache_s`.**
@@ -1207,7 +1210,7 @@ m6-http's bundled webpki-roots store, a second store beside the host's.
 - The md5 of the running executable: `BuildId.hash`, `executable_md5()` and the 64 KiB chunked read it did at start. The process reports the commit fixed at build time instead, so one tag built twice is still distinguishable and no process reads its own bytes for identity.
 - `md-5` from `m6-core`, whose only user was `executable_md5()`. Nothing else in the workspace declared or used it.
 
-### Security
+#### Security
 
 **Auth tokens name their kind, deployment and id, and `[tokens] issuer` no longer defaults to `localhost`.**
 Every token carries a `typ` header: `at+jwt` for a session access token, `m6-api+jwt` for an `m6-auth-cli token create` token and `m6-refresh+jwt` for a refresh token.
@@ -1291,7 +1294,7 @@ Verified with `a_symlinked_directory_inside_the_site_is_refused`, which returns 
 - **The start-up record no longer writes a credential from a table no m6 struct parses.** A `site.toml` with `[email] password` made every `Site` service's `config_section` line carry `"password": {"source": "file", "value": "..."}` in plain text, because the record copies `site.toml` as untyped TOML and only typed fields and secrets-file values were redacted. A value with no type is now `<redacted>` when its key holds `password`, `secret`, `token`, `credential` or `private_key`, by `m6_core::startup::names_a_secret`. The rule matches the key case-insensitively and anywhere in the key. A key ending in `_path`, `_paths`, `_file`, `_files` or `_dir`, and any key holding `public_key`, is a path and is still logged.
 - `[genid]`'s heartbeat token is `Option<Secret<String>>` and `RelayConfig::credentials` is `Option<Secret<(String, String)>>`, so neither can reach a line through `Serialize` or `Debug`. An application that builds a `RelayConfig` wraps the pair in `Secret::new`. The `[keys] private_key` fields of m6-auth-server and m6-auth-cli are `PathBuf`, because they hold a path.
 
-### Verified
+#### Verified
 
 - Unit tests with stub resolvers cover a confirmed name, a PTR whose forward lookup returns other addresses, a name with no forward answer, a failed forward lookup, no PTR, a name with no address (EAI_NONAME and EAI_NODATA), a slot free by the time the caller has the result, the per-poll lookup cap, expiry and cache bound, a report that reads stored results and resolves nothing, a resolver that never answers, and the thread bound (eight blocked lookups, then fifty more that return at once and start no thread, then slots free again).
 - No test uses a live public name.
@@ -1312,11 +1315,11 @@ Verified with `a_symlinked_directory_inside_the_site_is_refused`, which returns 
 - In journal mode 500 lines are 500 datagrams, one per line as the journal's native protocol requires. The flush in `log_perf` and `log_traffic` adds no send: 500 lines with a flush every 100 lines cost the same 523 sends as with none, on a macOS datagram pair whose reader drained between lines.
 - `m6-platform` holds `platform_gate` at 9 of 9 and the contract suite at 64 tests with 4 ignored.
 
-### Not measured
+#### Not measured
 
 - **Linux.** The release is measured on Linux: the release-build suite passes there, and the conformance suites score h2spec 146/146 and h3spec 47/49. The development host is macOS arm64, so the Linux arms of `host_facts()`, the cgroup walk and every `/proc` parse are exercised by that build rather than by a run on that host.
 - **The deploy-side writer of `[monitor] expected_deploy_file`.** The monitor reads the file and reports it as waiting. m6 ships no writer of the file, so until a deployment writes one no version or config sha256 is compared.
-### Known issues
+#### Known issues
 
 **HTTP/3 costs more than HTTP/2 on a loopback benchmark, and this release does not close that.** On a cached 52 KB page at four connections it uses about 2.6 times the server CPU per response, 215 us against 82 us, and its latency is about 2.2 times. HTTP/3 is still faster than 1.15.0 on every row measured, so the gap against HTTP/2 is older than this release rather than introduced by it.
 

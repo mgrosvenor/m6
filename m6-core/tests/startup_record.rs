@@ -159,6 +159,7 @@ fn the_record_is_several_self_contained_startup_lines() {
         "the record is several lines: {}",
         lines.len()
     );
+    let version = env!("CARGO_PKG_VERSION");
     for line in &lines {
         assert_eq!(field(line, "type"), "startup", "every line is type startup");
         assert_eq!(
@@ -166,7 +167,13 @@ fn the_record_is_several_self_contained_startup_lines() {
             "m6-service",
             "every line is self contained"
         );
-        assert!(field(line, "version").as_str().unwrap().contains('-'));
+        // A candidate carries the pre-release suffix and a release does not, so
+        // the check is the workspace version rather than a `-` that only a
+        // candidate has. Build metadata follows it.
+        assert!(field(line, "version")
+            .as_str()
+            .unwrap()
+            .starts_with(version));
         assert!(field(line, "run_id").as_str().unwrap().contains('-'));
         assert_eq!(line.get("level").unwrap(), "INFO");
     }
