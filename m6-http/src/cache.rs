@@ -1565,32 +1565,34 @@ impl Cache {
 
         // Expired entries first. The heap is ordered by `expires_at`, so the
         // earliest expiry is on top. A record that no longer matches the map
-        // (the entry was re-stored or removed) is stale and is skipped.
+        // (the entry was re-stored or removed) is stale and is skipped, and a
+        // record whose time has not come ends the pass without being popped.
         while self.bytes_held() > target {
             let Some(peek) = state.expiries.peek() else {
                 break;
             };
             let at = peek.0.at;
             let key = peek.0.key.clone();
-            let valid_expired = match state.map.get(&key) {
-                Some(e) => e.expires_at == Some(at) && now >= at,
-                None => false,
-            };
-            if !valid_expired {
-                state.expiries.pop();
-                // A valid record whose time has not come means every later
-                // record is later still, so the expired pass is over.
-                if state.map.get(&key).is_some() && now < at {
-                    break;
+            let (stale, not_yet) = match state.map.get(&key) {
+                None => (true, false),
+                Some(entry) => {
+                    if entry.expires_at != Some(at) {
+                        (true, false)
+                    } else {
+                        (false, now < at)
+                    }
                 }
-                continue;
+            };
+            if not_yet {
+                break;
             }
             state.expiries.pop();
-            let Some(entry) = state.map.remove(&key) else {
-                continue;
-            };
-            self.account_removal(entry.footprint, entry.queued);
-            dropped += 1;
+            if !stale {
+                if let Some(entry) = state.map.remove(&key) {
+                    self.account_removal(entry.footprint, entry.queued);
+                    dropped += 1;
+                }
+            }
         }
 
         // Then the least recently read. The front of the linked map is the
@@ -4156,5 +4158,46 @@ mod eviction_order_tests {
             + response.headers.footprint()
             + std::mem::size_of::<CacheEntry>();
         assert_eq!(entry_footprint(&key, &response), expected);
+    }
+}
+
+#[cfg(test)]
+mod re_store_tests {
+    use super::*;
+
+    fn resp(cc: &str, body: usize) -> CachedResponse {
+        CachedResponse {
+            genid: 0,
+            status: 200,
+            headers: HeaderBlock::from_pairs(vec![("cache-control".to_string(), cc.to_string())]),
+            body: bytes::Bytes::from(vec![0u8; body]),
+        }
+    }
+
+    /// A re-store changes an entry's expiry. The heap keeps the old record,
+    /// and eviction must skip it rather than trust it, so a fresh re-stored
+    /// entry is never dropped as though it were the expired copy it replaced.
+    #[test]
+    fn a_re_store_before_eviction_is_not_treated_as_its_old_expiry() {
+        let cache = Cache::with_max_bytes(100_000);
+        // Store once expired, then replace it with a fresh copy before the
+        // eviction that pressure will force.
+        cache.insert(CacheKey::new("/k", None, ""), resp("public, max-age=0", 10_000));
+        cache.insert(
+            CacheKey::new("/k", None, ""),
+            resp("public, max-age=86400", 10_000),
+        );
+        for i in 0..6 {
+            cache.insert(
+                CacheKey::new(&format!("/big{i}"), None, ""),
+                resp("public, max-age=86400", 20_000),
+            );
+        }
+        assert!(cache.bytes_held() <= 100_000);
+        assert_eq!(
+            cache.footprint_sum(),
+            cache.bytes_held(),
+            "accounting must stay in step after a re-store and eviction"
+        );
     }
 }
