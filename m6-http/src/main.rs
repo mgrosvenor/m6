@@ -5348,6 +5348,7 @@ fn handle_request_inner(
         && matches!(req.method.as_str(), "GET" | "HEAD");
     if (purge || status_read) && state.config.registration.is_some() {
         let reg_config = state.config.registration.as_ref().unwrap();
+        debug!(method = %req.method, path = %req.path, "control endpoint");
         // Only the source answers these. A cache node's registration is on
         // the control channel, not HTTP, so its config carries `origin` and
         // no claims; the gate below returns the 404 a disabled endpoint gets.
