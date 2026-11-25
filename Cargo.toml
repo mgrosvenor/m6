@@ -10,6 +10,7 @@ members = [
     "m6-html",
     "m6-monitor",
     "m6-auth-server",
+    "m6-redirect",
     "m6-md",
     # The two Rust backend examples, docs/m6-backend-examples.md. Workspace
     # members rather than standalone crates so the normal build compiles them,
