@@ -333,7 +333,7 @@ mod tests {
 
     fn make_config(routes: Vec<RouteConfig>, backends: Vec<BackendConfig>) -> Config {
         Config {
-            genid: None,
+            registration: None,
             cache_dir: None,
             limits: Default::default(),
             stats: StatsConfig::default(),
@@ -354,6 +354,7 @@ mod tests {
                 process_index: None,
                 status_bind: None,
                 h2c_bind: None,
+                registration_bind: None,
                 internal_binds: Vec::new(),
                 internal_peers: Vec::new(),
                 redirect_bind: None,

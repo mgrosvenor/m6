@@ -29,9 +29,10 @@ pub struct Config {
     pub errors: ErrorsConfig,
     pub security: SecurityConfig,
     pub auth: Option<AuthConfig>,
-    /// Where a source node's generation ID comes from, and who may read or
-    /// advance it. `None` means this node has no `/genid`.
-    pub genid: Option<GenidConfig>,
+    /// The node's cache-control registration: who may purge and read the
+    /// registered-cache set on an origin, or which origin a cache node follows.
+    /// `None` means this node takes no part in purging or registration.
+    pub registration: Option<RegistrationConfig>,
     /// A cache node's disk cache directory. `None` means the node keeps its
     /// cache in memory only.
     pub cache_dir: Option<PathBuf>,
@@ -46,52 +47,29 @@ pub struct Config {
     pub site_dir: PathBuf,
 }
 
-/// The node's `[genid]` table.
+/// The node's `[registration]` table.
 ///
-/// Two shapes, one table. A node with `upstream` is a cache node that follows
-/// another node's ID. A node without one is the source that owns the ID, and
-/// the claims say who may read or advance it.
-///
-/// On the source both claims are set or neither: one alone would leave one half
-/// of the endpoint unguarded. Both absent leaves `/genid` answering 404 to
-/// everyone, which is how a node says it does not serve a generation ID.
+/// Two shapes, one table. An origin sets the two claims: `read_require` gates
+/// `GET /m6/status` and `write_require` gates `PURGE`. A cache node sets
+/// `origin`, the `host:port` of the origin's control-channel listener, and
+/// holds no claims. Both claims or neither, as with the old generation ID.
 #[derive(Debug, Clone, Serialize)]
-pub struct GenidConfig {
-    /// `role:<name>` or `group:<name>` a `GET /genid` needs. Source only.
+pub struct RegistrationConfig {
+    /// `role:<name>` or `group:<name>` a `GET /m6/status` needs. Origin only.
     pub read_require: Option<String>,
-    /// The same for `POST /genid`, which advances the generation. Source only.
+    /// The same for `PURGE`, which removes paths from every cache. Origin only.
     pub write_require: Option<String>,
-    /// The `[[backend]]` a cache node follows. Present makes this node a cache
-    /// node, and the backend must have a `url`.
-    pub upstream: Option<String>,
-    /// The bearer token a heartbeat sends, read from `token_file` at load.
-    ///
-    /// `serde(skip)` in both directions: it must never be printed by
-    /// `--dump-config`, and it must not be settable inline from TOML. It is a
-    /// [`m6_core::Secret`] as well, so no other path can print it either.
-    #[serde(skip)]
-    pub token: Option<m6_core::Secret<String>>,
-    /// How long between heartbeats. Cache node only, default 10 s.
-    #[serde(rename = "heartbeat_secs", serialize_with = "serialize_secs")]
-    pub heartbeat: std::time::Duration,
+    /// The origin's control-channel address, `host:port`. Present makes this
+    /// node a cache node that registers with that origin.
+    pub origin: Option<String>,
 }
 
-/// A `Duration` as the whole seconds the config key spells.
-fn serialize_secs<S>(d: &std::time::Duration, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    serializer.serialize_u64(d.as_secs())
-}
-
-impl Default for GenidConfig {
+impl Default for RegistrationConfig {
     fn default() -> Self {
-        GenidConfig {
+        RegistrationConfig {
             read_require: None,
             write_require: None,
-            upstream: None,
-            token: None,
-            heartbeat: std::time::Duration::from_secs(crate::genid::DEFAULT_HEARTBEAT_SECS),
+            origin: None,
         }
     }
 }
@@ -215,6 +193,12 @@ pub struct ServerConfig {
     /// Intended for use over a private backbone between nodes.
     #[serde(default)]
     pub h2c_bind: Option<String>,
+    /// Optional cache-control listener address, a plain TCP line protocol on
+    /// the origin over the private backbone. Caches connect here to register
+    /// and to receive purges. Unset means no control channel. Read at start,
+    /// and a change needs a restart.
+    #[serde(default)]
+    pub registration_bind: Option<String>,
     /// Listeners this server treats as internal, by address. See
     /// docs/m6-site-toml.md. Validated by `load`: each entry is an IP and port
     /// in a local range (`m6_core::net::is_private_ip`) equal to `bind` or
@@ -965,7 +949,7 @@ struct RawSiteToml {
     errors: Option<ErrorsConfig>,
     security: Option<SecurityConfig>,
     auth: Option<AuthConfig>,
-    genid: Option<RawGenid>,
+    registration: Option<RawRegistration>,
     /// The disk cache directory. Node state, so the table is refused in
     /// `site.toml` in two-file mode.
     cache: Option<RawCache>,
@@ -1004,6 +988,7 @@ struct RawServerSection {
     process_index: Option<u32>,
     status_bind: Option<String>,
     h2c_bind: Option<String>,
+    registration_bind: Option<String>,
     internal_binds: Option<Vec<String>>,
     internal_peers: Option<Vec<String>>,
     redirect_bind: Option<String>,
@@ -1020,9 +1005,9 @@ struct RawSystemToml {
     /// `[auth]` lives here, so the verify key's path is owned by the same
     /// file as the node's other credentials.
     auth: Option<AuthConfig>,
-    /// The generation-ID endpoint. Node state: a site's content ships to every
-    /// node, its publish claims do not.
-    genid: Option<RawGenid>,
+    /// The registration endpoint. Node state: a site's content ships to every
+    /// node, its purge and status claims do not.
+    registration: Option<RawRegistration>,
     /// The disk cache directory. Node state, so it belongs beside the node's
     /// credentials rather than in the site that ships to every node.
     cache: Option<RawCache>,
@@ -1037,16 +1022,14 @@ struct RawCache {
     dir: Option<String>,
 }
 
-/// The `[genid]` keys. A source sets the two claims. A cache node sets
-/// `upstream` and `token_file`, and may set `heartbeat_secs`.
+/// The `[registration]` keys. An origin sets the two claims. A cache node sets
+/// `origin`, the `host:port` of the origin's control-channel listener.
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-struct RawGenid {
+struct RawRegistration {
     read_require: Option<String>,
     write_require: Option<String>,
-    upstream: Option<String>,
-    token_file: Option<String>,
-    heartbeat_secs: Option<u64>,
+    origin: Option<String>,
 }
 
 /// Parse a list of peer addresses into canonical form.
@@ -1083,6 +1066,21 @@ fn parse_local_peers(
 }
 
 // ── Loading ─────────────────────────────────────────────────────────────────
+
+/// Check `[server] registration_bind`: the control channel is only ever on the
+/// private backbone, so the address must be an IP literal in a local range.
+/// A name is refused, as the other internal listeners refuse names: the peer
+/// set is validated against resolved addresses, and a name would silently
+/// outlive a DNS change.
+fn validate_registration_bind(value: &str) -> anyhow::Result<String> {
+    let addr = crate::http11::resolve_bind(value)?;
+    if !m6_core::net::is_private_ip(addr.ip()) && !addr.ip().is_loopback() {
+        anyhow::bail!(
+            "config error: [server].registration_bind = \"{value}\" is not in a local range; the cache control channel must be a loopback, private (RFC 1918), link-local, shared (100.64.0.0/10) or IPv6 unique-local address"
+        );
+    }
+    Ok(value.to_string())
+}
 
 /// Check `[server] internal_binds` against the listeners and the local ranges.
 ///
@@ -1246,12 +1244,12 @@ pub fn load_traced(
     // mode, the one file in one-file mode. The system config is parsed strictly
     // only when it is a second file, so a one-file config is not refused for the
     // site-only keys it necessarily carries.
-    let (node_server, node, auth, raw_genid, raw_cache, raw_limits) = if one_file {
+    let (node_server, node, auth, raw_registration, raw_cache, raw_limits) = if one_file {
         (
             site_parsed.server.clone().unwrap_or_default(),
             site_parsed.node,
             site_parsed.auth,
-            site_parsed.genid,
+            site_parsed.registration,
             site_parsed.cache,
             site_parsed.limits,
         )
@@ -1262,7 +1260,7 @@ pub fn load_traced(
             system_parsed.server.clone().unwrap_or_default(),
             system_parsed.node,
             system_parsed.auth,
-            system_parsed.genid,
+            system_parsed.registration,
             system_parsed.cache,
             system_parsed.limits,
         )
@@ -1341,6 +1339,11 @@ pub fn load_traced(
         node_server.reuse_port_processes,
     )?;
     let h2c_bind = node_server.h2c_bind;
+    let registration_bind = node_server
+        .registration_bind
+        .as_deref()
+        .map(validate_registration_bind)
+        .transpose()?;
     // Nothing is inferred from an address: a listener is internal only when
     // this list names it. A redirector binds nothing the list could name, so a
     // site.toml shared with one must not break it.
@@ -1421,6 +1424,7 @@ pub fn load_traced(
         process_index,
         status_bind,
         h2c_bind,
+        registration_bind,
         internal_binds,
         internal_peers,
         warm_on_start,
@@ -1572,94 +1576,55 @@ pub fn load_traced(
         anyhow::bail!("config error: [errors] mode = \"custom\" requires `path`");
     }
 
-    // The generation endpoint. Both claims or neither: one alone would leave
-    // one half of the endpoint unguarded, and a value that names no role or
-    // group is a typo that would otherwise refuse every caller at run time.
-    // The generation state. `upstream` makes this a cache node that follows
-    // another node; without it the node is the source that owns the ID.
-    let genid = match raw_genid {
+    // The registration endpoint. An origin sets both claims or neither, and a
+    // value that names no role or group is a typo. A cache node sets `origin`
+    // and holds no claims; the two shapes are disjoint, so the keys of one
+    // shape applied to the other are refused by name.
+    let registration = match raw_registration {
         None => None,
         Some(raw) => {
-            // The keys of one shape applied to the other are typos that would
-            // otherwise be ignored, so each is refused by name.
-            if raw.upstream.is_some() {
+            if raw.origin.is_some() {
                 for (key, value) in [
                     ("read_require", raw.read_require.as_deref()),
                     ("write_require", raw.write_require.as_deref()),
                 ] {
                     if value.is_some() {
                         anyhow::bail!(
-                            "config error: [genid] {key} applies only to the source, which has no upstream"
+                            "config error: [registration] {key} applies only to the origin, which has no `origin`"
                         );
                     }
                 }
             } else {
-                for (key, present) in [
-                    ("token_file", raw.token_file.is_some()),
-                    ("heartbeat_secs", raw.heartbeat_secs.is_some()),
-                ] {
+                for (key, present) in [("origin", raw.origin.is_some())] {
                     if present {
                         anyhow::bail!(
-                            "config error: [genid] {key} applies only to a cache node with upstream"
+                            "config error: [registration] {key} applies only to a cache node, which has no claims"
                         );
                     }
                 }
             }
 
-            let (upstream, token, heartbeat) = match raw.upstream.as_deref() {
-                None => (
-                    None,
-                    None,
-                    std::time::Duration::from_secs(crate::genid::DEFAULT_HEARTBEAT_SECS),
-                ),
-                Some(name) => {
-                    let named = backends.iter().any(|b| b.name == name && b.url.is_some());
-                    if !named {
+            let origin = match raw.origin.as_deref() {
+                None => None,
+                Some(value) => {
+                    // A cache node's origin is a `host:port`, resolved at
+                    // start. A name that does not resolve fails there, not
+                    // here, but the shape is checked now.
+                    if value.is_empty() {
                         anyhow::bail!(
-                            "config error: [genid].upstream = \"{name}\" must name a [[backend]] with a url"
+                            "config error: [registration].origin must be \"host:port\""
                         );
                     }
-                    let Some(token_file) = raw.token_file.as_deref() else {
-                        anyhow::bail!(
-                            "config error: [genid].upstream = \"{name}\" needs token_file"
-                        );
-                    };
-                    let path = secret_path("[genid] token_file", token_file)?;
-                    let token = match std::fs::read_to_string(&path) {
-                        Ok(text) => text.trim().to_string(),
-                        Err(e) => anyhow::bail!(
-                            "config error: [genid] token_file {} cannot be read: {e}",
-                            path.display()
-                        ),
-                    };
-                    if token.is_empty() {
-                        anyhow::bail!(
-                            "config error: [genid] token_file {} is empty",
-                            path.display()
-                        );
-                    }
-                    let secs = raw
-                        .heartbeat_secs
-                        .unwrap_or(crate::genid::DEFAULT_HEARTBEAT_SECS);
-                    if secs == 0 {
-                        anyhow::bail!(
-                            "config error: [genid].heartbeat_secs must be at least 1, because 0 would send a heartbeat every loop turn"
-                        );
-                    }
-                    (
-                        Some(name.to_string()),
-                        Some(m6_core::Secret::new(token)),
-                        std::time::Duration::from_secs(secs),
-                    )
+                    Some(value.to_string())
                 }
             };
 
-            // The source's two claims, both or neither.
+            // The origin's two claims, both or neither.
             let read = raw.read_require.is_some();
             let write = raw.write_require.is_some();
             if read != write {
                 anyhow::bail!(
-                    "config error: [genid] needs both read_require and write_require, or neither"
+                    "config error: [registration] needs both read_require and write_require, or neither"
                 );
             }
             for (key, value) in [
@@ -1669,7 +1634,7 @@ pub fn load_traced(
                 let Some(value) = value else { continue };
                 if auth.is_none() {
                     anyhow::bail!(
-                        "config error: [genid] read_require and write_require need [auth] with a backend"
+                        "config error: [registration] read_require and write_require need [auth] with a backend"
                     );
                 }
                 let named = matches!(
@@ -1678,16 +1643,14 @@ pub fn load_traced(
                 );
                 if !named {
                     anyhow::bail!(
-                        "config error: [genid].{key} = \"{value}\" must be \"role:<name>\" or \"group:<name>\""
+                        "config error: [registration].{key} = \"{value}\" must be \"role:<name>\" or \"group:<name>\""
                     );
                 }
             }
-            Some(GenidConfig {
+            Some(RegistrationConfig {
                 read_require: raw.read_require,
                 write_require: raw.write_require,
-                upstream,
-                token,
-                heartbeat,
+                origin,
             })
         }
     };
@@ -1705,9 +1668,9 @@ pub fn load_traced(
             let dir = raw.dir.ok_or_else(|| {
                 anyhow::anyhow!("config error: [cache] needs dir = \"<absolute path>\"")
             })?;
-            let is_cache_node = genid.as_ref().is_some_and(|g| g.upstream.is_some());
+            let is_cache_node = registration.as_ref().is_some_and(|r| r.origin.is_some());
             if !is_cache_node {
-                anyhow::bail!("config error: [cache].dir is for a cache node ([genid] upstream)");
+                anyhow::bail!("config error: [cache].dir is for a cache node ([registration] origin)");
             }
             let path = PathBuf::from(&dir);
             if !path.is_absolute() {
@@ -1745,7 +1708,7 @@ pub fn load_traced(
             errors,
             security,
             auth,
-            genid,
+            registration,
             cache_dir,
             limits,
             backends,
@@ -1796,6 +1759,7 @@ const NODE_SERVER_KEYS: &[&str] = &[
     "tls_cert",
     "tls_key",
     "h2c_bind",
+    "registration_bind",
     "internal_binds",
     "internal_peers",
     "redirect_bind",
@@ -1813,7 +1777,7 @@ const NODE_SERVER_KEYS: &[&str] = &[
 ///
 /// `RawSiteToml` carries `[node]` only for one-file mode. In two-file mode a
 /// `[node]` in `site.toml` is named here so `load` refuses it.
-const NODE_SECTIONS: &[&str] = &["auth", "cache", "genid", "limits", "node"];
+const NODE_SECTIONS: &[&str] = &["auth", "cache", "registration", "limits", "node"];
 /// Keys that describe how the site's routes are served. They belong in
 /// `site.toml`.
 const SITE_SERVER_KEYS: &[&str] = &["backend_timeout_secs", "allowed_methods"];
@@ -2997,45 +2961,45 @@ domain = "test.example.com"
     }
 
     #[test]
-    fn genid_needs_both_requires_or_neither() {
+    fn registration_needs_both_requires_or_neither() {
         let auth = "\n[auth]\nbackend = \"m6-html\"\n";
         for only in [
-            "\n[genid]\nread_require = \"role:monitor\"\n",
-            "\n[genid]\nwrite_require = \"role:editor\"\n",
+            "\n[registration]\nread_require = \"role:monitor\"\n",
+            "\n[registration]\nwrite_require = \"role:editor\"\n",
         ] {
             let (_d, r) = load_with("", &format!("{auth}{only}"));
             let e = r.unwrap_err().to_string();
             assert_eq!(
                 e,
-                "config error: [genid] needs both read_require and write_require, or neither"
+                "config error: [registration] needs both read_require and write_require, or neither"
             );
         }
         let (_d, ok) = load_with(
             "",
             &format!(
-                "{auth}\n[genid]\nread_require = \"role:monitor\"\nwrite_require = \"role:editor\"\n"
+                "{auth}\n[registration]\nread_require = \"role:monitor\"\nwrite_require = \"role:editor\"\n"
             ),
         );
         let cfg = ok.expect("both claims load");
-        let g = cfg.genid.expect("[genid] present");
+        let g = cfg.registration.expect("[registration] present");
         assert_eq!(g.read_require.as_deref(), Some("role:monitor"));
         assert_eq!(g.write_require.as_deref(), Some("role:editor"));
     }
 
     #[test]
-    fn genid_require_needs_auth() {
+    fn registration_require_needs_auth() {
         let (_d, r) = load_with(
             "",
-            "\n[genid]\nread_require = \"role:monitor\"\nwrite_require = \"role:editor\"\n",
+            "\n[registration]\nread_require = \"role:monitor\"\nwrite_require = \"role:editor\"\n",
         );
         assert_eq!(
             r.unwrap_err().to_string(),
-            "config error: [genid] read_require and write_require need [auth] with a backend"
+            "config error: [registration] read_require and write_require need [auth] with a backend"
         );
     }
 
     #[test]
-    fn genid_require_must_name_a_role_or_group() {
+    fn registration_require_must_name_a_role_or_group() {
         for (key, bad) in [
             ("read_require", "admin"),
             ("write_require", "role:"),
@@ -3049,11 +3013,11 @@ domain = "test.example.com"
             };
             let (_d, r) = load_with(
                 "",
-                &format!("\n[auth]\nbackend = \"m6-html\"\n\n[genid]\n{body}"),
+                &format!("\n[auth]\nbackend = \"m6-html\"\n\n[registration]\n{body}"),
             );
             let e = r.unwrap_err().to_string();
             assert!(
-                e.contains(&format!("[genid].{key}"))
+                e.contains(&format!("[registration].{key}"))
                     && e.contains("must be \"role:<name>\" or \"group:<name>\""),
                 "{bad}: {e}"
             );
@@ -3061,14 +3025,14 @@ domain = "test.example.com"
     }
 
     #[test]
-    fn genid_in_the_system_config_loads() {
+    fn registration_in_the_system_config_loads() {
         let (_d, r) = load_with(
             "",
-            "\n[auth]\nbackend = \"m6-html\"\n\n[genid]\nread_require = \"group:ops\"\nwrite_require = \"role:editor\"\n",
+            "\n[auth]\nbackend = \"m6-html\"\n\n[registration]\nread_require = \"group:ops\"\nwrite_require = \"role:editor\"\n",
         );
         let cfg = r.expect("a source loads");
         assert_eq!(
-            cfg.genid.expect("present").read_require.as_deref(),
+            cfg.registration.expect("present").read_require.as_deref(),
             Some("group:ops")
         );
     }
@@ -3096,26 +3060,21 @@ domain = "test.example.com"
     }
 
     #[test]
-    fn genid_in_site_toml_is_refused() {
+    fn registration_in_site_toml_is_refused() {
         let (_d, r) = load_with(
-            "\n[genid]\nread_require = \"role:monitor\"\nwrite_require = \"role:editor\"\n",
+            "\n[registration]\nread_require = \"role:monitor\"\nwrite_require = \"role:editor\"\n",
             "\n[auth]\nbackend = \"m6-html\"\n",
         );
         let e = r.unwrap_err().to_string();
-        assert!(e.contains("site.toml sets [genid]"), "{e}");
+        assert!(e.contains("site.toml sets [registration]"), "{e}");
         assert!(e.contains("belongs in the system config"), "{e}");
     }
 
     /// A cache node's site: one URL backend named `origin`, then whatever the
-    /// test puts in `[genid]`. The token file is written with `token`, so a
-    /// positive case can read it.
-    fn load_cache_with(
-        sys_extra: &str,
-        token: &str,
-    ) -> (tempfile::TempDir, anyhow::Result<Config>) {
+    /// test puts in `[registration]`.
+    fn load_cache_with(sys_extra: &str) -> (tempfile::TempDir, anyhow::Result<Config>) {
         let dir = make_test_dir();
         setup_minimal(dir.path());
-        write_file(dir.path(), "genid-token", token);
         let mut site = minimal_site_toml();
         site.push_str("\n[[backend]]\nname = \"origin\"\nurl = \"https://127.0.0.1:9\"\n");
         write_file(dir.path(), "site.toml", &site);
@@ -3127,178 +3086,58 @@ domain = "test.example.com"
     }
 
     #[test]
-    fn genid_upstream_must_name_a_backend_with_a_url() {
-        for name in ["nope", "m6-html"] {
-            let (_d, r) = load_cache_with(
-                &format!(
-                    "\n[genid]\nupstream = \"{name}\"\ntoken_file = \"{{DIR}}/genid-token\"\n"
-                ),
-                "read-token",
-            );
-            assert_eq!(
-                r.unwrap_err().to_string(),
-                format!(
-                    "config error: [genid].upstream = \"{name}\" must name a [[backend]] with a url"
-                )
-            );
-        }
-    }
-
-    #[test]
-    fn genid_upstream_needs_a_token_file() {
-        let (_d, r) = load_cache_with("\n[genid]\nupstream = \"origin\"\n", "read-token");
-        assert_eq!(
-            r.unwrap_err().to_string(),
-            "config error: [genid].upstream = \"origin\" needs token_file"
-        );
-    }
-
-    #[test]
-    fn genid_token_file_is_a_secret_path() {
-        let (_d, r) = load_cache_with(
-            "\n[genid]\nupstream = \"origin\"\ntoken_file = \"genid-token\"\n",
-            "read-token",
-        );
-        let e = r.unwrap_err().to_string();
-        assert!(
-            e.contains("[genid] token_file") && e.contains("relative path"),
-            "{e}"
-        );
-    }
-
-    #[test]
-    fn genid_token_file_must_be_readable_and_not_empty() {
-        let (_d, r) = load_cache_with(
-            "\n[genid]\nupstream = \"origin\"\ntoken_file = \"{DIR}/missing\"\n",
-            "read-token",
-        );
-        let e = r.unwrap_err().to_string();
-        assert!(
-            e.contains("[genid] token_file") && e.contains("cannot be read"),
-            "{e}"
-        );
-
-        let (_d, r) = load_cache_with(
-            "\n[genid]\nupstream = \"origin\"\ntoken_file = \"{DIR}/genid-token\"\n",
-            "  \n",
-        );
-        let e = r.unwrap_err().to_string();
-        assert!(
-            e.contains("[genid] token_file") && e.contains("is empty"),
-            "{e}"
-        );
-    }
-
-    #[test]
-    fn genid_heartbeat_secs_must_be_positive() {
-        let (_d, r) = load_cache_with(
-            "\n[genid]\nupstream = \"origin\"\ntoken_file = \"{DIR}/genid-token\"\nheartbeat_secs = 0\n",
-            "read-token",
-        );
-        assert_eq!(
-            r.unwrap_err().to_string(),
-            "config error: [genid].heartbeat_secs must be at least 1, because 0 would send a heartbeat every loop turn"
-        );
-    }
-
-    #[test]
-    fn genid_cache_keys_need_an_upstream() {
-        let auth = "\n[auth]\nbackend = \"m6-html\"\n";
-        for key in ["token_file = \"{DIR}/genid-token\"", "heartbeat_secs = 5"] {
-            let (_d, r) = load_with("", &format!("{auth}\n[genid]\n{key}\n"));
-            assert_eq!(
-                r.unwrap_err().to_string(),
-                format!(
-                    "config error: [genid] {} applies only to a cache node with upstream",
-                    key.split(' ').next().unwrap()
-                )
-            );
-        }
-    }
-
-    #[test]
-    fn genid_source_claims_do_not_apply_to_a_cache_node() {
-        let auth = "\n[auth]\nbackend = \"m6-html\"\n";
-        let (_d, r) = load_cache_with(
-            &format!(
-                "{auth}\n[genid]\nupstream = \"origin\"\ntoken_file = \"{{DIR}}/genid-token\"\nread_require = \"role:monitor\"\nwrite_require = \"role:editor\"\n"
-            ),
-            "read-token",
-        );
-        assert_eq!(
-            r.unwrap_err().to_string(),
-            "config error: [genid] read_require applies only to the source, which has no upstream"
-        );
-    }
-
-    #[test]
-    fn genid_cache_node_loads_with_the_default_heartbeat() {
-        let (_d, r) = load_cache_with(
-            "\n[genid]\nupstream = \"origin\"\ntoken_file = \"{DIR}/genid-token\"\n",
-            "  read-token\n",
-        );
+    fn registration_cache_node_loads_with_an_origin() {
+        let (_d, r) = load_cache_with("\n[registration]\norigin = \"10.0.0.1:8444\"\n");
         let cfg = r.expect("a cache node loads");
-        let g = cfg.genid.as_ref().expect("[genid] present");
-        assert_eq!(g.upstream.as_deref(), Some("origin"));
-        assert_eq!(
-            g.token.as_ref().map(|t| t.expose().as_str()),
-            Some("read-token"),
-            "the file is trimmed"
-        );
-        assert_eq!(
-            g.heartbeat,
-            std::time::Duration::from_secs(crate::genid::DEFAULT_HEARTBEAT_SECS)
-        );
+        let g = cfg.registration.as_ref().expect("[registration] present");
+        assert_eq!(g.origin.as_deref(), Some("10.0.0.1:8444"));
         assert_eq!(g.read_require, None);
         assert_eq!(g.write_require, None);
-
-        // The token is a credential: `--dump-config` must never print it.
-        let dumped = serde_json::to_string(&cfg).expect("serialise");
-        assert!(!dumped.contains("read-token"), "{dumped}");
     }
 
-    /// The start-up record of a cache node, which holds m6-http's one
-    /// credential, carries neither the token nor its `Debug` form. Every other
-    /// field of the config is in the record, so the check reads a full record.
     #[test]
-    fn the_startup_record_carries_no_genid_token() {
-        let (dir, r) = load_cache_with(
-            "\n[genid]\nupstream = \"origin\"\ntoken_file = \"{DIR}/genid-token\"\n",
-            "SECRET-genid-token",
+    fn registration_origin_must_not_be_empty() {
+        let (_d, r) = load_cache_with("\n[registration]\norigin = \"\"\n");
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "config error: [registration].origin must be \"host:port\""
         );
-        let cfg = r.expect("a cache node loads");
-        let (_, trace) = load_traced(dir.path(), &dir.path().join("system.toml"))
-            .expect("the same config loads with its trace");
-        let record = startup::Record::new("m6-http", vec!["m6-http".to_string()])
-            .trace(trace.clone())
-            .sections(cfg.startup_sections(&trace))
-            .host(startup::HostReport::unknown("a test host knows nothing"));
-        let path = dir.path().join("record.jsonl");
-        let mut sink = m6_core::log::Sink::file(&path).expect("a file sink");
-        record.write(&mut sink);
-        sink.finish().expect("the sink flushes");
-        let text = std::fs::read_to_string(&path).expect("the record is text");
+    }
+
+    #[test]
+    fn registration_cache_keys_need_an_origin() {
+        let auth = "\n[auth]\nbackend = \"m6-html\"\n";
+        let (_d, r) = load_with("", &format!("{auth}\n[registration]\norigin = \"10.0.0.1:9\"\nread_require = \"role:monitor\"\n"));
+        let e = r.unwrap_err().to_string();
         assert!(
-            text.contains("origin"),
-            "the genid section is recorded: {text}"
+            e.contains("config error: [registration] read_require applies only to the origin"),
+            "{e}"
         );
-        assert!(!text.contains("SECRET-genid-token"), "{text}");
-        let debug = format!("{cfg:?}");
-        assert!(!debug.contains("SECRET-genid-token"), "{debug}");
     }
 
     #[test]
-    fn genid_cache_node_reads_heartbeat_secs() {
-        let (_d, r) = load_cache_with(
-            "\n[genid]\nupstream = \"origin\"\ntoken_file = \"{DIR}/genid-token\"\nheartbeat_secs = 3\n",
-            "read-token",
+    fn registration_source_claims_do_not_apply_to_a_cache_node() {
+        let auth = "\n[auth]\nbackend = \"m6-html\"\n";
+        let (_d, r) = load_cache_with(&format!(
+            "{auth}\n[registration]\norigin = \"10.0.0.1:8444\"\nread_require = \"role:monitor\"\nwrite_require = \"role:editor\"\n"
+        ));
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "config error: [registration] read_require applies only to the origin, which has no `origin`"
         );
-        let g = r
-            .expect("a cache node loads")
-            .genid
-            .expect("[genid] present");
-        assert_eq!(g.heartbeat, std::time::Duration::from_secs(3));
-        assert_eq!(g.upstream.as_deref(), Some("origin"));
+    }
+
+    #[test]
+    fn registration_origin_key_does_not_apply_to_a_source() {
+        let auth = "\n[auth]\nbackend = \"m6-html\"\n";
+        let (_d, r) = load_with(
+            "",
+            &format!("{auth}\n[registration]\nread_require = \"role:monitor\"\nwrite_require = \"role:editor\"\norigin = \"10.0.0.1:9\"\n"),
+        );
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            "config error: [registration] read_require applies only to the origin, which has no `origin`"
+        );
     }
 
     #[test]
@@ -3511,6 +3350,7 @@ domain = "test.example.com"
                 "process_index",
                 "redirect_bind",
                 "redirect_unmatched_to",
+                "registration_bind",
                 "reuse_port",
                 "reuse_port_processes",
                 "served_hosts",
@@ -3520,11 +3360,11 @@ domain = "test.example.com"
                 "warm_on_start",
             ]
         );
-        assert_eq!(NODE_SECTIONS, ["auth", "cache", "genid", "limits", "node"]);
-        // 13 base [server] keys + lock_memory (the mimalloc pin) + served_hosts
-        // and redirect_unmatched_to (the unmatched-host policy) = 16, plus the
+        assert_eq!(NODE_SECTIONS, ["auth", "cache", "registration", "limits", "node"]);
+        // 14 base [server] keys + lock_memory (the mimalloc pin) + served_hosts
+        // and redirect_unmatched_to (the unmatched-host policy) = 17, plus the
         // two site-wide [server] keys and the five node sections.
-        assert_eq!(all.len(), 18 + 5);
+        assert_eq!(all.len(), 19 + 5);
         for (section, key, belongs_in_system) in all {
             let body = match key {
                 Some(k) => format!("[{section}]\n{k} = 1\n"),
@@ -3676,11 +3516,10 @@ domain = "test.example.com"
             "system.toml",
             "[node]\nname = \"edge-a\"\n\n\
              [server]\nbind = \"127.0.0.1:8443\"\ntls_cert = \"{DIR}/cert.pem\"\ntls_key = \"{DIR}/key.pem\"\n\n\
-             [genid]\nupstream = \"origin\"\ntoken_file = \"{DIR}/genid-token\"\n",
+             [registration]\norigin = \"127.0.0.1:9443\"\n",
         );
         write_file(dir, "cert.pem", "dummy");
         write_file(dir, "key.pem", "dummy");
-        write_file(dir, "genid-token", "read-token\n");
     }
 
     fn append_to_system(dir: &Path, extra: &str) {
@@ -3746,7 +3585,7 @@ domain = "test.example.com"
             .to_string();
         assert_eq!(
             e,
-            "config error: [cache].dir is for a cache node ([genid] upstream)"
+            "config error: [cache].dir is for a cache node ([registration] origin)"
         );
     }
 

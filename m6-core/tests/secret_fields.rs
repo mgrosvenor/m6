@@ -199,9 +199,9 @@ fn every_credential_field_in_a_config_struct_is_a_secret() {
         plain.join("\n")
     );
 
-    // The two typed secrets the workspace has are found, so the walk reaches
+    // The typed secret the workspace still has is found, so the walk reaches
     // the crates and reads through `Option`.
-    for (owner, field) in [("GenidConfig", "token"), ("RelayConfig", "credentials")] {
+    for (owner, field) in [("RelayConfig", "credentials")] {
         assert!(
             found
                 .iter()

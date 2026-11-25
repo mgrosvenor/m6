@@ -2457,7 +2457,7 @@ fn write_response(
     body: &[u8],
     method: &str,
     keep_alive: bool,
-    genid: Option<u64>,
+    _genid: Option<u64>,
 ) {
     let is_head = method.eq_ignore_ascii_case("HEAD");
     let reason = status_reason(status);
@@ -2492,10 +2492,6 @@ fn write_response(
     // Applied at serialisation so every response carries them regardless of
     // which path produced it (cache hit, backend, error page, 429).
     crate::security::write_h1_headers(out, headers);
-
-    if let Some(genid) = genid {
-        write_genid_header(out, genid);
-    }
 
     // RFC 9110 9.3.2: a HEAD response's Content-Length describes the
     // representation a GET *would* have returned, not the zero bytes actually
@@ -2557,17 +2553,6 @@ fn status_reason(status: u16) -> &'static str {
         // is worse than a terse one.
         _ => "Unknown",
     }
-}
-
-/// Write the generation line into a response head, with no allocation.
-///
-/// One function for both writers, so the hit path and the miss path cannot
-/// disagree about the field's name or its decimal form.
-fn write_genid_header(out: &mut Vec<u8>, genid: u64) {
-    out.extend_from_slice(crate::genid::GENID_HEADER.as_bytes());
-    out.extend_from_slice(b": ");
-    out.extend_from_slice(itoa::Buffer::new().format(genid).as_bytes());
-    out.extend_from_slice(b"\r\n");
 }
 
 // ── Cached-hit writer ─────────────────────────────────────────────────────────
@@ -2828,8 +2813,6 @@ pub fn write_cached_h1(
     }
 
     crate::security::write_h1_headers(out, &entry.headers);
-
-    write_genid_header(out, entry.genid);
 
     if status_may_have_content_length(entry.status) {
         out.extend_from_slice(b"content-length: ");
