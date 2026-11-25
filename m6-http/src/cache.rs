@@ -1525,10 +1525,9 @@ impl Cache {
                 },
             );
             if let (Some(at), Some(heap_key)) = (expires_at, heap_key) {
-                state.expiries.push(std::cmp::Reverse(Expiry {
-                    at,
-                    key: heap_key,
-                }));
+                state
+                    .expiries
+                    .push(std::cmp::Reverse(Expiry { at, key: heap_key }));
             }
             let freed = replaced.map(|e| e.footprint).unwrap_or(0);
             self.counters
@@ -3674,7 +3673,10 @@ mod storable_status_tests {
             assert!(status_is_storable(302, &headers), "{cc} must store a 302");
         }
         // `Expires` is the older explicit freshness spelling.
-        let headers = vec![("Expires".to_string(), "Sun, 15 Nov 2026 00:00:00 GMT".to_string())];
+        let headers = vec![(
+            "Expires".to_string(),
+            "Sun, 15 Nov 2026 00:00:00 GMT".to_string(),
+        )];
         assert!(status_is_storable(302, &headers));
         // `no-cache` is not a freshness lifetime and must not admit a 302.
         let headers = vec![("Cache-Control".to_string(), "no-cache".to_string())];
@@ -4184,7 +4186,10 @@ mod re_store_tests {
         let cache = Cache::with_max_bytes(100_000);
         // Store once expired, then replace it with a fresh copy before the
         // eviction that pressure will force.
-        cache.insert(CacheKey::new("/k", None, ""), resp("public, max-age=0", 10_000));
+        cache.insert(
+            CacheKey::new("/k", None, ""),
+            resp("public, max-age=0", 10_000),
+        );
         cache.insert(
             CacheKey::new("/k", None, ""),
             resp("public, max-age=86400", 10_000),
