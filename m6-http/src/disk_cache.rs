@@ -64,6 +64,46 @@ pub const REMOVE_BUDGET: usize = 512;
 const MAGIC: &[u8; 4] = b"M6DC";
 const VERSION: u8 = 1;
 
+/// The change-counter file name, one decimal u64 and a newline.
+///
+/// The counter is not a generation: it exists only to reconcile a disk copy
+/// after a cache missed purges while away. On reconnect a cache presents its
+/// saved counter and the origin answers with its current one. Equal keeps the
+/// disk copy; different, or a missing file, purges the folder and refills.
+pub const CHANGE_COUNTER: &str = "change-counter";
+
+/// Read the saved change counter, or `None` when there is no file.
+///
+/// A file that does not hold a decimal u64 reads as missing, so a torn or
+/// hand-edited counter reconciles by purging rather than by trusting garbage.
+pub fn read_change_counter(dir: &Path) -> std::io::Result<Option<u64>> {
+    match std::fs::read_to_string(dir.join(CHANGE_COUNTER)) {
+        Ok(text) => Ok(text.trim().parse::<u64>().ok()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Write the change counter to a temp file and rename it over the saved file,
+/// so a reader sees either the old counter or the new one, never a torn write.
+pub fn write_change_counter(dir: &Path, counter: u64) -> std::io::Result<()> {
+    let path = dir.join(CHANGE_COUNTER);
+    let mut tmp = path.to_path_buf().into_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let result = (|| {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(&tmp)?;
+        writeln!(file, "{counter}")?;
+        drop(file);
+        std::fs::rename(&tmp, &path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// What one tick of the writer did, for the metrics document and the tests.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct TickStats {
@@ -319,6 +359,18 @@ impl DiskWriter {
     /// Entries skipped because the byte bound would be passed.
     pub fn skipped_full(&self) -> u64 {
         self.skipped_full
+    }
+
+    /// Times the writer skipped a write for being full, cumulative. This is
+    /// the `cache.disk_full` metric: a restarted cache with an incomplete disk
+    /// copy misses, so a full copy is reported and faulted, never silent.
+    pub fn disk_full(&self) -> u64 {
+        self.skipped_full
+    }
+
+    /// Total bytes of files on disk, the `cache.disk_bytes` metric.
+    pub fn disk_bytes(&self) -> u64 {
+        self.dir_bytes()
     }
 
     /// Ticks taken since the writer was created, including ticks with no work.
@@ -1428,5 +1480,46 @@ mod tests {
             "the whole directory fit the bound, so the test measures nothing"
         );
         assert_eq!(loaded.files.len(), total);
+    }
+}
+
+#[cfg(test)]
+mod change_counter_tests {
+    use super::*;
+
+    /// A missing file reads as no counter, so a fresh disk copy reconciles by
+    /// purging rather than by trusting a value that was never saved.
+    #[test]
+    fn a_missing_counter_reads_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_change_counter(dir.path()).unwrap(), None);
+    }
+
+    /// A written counter round-trips, and the write is atomic: a temp file is
+    /// never left behind and the value is a decimal u64 plus a newline.
+    #[test]
+    fn a_written_counter_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        write_change_counter(dir.path(), 42).unwrap();
+        assert_eq!(read_change_counter(dir.path()).unwrap(), Some(42));
+        let text = std::fs::read_to_string(dir.path().join(CHANGE_COUNTER)).unwrap();
+        assert_eq!(text, "42\n");
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")),
+            "the temp file is renamed away"
+        );
+    }
+
+    /// Garbage in the counter file reads as missing, never as a number that
+    /// would keep a disk copy the operator did not save.
+    #[test]
+    fn garbage_reads_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(CHANGE_COUNTER), b"not-a-counter\n").unwrap();
+        assert_eq!(read_change_counter(dir.path()).unwrap(), None);
     }
 }

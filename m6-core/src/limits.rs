@@ -163,9 +163,10 @@ pub const REQUEST_DICT: LimitSpec = count("request_dict", 32, 4096);
 pub const REFRESH_QUEUE: LimitSpec = count("refresh_queue", 16, 4096);
 /// Client addresses the per-address request counter tracks.
 pub const RATE_LIMIT_ADDRESSES: LimitSpec = count("rate_limit_addresses", 1024, 50_000);
-/// The response cache's memory. A cache holds what fits and evicts the least
-/// recently read entry for the next, so `start` equals `max`.
-pub const CACHE_BYTES: LimitSpec = bytes("cache_bytes", 128 * MIB, 128 * MIB);
+/// The response cache's memory. A cache holds what fits and evicts expired
+/// entries first, then the least recently read, so `start` is the bound a
+/// default config gets and `max` is the ceiling an operator may raise it to.
+pub const CACHE_BYTES: LimitSpec = bytes("cache_bytes", 128 * MIB, 4 * GIB);
 /// Polls the monitor holds in memory while its history file catches up.
 pub const HISTORY_QUEUE: LimitSpec = count("history_queue", 8, 1024);
 /// One line read from the journal: a whole metrics or traffic document with
@@ -542,28 +543,28 @@ const HEAP_HEADROOM: usize = 64 * 1024 * 1024;
 const HUGE_PAGE: usize = 2 * 1024 * 1024;
 
 /// The heap reservation a service makes, and a warning when an explicit
-/// `[limits.heap_reserve] start` cannot hold `[limits.cache_bytes] max`.
+/// `[limits.heap_reserve] start` cannot hold `[limits.cache_bytes] start`.
 ///
 /// The cache is the hot data, so its memory is carved from the huge-page
 /// reservation. Unless the config sets `start`, the reservation is the cache's
-/// max plus headroom, rounded up to the huge page size, so a default start
-/// reserves for the whole cache and the record's cache max is the bound the
+/// start plus headroom, rounded up to the huge page size, so a default start
+/// reserves for the whole cache and the record's cache start is the bound the
 /// cache really has. A `start` the config does set is used as written, and a
 /// cache above it is named: the caller then bounds the cache to the
-/// reservation, so the reported max overstates what the cache can hold and the
-/// operator hears why.
+/// reservation, so the reported start overstates what the cache can hold and
+/// the operator hears why.
 ///
 /// A default start warns about nothing. A warning on every default start is a
 /// warning nobody reads.
 pub fn heap_reserve(limits: &Limits) -> (usize, Option<String>) {
     let reserve = limits.get(&HEAP_RESERVE);
-    let cache = limits.get(&CACHE_BYTES).max();
+    let cache = limits.get(&CACHE_BYTES).start();
     if !reserve.start_set() {
         return ((cache + HEAP_HEADROOM).next_multiple_of(HUGE_PAGE), None);
     }
     let warning = (reserve.start() < cache).then(|| {
         format!(
-            "[limits.cache_bytes] max = {} is above [limits.heap_reserve] start = {}, so the cache is bounded by the reservation. Raise [limits.heap_reserve] start to at least {} in {}",
+            "[limits.cache_bytes] start = {} is above [limits.heap_reserve] start = {}, so the cache is bounded by the reservation. Raise [limits.heap_reserve] start to at least {} in {}",
             limits.get(&CACHE_BYTES).text(cache),
             reserve.text(reserve.start()),
             reserve.text((cache + HEAP_HEADROOM).next_multiple_of(HUGE_PAGE)),
@@ -894,7 +895,7 @@ mod tests {
         assert!(warning.is_none(), "{warning:?}");
         assert_eq!(bytes, 192 * MIB);
         // The cache really can hold its reported max inside it.
-        assert!(l.get(&CACHE_BYTES).max() <= bytes);
+        assert!(l.get(&CACHE_BYTES).start() <= bytes);
     }
 
     /// A reservation below the cache warns, naming both keys and the value to
@@ -905,7 +906,7 @@ mod tests {
         let (bytes, warning) = heap_reserve(&l);
         assert_eq!(bytes, 64 * MIB);
         let warning = warning.expect("128 MiB of cache cannot fit in 64 MiB");
-        assert!(warning.contains("[limits.cache_bytes] max"), "{warning}");
+        assert!(warning.contains("[limits.cache_bytes] start"), "{warning}");
         assert!(
             warning.contains("is above [limits.heap_reserve] start"),
             "{warning}"

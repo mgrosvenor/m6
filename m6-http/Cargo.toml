@@ -102,6 +102,7 @@ anyhow         = "1"
 thiserror      = "1"
 m6-core        = { path = "../m6-core", default-features = false }
 glob           = "0.3"
+hashlink       = "0.12"
 bytes          = "1"
 base64         = "0.22"
 # Used only by `alloc-attribution`: the heap profiler that records a

@@ -14,7 +14,9 @@
 
 use std::net::IpAddr;
 
+use crate::cache::Cache;
 use crate::config::GenidConfig;
+use crate::disk_cache::DiskWriter;
 use crate::stats::Iface;
 
 pub use m6_core::monitoring::{not_found, HealthReport, PerfReport, PerfSubject, PoolHealth};
@@ -683,6 +685,8 @@ pub fn perf_document<'a>(
         &'a GenidConfig,
         Option<DiskPerf<'a>>,
     )>,
+    cache: &'a Cache,
+    disk: Option<&'a DiskWriter>,
 ) -> PerfDocument<'a> {
     let now = m6_core::platform::now();
     let (genid, disk_cache) = match genid {
@@ -707,6 +711,15 @@ pub fn perf_document<'a>(
         report,
         genid,
         disk_cache,
+        cache: CacheBlock {
+            bytes: cache.bytes_held() as u64,
+            limit: cache.max_bytes() as u64,
+            entries: cache.len() as u64,
+            disk_bytes: disk.map(|w| w.disk_bytes()).unwrap_or(0),
+            evictions: cache.evictions(),
+            disk_full: disk.map(|w| w.disk_full()).unwrap_or(0),
+            expired: cache.expired(),
+        },
     }
 }
 
@@ -719,6 +732,20 @@ pub struct PerfDocument<'a> {
     genid: Option<GenidBlock<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     disk_cache: Option<DiskCacheBlock>,
+    cache: CacheBlock,
+}
+
+/// The `cache` object: memory and eviction figures, at the top level so
+/// m6-monitor reads one place for fill, entries and evictions.
+#[derive(serde::Serialize)]
+struct CacheBlock {
+    bytes: u64,
+    limit: u64,
+    entries: u64,
+    disk_bytes: u64,
+    evictions: u64,
+    disk_full: u64,
+    expired: u64,
 }
 
 /// The `disk_cache` object.

@@ -1,4 +1,4 @@
-use ahash::AHashMap;
+use ahash::RandomState;
 /// In-memory response cache with atomic Arc swap.
 use m6_core::http::HeaderSource;
 use std::borrow::Borrow;
@@ -492,7 +492,7 @@ pub use m6_core::conditional::{
 /// The query string is part of the key. It used to be stripped, which meant
 /// `/search?q=a` and `/search?q=b` shared one entry and whichever ran first
 /// was served to everyone.
-#[derive(Debug, Hash, Eq, PartialEq)]
+#[derive(Debug, Hash, Eq, PartialEq, PartialOrd, Ord)]
 pub struct CacheKey(Box<str>);
 
 impl CacheKey {
@@ -898,11 +898,6 @@ struct CacheEntry {
     /// point is to bound growth, and the error is a small constant per entry
     /// against bodies measured in kilobytes.
     footprint: usize,
-    /// Monotonic tick of the last read, for eviction order.
-    ///
-    /// `AtomicU64` so `lookup` can record a read while holding only the shared
-    /// lock. One relaxed store per cache hit, no lock upgrade, no allocation.
-    last_read: std::sync::atomic::AtomicU64,
 }
 
 /// The result of a cache lookup.
@@ -942,7 +937,40 @@ impl Lookup {
     }
 }
 
-type CacheMap = AHashMap<CacheKey, CacheEntry>;
+/// The entry map, in least-recently-read order.
+///
+/// `hashlink::LinkedHashMap` is the same hash table as `AHashMap` with an
+/// intrusive linked list, so a hit is one hash lookup and one O(1) move to the
+/// most-recent end. The list is the LRU order: the front is the entry read
+/// least recently, and eviction removes from the front.
+type CacheMap = hashlink::LinkedHashMap<CacheKey, CacheEntry, RandomState>;
+
+/// A scheduled expiry: the instant an entry goes stale, and the key it is
+/// stored under.
+///
+/// Kept in a binary heap ordered by `at`, so eviction finds the earliest
+/// expired entry without scanning the map. An entry with no freshness
+/// lifetime never expires and is never pushed. A re-store pushes a second
+/// record; the heap record that no longer matches the map is skipped on pop,
+/// which is the lazy-deletion technique a standard cache uses rather than
+/// scanning the heap on every removal.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Expiry {
+    at: std::time::Instant,
+    key: CacheKey,
+}
+
+/// The expiry heap: a min-heap by `Expiry::at` via `Reverse`.
+type ExpiryHeap = std::collections::BinaryHeap<std::cmp::Reverse<Expiry>>;
+
+/// The cache's locked state: the entry map and the expiry heap, kept in step.
+///
+/// They share one lock, so a mutation is one map write and one heap push, and
+/// a reader never sees one without the other.
+struct CacheState {
+    map: CacheMap,
+    expiries: ExpiryHeap,
+}
 
 /// Default ceiling on total cached bytes.
 ///
@@ -969,13 +997,9 @@ type CacheMap = AHashMap<CacheKey, CacheEntry>;
 /// key-space explosion, including ones nobody has thought of.
 const DEFAULT_MAX_BYTES: usize = 128 * 1024 * 1024;
 
-/// Monotonic read counter, for eviction order. Wrapping is not a concern: at
-/// one tick per cache hit it would take centuries.
-static READ_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 use std::sync::{Arc, RwLock};
 
-/// The two counters a cache keeps in step with its map.
+/// The counters a cache keeps in step with its map.
 ///
 /// They share one allocation so a generation swap allocates the map and this,
 /// and nothing else. The queued count is what lets an idle tick skip the scan.
@@ -984,14 +1008,16 @@ struct Counters {
     bytes: std::sync::atomic::AtomicUsize,
     /// Entries whose `queued` flag is set, for the disk writer.
     queued: std::sync::atomic::AtomicUsize,
+    /// Entries the byte-bound eviction has dropped, cumulative since start.
+    evictions: std::sync::atomic::AtomicUsize,
 }
 
-/// Cache backed by `Arc<RwLock<HashMap>>`: a clone is cheap, and
+/// Cache backed by `Arc<RwLock<CacheState>>`: a clone is cheap, and
 /// [`Cache::swap_generation`] publishes a whole new generation with one
 /// assignment.
 #[derive(Clone)]
 pub struct Cache {
-    map: Arc<RwLock<CacheMap>>,
+    state: Arc<RwLock<CacheState>>,
     counters: Arc<Counters>,
     max_bytes: usize,
     /// Serve an entry that is past its freshness and stale windows rather than
@@ -1000,6 +1026,23 @@ pub struct Cache {
     /// A plain field, not an `Arc`: the loop owns the `Cache` value in
     /// `ServerState` and is the only writer, so a hit path reads one `bool`.
     serve_held: bool,
+}
+
+/// Build the locked state a fresh cache starts with.
+fn new_cache_state() -> CacheState {
+    CacheState {
+        map: CacheMap::with_hasher(RandomState::default()),
+        expiries: ExpiryHeap::new(),
+    }
+}
+
+/// Build the zeroed counters a fresh cache starts with.
+fn new_counters() -> Counters {
+    Counters {
+        bytes: std::sync::atomic::AtomicUsize::new(0),
+        queued: std::sync::atomic::AtomicUsize::new(0),
+        evictions: std::sync::atomic::AtomicUsize::new(0),
+    }
 }
 
 impl Default for Cache {
@@ -1016,11 +1059,8 @@ impl Cache {
     /// A cache bounded at `max_bytes` of total response footprint.
     pub fn with_max_bytes(max_bytes: usize) -> Self {
         Cache {
-            map: Arc::new(RwLock::new(CacheMap::new())),
-            counters: Arc::new(Counters {
-                bytes: std::sync::atomic::AtomicUsize::new(0),
-                queued: std::sync::atomic::AtomicUsize::new(0),
-            }),
+            state: Arc::new(RwLock::new(new_cache_state())),
+            counters: Arc::new(new_counters()),
             max_bytes,
             serve_held: false,
         }
@@ -1042,6 +1082,32 @@ impl Cache {
         self.counters
             .bytes
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Entries the byte-bound eviction has dropped, cumulative since start.
+    pub fn evictions(&self) -> u64 {
+        self.counters
+            .evictions
+            .load(std::sync::atomic::Ordering::Relaxed) as u64
+    }
+
+    /// Expired entries still held in the map, current.
+    ///
+    /// This is a point-in-time figure the metrics tick asks for, never the
+    /// request path. It scans the map once rather than keep a timer: an entry
+    /// becomes expired by time passing alone, so the count cannot be
+    /// maintained incrementally without a background reaper, which the
+    /// architecture rules out.
+    pub fn expired(&self) -> u64 {
+        let Ok(state) = self.state.read() else {
+            return 0;
+        };
+        let now = m6_core::platform::now();
+        state
+            .map
+            .values()
+            .filter(|e| e.expires_at.is_some_and(|at| now >= at))
+            .count() as u64
     }
 
     /// A cache whose hasher is seeded deterministically. **Benchmarks only.**
@@ -1068,11 +1134,11 @@ impl Cache {
             0x082e_fa98_ec4e_6c89,
         );
         Cache {
-            map: Arc::new(RwLock::new(CacheMap::with_hasher(hasher))),
-            counters: Arc::new(Counters {
-                bytes: std::sync::atomic::AtomicUsize::new(0),
-                queued: std::sync::atomic::AtomicUsize::new(0),
-            }),
+            state: Arc::new(RwLock::new(CacheState {
+                map: CacheMap::with_hasher(hasher),
+                expiries: ExpiryHeap::new(),
+            })),
+            counters: Arc::new(new_counters()),
             max_bytes: DEFAULT_MAX_BYTES,
             serve_held: false,
         }
@@ -1182,8 +1248,8 @@ impl Cache {
         CacheKey: std::borrow::Borrow<Q>,
         Q: std::hash::Hash + Eq + ?Sized,
     {
-        let map = self.map.read().ok()?;
-        let entry = map.get(key)?;
+        let state = self.state.read().ok()?;
+        let entry = state.map.get(key)?;
         // No expiry at all means it never goes stale, so any min-fresh is met.
         let Some(expires_at) = entry.expires_at else {
             return Some(std::time::Duration::from_secs(u32::MAX as u64));
@@ -1197,8 +1263,8 @@ impl Cache {
         CacheKey: std::borrow::Borrow<Q>,
         Q: std::hash::Hash + Eq + ?Sized,
     {
-        let map = self.map.read().ok()?;
-        let entry = map.get(key)?;
+        let state = self.state.read().ok()?;
+        let entry = state.map.get(key)?;
         let expires_at = entry.expires_at?;
         m6_core::platform::now().checked_duration_since(expires_at)
     }
@@ -1214,39 +1280,43 @@ impl Cache {
         CacheKey: std::borrow::Borrow<Q>,
         Q: std::hash::Hash + Eq + ?Sized,
     {
-        let Ok(map) = self.map.read() else {
+        let Ok(mut state) = self.state.write() else {
             return Lookup::Miss;
         };
-        let Some(entry) = map.get(key) else {
-            return Lookup::Miss;
-        };
-        // One relaxed store, under the shared lock, so eviction can prefer
-        // entries nobody reads. No lock upgrade and no allocation: the
-        // attack this defends against is a flood of entries that are written
-        // once and never read, and without a read order the eviction would
-        // discard the hot ones instead.
-        entry.last_read.store(
-            READ_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            std::sync::atomic::Ordering::Relaxed,
-        );
         let now = m6_core::platform::now();
-        // Current age: how long we have held it, plus whatever age it already
-        // had on arrival. Resetting to zero at each hop is what makes a chain
-        // of caches report content as fresher than it is.
-        let age = entry.upstream_age + now.saturating_duration_since(entry.stored_at);
-        // Every branch decides before cloning, so a miss costs no copy.
-        let Some(expires_at) = entry.expires_at else {
-            return Lookup::Fresh(entry.response.clone(), age);
+        // Read and decide inside one scope, then release the entry borrow
+        // before the promotion mutates the list.
+        let decided = {
+            let Some(entry) = state.map.get_mut(key) else {
+                return Lookup::Miss;
+            };
+            // Current age: how long we have held it, plus whatever age it already
+            // had on arrival. Resetting to zero at each hop is what makes a chain
+            // of caches report content as fresher than it is.
+            let age = entry.upstream_age + now.saturating_duration_since(entry.stored_at);
+            let response = entry.response.clone();
+            let expires_at = entry.expires_at;
+            let serve_stale_until = entry.serve_stale_until;
+            (response, age, expires_at, serve_stale_until)
+        };
+        // A hit is one O(1) promotion to the most-recent end, so the LRU
+        // order is exactly read order with no sort ever.
+        state.map.to_back(key);
+        let (response, age, expires_at, serve_stale_until) = decided;
+        // Every branch decides after the single clone, so a miss costs only
+        // that clone, never a second.
+        let Some(expires_at) = expires_at else {
+            return Lookup::Fresh(response, age);
         };
         if now < expires_at {
-            Lookup::Fresh(entry.response.clone(), age)
-        } else if entry.serve_stale_until.is_some_and(|until| now < until) {
-            Lookup::Stale(entry.response.clone(), age)
+            Lookup::Fresh(response, age)
+        } else if serve_stale_until.is_some_and(|until| now < until) {
+            Lookup::Stale(response, age)
         } else if self.serve_held {
             // The upstream is down. A working site with old pages beats an
             // error page, so an entry past every window is served at any age,
             // flagged stale.
-            Lookup::Stale(entry.response.clone(), age)
+            Lookup::Stale(response, age)
         } else {
             Lookup::Miss
         }
@@ -1262,8 +1332,8 @@ impl Cache {
         CacheKey: std::borrow::Borrow<Q>,
         Q: std::hash::Hash + Eq + ?Sized,
     {
-        let map = self.map.read().ok()?;
-        let entry = map.get(key)?;
+        let state = self.state.read().ok()?;
+        let entry = state.map.get(key)?;
         let now = m6_core::platform::now();
         let age = entry.upstream_age + now.saturating_duration_since(entry.stored_at);
         Some((entry.response.clone(), age))
@@ -1279,8 +1349,8 @@ impl Cache {
         CacheKey: std::borrow::Borrow<Q>,
         Q: std::hash::Hash + Eq + ?Sized,
     {
-        let map = self.map.read().ok()?;
-        map.get(key).map(|e| e.response.clone())
+        let state = self.state.read().ok()?;
+        state.map.get(key).map(|e| e.response.clone())
     }
 
     /// Entries waiting for the disk writer.
@@ -1299,11 +1369,11 @@ impl Cache {
     /// whole queue: a store sets one bool, and nothing is copied or pushed, so
     /// the request path allocates nothing for the writer.
     pub fn scan_queued(&mut self, mut f: impl FnMut(&CacheKey, &CachedResponse) -> bool) {
-        let Ok(mut map) = self.map.write() else {
+        let Ok(mut state) = self.state.write() else {
             return;
         };
         let mut cleared = 0usize;
-        for (key, entry) in map.iter_mut() {
+        for (key, entry) in state.map.iter_mut() {
             if !entry.queued {
                 continue;
             }
@@ -1428,15 +1498,19 @@ impl Cache {
         };
         let serve_stale_until = expires_at.map(|e| e + stale_window);
         let footprint = entry_footprint(&key, &response);
-        if let Ok(mut map) = self.map.write() {
+        if let Ok(mut state) = self.state.write() {
             // A re-store before the disk writer's tick must keep the entry's
             // queued flag: the writer writes the current entry once, so the
             // replacement is the one that gets written and the ring does not
             // grow a duplicate. This one extra probe is on the store path,
             // never on a hit.
-            let was_queued = map.get(&key).is_some_and(|e| e.queued);
+            let was_queued = state.map.get(&key).is_some_and(|e| e.queued);
             let is_queued = queued || was_queued;
-            let replaced = map.insert(
+            // The heap keeps a snapshot of the expiry. A re-store pushes a
+            // second record; the stale one is skipped when it is popped, so
+            // the heap never needs a scan or a deletion.
+            let heap_key = key.clone();
+            let replaced = state.map.insert(
                 key,
                 CacheEntry {
                     response,
@@ -1446,113 +1520,117 @@ impl Cache {
                     serve_stale_until,
                     queued: is_queued,
                     footprint,
-                    last_read: std::sync::atomic::AtomicU64::new(
-                        READ_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                    ),
                 },
             );
+            if let Some(at) = expires_at {
+                state.expiries.push(std::cmp::Reverse(Expiry {
+                    at,
+                    key: heap_key,
+                }));
+            }
             let freed = replaced.map(|e| e.footprint).unwrap_or(0);
-            let held = self
-                .counters
-                .bytes
-                .fetch_add(footprint, std::sync::atomic::Ordering::Relaxed)
-                .saturating_sub(freed)
-                + footprint;
             self.counters
                 .bytes
-                .store(held, std::sync::atomic::Ordering::Relaxed);
+                .fetch_add(footprint, std::sync::atomic::Ordering::Relaxed);
+            if freed > 0 {
+                self.counters
+                    .bytes
+                    .fetch_sub(freed, std::sync::atomic::Ordering::Relaxed);
+            }
             if is_queued && !was_queued {
                 self.counters
                     .queued
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            if held > self.max_bytes {
-                self.evict_until_under(&mut map);
+            if self.bytes_held() > self.max_bytes {
+                self.evict_until_under(&mut state);
             }
         }
     }
 
-    /// Drop least-recently-read entries until the cache is inside its bound.
+    /// Drop entries until the cache is inside its bound: expired entries
+    /// first, then the least recently read.
     ///
-    /// Called only from `insert`, and only when the bound is exceeded, so the
-    /// O(n) scan is off the read path entirely. It costs far less than the
-    /// origin round trip that produced the entry which tipped it over.
-    ///
-    /// Least-recently-read rather than oldest-inserted on purpose: the flood
-    /// this defends against writes entries and never reads them again, so read
-    /// order is exactly the signal that separates an attacker's entries from
-    /// the site's own.
-    fn evict_until_under(&self, map: &mut CacheMap) {
+    /// Called only from `insert`, and only when the bound is exceeded, so it is
+    /// off the read path entirely. There is no whole-map sort: the expiry heap
+    /// yields the earliest expiry in O(log n) and the LRU list yields the
+    /// least-recently-read entry in O(1), one entry at a time.
+    fn evict_until_under(&self, state: &mut CacheState) {
         let target = self.max_bytes - self.max_bytes / 8; // drop to 87.5%
+        if self.bytes_held() <= target {
+            return;
+        }
+        let now = m6_core::platform::now();
+        let mut dropped = 0usize;
 
-        // One pass to collect `(last_read, footprint)`, sort by read order,
-        // and find the tick above which enough bytes survive. Then one
-        // `retain`.
-        //
-        // The obvious version collects `(tick, key.clone())` and sorts that,
-        // which clones every key in the map -- and a `CacheKey` is a
-        // `Box<str>`, so that is one heap allocation per entry, in a burst,
-        // while holding the write lock every reader needs. This is one `Vec`
-        // and no per-entry allocation.
-        //
-        // Ticks are unique: both `insert` and `lookup` take a fresh value from
-        // the global counter, so no two entries share one.
-        let mut entries: Vec<(u64, usize)> = map
-            .values()
-            .map(|e| {
-                (
-                    e.last_read.load(std::sync::atomic::Ordering::Relaxed),
-                    e.footprint,
-                )
-            })
-            .collect();
-        entries.sort_unstable_by_key(|(tick, _)| *tick);
-
-        let mut held = self
-            .counters
-            .bytes
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let mut cutoff = 0u64;
-        for (tick, footprint) in &entries {
-            if held <= target {
+        // Expired entries first. The heap is ordered by `expires_at`, so the
+        // earliest expiry is on top. A record that no longer matches the map
+        // (the entry was re-stored or removed) is stale and is skipped.
+        while self.bytes_held() > target {
+            let Some(peek) = state.expiries.peek() else {
                 break;
+            };
+            let at = peek.0.at;
+            let key = peek.0.key.clone();
+            let valid_expired = match state.map.get(&key) {
+                Some(e) => e.expires_at == Some(at) && now >= at,
+                None => false,
+            };
+            if !valid_expired {
+                state.expiries.pop();
+                // A valid record whose time has not come means every later
+                // record is later still, so the expired pass is over.
+                if state.map.get(&key).is_some() && now < at {
+                    break;
+                }
+                continue;
             }
-            held = held.saturating_sub(*footprint);
-            cutoff = *tick + 1;
+            state.expiries.pop();
+            let Some(entry) = state.map.remove(&key) else {
+                continue;
+            };
+            self.account_removal(entry.footprint, entry.queued);
+            dropped += 1;
         }
 
-        let before = map.len();
-        let mut freed = 0usize;
-        let mut dropped_queued = 0usize;
-        map.retain(|_, e| {
-            let keep = e.last_read.load(std::sync::atomic::Ordering::Relaxed) >= cutoff;
-            if !keep {
-                freed += e.footprint;
-                if e.queued {
-                    dropped_queued += 1;
-                }
-            }
-            keep
-        });
-        if dropped_queued > 0 {
-            self.counters
-                .queued
-                .fetch_sub(dropped_queued, std::sync::atomic::Ordering::Relaxed);
+        // Then the least recently read. The front of the linked map is the
+        // entry nobody has read for the longest; removing it is O(1).
+        while self.bytes_held() > target {
+            let Some((key, _)) = state.map.front() else {
+                break;
+            };
+            let key = key.clone();
+            let Some(entry) = state.map.remove(&key) else {
+                continue;
+            };
+            self.account_removal(entry.footprint, entry.queued);
+            dropped += 1;
         }
-        let now_held = self
-            .counters
-            .bytes
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .saturating_sub(freed);
+
+        if dropped > 0 {
+            self.counters
+                .evictions
+                .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+            m6_core::log::info!(
+                dropped,
+                bytes_held = self.bytes_held(),
+                max_bytes = self.max_bytes,
+                "cache: evicted to stay inside the byte bound"
+            );
+        }
+    }
+
+    /// Subtract one removed entry's footprint and queued flag from the
+    /// counters, shared by eviction, purge and clear.
+    fn account_removal(&self, footprint: usize, queued: bool) {
         self.counters
             .bytes
-            .store(now_held, std::sync::atomic::Ordering::Relaxed);
-        m6_core::log::info!(
-            dropped = before - map.len(),
-            bytes_held = now_held,
-            max_bytes = self.max_bytes,
-            "cache: evicted to stay inside the byte bound"
-        );
+            .fetch_sub(footprint, std::sync::atomic::Ordering::Relaxed);
+        if queued {
+            self.counters
+                .queued
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Evict a specific path — every query and encoding variant of it.
@@ -1560,7 +1638,7 @@ impl Cache {
     /// Keys are `path\x01query\x01encoding`, so the `path\x01` prefix matches
     /// all variants of that path and nothing else.
     pub fn evict_path(&self, path: &str) {
-        if let Ok(mut map) = self.map.write() {
+        if let Ok(mut state) = self.state.write() {
             let path_stripped = &path[..path.find('?').unwrap_or(path.len())];
             // Collect keys whose inner str starts with `path_stripped\x01`.
             let prefix = {
@@ -1569,7 +1647,8 @@ impl Cache {
                 p.push('\x01');
                 p
             };
-            let keys: Vec<CacheKey> = map
+            let keys: Vec<CacheKey> = state
+                .map
                 .keys()
                 .filter(|k| {
                     let s: &str = (*k).borrow();
@@ -1589,19 +1668,12 @@ impl Cache {
                         "cache: evicted"
                     );
                 }
-                if let Some(e) = map.remove(k) {
+                if let Some(e) = state.map.remove(k) {
                     // Every removal path must return the bytes, or the counter
                     // drifts up while the map shrinks and the cache evicts on
                     // every insert forever. Deploys call this on every
                     // invalidation, so the drift would be relentless.
-                    self.counters
-                        .bytes
-                        .fetch_sub(e.footprint, std::sync::atomic::Ordering::Relaxed);
-                    if e.queued {
-                        self.counters
-                            .queued
-                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    }
+                    self.account_removal(e.footprint, e.queued);
                 }
             }
         }
@@ -1616,8 +1688,9 @@ impl Cache {
 
     /// Evict all entries.
     pub fn clear(&self) {
-        if let Ok(mut map) = self.map.write() {
-            map.clear();
+        if let Ok(mut state) = self.state.write() {
+            state.map.clear();
+            state.expiries.clear();
             self.counters
                 .bytes
                 .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -1666,9 +1739,9 @@ impl Cache {
     /// points back at the arithmetic.
     #[cfg(test)]
     fn footprint_sum(&self) -> usize {
-        self.map
+        self.state
             .read()
-            .map(|m| m.values().map(|e| e.footprint).sum())
+            .map(|s| s.map.values().map(|e| e.footprint).sum())
             .unwrap_or(0)
     }
 
@@ -1676,7 +1749,7 @@ impl Cache {
     /// lifetime but haven't been read (and so overwritten) since. This is a
     /// memory-occupancy figure, not a count of servable entries.
     pub fn len(&self) -> usize {
-        self.map.read().map(|m| m.len()).unwrap_or(0)
+        self.state.read().map(|s| s.map.len()).unwrap_or(0)
     }
 
     /// Whether the cache holds nothing. A poisoned lock reads as empty, for the
@@ -1704,7 +1777,7 @@ fn entry_footprint(key: &CacheKey, response: &CachedResponse) -> usize {
 /// Determine whether a response should be cached.
 /// Returns true if Cache-Control: public and status is 2xx.
 pub fn should_cache(status: u16, headers: &(impl HeaderSource + ?Sized)) -> bool {
-    if !status_is_storable(status) {
+    if !status_is_storable(status, headers) {
         return false;
     }
 
@@ -1748,7 +1821,7 @@ pub fn should_cache(status: u16, headers: &(impl HeaderSource + ?Sized)) -> bool
 ///
 /// Split out from the status range so the reason is stated where the decision
 /// is made, rather than being implicit in an inequality.
-fn status_is_storable(status: u16) -> bool {
+fn status_is_storable(status: u16, headers: &(impl HeaderSource + ?Sized)) -> bool {
     // RFC 9111 3: the statuses a cache may store by default. Only 2xx was
     // accepted before, which made every 404, 301 and 410 permanently
     // uncacheable no matter what its headers said.
@@ -1762,13 +1835,32 @@ fn status_is_storable(status: u16) -> bool {
     // with the Range request that produced it, and the cache key carries no
     // Range component, so a stored 206 would be replayed to a client that
     // asked for the whole thing.
+    if status == 206 {
+        return false;
+    }
+    // RFC 9111 3 plus explicit freshness. A status outside the default list is
+    // still storable when the response declares its own lifetime with
+    // `max-age`, `s-maxage` or `Expires`. A 302 carrying `s-maxage` is the
+    // short-redirect case this enables: without the arm it could never be
+    // cached and every expansion paid the backend round trip.
     //
     // Storability is necessary, not sufficient -- `should_cache` still
     // applies Vary, no-store, private and the rest on top of this.
     matches!(
         status,
         200 | 203 | 204 | 300 | 301 | 308 | 404 | 405 | 410 | 414 | 501
-    )
+    ) || has_explicit_freshness(headers)
+}
+
+/// Whether a response declares its own freshness lifetime, which makes a
+/// status outside the RFC 9111 3 default list storable.
+///
+/// `max-age` and `s-maxage` come from `Cache-Control`; `Expires` is the older
+/// header with the same meaning. `no-cache` is not freshness: it forbids reuse
+/// without revalidation, so it does not make a 302 storable.
+fn has_explicit_freshness(headers: &(impl HeaderSource + ?Sized)) -> bool {
+    let cc = CacheControl::parse(headers);
+    cc.max_age.is_some() || cc.s_maxage.is_some() || expires_lifetime(headers).is_some()
 }
 
 /// Whether the REQUEST permits this response to be stored.
@@ -3046,8 +3138,8 @@ mod heuristic_freshness_tests {
         // Still fresh now, which is the behaviour the deploy model relies on.
         assert!(matches!(c.lookup("/p\u{1}\u{1}"), Lookup::Fresh(..)));
         // But it has a finite deadline rather than none at all.
-        let map = c.map.read().unwrap();
-        let e = map.get("/p\u{1}\u{1}").expect("stored");
+        let state = c.state.read().unwrap();
+        let e = state.map.get("/p\u{1}\u{1}").expect("stored");
         assert!(
             e.expires_at.is_some(),
             "bare `public` must not be fresh forever"
@@ -3060,8 +3152,8 @@ mod heuristic_freshness_tests {
     fn an_explicit_max_age_is_unaffected() {
         let c = Cache::new();
         c.insert(CacheKey::new("/q", None, ""), resp("public, max-age=60"));
-        let map = c.map.read().unwrap();
-        let e = map.get("/q\u{1}\u{1}").expect("stored");
+        let state = c.state.read().unwrap();
+        let e = state.map.get("/q\u{1}\u{1}").expect("stored");
         let ttl = e
             .expires_at
             .unwrap()
@@ -3102,8 +3194,8 @@ mod expires_tests {
                 body: bytes::Bytes::from_static(b"x"),
             },
         );
-        let map = c.map.read().unwrap();
-        map.get("/e\u{1}\u{1}").and_then(|e| e.expires_at)
+        let state = c.state.read().unwrap();
+        state.map.get("/e\u{1}\u{1}").and_then(|e| e.expires_at)
     }
 
     /// `Expires` was ignored entirely, so a response carrying an explicit
@@ -3519,13 +3611,17 @@ mod corrected_age_tests {
 mod storable_status_tests {
     use super::*;
 
+    fn empty() -> Vec<(String, String)> {
+        Vec::new()
+    }
+
     /// RFC 9111 3, in full. The list is short and fixed, so it is worth
     /// asserting exactly rather than by range.
     #[test]
     fn the_rfc_9111_set_is_storable() {
         for s in [200, 203, 204, 300, 301, 308, 404, 405, 410, 414, 501] {
             assert!(
-                status_is_storable(s),
+                status_is_storable(s, &empty()),
                 "{s} is heuristically cacheable per RFC 9111 3"
             );
         }
@@ -3535,7 +3631,7 @@ mod storable_status_tests {
     /// node every one was a round trip to the origin.
     #[test]
     fn a_404_is_now_storable() {
-        assert!(status_is_storable(404));
+        assert!(status_is_storable(404, &empty()));
     }
 
     /// 206 stays excluded. The cache key is (path, query, encoding) with no
@@ -3543,7 +3639,10 @@ mod storable_status_tests {
     /// client that asked for the whole resource.
     #[test]
     fn partial_content_is_never_storable() {
-        assert!(!status_is_storable(206));
+        assert!(!status_is_storable(206, &empty()));
+        // Not even explicit freshness can admit a partial representation.
+        let cc = vec![("Cache-Control".to_string(), "max-age=60".to_string())];
+        assert!(!status_is_storable(206, &cc));
     }
 
     /// Statuses outside the list must not creep in via a range check. 201 and
@@ -3552,8 +3651,30 @@ mod storable_status_tests {
     #[test]
     fn everything_else_is_refused() {
         for s in [201, 202, 205, 302, 303, 307, 400, 401, 403, 500, 502, 503] {
-            assert!(!status_is_storable(s), "{s} must not be storable");
+            assert!(!status_is_storable(s, &empty()), "{s} must not be storable");
         }
+    }
+
+    /// A 302 is storable only when the response declares its own lifetime.
+    /// Without freshness it is refused, so a redirect nobody gave a lifetime to
+    /// is never held forever.
+    #[test]
+    fn a_302_is_storable_with_explicit_freshness_only() {
+        assert!(!status_is_storable(302, &empty()));
+        for cc in [
+            "public, s-maxage=7776000",
+            "public, max-age=60",
+            "s-maxage=7776000, stale-while-revalidate=86400",
+        ] {
+            let headers = vec![("Cache-Control".to_string(), cc.to_string())];
+            assert!(status_is_storable(302, &headers), "{cc} must store a 302");
+        }
+        // `Expires` is the older explicit freshness spelling.
+        let headers = vec![("Expires".to_string(), "Sun, 15 Nov 2026 00:00:00 GMT".to_string())];
+        assert!(status_is_storable(302, &headers));
+        // `no-cache` is not a freshness lifetime and must not admit a 302.
+        let headers = vec![("Cache-Control".to_string(), "no-cache".to_string())];
+        assert!(!status_is_storable(302, &headers));
     }
 
     /// Storable is necessary, not sufficient: no-store still wins.
@@ -3895,5 +4016,145 @@ mod generation_swap_tests {
             !cache.serve_held(),
             "the new generation must not serve the old one's held content"
         );
+    }
+}
+
+#[cfg(test)]
+mod eviction_order_tests {
+    use super::*;
+
+    fn resp(cc: &str, body: usize) -> CachedResponse {
+        CachedResponse {
+            genid: 0,
+            status: 200,
+            headers: HeaderBlock::from_pairs(vec![("cache-control".to_string(), cc.to_string())]),
+            body: bytes::Bytes::from(vec![0u8; body]),
+        }
+    }
+
+    /// Whether the map holds `path` at any age, without evaluating freshness.
+    fn holds(cache: &Cache, path: &str) -> bool {
+        let mut buf = String::with_capacity(512);
+        let k = make_lookup_key(path, None, "", &mut buf);
+        cache.get_any(k).is_some()
+    }
+
+    /// The eviction policy, end to end: expired entries go first, and fresh
+    /// entries then go least-recently-read. No whole-map sort is involved, and
+    /// the eviction counter records exactly the entries the bound dropped.
+    ///
+    /// Break: evict by insertion order only, and the expired entries survive
+    /// while the read entry goes; or forget the expired-first pass, and the
+    /// read entry is evicted before an expired one.
+    #[test]
+    fn expired_entries_go_first_then_least_recently_read() {
+        let cache = Cache::with_max_bytes(100_000);
+        cache.insert(
+            CacheKey::new("/expired-a", None, ""),
+            resp("public, max-age=0", 10_000),
+        );
+        cache.insert(
+            CacheKey::new("/expired-b", None, ""),
+            resp("public, max-age=0", 10_000),
+        );
+        cache.insert(
+            CacheKey::new("/hot", None, ""),
+            resp("public, max-age=86400", 10_000),
+        );
+        cache.insert(
+            CacheKey::new("/cold", None, ""),
+            resp("public, max-age=86400", 10_000),
+        );
+        // Read the cold entry once, then the hot one: the cold entry is the
+        // least recently read of the two fresh entries.
+        assert!(holds(&cache, "/cold"));
+        for _ in 0..8 {
+            let mut buf = String::with_capacity(512);
+            let k = make_lookup_key("/hot", None, "", &mut buf);
+            assert!(!matches!(cache.lookup(k), Lookup::Miss));
+        }
+
+        // One insert tips the cache over its bound.
+        cache.insert(
+            CacheKey::new("/big", None, ""),
+            resp("public, max-age=86400", 70_000),
+        );
+
+        assert!(!holds(&cache, "/expired-a"), "expired entries go first");
+        assert!(!holds(&cache, "/expired-b"), "expired entries go first");
+        assert!(holds(&cache, "/hot"), "the read entry survives");
+        assert!(
+            !holds(&cache, "/cold"),
+            "the least-recently-read fresh entry is the LRU victim"
+        );
+        assert!(holds(&cache, "/big"), "the newest entry survives");
+        assert!(cache.bytes_held() <= 100_000);
+        assert_eq!(
+            cache.evictions(),
+            3,
+            "two expired plus one LRU entry were evicted"
+        );
+    }
+
+    /// An expired entry still in the map is reported, and a fresh entry is not.
+    /// The count is current, not cumulative, so it falls when the expired
+    /// entries are evicted or purged.
+    #[test]
+    fn expired_reports_only_entries_past_their_lifetime() {
+        let cache = Cache::new();
+        cache.insert(
+            CacheKey::new("/expired", None, ""),
+            resp("public, max-age=0", 10),
+        );
+        cache.insert(
+            CacheKey::new("/fresh", None, ""),
+            resp("public, max-age=86400", 10),
+        );
+        assert_eq!(cache.expired(), 1);
+
+        cache.evict_path("/expired");
+        assert_eq!(cache.expired(), 0);
+    }
+
+    /// Eviction is the only path that counts an eviction. A purge and a clear
+    /// are operator actions, not the cache running out of room, so they do not
+    /// raise the counter that m6-monitor faults on.
+    #[test]
+    fn purges_and_clears_do_not_count_as_evictions() {
+        let cache = Cache::with_max_bytes(64 * 1024);
+        cache.insert(
+            CacheKey::new("/held", None, ""),
+            resp("public, max-age=86400", 8_000),
+        );
+        cache.insert(
+            CacheKey::new("/gone", None, ""),
+            resp("public, max-age=86400", 8_000),
+        );
+        cache.evict_path("/gone");
+        assert_eq!(cache.evictions(), 0, "a purge is not an eviction");
+
+        cache.clear();
+        assert_eq!(cache.evictions(), 0, "a clear is not an eviction");
+    }
+
+    /// The byte accounting formula: body, headers, key and the fixed per-entry
+    /// overhead, so the bound counts total memory rather than bodies alone.
+    #[test]
+    fn footprint_counts_body_headers_key_and_fixed_overhead() {
+        let key = CacheKey::new("/abc/def", Some("q=1"), "gzip");
+        let response = CachedResponse {
+            genid: 0,
+            status: 200,
+            headers: HeaderBlock::from_pairs(vec![(
+                "content-type".to_string(),
+                "text/html; charset=utf-8".to_string(),
+            )]),
+            body: bytes::Bytes::from(vec![0u8; 1234]),
+        };
+        let expected = key.0.len()
+            + response.body.len()
+            + response.headers.footprint()
+            + std::mem::size_of::<CacheEntry>();
+        assert_eq!(entry_footprint(&key, &response), expected);
     }
 }

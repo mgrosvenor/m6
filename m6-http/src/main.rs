@@ -575,7 +575,12 @@ impl ServerState {
             .genid
             .as_ref()
             .map(|genid_config| (&self.genid, genid_config, self.disk_perf()));
-        m6_http_lib::stats::log_perf(&health::perf_document(&report, genid));
+        m6_http_lib::stats::log_perf(&health::perf_document(
+            &report,
+            genid,
+            &self.cache,
+            self.disk.as_ref(),
+        ));
     }
 }
 

@@ -76,8 +76,8 @@ pub fn log_growth(limit: &Limit, before: usize, after: usize, what: &str) {
 ///
 /// The rule is [`m6_core::limits::heap_reserve`], shared with m6-file so the
 /// two services cannot drift: unless `start` is set, the reservation is
-/// `cache_bytes` max plus 64 MiB, rounded up to the huge page size, and the
-/// cache holds the max the record prints.
+/// `cache_bytes` start plus 64 MiB, rounded up to the huge page size, and the
+/// cache holds the start the record prints.
 pub fn heap_reserve(limits: &Limits) -> (usize, Option<String>) {
     m6_core::limits::heap_reserve(limits)
 }
@@ -113,7 +113,7 @@ mod tests {
         assert_eq!(bytes, 64 * 1024 * 1024);
         let warning = warning.expect("the cache does not fit in 64 MiB");
         assert!(warning.contains("[limits.heap_reserve] start"), "{warning}");
-        assert!(warning.contains("[limits.cache_bytes] max"), "{warning}");
+        assert!(warning.contains("[limits.cache_bytes] start"), "{warning}");
         let (_, warning) = heap_reserve(&limits("[limits.heap_reserve]\nstart = \"256MiB\"\n"));
         assert!(warning.is_none());
     }
