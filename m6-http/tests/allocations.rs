@@ -156,14 +156,11 @@ use m6_http_lib::h2s_client::H2sTlsClientConn;
 // names and values in one byte arena with `Range<u32>` pairs, so
 // `strip_uncacheable`'s twelve clones per insert became one arena build.
 //
-// The LRU list plus expiry heap took it to 49,002 measured: a
-// `hashlink::LinkedHashMap` stores each entry in one boxed node (so a hit is an
-// O(1) move, never a scan), and the expiry heap holds one key clone so eviction
-// can find the earliest expiry without sorting the map. The hit rows are
-// unchanged, because a hit is one hash lookup and one list move. The miss
-// insert is the only row that pays the two structures' per-entry cost. The
-// budget leaves room for run-to-run noise while still catching one more
-// allocation per request.
+// The second phase of the h1 work took h1_tls_miss_insert to 58,004 by removing
+// the per-header `format!` and the `String` per `Cache-Control` directive.
+// The header-arena change took it to 47,004: a cache entry stores its header
+// names and values in one byte arena with `Range<u32>` pairs, so
+// `strip_uncacheable`'s twelve clones per insert became one arena build.
 //
 // The new-connection row is a measure, not a budget: a full handshake per
 // connection read 122.859 to 123.849 per connection across the same runs, so a
@@ -173,7 +170,7 @@ use m6_http_lib::h2s_client::H2sTlsClientConn;
 // budgeted row, which is the break.
 const H1_TLS_HIT_CALLS: u64 = 2_001;
 const H2_TLS_HIT_CALLS: u64 = 3_001;
-const H1_TLS_MISS_INSERT_CALLS: u64 = 49_500;
+const H1_TLS_MISS_INSERT_CALLS: u64 = 47_004;
 
 /// The number of requests in the short run. The budgets are per 1,000 of the
 /// row's unit, which is this many.

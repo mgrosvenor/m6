@@ -2702,7 +2702,6 @@ dependencies = [
  "filetime",
  "glob",
  "h2",
- "hashlink",
  "hpack",
  "http",
  "httparse",
