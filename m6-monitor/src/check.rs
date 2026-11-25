@@ -525,6 +525,54 @@ pub fn render(d: &Digest, readings: &[NodeReading], verdicts: &Verdicts) -> Stri
                 .unwrap_or_else(|| "-".into()),
         );
     }
+
+    // ── cache ────────────────────────────────────────────────────────────────
+    //
+    // One line per node whose metrics document carries the cache object. Any
+    // eviction and any disk-copy-full is a FAULT in the verdict, and fill at
+    // or over the warning threshold is a warning: the cache exists so a
+    // visitor hits rather than misses, so a cache that has evicted is a cache
+    // that already missed.
+    let any_cache = d.nodes.iter().any(|n| n.cache.is_some());
+    if any_cache {
+        let _ = writeln!(
+            o,
+            "\n  cache  (fill is bytes over the configured limit; eviction and a \
+             full disk copy fault in the verdict)"
+        );
+        let _ = writeln!(
+            o,
+            "  {:<5} {:>6} {:>8} {:>8} {:>8} {:>9} {:>8} {:>9} {:>8}",
+            "node",
+            "fill",
+            "entries",
+            "bytes",
+            "limit",
+            "evictions",
+            "expired",
+            "disk-full",
+            "disk"
+        );
+        for n in &d.nodes {
+            let Some(c) = &n.cache else { continue };
+            let _ = writeln!(
+                o,
+                "  {:<5} {:>6} {:>8} {:>8} {:>8} {:>9} {:>8} {:>9} {:>8}",
+                n.name,
+                c.fill
+                    .map(|f| format!("{:.0}%", f * 100.0))
+                    .unwrap_or_else(|| "-".into()),
+                c.entries,
+                fmt_cache_bytes(c.bytes),
+                fmt_cache_bytes(c.limit),
+                c.evictions,
+                c.expired,
+                c.disk_full,
+                fmt_cache_bytes(c.disk_bytes),
+            );
+        }
+    }
+
     // ── The channel split ────────────────────────────────────────────────────
     //
     // A node's aggregate hit rate mixes channels and two of them are SUPPOSED to
@@ -1313,6 +1361,21 @@ fn fmt_cert_expiry(secs: i64) -> String {
     }
 }
 
+/// A byte count in the unit a cache operator thinks in: `B`, `K`, `M` or `G`,
+/// whole numbers. A cache is configured in MiB and reported in bytes, so the
+/// two must meet on one scale and this is it.
+fn fmt_cache_bytes(n: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "K", "M", "G"];
+    let mut value = n as f64;
+    for (i, unit) in UNITS.iter().enumerate() {
+        if value < 1024.0 || i == UNITS.len() - 1 {
+            return format!("{value:.0}{unit}");
+        }
+        value /= 1024.0;
+    }
+    format!("{n}B")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1490,6 +1553,55 @@ mod tests {
 
     pub(super) fn digest() -> Digest {
         crate::digest::build(&[], &crate::digest::Thresholds::default(), "now".into())
+    }
+
+    /// The cache section prints the per-node figures: fill, entries, bytes,
+    /// limit, evictions, expired and disk-full. It is the one place an
+    /// operator sees a cache that is filling or has evicted without opening a
+    /// node's own metrics.
+    #[test]
+    fn the_cache_section_reports_fill_entries_and_the_counters() {
+        use m6_core::monitoring::{CacheMetrics, HealthReport};
+        let mut p =
+            crate::digest::tests::perf(m6_core::platform::host::HostSnapshot::default(), vec![]);
+        p.cache = Some(CacheMetrics {
+            bytes: 50,
+            limit: 100,
+            entries: 7,
+            disk_bytes: 20,
+            evictions: 1,
+            disk_full: 2,
+            expired: 3,
+        });
+        let r = NodeReading {
+            name: "edge-a".into(),
+            role: "cache".into(),
+            url: "http://edge-a.example.com".into(),
+            health: Some(HealthReport {
+                process_index: None,
+                status: "ok".into(),
+                node: "edge-a".into(),
+            }),
+            health_status: Some(200),
+            perf: Some(p),
+            perf_error: None,
+            traffic: None,
+            traffic_error: None,
+            header_checks: Vec::new(),
+            rtt: None,
+            unreachable: None,
+            tunnel: None,
+        };
+        let d = crate::digest::build(
+            std::slice::from_ref(&r),
+            &crate::digest::Thresholds::default(),
+            "now".into(),
+        );
+        let out = render(&d, std::slice::from_ref(&r));
+        assert!(out.contains("cache"), "{out}");
+        assert!(out.contains("edge-a"), "{out}");
+        assert!(out.contains("50%"), "the fill fraction is printed: {out}");
+        assert!(out.contains("disk-full"), "{out}");
     }
 
     /// **The section a reader decides from, tested as it is printed.**

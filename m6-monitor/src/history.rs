@@ -320,6 +320,25 @@ CREATE TABLE build (id INTEGER PRIMARY KEY, binary TEXT NOT NULL, "release" TEXT
 UPDATE health SET build_id = NULL WHERE build_id IS NOT NULL;
 "#;
 
+/// Migration 4: the cache's figures, one nullable column per value.
+///
+/// The metrics document gains a `cache` object with `bytes`, `limit`,
+/// `entries`, `disk_bytes`, `evictions`, `disk_full` and `expired`, all
+/// unsigned integers. A node older than the field reports none of them, so
+/// every column is nullable and a pre-v4 row keeps NULL. The fill fraction is
+/// not stored: it is derived from `bytes` and `limit` on the read, the one
+/// rule the digest already follows, so a history row and a live digest can
+/// never disagree about it.
+const SCHEMA_V4: &str = "
+ALTER TABLE health ADD COLUMN cache_bytes INTEGER;
+ALTER TABLE health ADD COLUMN cache_limit INTEGER;
+ALTER TABLE health ADD COLUMN cache_entries INTEGER;
+ALTER TABLE health ADD COLUMN cache_disk_bytes INTEGER;
+ALTER TABLE health ADD COLUMN cache_evictions INTEGER;
+ALTER TABLE health ADD COLUMN cache_disk_full INTEGER;
+ALTER TABLE health ADD COLUMN cache_expired INTEGER;
+";
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -332,6 +351,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 3,
         sql: SCHEMA_V3,
+    },
+    Migration {
+        version: 4,
+        sql: SCHEMA_V4,
     },
 ];
 
@@ -351,8 +374,8 @@ const BUILD_RESET: &str = concat!(
 /// Whether opening a file at `version` must say the build table was rebuilt.
 ///
 /// Migration 1 and 2 files held build rows in the old shape and lose them. A
-/// fresh file (version 0) had none to lose and says nothing, and a file already
-/// at 3 is opened without a migration.
+/// fresh file (version 0) had none to lose and says nothing, and a file at 3
+/// or later keeps its build rows and runs no build reset.
 fn announces_build_reset(version: u32) -> bool {
     (1..3).contains(&version)
 }
@@ -435,6 +458,20 @@ pub struct FindingRow {
     pub node: String,
     pub polled: bool,
     pub text: String,
+}
+
+/// The cache figures one health row keeps, copied from the digest's
+/// [`crate::digest::CacheDigest`]. Every value is an unsigned integer widened
+/// to `i64` for SQLite, and `None` on a node that reported no cache object.
+#[derive(Debug, Clone, Default)]
+pub struct CacheRow {
+    pub bytes: Option<i64>,
+    pub limit: Option<i64>,
+    pub entries: Option<i64>,
+    pub disk_bytes: Option<i64>,
+    pub evictions: Option<i64>,
+    pub disk_full: Option<i64>,
+    pub expired: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -552,6 +589,7 @@ pub struct Row {
     pub disk_total_bytes: Option<i64>,
     pub thermal_max_c: Option<f64>,
     pub cert_not_after_unix: Option<i64>,
+    pub cache: Option<CacheRow>,
     pub tunnel: Option<TunnelRow>,
     pub channels: Vec<ChannelRow>,
     pub net: Vec<NetRow>,
@@ -603,6 +641,15 @@ fn row(r: &NodeReading, n: &NodeDigest, d: &Digest) -> Row {
         disk_total_bytes: n.disk_total_bytes.map(i),
         thermal_max_c: n.thermal_max_c.map(|t| t as f64),
         cert_not_after_unix: n.cert_not_after_unix,
+        cache: n.cache.as_ref().map(|c| CacheRow {
+            bytes: Some(i(c.bytes)),
+            limit: Some(i(c.limit)),
+            entries: Some(i(c.entries)),
+            disk_bytes: Some(i(c.disk_bytes)),
+            evictions: Some(i(c.evictions)),
+            disk_full: Some(i(c.disk_full)),
+            expired: Some(i(c.expired)),
+        }),
         tunnel: n.tunnel.as_ref().map(|t| TunnelRow {
             rtt_ms: t.rtt_ms,
             rtt_n: iu(t.rtt_samples_ms.len()),
@@ -964,6 +1011,13 @@ impl Store {
                 ":memory_total_bytes": r.memory_total_bytes, ":disk_used": r.disk_used,
                 ":disk_total_bytes": r.disk_total_bytes, ":thermal_max_c": r.thermal_max_c,
                 ":cert_not_after_unix": r.cert_not_after_unix,
+                ":cache_bytes": r.cache.as_ref().and_then(|c| c.bytes),
+                ":cache_limit": r.cache.as_ref().and_then(|c| c.limit),
+                ":cache_entries": r.cache.as_ref().and_then(|c| c.entries),
+                ":cache_disk_bytes": r.cache.as_ref().and_then(|c| c.disk_bytes),
+                ":cache_evictions": r.cache.as_ref().and_then(|c| c.evictions),
+                ":cache_disk_full": r.cache.as_ref().and_then(|c| c.disk_full),
+                ":cache_expired": r.cache.as_ref().and_then(|c| c.expired),
                 ":tunnel_rtt_ms": t.and_then(|t| t.rtt_ms), ":tunnel_rtt_n": t.map(|t| t.rtt_n),
                 ":tunnel_probe": t.map(|t| t.probe.as_str()),
                 ":tunnel_probe_error": t.and_then(|t| t.probe_error.as_deref()),
@@ -1187,15 +1241,17 @@ const INSERT_HEALTH: &str = "INSERT INTO health (poll_id, at_ms, node_id, level,
 detail, traffic_error, rtt_ms, build_id, uptime_s, host_uptime_s, requests_total, monitor_requests, \
 cache_hits, cache_misses, backend_errors, hit_samples, hit_p50_ns, hit_p99_ns, miss_samples, \
 miss_p50_ns, miss_p99_ns, load_one, cpus, memory_used, memory_total_bytes, disk_used, \
-disk_total_bytes, thermal_max_c, cert_not_after_unix, tunnel_rtt_ms, tunnel_rtt_n, tunnel_probe, \
-tunnel_probe_error, tunnel_handshake, tunnel_handshake_age_s, tunnel_handshake_detail) \
+disk_total_bytes, thermal_max_c, cert_not_after_unix, cache_bytes, cache_limit, cache_entries, \
+cache_disk_bytes, cache_evictions, cache_disk_full, cache_expired, tunnel_rtt_ms, tunnel_rtt_n, \
+tunnel_probe, tunnel_probe_error, tunnel_handshake, tunnel_handshake_age_s, tunnel_handshake_detail) \
 VALUES (:poll_id, :at_ms, :node_id, :level, :reachable, \
 :status, :detail, :traffic_error, :rtt_ms, :build_id, :uptime_s, :host_uptime_s, :requests_total, \
 :monitor_requests, :cache_hits, :cache_misses, :backend_errors, :hit_samples, :hit_p50_ns, \
 :hit_p99_ns, :miss_samples, :miss_p50_ns, :miss_p99_ns, :load_one, :cpus, :memory_used, \
 :memory_total_bytes, :disk_used, :disk_total_bytes, :thermal_max_c, :cert_not_after_unix, \
-:tunnel_rtt_ms, :tunnel_rtt_n, :tunnel_probe, :tunnel_probe_error, :tunnel_handshake, \
-:tunnel_handshake_age_s, :tunnel_handshake_detail)";
+:cache_bytes, :cache_limit, :cache_entries, :cache_disk_bytes, :cache_evictions, \
+:cache_disk_full, :cache_expired, :tunnel_rtt_ms, :tunnel_rtt_n, :tunnel_probe, \
+:tunnel_probe_error, :tunnel_handshake, :tunnel_handshake_age_s, :tunnel_handshake_detail)";
 
 // ── status ───────────────────────────────────────────────────────────────────
 
@@ -1578,6 +1634,20 @@ fn rate(hits: Option<i64>, misses: Option<i64>) -> Option<f64> {
 }
 
 #[derive(Debug, Serialize)]
+pub struct CacheOut {
+    pub bytes: Option<i64>,
+    pub limit: Option<i64>,
+    pub entries: Option<i64>,
+    pub disk_bytes: Option<i64>,
+    pub evictions: Option<i64>,
+    pub disk_full: Option<i64>,
+    pub expired: Option<i64>,
+    /// `bytes / limit`, derived on the read the way the live digest derives it,
+    /// so a history row and a live digest can never disagree about it.
+    pub fill: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct TunnelOut {
     pub rtt_ms: Option<f64>,
     pub rtt_n: Option<i64>,
@@ -1680,6 +1750,7 @@ pub struct PageRow {
     pub thermal_max_c: Option<f64>,
     pub cert_not_after_unix: Option<i64>,
     pub cert_expires_in_s: Option<i64>,
+    pub cache: Option<CacheOut>,
     pub tunnel: Option<TunnelOut>,
     pub net: Vec<NetRow>,
     pub channels: Vec<ChannelOut>,
@@ -1698,7 +1769,9 @@ h.miss_samples, h.miss_p50_ns, h.miss_p99_ns, \
 h.load_one, h.cpus, h.memory_used, h.memory_total_bytes, h.disk_used, h.disk_total_bytes, \
 h.thermal_max_c, h.cert_not_after_unix, h.tunnel_rtt_ms, h.tunnel_rtt_n, h.tunnel_probe, \
 h.tunnel_probe_error, h.tunnel_handshake, h.tunnel_handshake_age_s, h.tunnel_handshake_detail, \
-h.poll_id \
+h.poll_id, \
+h.cache_bytes, h.cache_limit, h.cache_entries, h.cache_disk_bytes, h.cache_evictions, \
+h.cache_disk_full, h.cache_expired \
 FROM health h JOIN node n ON n.id = h.node_id JOIN poll p ON p.id = h.poll_id \
 LEFT JOIN build b ON b.id = h.build_id \
 WHERE h.at_ms >= ?1 AND h.at_ms < ?2 AND (?3 IS NULL OR h.node_id = ?3) \
@@ -1788,6 +1861,25 @@ pub fn health_page(
             let hits: Option<i64> = r.get(18)?;
             let misses: Option<i64> = r.get(19)?;
             let cert: Option<i64> = r.get(34)?;
+            let cache_bytes: Option<i64> = r.get(43)?;
+            let cache_limit: Option<i64> = r.get(44)?;
+            let cache_entries: Option<i64> = r.get(45)?;
+            let cache_disk_bytes: Option<i64> = r.get(46)?;
+            let cache_evictions: Option<i64> = r.get(47)?;
+            let cache_disk_full: Option<i64> = r.get(48)?;
+            let cache_expired: Option<i64> = r.get(49)?;
+            let cache = (cache_bytes.is_some() || cache_limit.is_some()).then(|| CacheOut {
+                bytes: cache_bytes,
+                limit: cache_limit,
+                entries: cache_entries,
+                disk_bytes: cache_disk_bytes,
+                evictions: cache_evictions,
+                disk_full: cache_disk_full,
+                expired: cache_expired,
+                fill: cache_bytes
+                    .zip(cache_limit)
+                    .and_then(|(b, l)| (l > 0).then(|| b as f64 / l as f64)),
+            });
             let tunnel_probe: Option<String> = r.get(37)?;
             let tunnel = match tunnel_probe {
                 None => None,
@@ -1840,6 +1932,7 @@ pub fn health_page(
                 thermal_max_c: r.get(33)?,
                 cert_not_after_unix: cert,
                 cert_expires_in_s: cert.map(|c| c - at / 1000),
+                cache,
                 tunnel,
                 net: Vec::new(),
                 channels: Vec::new(),
@@ -2117,7 +2210,7 @@ pub fn fill_page<T: Keyed>(
 mod tests {
     use super::*;
     use crate::digest::{self, Thresholds};
-    use m6_core::monitoring::{LoggingHealth, TrafficReport};
+    use m6_core::monitoring::{CacheMetrics, LoggingHealth, TrafficReport};
     use m6_core::platform::host::{
         Disk, HostSnapshot, LoadAverage, Memory, MemorySource, NetDevice,
     };
@@ -2332,7 +2425,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = open(dir.path());
         assert!(cfg(dir.path(), 1).file.exists());
-        assert_eq!(sqlite::schema_version(&s.conn).unwrap(), 3);
+        assert_eq!(sqlite::schema_version(&s.conn).unwrap(), 4);
         let mut stmt = s
             .conn
             .prepare("SELECT name, strict FROM pragma_table_list WHERE schema = 'main' AND name NOT LIKE 'sqlite_%'")
@@ -2380,7 +2473,7 @@ mod tests {
         let s = open(dir.path());
         assert_eq!(count(&s, "poll"), 1);
         assert_eq!(count(&s, "health"), 1);
-        assert_eq!(sqlite::schema_version(&s.conn).unwrap(), 3);
+        assert_eq!(sqlite::schema_version(&s.conn).unwrap(), 4);
     }
 
     /// The last-200 read is answered from the partial index. The plan must name
@@ -2474,7 +2567,7 @@ mod tests {
         };
 
         let s = open(dir.path());
-        assert_eq!(sqlite::schema_version(&s.conn).unwrap(), 3);
+        assert_eq!(sqlite::schema_version(&s.conn).unwrap(), 4);
         assert_eq!(
             columns_of(&s.conn, "build"),
             ["id", "binary", "release", "commit", "dirty"],
@@ -2505,6 +2598,10 @@ mod tests {
         );
         for r in &mut health {
             r[build_id] = Value::Null;
+            // Migration 4 appends the seven cache columns, each nullable, so a
+            // pre-v4 row keeps every figure and reads NULL for the cache it
+            // never reported.
+            r.extend(std::iter::repeat_n(Value::Null, 7));
         }
         assert_eq!(
             every_row(&s.conn, "health"),
@@ -2541,7 +2638,14 @@ mod tests {
         assert!(!announces_build_reset(0), "a fresh file has no build rows");
         assert!(announces_build_reset(1), "a version 1 file had build rows");
         assert!(announces_build_reset(2), "a version 2 file had build rows");
-        assert!(!announces_build_reset(3), "an open at 3 runs no migration");
+        assert!(
+            !announces_build_reset(3),
+            "an open at 3 keeps its build rows"
+        );
+        assert!(
+            !announces_build_reset(4),
+            "an open at 4 keeps its build rows"
+        );
         assert!(
             !BUILD_RESET.contains('\n'),
             "one log line, so the message carries no newline"
@@ -2555,7 +2659,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         drop(open(dir.path()));
         let c = Connection::open(cfg(dir.path(), 1).file).unwrap();
-        c.pragma_update(None, "user_version", 4).unwrap();
+        c.pragma_update(None, "user_version", 5).unwrap();
         drop(c);
         let err = Store::open(&cfg(dir.path(), 1)).err().expect("refused");
         assert!(is_fatal(&err), "{err:#}");
@@ -2658,6 +2762,66 @@ mod tests {
             (3, "connected", "ok", 42)
         );
         assert!((rtt - 0.4).abs() < 1e-9);
+    }
+
+    /// The cache figures are stored per poll and served back with the fill
+    /// derived from bytes and limit, the one rule the live digest follows.
+    #[test]
+    fn cache_figures_are_stored_and_served_with_the_fill_derived() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path());
+        let mut r = reading("a");
+        r.perf.as_mut().unwrap().cache = Some(CacheMetrics {
+            bytes: 50,
+            limit: 100,
+            entries: 7,
+            disk_bytes: 20,
+            evictions: 1,
+            disk_full: 2,
+            expired: 3,
+        });
+        s.write(&make(T0, &[r])).unwrap();
+        let (bytes, limit, entries, disk_bytes, evictions, disk_full, expired): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = s
+            .conn
+            .query_row(
+                "SELECT cache_bytes, cache_limit, cache_entries, cache_disk_bytes, \
+                 cache_evictions, cache_disk_full, cache_expired FROM health",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (bytes, limit, entries, disk_bytes, evictions, disk_full, expired),
+            (50, 100, 7, 20, 1, 2, 3)
+        );
+        let page = health_page(&s.conn, T0, T0 + 10_000, None, None, 10).unwrap();
+        let cache = page[0].cache.as_ref().expect("the row carries the cache");
+        assert_eq!(cache.bytes, Some(50));
+        assert_eq!(cache.limit, Some(100));
+        assert_eq!(cache.entries, Some(7));
+        assert_eq!(cache.disk_bytes, Some(20));
+        assert_eq!(cache.evictions, Some(1));
+        assert_eq!(cache.disk_full, Some(2));
+        assert_eq!(cache.expired, Some(3));
+        assert_eq!(cache.fill, Some(0.5));
     }
 
     #[test]
@@ -3073,7 +3237,7 @@ mod tests {
                  cache_hits cache_misses hit_rate backend_errors hit_samples hit_p50_ns hit_p99_ns \
                  miss_samples miss_p50_ns miss_p99_ns load_one cpus memory_used memory_total_bytes \
                  disk_used disk_total_bytes thermal_max_c cert_not_after_unix cert_expires_in_s \
-                 tunnel net channels findings other_findings"
+                 cache tunnel net channels findings other_findings"
             )
         );
         assert_eq!(v["at"], "2027-01-15T08:00:00.000Z");
