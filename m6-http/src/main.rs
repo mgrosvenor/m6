@@ -576,9 +576,11 @@ impl ServerState {
     /// disk blocks, serialised straight into the log buffer.
     fn log_perf(&self) {
         let report = self.perf_report();
-        let registration = self.config.registration.as_ref().map(|reg| {
-            (&self.registration, reg, self.disk_perf())
-        });
+        let registration = self
+            .config
+            .registration
+            .as_ref()
+            .map(|reg| (&self.registration, reg, self.disk_perf()));
         m6_http_lib::stats::log_perf(&health::perf_document(&report, registration));
     }
 }
@@ -2110,11 +2112,7 @@ fn purge_local(state: &mut ServerState, target: &str) -> bool {
 /// demand. Runs only when the origin answers the cache's REGISTER, never on
 /// the request path.
 fn reconcile_disk(state: &mut ServerState, counter: u64) {
-    let saved = state
-        .registration
-        .cache()
-        .map(|f| f.counter())
-        .unwrap_or(0);
+    let saved = state.registration.cache().map(|f| f.counter()).unwrap_or(0);
     if let Some(loaded) = state.pending_disk.take() {
         if loaded.id == counter {
             let id = loaded.id;
@@ -2126,7 +2124,10 @@ fn reconcile_disk(state: &mut ServerState, counter: u64) {
             if let Some(disk) = state.disk.as_mut() {
                 disk.use_id(counter);
             }
-            info!(counter, "disk cache discarded: the counter moved while this node was down");
+            info!(
+                counter,
+                "disk cache discarded: the counter moved while this node was down"
+            );
         }
     } else if let Some(disk) = state.disk.as_mut() {
         disk.use_id(counter);
@@ -2139,11 +2140,7 @@ fn reconcile_disk(state: &mut ServerState, counter: u64) {
 
 /// Write the running fan-out's `PURGE` line to every registered cache.
 fn write_fanout_purge(state: &mut ServerState) {
-    let line = match state
-        .registration
-        .source()
-        .and_then(|s| s.fanout_purge())
-    {
+    let line = match state.registration.source().and_then(|s| s.fanout_purge()) {
         Some((target, counter)) => registration::purge_line(target, counter),
         None => return,
     };
@@ -2164,7 +2161,11 @@ fn purge_reply_body(origin_name: &str, finished: &registration::Finished) -> Vec
     body.extend_from_slice(b"{\"nodes\":{\"");
     body.extend_from_slice(origin_name.as_bytes());
     body.extend_from_slice(b"\":{\"resident\":");
-    body.extend_from_slice(if finished.self_resident { b"true" } else { b"false" });
+    body.extend_from_slice(if finished.self_resident {
+        b"true"
+    } else {
+        b"false"
+    });
     body.push(b'}');
     for (name, answer) in &finished.nodes {
         body.extend_from_slice(b",\"");
@@ -2188,7 +2189,12 @@ fn purge_reply_body(origin_name: &str, finished: &registration::Finished) -> Vec
 /// Complete the running fan-out, write its reply, and start the next queued
 /// purge.
 fn finish_fanout(cx: &mut CompletionCtx<'_>) {
-    let Some(finished) = cx.state.registration.source_mut().and_then(|s| s.finish_fanout()) else {
+    let Some(finished) = cx
+        .state
+        .registration
+        .source_mut()
+        .and_then(|s| s.finish_fanout())
+    else {
         return;
     };
     let origin = cx.state.config.node.name.clone();
@@ -2228,7 +2234,11 @@ fn finish_fanout(cx: &mut CompletionCtx<'_>) {
 
 /// The `/m6/status` body: the change counter and the registered cache names.
 fn status_body(state: &ServerState) -> Vec<u8> {
-    let counter = state.registration.source().map(|s| s.counter()).unwrap_or(0);
+    let counter = state
+        .registration
+        .source()
+        .map(|s| s.counter())
+        .unwrap_or(0);
     let mut body = Vec::with_capacity(64);
     body.extend_from_slice(b"{\"counter\":\"");
     body.extend_from_slice(itoa::Buffer::new().format(counter).as_bytes());
@@ -2294,9 +2304,11 @@ fn handle_purge(
 /// hit its deadline. Reconnection is on the accounting tick, not here, so a
 /// downed origin is retried once a second rather than every turn.
 fn control_pump(cx: &mut CompletionCtx<'_>) {
-    let complete = cx.state.registration.source().is_some_and(|s| {
-        s.fanout_running() && (s.fanout_due(cx.now) || s.fanout_complete())
-    });
+    let complete = cx
+        .state
+        .registration
+        .source()
+        .is_some_and(|s| s.fanout_running() && (s.fanout_due(cx.now) || s.fanout_complete()));
     if complete {
         finish_fanout(cx);
     }
@@ -2452,11 +2464,7 @@ fn drive_control(token: Token, cx: &mut CompletionCtx<'_>) -> bool {
 
 /// Accept control connections the listener queued, up to the descriptor
 /// budget, and register each for its first read.
-fn accept_controls(
-    state: &mut ServerState,
-    registry: &m6_core::platform::Registry,
-    max: usize,
-) {
+fn accept_controls(state: &mut ServerState, registry: &m6_core::platform::Registry, max: usize) {
     for _ in 0..max {
         // Accept first, so no borrow of the listener outlives the mutations
         // of `controls` and `sources` below.
@@ -4857,14 +4865,7 @@ fn dispatch_url_backend(
     match state.pool_manager.url_backend(backend_idx).scheme {
         pool::UrlScheme::H2c | pool::UrlScheme::H2s => {
             let original_host = origin_host(req, &state.config).to_string();
-            dispatch_h2(
-                state,
-                registry,
-                backend_idx,
-                req,
-                client_ip,
-                &original_host,
-            )
+            dispatch_h2(state, registry, backend_idx, req, client_ip, &original_host)
         }
         pool::UrlScheme::Http | pool::UrlScheme::Https => {
             launch_url_upstream(state, registry, req, client_ip, backend_idx).map(UpstreamId::Slot)
@@ -4893,7 +4894,14 @@ fn dispatch_h2(
         let backend = state.pool_manager.url_backend(backend_idx);
         let (conn, stream) = state
             .h2c_pool
-            .dispatch(&backend.url, req, client_ip, original_host, Some(&state.via), registry)
+            .dispatch(
+                &backend.url,
+                req,
+                client_ip,
+                original_host,
+                Some(&state.via),
+                registry,
+            )
             .map_err(UrlDispatchError::Failed)?;
         Ok(UpstreamId::H2c { conn, stream })
     } else {
@@ -4901,7 +4909,14 @@ fn dispatch_h2(
         let backend = state.pool_manager.url_backend(backend_idx);
         let (conn, stream) = state
             .h2s_pool
-            .dispatch(&backend.url, req, client_ip, original_host, Some(&state.via), registry)
+            .dispatch(
+                &backend.url,
+                req,
+                client_ip,
+                original_host,
+                Some(&state.via),
+                registry,
+            )
             .map_err(UrlDispatchError::Failed)?;
         Ok(UpstreamId::H2s { conn, stream })
     }
@@ -5344,8 +5359,8 @@ fn handle_request_inner(
     // [registration] claims has no entry here and falls through: PURGE is
     // then 501 from the method check, and /m6/status is a route miss.
     let purge = req.method == registration::PURGE_METHOD;
-    let status_read = req.path == registration::STATUS_PATH
-        && matches!(req.method.as_str(), "GET" | "HEAD");
+    let status_read =
+        req.path == registration::STATUS_PATH && matches!(req.method.as_str(), "GET" | "HEAD");
     if (purge || status_read) && state.config.registration.is_some() {
         let reg_config = state.config.registration.as_ref().unwrap();
         debug!(method = %req.method, path = %req.path, "control endpoint");
@@ -5398,7 +5413,13 @@ fn handle_request_inner(
                     }
                     refusal => {
                         let (code, headers, body) = refusal.refusal().expect("a refusal");
-                        return RequestOutcome::Ready(code, headers, body, "auth".to_string(), None);
+                        return RequestOutcome::Ready(
+                            code,
+                            headers,
+                            body,
+                            "auth".to_string(),
+                            None,
+                        );
                     }
                 }
             }
@@ -7908,13 +7929,19 @@ fn run(args: Vec<String>) -> i32 {
     // its origin's counter, read from its disk copy at start (stream B's
     // `disk_cache::load` returns it).
     let mut registration = match &config.registration {
-        Some(cfg) if cfg.origin.is_some() => registration::Role::Cache(registration::Follower::new(0)),
+        Some(cfg) if cfg.origin.is_some() => {
+            registration::Role::Cache(registration::Follower::new(0))
+        }
         Some(_) => registration::Role::Source(registration::Source::new(0)),
         None => registration::Role::Source(registration::Source::new(0)),
     };
 
     // A cache node's control-channel target, resolved once at start.
-    let control_origin = match config.registration.as_ref().and_then(|r| r.origin.as_deref()) {
+    let control_origin = match config
+        .registration
+        .as_ref()
+        .and_then(|r| r.origin.as_deref())
+    {
         Some(origin) => {
             let Some((host, port)) = origin.rsplit_once(':') else {
                 eprintln!(

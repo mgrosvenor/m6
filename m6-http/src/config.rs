@@ -53,7 +53,7 @@ pub struct Config {
 /// `GET /m6/status` and `write_require` gates `PURGE`. A cache node sets
 /// `origin`, the `host:port` of the origin's control-channel listener, and
 /// holds no claims. Both claims or neither, as with the old generation ID.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct RegistrationConfig {
     /// `role:<name>` or `group:<name>` a `GET /m6/status` needs. Origin only.
     pub read_require: Option<String>,
@@ -62,16 +62,6 @@ pub struct RegistrationConfig {
     /// The origin's control-channel address, `host:port`. Present makes this
     /// node a cache node that registers with that origin.
     pub origin: Option<String>,
-}
-
-impl Default for RegistrationConfig {
-    fn default() -> Self {
-        RegistrationConfig {
-            read_require: None,
-            write_require: None,
-            origin: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1611,9 +1601,7 @@ pub fn load_traced(
                     // start. A name that does not resolve fails there, not
                     // here, but the shape is checked now.
                     if value.is_empty() {
-                        anyhow::bail!(
-                            "config error: [registration].origin must be \"host:port\""
-                        );
+                        anyhow::bail!("config error: [registration].origin must be \"host:port\"");
                     }
                     Some(value.to_string())
                 }
@@ -1670,7 +1658,9 @@ pub fn load_traced(
             })?;
             let is_cache_node = registration.as_ref().is_some_and(|r| r.origin.is_some());
             if !is_cache_node {
-                anyhow::bail!("config error: [cache].dir is for a cache node ([registration] origin)");
+                anyhow::bail!(
+                    "config error: [cache].dir is for a cache node ([registration] origin)"
+                );
             }
             let path = PathBuf::from(&dir);
             if !path.is_absolute() {
@@ -3360,7 +3350,10 @@ domain = "test.example.com"
                 "warm_on_start",
             ]
         );
-        assert_eq!(NODE_SECTIONS, ["auth", "cache", "registration", "limits", "node"]);
+        assert_eq!(
+            NODE_SECTIONS,
+            ["auth", "cache", "registration", "limits", "node"]
+        );
         // 14 base [server] keys + lock_memory (the mimalloc pin) + served_hosts
         // and redirect_unmatched_to (the unmatched-host policy) = 17, plus the
         // two site-wide [server] keys and the five node sections.

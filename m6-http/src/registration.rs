@@ -56,7 +56,10 @@ pub fn parse_cache_line(line: &str) -> CacheLine<'_> {
     let mut parts = line.split_whitespace();
     let verb = parts.next().unwrap_or("");
     match verb {
-        "REGISTER" => match (parts.next(), parts.next().and_then(|c| c.parse::<u64>().ok())) {
+        "REGISTER" => match (
+            parts.next(),
+            parts.next().and_then(|c| c.parse::<u64>().ok()),
+        ) {
             (Some(name), Some(counter)) => CacheLine::Register { name, counter },
             _ => CacheLine::Unknown,
         },
@@ -77,7 +80,10 @@ pub fn parse_origin_line(line: &str) -> OriginLine<'_> {
             Some(counter) => OriginLine::Counter(counter),
             None => OriginLine::Unknown,
         },
-        "PURGE" => match (parts.next(), parts.next().and_then(|c| c.parse::<u64>().ok())) {
+        "PURGE" => match (
+            parts.next(),
+            parts.next().and_then(|c| c.parse::<u64>().ok()),
+        ) {
             (Some(target), Some(counter)) => OriginLine::Purge { target, counter },
             _ => OriginLine::Unknown,
         },
@@ -148,7 +154,11 @@ impl ControlConn {
         let connected = state == m6_core::platform::net::Connect::Connected;
         Ok(Self {
             stream: Some(stream),
-            phase: if connected { Phase::Open } else { Phase::Connecting },
+            phase: if connected {
+                Phase::Open
+            } else {
+                Phase::Connecting
+            },
             read_buf: Vec::with_capacity(MAX_LINE),
             write_buf: Vec::with_capacity(MAX_LINE),
             lines: Vec::with_capacity(4),
@@ -227,7 +237,11 @@ impl ControlConn {
             return false;
         }
         if self.phase == Phase::Connecting {
-            match self.stream.as_ref().and_then(|s| s.take_error().ok().flatten()) {
+            match self
+                .stream
+                .as_ref()
+                .and_then(|s| s.take_error().ok().flatten())
+            {
                 Some(_) => {
                     self.close();
                     return false;
@@ -583,9 +597,7 @@ impl Source {
     /// The running fan-out's target and new counter, for the caller to write
     /// one `PURGE` line to each registered cache. `None` when no fan-out runs.
     pub fn fanout_purge(&self) -> Option<(&str, u64)> {
-        self.fanout
-            .as_ref()
-            .map(|f| (f.target.as_str(), f.counter))
+        self.fanout.as_ref().map(|f| (f.target.as_str(), f.counter))
     }
 
     /// The cache connections the fan-out must reach, in order, so the caller
@@ -593,12 +605,7 @@ impl Source {
     pub fn fanout_conns(&self) -> Vec<(String, Token)> {
         self.fanout
             .as_ref()
-            .map(|f| {
-                f.entries
-                    .iter()
-                    .map(|e| (e.name.clone(), e.conn))
-                    .collect()
-            })
+            .map(|f| f.entries.iter().map(|e| (e.name.clone(), e.conn)).collect())
             .unwrap_or_default()
     }
 
@@ -613,7 +620,10 @@ impl Source {
                 entry.resident = Some(resident);
             }
         }
-        fanout.entries.iter().all(|e| e.resident.is_some() || e.gone)
+        fanout
+            .entries
+            .iter()
+            .all(|e| e.resident.is_some() || e.gone)
     }
 
     /// Whether the fan-out's deadline has passed, so the caller can complete it
@@ -667,8 +677,105 @@ impl Source {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "test fixtures connect loopback sockets and wait for the peer"
+)]
 mod tests {
     use super::*;
+
+    /// Two `ControlConn`s over a loopback TCP pair exchange the protocol
+    /// lines, so the cache side's encoder and the origin side's parser
+    /// round-trip on a real descriptor rather than only through the string
+    /// helpers.
+    #[test]
+    fn control_conns_exchange_lines_over_tcp() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a listener");
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        client.set_nonblocking(true).unwrap();
+        server.set_nonblocking(true).unwrap();
+        let mut cache = ControlConn::accepted(client).expect("cache side");
+        let mut origin = ControlConn::accepted(server).expect("origin side");
+
+        cache.send_line(&register_line("lon", 7));
+        assert!(cache.drive(), "the cache side stays open");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(origin.drive(), "the origin side stays open");
+        let lines = origin.drain_lines();
+        assert_eq!(lines.len(), 1, "one register line arrived: {lines:?}");
+        assert!(matches!(
+            parse_cache_line(&lines[0]),
+            CacheLine::Register {
+                name: "lon",
+                counter: 7
+            }
+        ));
+
+        // The origin answers its counter, and the cache parses it.
+        origin.send_line(&counter_line(9));
+        assert!(origin.drive());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(cache.drive());
+        let replies = cache.drain_lines();
+        assert_eq!(replies.len(), 1, "one counter line arrived: {replies:?}");
+        assert!(matches!(
+            parse_origin_line(&replies[0]),
+            OriginLine::Counter(9)
+        ));
+
+        // A purge and its residency answer round-trip the same way.
+        origin.send_line(&purge_line("/r/cap7k9", 10));
+        assert!(origin.drive());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(cache.drive());
+        let purges = cache.drain_lines();
+        assert_eq!(purges.len(), 1, "one purge line arrived: {purges:?}");
+        assert!(matches!(
+            parse_origin_line(&purges[0]),
+            OriginLine::Purge {
+                target: "/r/cap7k9",
+                counter: 10
+            }
+        ));
+
+        cache.send_line(&resident_line(true));
+        assert!(cache.drive());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(origin.drive());
+        let answers = origin.drain_lines();
+        assert_eq!(answers.len(), 1, "one resident line arrived: {answers:?}");
+        assert!(matches!(
+            parse_cache_line(&answers[0]),
+            CacheLine::Resident(true)
+        ));
+    }
+
+    /// A peer that closes its side ends the other's drive, which is how a
+    /// dropped cache is unregistered.
+    #[test]
+    fn a_closed_peer_ends_the_drive() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a listener");
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        client.set_nonblocking(true).unwrap();
+        server.set_nonblocking(true).unwrap();
+        let cache = ControlConn::accepted(client).expect("cache side");
+        let mut origin = ControlConn::accepted(server).expect("origin side");
+
+        drop(cache);
+        let mut open = true;
+        for _ in 0..10 {
+            open = origin.drive();
+            if !open {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(!open, "a closed peer ends the drive");
+    }
 
     fn waiter(n: usize) -> Waiter {
         Waiter::H1 {
@@ -766,7 +873,10 @@ mod tests {
         assert!(!s.post_purge("/b".to_string(), false, waiter(2), timeout()));
         assert!(s.resident(tok(1), true));
         let first = s.finish_fanout().expect("finished");
-        assert_eq!(first.nodes, vec![("lon".to_string(), NodeAnswer::Resident(true))]);
+        assert_eq!(
+            first.nodes,
+            vec![("lon".to_string(), NodeAnswer::Resident(true))]
+        );
         assert!(first.again, "a queued purge waits");
         let next = s.take_queued().expect("queued");
         assert_eq!(next.target, "/b");

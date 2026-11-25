@@ -593,7 +593,12 @@ impl Gate {
 /// 2. The one token check decides with `read_require` for a read (`GET
 ///    /m6/status`) or `write_require` for a write (`PURGE`). It is called
 ///    once, here, and its refusal is the answer unchanged.
-pub fn control_gate(g: &RegistrationConfig, client_ip: &str, from_internal: bool, write: bool) -> Gate {
+pub fn control_gate(
+    g: &RegistrationConfig,
+    client_ip: &str,
+    from_internal: bool,
+    write: bool,
+) -> Gate {
     if !control_address_ok(client_ip, from_internal) {
         return Gate::disabled();
     }

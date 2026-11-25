@@ -233,13 +233,7 @@ write_require = "role:writer"
     }
 
     fn purge(&self, path: &str, token: Option<&str>) -> HttpResponse {
-        request(
-            self.port,
-            "PURGE",
-            path,
-            token,
-            tls_config(&self.cert_der),
-        )
+        request(self.port, "PURGE", path, token, tls_config(&self.cert_der))
     }
 
     fn status(&self, token: &str) -> HttpResponse {
@@ -267,7 +261,11 @@ fn a_purge_with_the_write_token_answers_and_raises_the_counter() {
         None,
         tls_config(&fixture.cert_der),
     );
-    assert_eq!(warm.status, 200, "the warm fetch serves the file: {}", warm.body);
+    assert_eq!(
+        warm.status, 200,
+        "the warm fetch serves the file: {}",
+        warm.body
+    );
 
     let first = fixture.purge("/r/missing", Some("writer"));
     assert_eq!(first.status, 200, "body: {}", first.body);
