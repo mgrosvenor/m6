@@ -676,6 +676,19 @@ fn without_pressure_blocks(mut document: serde_json::Value) -> serde_json::Value
     document
 }
 
+/// Strip the top-level objects m6-http adds beside the m6-core report: the
+/// cache, generation and disk-cache blocks. The report round-trip does not
+/// model them, so the field-for-field comparison runs on the report's own
+/// fields, and the cache object is asserted separately.
+fn without_http_blocks(mut document: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = document.as_object_mut() {
+        for key in ["cache", "genid", "disk_cache"] {
+            object.remove(key);
+        }
+    }
+    document
+}
+
 fn wait_for_perf_lines(srv: &Server, want: usize) -> Vec<serde_json::Value> {
     let ok = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
         read_perf_lines(&srv.http.borrow().output()).len() >= want
@@ -758,9 +771,29 @@ fn the_stats_line_carries_the_perf_document() {
             from_report["host"]
         );
     }
+    // The cache object is m6-http's addition, not a PerfReport field, so it
+    // is asserted here and stripped from the round-trip comparison below.
+    let cache = from_line
+        .get("cache")
+        .cloned()
+        .expect("the line carries the cache object");
+    for key in [
+        "bytes",
+        "limit",
+        "entries",
+        "disk_bytes",
+        "evictions",
+        "disk_full",
+        "expired",
+    ] {
+        assert!(
+            cache.get(key).is_some_and(serde_json::Value::is_u64),
+            "cache.{key} is an unsigned integer: {cache}"
+        );
+    }
     assert_eq!(
-        without_pressure_blocks(from_report),
-        without_pressure_blocks(from_line),
+        without_pressure_blocks(without_http_blocks(from_report)),
+        without_pressure_blocks(without_http_blocks(from_line)),
         "the line is the document, field for field"
     );
 }
