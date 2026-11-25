@@ -1508,8 +1508,10 @@ impl Cache {
             let is_queued = queued || was_queued;
             // The heap keeps a snapshot of the expiry. A re-store pushes a
             // second record; the stale one is skipped when it is popped, so
-            // the heap never needs a scan or a deletion.
-            let heap_key = key.clone();
+            // the heap never needs a scan or a deletion. The key is cloned
+            // only when the entry expires, so a non-expiring entry allocates
+            // nothing for the heap.
+            let heap_key = expires_at.map(|_| key.clone());
             let replaced = state.map.insert(
                 key,
                 CacheEntry {
@@ -1522,7 +1524,7 @@ impl Cache {
                     footprint,
                 },
             );
-            if let Some(at) = expires_at {
+            if let (Some(at), Some(heap_key)) = (expires_at, heap_key) {
                 state.expiries.push(std::cmp::Reverse(Expiry {
                     at,
                     key: heap_key,

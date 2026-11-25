@@ -894,7 +894,7 @@ mod tests {
         let (bytes, warning) = heap_reserve(&l);
         assert!(warning.is_none(), "{warning:?}");
         assert_eq!(bytes, 192 * MIB);
-        // The cache really can hold its reported max inside it.
+        // The cache really can hold its reported start inside it.
         assert!(l.get(&CACHE_BYTES).start() <= bytes);
     }
 
