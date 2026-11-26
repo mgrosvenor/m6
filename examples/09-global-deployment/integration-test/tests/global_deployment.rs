@@ -35,25 +35,50 @@ fn m6_root() -> PathBuf {
         .expect("m6 workspace root")
 }
 
-fn m6_bin(name: &str) -> Option<PathBuf> {
-    let release = m6_root().join("target/release").join(name);
-    if release.exists() {
-        return Some(release);
-    }
-    which(name)
+/// The first of `<target>/release/<name>` and `<target>/debug/<name>` that
+/// exists, so a release build wins and a debug build is enough.
+fn built(target: &Path, name: &str) -> Option<PathBuf> {
+    ["release", "debug"]
+        .iter()
+        .map(|profile| target.join(profile).join(name))
+        .find(|p| p.exists())
 }
 
-fn render_cms_bin() -> Option<PathBuf> {
-    // integration-test/ → 09-global-deployment/ → examples/target/release/
-    let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/release/render-cms")
-        .canonicalize();
-    if let Ok(p) = bin {
-        if p.exists() {
-            return Some(p);
-        }
+/// An m6 binary: built in the m6 workspace, else on `PATH`.
+fn m6_bin(name: &str) -> Result<PathBuf, String> {
+    let target = m6_root().join("target");
+    built(&target, name).or_else(|| which(name)).ok_or_else(|| {
+        format!(
+            "no {name} in {}/{{release,debug}} or on PATH; build it with `cargo build --bins` in the m6 workspace",
+            target.display()
+        )
+    })
+}
+
+/// The render-cms binary: built in the examples workspace, else on `PATH`.
+fn render_cms_bin() -> Result<PathBuf, String> {
+    // integration-test/ → 09-global-deployment/ → examples/target/
+    let target = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target");
+    built(&target, "render-cms")
+        .or_else(|| which("render-cms"))
+        .ok_or_else(|| {
+            format!(
+                "no render-cms in {}/{{release,debug}} or on PATH; build it with `cargo build --release -p render-cms` in examples/",
+                target.display()
+            )
+        })
+}
+
+/// Name the step that failed, so every early exit from [`GlobalStack::start`]
+/// says why.
+trait Why<T> {
+    fn why(self, what: &str) -> Result<T, String>;
+}
+
+impl<T, E: std::fmt::Display> Why<T> for Result<T, E> {
+    fn why(self, what: &str) -> Result<T, String> {
+        self.map_err(|e| format!("{what}: {e}"))
     }
-    which("render-cms")
 }
 
 fn which(name: &str) -> Option<PathBuf> {
@@ -530,9 +555,22 @@ struct GlobalStack {
     _temp_dirs: Vec<tempfile::TempDir>,
 }
 impl GlobalStack {
-    /// Build and start the full 6-node topology.
-    /// Returns None if any required binary or site setup is missing.
+    /// Build and start the full 6-node topology, or print the `SKIP:` line
+    /// that names what was missing and return `None`.
     fn start() -> Option<Self> {
+        match Self::try_start() {
+            Ok(stack) => Some(stack),
+            Err(why) => {
+                eprintln!("SKIP: {why}");
+                None
+            }
+        }
+    }
+
+    /// Build and start the full 6-node topology. The error names the step
+    /// that failed: a missing binary, a site file, or a node that never came
+    /// up.
+    fn try_start() -> Result<Self, String> {
         let site09 = example09_dir();
 
         let m6_http = m6_bin("m6-http")?;
@@ -558,19 +596,19 @@ impl GlobalStack {
             .collect();
 
         // Generate self-signed cert.
-        let cert_dir = tempfile::tempdir().ok()?;
+        let cert_dir = tempfile::tempdir().why("make the certificate directory")?;
         let (cert_path, key_path) = generate_test_cert(cert_dir.path());
 
         // A copy of 07's site, whose configs this run rewrites: keys, auth database and
         // tokens are made here, so the test needs no dev.sh and leaves the repo alone.
-        let work = tempfile::tempdir().ok()?;
+        let work = tempfile::tempdir().why("make the work directory")?;
         let w = work.path().to_path_buf();
         let site07 = w.join("site07");
         copy_site(&site07_dir(), &site07);
-        let signing = rcgen::KeyPair::generate().ok()?;
+        let signing = rcgen::KeyPair::generate().why("make the auth signing key")?;
         let (auth_pem, auth_pub) = (w.join("auth.pem"), w.join("auth.pub"));
-        std::fs::write(&auth_pem, signing.serialize_pem()).ok()?;
-        std::fs::write(&auth_pub, signing.public_key_pem()).ok()?;
+        std::fs::write(&auth_pem, signing.serialize_pem()).why("write auth.pem")?;
+        std::fs::write(&auth_pub, signing.public_key_pem()).why("write auth.pub")?;
         let rewrite = |file: &str, pairs: &[(&str, String)]| {
             let path = site07.join(file);
             let mut text = std::fs::read_to_string(&path)
@@ -643,16 +681,16 @@ impl GlobalStack {
             &auth_conf,
             &["token", "create", "publisher", "--name", "publisher"],
         );
-        std::fs::write(&write_token, token).ok()?;
+        std::fs::write(&write_token, token).why("write the publisher token")?;
         let logs = w.join("logs");
-        std::fs::create_dir_all(&logs).ok()?;
+        std::fs::create_dir_all(&logs).why("make the log directory")?;
         let state = w.join("state");
-        std::fs::create_dir_all(&state).ok()?;
+        std::fs::create_dir_all(&state).why("make the state directory")?;
 
         // ── Origin site dir ───────────────────────────────────────────────────
         // Write origin site.toml: full route table, socket paths in a temp dir.
 
-        let origin_sock_dir = tempfile::tempdir().ok()?;
+        let origin_sock_dir = tempfile::tempdir().why("make the origin directory")?;
         let html_sock = origin_sock_dir.path().join("m6-html.sock");
         let file_sock = origin_sock_dir.path().join("m6-file.sock");
         let auth_sock = origin_sock_dir.path().join("m6-auth.sock");
@@ -661,10 +699,10 @@ impl GlobalStack {
         // Copy site-origin/site.toml and patch socket paths.
         let origin_site_src = site09.join("site-origin/site.toml");
         if !origin_site_src.exists() {
-            eprintln!("SKIP: site-origin/site.toml not found");
-            return None;
+            return Err("site-origin/site.toml not found".to_string());
         }
-        let origin_site_toml = std::fs::read_to_string(&origin_site_src).ok()?;
+        let origin_site_toml =
+            std::fs::read_to_string(&origin_site_src).why("read site-origin/site.toml")?;
         let check_sock = origin_sock_dir.path().join("check-m6-auth.sock");
         let origin_site_toml = origin_site_toml
             .replace("/tmp/m6/m6-html*.sock", &html_sock.display().to_string())
@@ -676,7 +714,8 @@ impl GlobalStack {
             .replace("/tmp/m6/m6-auth*.sock", &auth_sock.display().to_string())
             .replace("/tmp/m6/render-cms*.sock", &cms_sock.display().to_string());
 
-        std::fs::write(origin_sock_dir.path().join("site.toml"), &origin_site_toml).ok()?;
+        std::fs::write(origin_sock_dir.path().join("site.toml"), &origin_site_toml)
+            .why("write the origin site.toml")?;
 
         // Symlink site subdirs so m6-http resolves template/asset paths correctly.
         for subdir in &["templates", "data", "assets", "configs", "keys", "content"] {
@@ -697,21 +736,22 @@ impl GlobalStack {
         std::fs::write(&origin_sys_toml, format!(
             "[server]\nbind     = \"{origin_tls_addr}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\nh2c_bind = \"{origin_h2c_addr}\"\ninternal_binds = [\"{origin_h2c_addr}\"]\ninternal_peers = [\"127.0.0.1\"]\nregistration_bind = \"127.0.0.1:{control_port}\"\nlock_memory = false\n\n[auth]\nbackend = \"m6-auth-check\"\n\n[registration]\nread_require  = \"role:purge-read\"\nwrite_require = \"role:purge-write\"\n\n[node]\nname = \"origin\"\n",
             cert_path.display(), key_path.display(),
-        )).ok()?;
+        )).why("write the origin system.toml")?;
 
         // ── Cache site dir ────────────────────────────────────────────────────
-        let cache_sock_dir = tempfile::tempdir().ok()?;
+        let cache_sock_dir = tempfile::tempdir().why("make the cache directory")?;
         let cache_site_src = site09.join("site-cache/site.toml");
         if !cache_site_src.exists() {
-            eprintln!("SKIP: site-cache/site.toml not found");
-            return None;
+            return Err("site-cache/site.toml not found".to_string());
         }
-        let cache_site_toml = std::fs::read_to_string(&cache_site_src).ok()?;
+        let cache_site_toml =
+            std::fs::read_to_string(&cache_site_src).why("read site-cache/site.toml")?;
         let cache_site_toml = cache_site_toml.replace(
             "h2c://127.0.0.1:9000",
             &format!("h2c://127.0.0.1:{h2c_port}"),
         );
-        std::fs::write(cache_sock_dir.path().join("site.toml"), &cache_site_toml).ok()?;
+        std::fs::write(cache_sock_dir.path().join("site.toml"), &cache_site_toml)
+            .why("write the cache site.toml")?;
 
         let mut processes = Children::new();
         let mut temp_dirs: Vec<tempfile::TempDir> = vec![cert_dir, work];
@@ -727,7 +767,7 @@ impl GlobalStack {
                 .stdout(log_file(&logs, "m6-html"))
                 .stderr(log_file(&logs, "m6-html"))
                 .spawn()
-                .ok()?,
+                .why("spawn a stack process")?,
         );
 
         processes.push(
@@ -740,7 +780,7 @@ impl GlobalStack {
                 .stdout(log_file(&logs, "m6-file"))
                 .stderr(log_file(&logs, "m6-file"))
                 .spawn()
-                .ok()?,
+                .why("spawn a stack process")?,
         );
 
         processes.push(
@@ -753,7 +793,7 @@ impl GlobalStack {
                 .stdout(log_file(&logs, "m6-auth"))
                 .stderr(log_file(&logs, "m6-auth"))
                 .spawn()
-                .ok()?,
+                .why("spawn a stack process")?,
         );
 
         processes.push(
@@ -766,15 +806,14 @@ impl GlobalStack {
                 .stdout(log_file(&logs, "render-cms"))
                 .stderr(log_file(&logs, "render-cms"))
                 .spawn()
-                .ok()?,
+                .why("spawn a stack process")?,
         );
 
         let to = Duration::from_secs(15);
         for sock in [&html_sock, &file_sock, &auth_sock, &check_sock, &cms_sock] {
             if !wait_socket(sock, to) {
-                eprintln!("SKIP: socket {} not ready", sock.display());
                 dump_logs(&logs);
-                return None;
+                return Err(format!("socket {} not ready", sock.display()));
             }
         }
 
@@ -789,18 +828,16 @@ impl GlobalStack {
                 .stdout(log_file(&logs, "origin"))
                 .stderr(log_file(&logs, "origin"))
                 .spawn()
-                .ok()?,
+                .why("spawn a stack process")?,
         );
 
         if !wait_tcp(&origin_tls_addr, to) {
-            eprintln!("SKIP: origin TLS not ready on {origin_tls_addr}");
             dump_logs(&logs);
-            return None;
+            return Err(format!("origin TLS not ready on {origin_tls_addr}"));
         }
         if !wait_tcp(&origin_h2c_addr, to) {
-            eprintln!("SKIP: origin H2C not ready on {origin_h2c_addr}");
             dump_logs(&logs);
-            return None;
+            return Err(format!("origin H2C not ready on {origin_h2c_addr}"));
         }
 
         // ── 5 cache nodes ─────────────────────────────────────────────────────
@@ -810,7 +847,7 @@ impl GlobalStack {
             std::fs::write(&sys, format!(
                 "# Cache node: {}\n[server]\nbind     = \"127.0.0.1:{port}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\nlock_memory = false\n\n[node]\nname = \"cache-{i}\"\n\n[registration]\norigin = \"127.0.0.1:{control_port}\"\n",
                 node_names[i], cert_path.display(), key_path.display(),
-            )).ok()?;
+            )).why("write a cache system.toml")?;
 
             processes.push(
                 Command::new(&m6_http)
@@ -821,29 +858,28 @@ impl GlobalStack {
                     .stdout(log_file(&logs, &format!("cache-{i}")))
                     .stderr(log_file(&logs, &format!("cache-{i}")))
                     .spawn()
-                    .ok()?,
+                    .why("spawn a cache node")?,
             );
         }
 
         for addr in &cache_addrs {
             if !wait_tcp(addr, to) {
-                eprintln!("SKIP: cache node not ready on {addr}");
                 dump_logs(&logs);
-                return None;
+                return Err(format!("cache node not ready on {addr}"));
             }
         }
 
         temp_dirs.push(origin_sock_dir);
         temp_dirs.push(cache_sock_dir);
 
-        Some(GlobalStack {
+        Ok(GlobalStack {
             origin_addr: origin_tls_addr,
             origin_h2c: origin_h2c_addr,
             cache_addrs,
             site_dir: site07,
             html_sock,
             write_token: std::fs::read_to_string(&write_token)
-                .ok()?
+                .why("read the publisher token")?
                 .trim()
                 .to_string(),
             _processes: processes,
