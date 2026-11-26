@@ -500,6 +500,15 @@ echo "### 05-cms end-to-end"
 cargo build --release -p render-cms 2>&1 | tail -1
 (cd "$M6_DIR" && cargo build --workspace --release 2>&1 | tail -1)
 
+# dev.sh keeps the auth database between runs, which a fresh CI runner never
+# does, so the publisher's role has to be granted to a user that already exists
+# without it. A failure here explains the publish 502 the suite would report.
+if ! PATH="$M6_DIR/target/release:$PATH" ./dev-token-test.sh; then
+    echo "EG_CMS_STATUS=1"
+    echo "dev-token.sh does not grant its role to a user the auth database kept"
+    exit 0
+fi
+
 cd 05-cms || exit 1
 
 # ── The port has to be ours ───────────────────────────────────────────────────

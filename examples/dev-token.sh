@@ -15,11 +15,18 @@ USER_NAME="$2"
 ROLE="$3"
 OUT="$4"
 
+# A second run finds the user already there, which is fine. The role is granted
+# on every run, because `user add` leaves an existing user's roles alone: an
+# auth database kept from before a role was renamed (genid-write became
+# purge-write) would otherwise hand out a token whose user lacks the role, and
+# every PURGE with it is refused. m6-auth reads roles from the database at each
+# check, so the grant counts at once and an existing token needs no reissue.
+m6-auth-cli "$CONF" user add "$USER_NAME" --role "$ROLE" \
+    --password "$(openssl rand -hex 16)" >/dev/null 2>&1 || true
+m6-auth-cli "$CONF" user roles "$USER_NAME" --set "$ROLE" >/dev/null 2>&1
+
 if [ ! -s "$OUT" ] || [ -n "$(find "$OUT" -mtime +25 2>/dev/null)" ]; then
     mkdir -p "$(dirname "$OUT")"
-    # A second run finds the user already there, which is fine.
-    m6-auth-cli "$CONF" user add "$USER_NAME" --role "$ROLE" \
-        --password "$(openssl rand -hex 16)" >/dev/null 2>&1 || true
     umask 077
     m6-auth-cli "$CONF" token create "$USER_NAME" --name "$USER_NAME" --ttl-days 30 > "$OUT"
 fi

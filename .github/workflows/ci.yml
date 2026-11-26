@@ -802,6 +802,13 @@ jobs:
         run: |
           ./dev-keys.sh
 
+      # dev.sh keeps the auth database between runs, so dev-token.sh has to
+      # grant the publisher's role to a user that already exists without it.
+      - name: dev-token.sh grants its role to a user the database kept
+        if: ${{ !cancelled() && steps.build_m6.outcome == 'success' }}
+        working-directory: examples
+        run: ./dev-token-test.sh
+
       - name: Every example's config parses
         if: ${{ !cancelled() && steps.build_m6.outcome == 'success' }}
         working-directory: examples
