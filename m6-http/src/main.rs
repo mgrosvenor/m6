@@ -2096,9 +2096,7 @@ fn purge_local(state: &mut ServerState, target: &str) -> bool {
         state.cache.clear();
         resident
     } else {
-        let resident = state.cache.path_resident(target);
-        state.cache.evict_path(target);
-        resident
+        state.cache.evict_path(target)
     }
 }
 
@@ -8255,7 +8253,7 @@ fn run(args: Vec<String>) -> i32 {
             format!("link: <{}>; rel=\"describedby\"", config.site.describedby).into_bytes(),
         ))
     };
-    let cache = Cache::with_max_bytes(config.limits.get(&m6_core::limits::CACHE_BYTES).max());
+    let cache = Cache::with_max_bytes(m6_http_lib::limits::cache_bound(&config.limits));
     // The disk writer shares the memory cache's bound, so a disk copy cannot
     // outgrow the memory it shadows. Built at start, where a missing or
     // unwritable directory is already an error.
