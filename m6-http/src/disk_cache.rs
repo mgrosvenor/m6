@@ -737,7 +737,6 @@ pub fn decode(bytes: &[u8]) -> Result<(String, CachedResponse), DecodeError> {
     Ok((
         meta.key,
         CachedResponse {
-            genid: 0,
             status: meta.status,
             headers: crate::cache::HeaderBlock::from_pairs(meta.headers),
             body: bytes::Bytes::from(body),
@@ -789,7 +788,6 @@ mod tests {
     /// A response with one header and a body of `body_len` zero bytes.
     fn response(body: &[u8]) -> CachedResponse {
         CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::from_pairs(vec![(
                 "content-type".to_string(),
@@ -833,7 +831,6 @@ mod tests {
     fn encode_then_decode_round_trips() {
         let body = b"hello, disk";
         let r = CachedResponse {
-            genid: 0,
             status: 203,
             headers: HeaderBlock::from_pairs(vec![
                 ("content-type".to_string(), "text/plain".to_string()),

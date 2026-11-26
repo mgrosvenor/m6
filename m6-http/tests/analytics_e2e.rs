@@ -677,12 +677,12 @@ fn without_pressure_blocks(mut document: serde_json::Value) -> serde_json::Value
 }
 
 /// Strip the top-level objects m6-http adds beside the m6-core report: the
-/// cache, generation and disk-cache blocks. The report round-trip does not
+/// cache, registration and disk-cache blocks. The report round-trip does not
 /// model them, so the field-for-field comparison runs on the report's own
 /// fields, and the cache object is asserted separately.
 fn without_http_blocks(mut document: serde_json::Value) -> serde_json::Value {
     if let Some(object) = document.as_object_mut() {
-        for key in ["cache", "genid", "disk_cache"] {
+        for key in ["cache", "registration", "disk_cache"] {
             object.remove(key);
         }
     }

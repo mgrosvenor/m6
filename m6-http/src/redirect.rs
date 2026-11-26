@@ -68,7 +68,7 @@ fn host_is_safe(h: &str) -> bool {
 const ALLOW: &str = "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS";
 
 fn ready(status: u16, headers: Vec<(String, String)>) -> RequestOutcome {
-    RequestOutcome::Ready(status, headers, Vec::new(), String::new(), None)
+    RequestOutcome::Ready(status, headers, Vec::new(), String::new())
 }
 
 /// The whole of the redirect: one status, one header.

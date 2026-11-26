@@ -82,7 +82,6 @@ fn fixtures() -> Fixtures {
         ("content-language".to_string(), "en".to_string()),
     ];
     let entry = CachedResponse {
-        genid: 0,
         status: 200,
         headers: m6_http_lib::cache::HeaderBlock::from_pairs(headers.clone()),
         body: bytes::Bytes::from(vec![b'x'; BODY_LEN]),

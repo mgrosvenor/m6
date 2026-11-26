@@ -24,9 +24,9 @@ use std::borrow::Borrow;
 /// with absolute `u32` offsets into the text. The slot area is fixed at
 /// construction (with spare slots for the headers a response gains on its way
 /// out), so appending a field only extends the text and bumps the count. A
-/// field whose name is `Set-Cookie` or `M6-Genid` is marked not-storable and is
-/// dropped when the block is stored, and that is the only per-field metadata,
-/// packed into the top bit of the name length.
+/// field whose name is `Set-Cookie` is marked not-storable and is dropped when
+/// the block is stored, and that is the only per-field metadata, packed into
+/// the top bit of the name length.
 ///
 /// The text buffer is built only from `&str`, so it is valid UTF-8 by
 /// construction. A field view is a `str` range, which checks two character
@@ -125,9 +125,9 @@ impl HeaderBlock {
 
     /// The storable subset, as a block.
     ///
-    /// A backend reply may carry `Set-Cookie` (one visitor's session) or a
-    /// stale `M6-Genid`; neither may be stored. When nothing is marked, this
-    /// is a refcount bump and allocates nothing, which is the ordinary case.
+    /// A backend reply may carry `Set-Cookie` (one visitor's session), which
+    /// must not be stored. When nothing is marked, this is a refcount bump and
+    /// allocates nothing, which is the ordinary case.
     pub fn storable(&self) -> HeaderBlock {
         let view = self.view();
         if view.iter(true).count() == view.count() {
@@ -466,9 +466,6 @@ pub struct CachedResponse {
     pub status: u16,
     pub headers: HeaderBlock,
     pub body: bytes::Bytes,
-    /// The source's site generation when the response was dispatched. Written
-    /// as `M6-Genid` on a hit, so a client can tell which generation it saw.
-    pub genid: u64,
 }
 // Conditional requests and preconditions live in `m6_core::conditional`.
 // They are version-independent semantics with two consumers, and the second
@@ -1705,12 +1702,11 @@ impl Cache {
         }
     }
 
-    /// Replace the live generation with an empty cache in one assignment.
+    /// Replace the live cache with an empty one in one assignment.
     ///
-    /// The rule for a site generation change is a full flush (`DESIGN-genid`
-    /// point 8): no entry survives into the new generation, and the cache
-    /// refills on demand. This method is that whole rule. It builds the
-    /// replacement beside the live cache and publishes it with
+    /// The rule for a full flush: no entry survives, and the cache refills on
+    /// demand. This method is that whole rule. It builds the replacement
+    /// beside the live cache and publishes it with
     /// `std::mem::replace`, which is read-copy-update's answer in one process
     /// and the same publish rule a `Site` reload uses.
     ///
@@ -2163,7 +2159,6 @@ mod tests {
         let cache = Cache::new();
         let key = CacheKey::new("/hello", None, "");
         let resp = CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::empty(),
             body: bytes::Bytes::from_static(b"world"),
@@ -2190,7 +2185,6 @@ mod tests {
             vec![("cache-control".to_string(), cc.to_string())]
         };
         CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::from_pairs(headers),
             body: bytes::Bytes::from_static(b"world"),
@@ -2437,7 +2431,6 @@ mod tests {
         let k2 = CacheKey::new("/page", None, "br");
         let k3 = CacheKey::new("/other", None, "");
         let resp = CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::empty(),
             body: bytes::Bytes::new(),
@@ -2468,7 +2461,6 @@ mod tests {
         // key stored with no query
         let k = CacheKey::new("/page", None, "");
         let resp = CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::empty(),
             body: bytes::Bytes::new(),
@@ -2488,7 +2480,6 @@ mod tests {
         let cache = Cache::new();
         let key = CacheKey::new("/blog/hello", None, "");
         let resp = CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::from_pairs(vec![(
                 "cache-control".to_string(),
@@ -2530,7 +2521,6 @@ mod tests {
             headers.push(("content-encoding".to_string(), enc.to_string()));
         }
         CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::from_pairs(headers),
             body: bytes::Bytes::from_static(body),
@@ -2668,7 +2658,6 @@ mod tests {
     fn test_evict_path_removes_all_query_variants() {
         let cache = Cache::new();
         let resp = CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::empty(),
             body: bytes::Bytes::new(),
@@ -2794,7 +2783,6 @@ mod method_gate_tests {
         cache.insert(
             CacheKey::new("/page", None, "br"),
             CachedResponse {
-                genid: 0,
                 status: 200,
                 headers: HeaderBlock::empty(),
                 body: bytes::Bytes::from_static(b"full GET body"),
@@ -3023,7 +3011,6 @@ mod age_tests {
 
     fn resp(headers: &[(&str, &str)]) -> CachedResponse {
         CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::from_pairs(
                 headers
@@ -3119,7 +3106,6 @@ mod heuristic_freshness_tests {
 
     fn resp(cc: &str) -> CachedResponse {
         CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::from_pairs(vec![("cache-control".into(), cc.into())]),
             body: bytes::Bytes::from_static(b"x"),
@@ -3187,7 +3173,6 @@ mod expires_tests {
         c.insert(
             CacheKey::new("/e", None, ""),
             CachedResponse {
-                genid: 0,
                 status: 200,
                 headers: HeaderBlock::from_pairs(headers),
                 body: bytes::Bytes::from_static(b"x"),
@@ -3442,7 +3427,6 @@ mod request_directive_tests {
         let cache = Cache::new();
         let key = CacheKey::new("/p", None, "");
         let resp = CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::from_pairs(vec![("cache-control".into(), cc.into())]),
             body: bytes::Bytes::from_static(b"body"),
@@ -3502,7 +3486,6 @@ mod corrected_age_tests {
 
     fn resp_with(headers: &[(&str, &str)]) -> CachedResponse {
         CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::from_pairs(
                 headers
@@ -3696,7 +3679,6 @@ mod capacity_tests {
 
     fn resp(body_len: usize) -> CachedResponse {
         CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::from_pairs(vec![(
                 "cache-control".to_string(),
@@ -3792,7 +3774,6 @@ mod capacity_accounting_tests {
 
     fn resp(n: usize) -> CachedResponse {
         CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::from_pairs(vec![(
                 "cache-control".to_string(),
@@ -3889,9 +3870,8 @@ mod capacity_accounting_tests {
 mod generation_swap_tests {
     use super::*;
 
-    fn resp(genid: u64, body: &[u8]) -> CachedResponse {
+    fn resp(body: &[u8]) -> CachedResponse {
         CachedResponse {
-            genid,
             status: 200,
             headers: HeaderBlock::from_pairs(vec![(
                 "cache-control".to_string(),
@@ -3911,7 +3891,7 @@ mod generation_swap_tests {
         for i in 0..8 {
             cache.insert(
                 CacheKey::new(&format!("/p{i}"), None, "gzip"),
-                resp(5, b"the old generation"),
+                resp(b"the old generation"),
             );
         }
         let held_before = cache.bytes_held();
@@ -3952,7 +3932,7 @@ mod generation_swap_tests {
     fn a_request_holding_the_old_generation_finishes_on_it() {
         let mut cache = Cache::with_max_bytes(1024 * 1024);
         let key = CacheKey::new("/held", None, "gzip");
-        cache.insert(key.clone(), resp(41, b"the old generation"));
+        cache.insert(key.clone(), resp(b"the old generation"));
 
         // What a request in flight holds: the response clone from its lookup,
         // and a clone of the cache it began on.
@@ -3965,7 +3945,6 @@ mod generation_swap_tests {
             matches!(cache.lookup(&key), Lookup::Miss),
             "the live cache serves the new generation only"
         );
-        assert_eq!(held.genid, 41, "the held response keeps its generation");
         assert_eq!(
             &held.body[..],
             b"the old generation",
@@ -3974,8 +3953,14 @@ mod generation_swap_tests {
         let still = in_flight
             .get(&key)
             .expect("an in-flight holder keeps the generation it began on");
-        assert_eq!(still.genid, 41);
-        assert_eq!(old.get(&key).map(|r| r.genid), Some(41));
+        assert_eq!(&still.body[..], b"the old generation");
+        assert_eq!(
+            old.get(&key)
+                .expect("the old generation holds the entry")
+                .body
+                .as_ref(),
+            b"the old generation"
+        );
     }
 
     /// The new generation keeps the old generation's bound, so a swap cannot
@@ -3986,12 +3971,12 @@ mod generation_swap_tests {
     #[test]
     fn a_swapped_cache_keeps_its_bound() {
         let mut cache = Cache::with_max_bytes(64 * 1024);
-        cache.insert(CacheKey::new("/before", None, "gzip"), resp(5, b"x"));
+        cache.insert(CacheKey::new("/before", None, "gzip"), resp(b"x"));
         let _old = cache.swap_generation();
 
         cache.insert(
             CacheKey::new("/big", None, "gzip"),
-            resp(6, &vec![0u8; 100 * 1024]),
+            resp(&vec![0u8; 100 * 1024]),
         );
 
         assert!(
@@ -4027,7 +4012,6 @@ mod eviction_policy_tests {
 
     fn resp(cc: &str, body: usize) -> CachedResponse {
         CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::from_pairs(vec![("cache-control".to_string(), cc.to_string())]),
             body: bytes::Bytes::from(vec![0u8; body]),
@@ -4145,7 +4129,6 @@ mod eviction_policy_tests {
     fn footprint_counts_body_headers_key_and_fixed_overhead() {
         let key = CacheKey::new("/abc/def", Some("q=1"), "gzip");
         let response = CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::from_pairs(vec![(
                 "content-type".to_string(),

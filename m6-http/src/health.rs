@@ -617,8 +617,8 @@ pub fn control_gate(
 
 /// The address rule alone: loopback, or an internal listener.
 ///
-/// The same rule the old `/genid` endpoint used. A public peer gets the 404
-/// an unknown path gives, before the request is read or forwarded.
+/// A public peer gets the 404 an unknown path gives, before the request is
+/// read or forwarded.
 pub fn control_address_ok(client_ip: &str, from_internal: bool) -> bool {
     let loopback = client_ip
         .parse::<IpAddr>()

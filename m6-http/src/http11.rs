@@ -38,11 +38,10 @@ use m6_core::platform::{Interest, Registry, Token};
 
 /// The result of dispatching a request to a backend.
 pub enum RequestOutcome {
-    /// Response is available immediately (cache hit, socket backend, auth error, etc.)
+    /// Response is available immediately (cache hit, socket backend, auth error, etc.).
     ///
-    /// The last field is the site generation to write as `M6-Genid`, when the
-    /// response has one. A locally built answer has none.
-    Ready(u16, Vec<(String, String)>, Vec<u8>, String, Option<u64>),
+    /// The last field is the backend name, for stats and analytics.
+    Ready(u16, Vec<(String, String)>, Vec<u8>, String),
     /// A fresh or stale cache hit, carried as a shared entry so the HTTP/1.1
     /// writer can emit it without copying the headers or the body. The other
     /// protocols convert it back to `Ready` with their owned header form.
@@ -713,7 +712,7 @@ impl Http11Listener {
     /// waiting on it and drive the write now, so the first bytes leave in this
     /// turn. A connection that is no longer waiting (closed, or reused by a
     /// newer connection) is a no-op, so a stale completion drops its result.
-    #[allow(clippy::too_many_arguments)] // one response's five fields plus the loop's
+    #[allow(clippy::too_many_arguments)] // one response's fields plus the loop's
     pub fn complete_h1(
         &mut self,
         key: usize,
@@ -721,7 +720,6 @@ impl Http11Listener {
         headers: &[(String, String)],
         body: Vec<u8>,
         method: &str,
-        genid: Option<u64>,
         registry: &Registry,
     ) -> ConnDrive {
         let mut drive = ConnDrive {
@@ -746,15 +744,7 @@ impl Http11Listener {
             body.len(),
         ) {
             h1.out_buf.clear();
-            write_response(
-                &mut h1.out_buf,
-                status,
-                headers,
-                &body,
-                method,
-                keep_alive,
-                genid,
-            );
+            write_response(&mut h1.out_buf, status, headers, &body, method, keep_alive);
             h1.state = H1State::Writing { pos: 0 };
         }
         let mut unit = ();
@@ -822,7 +812,6 @@ impl Http11Listener {
         stream_id: u32,
         response: (u16, Vec<(String, String)>, Vec<u8>),
         method: &str,
-        genid: Option<u64>,
         registry: &Registry,
     ) -> bool {
         let (status, headers, body) = response;
@@ -836,7 +825,7 @@ impl Http11Listener {
                     tls: conn.tls.as_mut().expect("tls path"),
                     stream: conn.stream.as_ref().expect("tls stream"),
                 };
-                h2.complete_stream(&mut io, stream_id, status, headers, body, method, genid);
+                h2.complete_stream(&mut io, stream_id, status, headers, body, method);
             }
             h2.is_done()
         };
@@ -1375,7 +1364,6 @@ impl H2cListener {
         stream_id: u32,
         response: (u16, Vec<(String, String)>, Vec<u8>),
         method: &str,
-        genid: Option<u64>,
         registry: &Registry,
     ) -> bool {
         let (status, headers, body) = response;
@@ -1388,7 +1376,7 @@ impl H2cListener {
                 let mut io = H2Io::Plain {
                     stream: conn.stream.as_ref().expect("h2c stream"),
                 };
-                h2.complete_stream(&mut io, stream_id, status, headers, body, method, genid);
+                h2.complete_stream(&mut io, stream_id, status, headers, body, method);
             }
             h2.is_done()
         };
@@ -1951,8 +1939,7 @@ fn drive_h1<S, FH, FO, FR>(
                             // `Connection: close`, so the unread body is not
                             // taken for the next request on this connection.
                             if let Some(outcome) = on_head_early(state, &head, client_ip) {
-                                let RequestOutcome::Ready(status, headers, body, _, genid) =
-                                    outcome
+                                let RequestOutcome::Ready(status, headers, body, _) = outcome
                                 else {
                                     unreachable!("a head refusal is ready")
                                 };
@@ -1971,7 +1958,6 @@ fn drive_h1<S, FH, FO, FR>(
                                         &body,
                                         head.method,
                                         false,
-                                        genid,
                                     );
                                     h1.state = H1State::Writing { pos: 0 };
                                 }
@@ -2017,13 +2003,7 @@ fn drive_h1<S, FH, FO, FR>(
                                     h1.keep_alive =
                                         wants_keep_alive(&req) && h1.served + 1 < h1.max_requests;
                                     match on_owned(state, RequestRef::Owned(&req), client_ip) {
-                                        RequestOutcome::Ready(
-                                            status,
-                                            resp_headers,
-                                            body,
-                                            _,
-                                            genid,
-                                        ) => {
+                                        RequestOutcome::Ready(status, resp_headers, body, _) => {
                                             if make_out_room(
                                                 &mut h1.out_buf,
                                                 &mut h1.state,
@@ -2038,7 +2018,6 @@ fn drive_h1<S, FH, FO, FR>(
                                                     &body,
                                                     &req.method,
                                                     h1.keep_alive,
-                                                    genid,
                                                 );
                                                 h1.state = H1State::Writing { pos: 0 };
                                             }
@@ -2120,7 +2099,7 @@ fn drive_h1<S, FH, FO, FR>(
                                     }
                                     continue;
                                 }
-                                RequestOutcome::Ready(status, resp_headers, body, _, genid) => {
+                                RequestOutcome::Ready(status, resp_headers, body, _) => {
                                     if make_out_room(
                                         &mut h1.out_buf,
                                         &mut h1.state,
@@ -2135,7 +2114,6 @@ fn drive_h1<S, FH, FO, FR>(
                                             &body,
                                             method,
                                             keep_alive,
-                                            genid,
                                         );
                                         h1.keep_alive = keep_alive;
                                         h1.state = H1State::Writing { pos: 0 };
@@ -2423,25 +2401,20 @@ pub fn status_may_have_content_length(status: u16) -> bool {
 
 /// Write a completed HTTP/1.1 response into a new buffer.
 ///
-/// Public so the generation check can count what the miss path allocates with
-/// and without an ID. The writer itself is the production one. The production
-/// request path does not call this: it hands `write_response` (private, so
-/// named here in backticks) the connection's own output buffer, which is why a
-/// response no longer allocates its bytes.
+/// The writer itself is the production one. The production request path does
+/// not call this: it hands `write_response` (private, so named here in
+/// backticks) the connection's own output buffer, which is why a response no
+/// longer allocates its bytes.
 pub fn build_response(
     status: u16,
     headers: &[(String, String)],
     body: &[u8],
     method: &str,
     keep_alive: bool,
-    genid: Option<u64>,
 ) -> Vec<u8> {
     let is_head = method.eq_ignore_ascii_case("HEAD");
-    // Room for the generation line, so adding one never grows the buffer a
-    // second time: it is written with `itoa` into bytes this response already
-    // owns.
     let mut out = Vec::with_capacity(280 + if is_head { 0 } else { body.len() });
-    write_response(&mut out, status, headers, body, method, keep_alive, genid);
+    write_response(&mut out, status, headers, body, method, keep_alive);
     out
 }
 
@@ -2457,7 +2430,6 @@ fn write_response(
     body: &[u8],
     method: &str,
     keep_alive: bool,
-    _genid: Option<u64>,
 ) {
     let is_head = method.eq_ignore_ascii_case("HEAD");
     let reason = status_reason(status);
@@ -3008,7 +2980,7 @@ mod head_framing_tests {
     #[test]
     fn get_sends_the_body() {
         let (head, body) = {
-            let raw = build_response(200, &hdrs(), BODY, "GET", false, None);
+            let raw = build_response(200, &hdrs(), BODY, "GET", false);
             let (h, b) = split(&raw);
             (h, b.to_vec())
         };
@@ -3022,7 +2994,7 @@ mod head_framing_tests {
     /// it because it parses and discards the body, so every hand check passed.
     #[test]
     fn head_sends_zero_body_bytes() {
-        let raw = build_response(200, &hdrs(), BODY, "HEAD", false, None);
+        let raw = build_response(200, &hdrs(), BODY, "HEAD", false);
         let (_, body) = split(&raw);
         assert_eq!(
             body.len(),
@@ -3038,7 +3010,7 @@ mod head_framing_tests {
     /// the size checks that are most of the reason to send one.
     #[test]
     fn head_still_advertises_the_get_length() {
-        let raw = build_response(200, &hdrs(), BODY, "HEAD", false, None);
+        let raw = build_response(200, &hdrs(), BODY, "HEAD", false);
         let (head, _) = split(&raw);
         assert!(
             head.contains(&format!("content-length: {}", BODY.len())),
@@ -3052,12 +3024,12 @@ mod head_framing_tests {
     #[test]
     fn head_and_get_headers_match() {
         let (gh, _) = {
-            let r = build_response(200, &hdrs(), BODY, "GET", false, None);
+            let r = build_response(200, &hdrs(), BODY, "GET", false);
             let (h, _) = split(&r);
             (h, ())
         };
         let (hh, _) = {
-            let r = build_response(200, &hdrs(), BODY, "HEAD", false, None);
+            let r = build_response(200, &hdrs(), BODY, "HEAD", false);
             let (h, _) = split(&r);
             (h, ())
         };
@@ -3066,7 +3038,7 @@ mod head_framing_tests {
 
     #[test]
     fn method_match_is_case_insensitive() {
-        let raw = build_response(200, &hdrs(), BODY, "head", false, None);
+        let raw = build_response(200, &hdrs(), BODY, "head", false);
         let (_, body) = split(&raw);
         assert_eq!(body.len(), 0);
     }
@@ -3084,7 +3056,7 @@ mod head_framing_tests {
     #[test]
     fn empty_body_is_unchanged() {
         for m in ["GET", "HEAD"] {
-            let raw200 = build_response(200, &hdrs(), b"", m, false, None);
+            let raw200 = build_response(200, &hdrs(), b"", m, false);
             let (head, body) = split(&raw200);
             assert_eq!(body.len(), 0);
             assert!(
@@ -3092,7 +3064,7 @@ mod head_framing_tests {
                 "200 must state its length:\n{head}"
             );
 
-            let raw204 = build_response(204, &hdrs(), b"", m, false, None);
+            let raw204 = build_response(204, &hdrs(), b"", m, false);
             let (head, body) = split(&raw204);
             assert_eq!(body.len(), 0);
             assert!(
@@ -3186,7 +3158,7 @@ mod response_header_tests {
             ("Content-Type".to_string(), "image/svg+xml".to_string()),
         ];
         for method in ["GET", "HEAD"] {
-            let raw = build_response(200, &upstream, b"", method, false, None);
+            let raw = build_response(200, &upstream, b"", method, false);
             let found = header_lines(&raw, "content-length");
             assert_eq!(
                 found.len(),
@@ -3203,7 +3175,7 @@ mod response_header_tests {
     #[test]
     fn head_reports_the_get_representation_length() {
         let upstream = vec![("Content-Length".to_string(), "16580".to_string())];
-        let raw = build_response(200, &upstream, b"", "HEAD", false, None);
+        let raw = build_response(200, &upstream, b"", "HEAD", false);
         assert_eq!(
             header_lines(&raw, "content-length"),
             vec!["content-length: 16580"]
@@ -3222,7 +3194,7 @@ mod response_header_tests {
     #[test]
     fn body_length_wins_when_a_body_is_present() {
         let upstream = vec![("Content-Length".to_string(), "99999".to_string())];
-        let raw = build_response(200, &upstream, b"hello", "GET", false, None);
+        let raw = build_response(200, &upstream, b"hello", "GET", false);
         assert_eq!(
             header_lines(&raw, "content-length"),
             vec!["content-length: 5"]
@@ -3233,7 +3205,7 @@ mod response_header_tests {
     #[test]
     fn exactly_one_connection_header() {
         let upstream = vec![("Connection".to_string(), "keep-alive".to_string())];
-        let raw = build_response(200, &upstream, b"x", "GET", false, None);
+        let raw = build_response(200, &upstream, b"x", "GET", false);
         assert_eq!(header_lines(&raw, "connection").len(), 1);
     }
 
@@ -3244,7 +3216,7 @@ mod response_header_tests {
             ("Content-Type".to_string(), "text/html".to_string()),
             ("ETag".to_string(), "\"abc\"".to_string()),
         ];
-        let raw = build_response(200, &upstream, b"x", "GET", false, None);
+        let raw = build_response(200, &upstream, b"x", "GET", false);
         assert_eq!(header_lines(&raw, "content-type").len(), 1);
         assert_eq!(header_lines(&raw, "etag").len(), 1);
     }
@@ -3261,7 +3233,6 @@ mod bodyless_status_tests {
             b"",
             "GET",
             false,
-            None,
         );
         String::from_utf8_lossy(&raw)
             .split("\r\n\r\n")
@@ -3324,7 +3295,6 @@ mod bodyless_status_tests {
             b"",
             "GET",
             true,
-            None,
         );
         let head = String::from_utf8_lossy(&raw);
         let head = head.split("\r\n\r\n").next().unwrap_or("").to_string();

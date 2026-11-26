@@ -922,7 +922,7 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
 ) -> Routed {
     let ua = analytics::header(headers, "user-agent");
     if let Some(blocked) = check_rate_limit(state, client_ip, path, ua) {
-        let RequestOutcome::Ready(s, h, b, n, _) = blocked else {
+        let RequestOutcome::Ready(s, h, b, n) = blocked else {
             unreachable!("check_rate_limit returns Ready")
         };
         return Routed::Ready(s, h, b, n);
@@ -959,7 +959,7 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
     // A method the matched route does not answer is refused here, before the
     // cache lookup and any backend contact.
     if let Some(outcome) = route_method_refusal(state, path, method) {
-        let RequestOutcome::Ready(status, headers, body, backend, _) = outcome else {
+        let RequestOutcome::Ready(status, headers, body, backend) = outcome else {
             unreachable!("a method refusal is ready")
         };
         return Routed::Ready(status, headers, body, backend);
@@ -1149,7 +1149,7 @@ fn on_request_impl(
                 set_cookie,
             }
         }
-        Routed::Ready(s, h, b, n) => RequestOutcome::Ready(s, h, b, n, None),
+        Routed::Ready(s, h, b, n) => RequestOutcome::Ready(s, h, b, n),
         Routed::Miss {
             start,
             version,
@@ -1205,7 +1205,7 @@ fn on_request_h2(
             age,
             set_cookie,
         },
-        Routed::Ready(s, h, b, n) => RequestOutcome::Ready(s, h, b, n, None),
+        Routed::Ready(s, h, b, n) => RequestOutcome::Ready(s, h, b, n),
         Routed::Miss {
             start,
             version,
@@ -1258,7 +1258,7 @@ fn on_request_head(
             age,
             set_cookie,
         },
-        Routed::Ready(s, h, b, n) => RequestOutcome::Ready(s, h, b, n, None),
+        Routed::Ready(s, h, b, n) => RequestOutcome::Ready(s, h, b, n),
         Routed::Miss {
             start,
             version,
@@ -1297,7 +1297,7 @@ fn finish_miss(
     iface: Iface,
     quic_port: u16,
 ) -> RequestOutcome {
-    if let RequestOutcome::Ready(status, ref mut headers, _, ref backend, _) = outcome {
+    if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome {
         set_alt_svc(headers, quic_port);
         let elapsed_ns = start.elapsed().as_nanos() as u64;
         let chan = Channel::new(version, iface);
@@ -1579,13 +1579,7 @@ fn is_status_path(state: &ServerState, path: &str) -> bool {
 /// endpoint, which says nothing about the site.
 fn status_refusal() -> RequestOutcome {
     let (code, headers, body) = health::not_found();
-    RequestOutcome::Ready(
-        code,
-        headers,
-        body,
-        health::HEALTH_BACKEND.to_string(),
-        None,
-    )
+    RequestOutcome::Ready(code, headers, body, health::HEALTH_BACKEND.to_string())
 }
 
 /// Deregister and free a connection token.
@@ -1692,8 +1686,7 @@ fn write_waiter(
             }
             if let Source::TlsConn(slot) = *cx.state.sources.get(conn.0) {
                 if let Some(t) = cx.tcp {
-                    let drive =
-                        t.complete_h1(slot, status, &headers, body, method, None, cx.registry);
+                    let drive = t.complete_h1(slot, status, &headers, body, method, cx.registry);
                     after_conn_drive(conn, &drive, cx.state, cx.tcp, cx.h2c, cx.registry, cx.now);
                 }
             }
@@ -1704,24 +1697,10 @@ fn write_waiter(
             }
             let done = match *cx.state.sources.get(conn.0) {
                 Source::TlsConn(slot) => cx.tcp.as_mut().is_some_and(|t| {
-                    t.complete_h2(
-                        slot,
-                        stream,
-                        (status, headers, body),
-                        method,
-                        None,
-                        cx.registry,
-                    )
+                    t.complete_h2(slot, stream, (status, headers, body), method, cx.registry)
                 }),
                 Source::H2cConn(slot) => cx.h2c.as_mut().is_some_and(|h| {
-                    h.complete_h2(
-                        slot,
-                        stream,
-                        (status, headers, body),
-                        method,
-                        None,
-                        cx.registry,
-                    )
+                    h.complete_h2(slot, stream, (status, headers, body), method, cx.registry)
                 }),
                 _ => false,
             };
@@ -1985,7 +1964,7 @@ fn complete_auth(
         priority::Priority::default()
     };
     match outcome {
-        RequestOutcome::Ready(status, mut headers, body, backend, _) => {
+        RequestOutcome::Ready(status, mut headers, body, backend) => {
             // The re-entry writes its answer here, not through `finish_miss`,
             // so it runs the two steps that tail runs. Without them the
             // authority's 401, the browser's 302, the 403 and the 503 are the
@@ -2279,7 +2258,6 @@ fn handle_purge(
             headers,
             Vec::new(),
             health::CONTROL_BACKEND.to_string(),
-            None,
         );
     }
     let ctx = forward::PendingUrlContext {
@@ -4110,7 +4088,7 @@ fn handle_h3_request(
                 .then(|| std::str::from_utf8(h.value()).ok().map(str::to_string))
                 .flatten()
         });
-        if let Some(RequestOutcome::Ready(status, headers, body, _, _)) =
+        if let Some(RequestOutcome::Ready(status, headers, body, _)) =
             check_rate_limit(state, &client_ip, path_str, ua_owned.as_deref())
         {
             // Rate-limit rejection: tiny body, but a HEAD still must not carry one.
@@ -4177,7 +4155,7 @@ fn handle_h3_request(
     // not pass through `route_request`.
     let method_str = std::str::from_utf8(method_bytes).unwrap_or("GET");
     if let Some(outcome) = route_method_refusal(state, path_str, method_str) {
-        let RequestOutcome::Ready(status, headers, body, _, _) = outcome else {
+        let RequestOutcome::Ready(status, headers, body, _) = outcome else {
             unreachable!("a method refusal is ready")
         };
         send_h3_response(
@@ -4478,7 +4456,7 @@ fn handle_h3_request(
         h3.registry,
         None,
     ) {
-        RequestOutcome::Ready(status, mut resp_headers, body, backend_name, _) => {
+        RequestOutcome::Ready(status, mut resp_headers, body, backend_name) => {
             // Add alt-svc header.
             set_alt_svc(&mut resp_headers, h3.quic_port);
 
@@ -4817,7 +4795,7 @@ fn handle_request(
         registry,
         pre_decided,
     );
-    if let RequestOutcome::Ready(status, ref mut headers, _, ref backend, _) = outcome {
+    if let RequestOutcome::Ready(status, ref mut headers, _, ref backend) = outcome {
         let compresses = state.config.backend_compresses(backend);
         set_vary_accept_encoding(headers, compresses);
         set_date(headers);
@@ -5281,7 +5259,6 @@ fn method_refusal_value(allow: String) -> RequestOutcome {
         headers,
         b"Method Not Allowed".to_vec(),
         "method-check".to_string(),
-        None,
     )
 }
 
@@ -5379,7 +5356,6 @@ fn handle_request_inner(
                     headers,
                     body,
                     health::CONTROL_BACKEND.to_string(),
-                    None,
                 );
             }
             health::Gate::Open => {}
@@ -5418,13 +5394,7 @@ fn handle_request_inner(
                     }
                     refusal => {
                         let (code, headers, body) = refusal.refusal().expect("a refusal");
-                        return RequestOutcome::Ready(
-                            code,
-                            headers,
-                            body,
-                            "auth".to_string(),
-                            None,
-                        );
+                        return RequestOutcome::Ready(code, headers, body, "auth".to_string());
                     }
                 }
             }
@@ -5439,7 +5409,6 @@ fn handle_request_inner(
                 vec![("Cache-Control".to_string(), "no-store".to_string())],
                 Vec::new(),
                 health::CONTROL_BACKEND.to_string(),
-                None,
             );
         }
         let body = status_body(state);
@@ -5451,7 +5420,6 @@ fn handle_request_inner(
             ],
             body,
             health::CONTROL_BACKEND.to_string(),
-            None,
         );
     }
 
@@ -5513,13 +5481,7 @@ fn handle_request_inner(
         } else {
             b"Not Implemented"
         };
-        return RequestOutcome::Ready(
-            status,
-            headers,
-            body.to_vec(),
-            "method-check".to_string(),
-            None,
-        );
+        return RequestOutcome::Ready(status, headers, body.to_vec(), "method-check".to_string());
     }
 
     // ── Health endpoint, ahead of routing/cache/backends ────────────────────
@@ -5555,13 +5517,7 @@ fn handle_request_inner(
             None,
             &mut state.traffic,
         );
-        return RequestOutcome::Ready(
-            code,
-            headers,
-            body,
-            health::HEALTH_BACKEND.to_string(),
-            None,
-        );
+        return RequestOutcome::Ready(code, headers, body, health::HEALTH_BACKEND.to_string());
     }
 
     // The custom-error render route takes `status`/`from` (and optional
@@ -5604,7 +5560,7 @@ fn handle_request_inner(
                     ("Location".to_string(), location),
                     ("Content-Type".to_string(), "text/html".to_string()),
                 ];
-                return RequestOutcome::Ready(301, headers, vec![], "redirect".to_string(), None);
+                return RequestOutcome::Ready(301, headers, vec![], "redirect".to_string());
             }
             // Prefer fetching the real custom error page. On a node whose error
             // backend is itself a URL/H2C/H2S backend — every cache node,
@@ -5636,8 +5592,9 @@ fn handle_request_inner(
     // answer and no second check is sent.
     //
     // The representation is this block's only choice. An API caller gets the
-    // check's refusal unchanged, the same status, headers and body `/genid`
-    // answers. A browser is a route-level choice made on top of that decision:
+    // check's refusal unchanged, the same status, headers and body the cache
+    // control endpoints answer. A browser is a route-level choice made on top
+    // of that decision:
     // no credential redirects to login (or to the refresh path, when it still
     // holds a refresh cookie), and a credential lacking the role gets the
     // site's own 403 page rather than JSON.
@@ -5698,13 +5655,7 @@ fn handle_request_inner(
                             ("Location".to_string(), redirect_url),
                             ("Content-Type".to_string(), "text/html".to_string()),
                         ];
-                        return RequestOutcome::Ready(
-                            302,
-                            headers,
-                            vec![],
-                            "auth".to_string(),
-                            None,
-                        );
+                        return RequestOutcome::Ready(302, headers, vec![], "auth".to_string());
                     }
                     warn!(
                         path = %req.path,
@@ -5720,7 +5671,7 @@ fn handle_request_inner(
                 }
                 warn!(path = %req.path, require = %require, "auth: refused");
                 let (code, headers, body) = refusal.refusal().expect("a refusal, by construction");
-                return RequestOutcome::Ready(code, headers, body, "auth".to_string(), None);
+                return RequestOutcome::Ready(code, headers, body, "auth".to_string());
             }
         }
     }
@@ -5911,7 +5862,7 @@ fn backend_unavailable(
     match apply_error_mode(503, req, client_ip, state, Some(&err_ctx), registry) {
         ErrorOutcome::Ready(s, mut h, b, n) => {
             h.push(("Retry-After".to_string(), "1".to_string()));
-            RequestOutcome::Ready(s, h, b, n, None)
+            RequestOutcome::Ready(s, h, b, n)
         }
         ErrorOutcome::Pending { id, mut ctx } => {
             ctx.extra_headers
@@ -5959,7 +5910,6 @@ fn check_rate_limit(
         headers,
         b"Too Many Requests".to_vec(),
         "rate-limit".to_string(),
-        None,
     ))
 }
 
@@ -6025,7 +5975,6 @@ fn dispatch_custom_error_async(
             headers,
             body,
             "error-local".to_string(),
-            None,
         ));
     }
 
@@ -6170,7 +6119,7 @@ fn apply_error_mode(
             }
 
             match dispatch_custom_error_async(status, req, client_ip, state, registry, ctx) {
-                Some(RequestOutcome::Ready(s, h, b, n, _)) => ErrorOutcome::Ready(s, h, b, n),
+                Some(RequestOutcome::Ready(s, h, b, n)) => ErrorOutcome::Ready(s, h, b, n),
                 Some(RequestOutcome::Pending { id, ctx }) => ErrorOutcome::Pending { id, ctx },
                 Some(RequestOutcome::Cached { .. }) => {
                     unreachable!("a custom error page is never a cached hit")
@@ -6205,7 +6154,7 @@ fn request_error(
     registry: &m6_core::platform::Registry,
 ) -> RequestOutcome {
     match apply_error_mode(status, req, client_ip, state, ctx, registry) {
-        ErrorOutcome::Ready(s, h, b, n) => RequestOutcome::Ready(s, h, b, n, None),
+        ErrorOutcome::Ready(s, h, b, n) => RequestOutcome::Ready(s, h, b, n),
         ErrorOutcome::Pending { id, ctx } => RequestOutcome::Pending { id, ctx },
     }
 }
@@ -6578,7 +6527,6 @@ fn complete_socket_response(
                 // request path copies no key and pushes nothing. Nothing is
                 // written here.
                 let response = CachedResponse {
-                    genid: 0,
                     status: http_resp.status,
                     headers: strip_uncacheable(&http_resp.headers),
                     body: Bytes::from(http_resp.body.clone()),
@@ -6778,7 +6726,6 @@ fn finalize_url_response_inner(
                 // The same store as the synchronous path: the flag rides
                 // the insert, and the disk write itself waits for the tick.
                 let response = CachedResponse {
-                    genid: 0,
                     status: http_resp.status,
                     headers: strip_uncacheable(&http_resp.headers),
                     body: Bytes::from(http_resp.body.clone()),
