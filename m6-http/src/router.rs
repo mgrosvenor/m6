@@ -85,6 +85,9 @@ pub struct RouteEntry {
     /// route lists none, which is the behaviour every route had before the key
     /// existed.
     pub methods: Methods,
+    /// The query parameter names that belong in this route's cache key.
+    /// Empty keeps none, so a junk or UTM query cannot split the entry.
+    pub query_key: Vec<String>,
 }
 
 /// Built route table.
@@ -105,6 +108,12 @@ pub struct RouteTable {
     /// restricted — the common case — it answers from this flag with no route
     /// lookup at all.
     has_restricted_routes: bool,
+    /// Whether *any* route lists `query_key` parameters.
+    ///
+    /// When no route does, the filtered query is empty for every path and the
+    /// cache key never needs a route lookup, so the hot path keeps its
+    /// traversals.
+    has_query_keys: bool,
 }
 
 impl RouteTable {
@@ -142,6 +151,7 @@ impl RouteTable {
                     route.methods.as_deref(),
                     &format!("route \"{}\" ([[route]] number {})", route.path, i + 1),
                 )?,
+                query_key: route.query_key.clone(),
             };
             // matchit returns error on duplicate; we already validate in config
             if let Err(e) = router.insert(route.path.clone(), entry.clone()) {
@@ -199,6 +209,7 @@ impl RouteTable {
                     require: rg.require.clone(),
                     cache: rg.cache.clone(),
                     methods,
+                    query_key: rg.query_key.clone(),
                 };
 
                 // Skip if already added (explicit route takes precedence)
@@ -217,11 +228,13 @@ impl RouteTable {
 
         let has_protected_routes = entries.iter().any(|e| e.require.is_some());
         let has_restricted_routes = entries.iter().any(|e| e.methods != Methods::ANY);
+        let has_query_keys = entries.iter().any(|e| !e.query_key.is_empty());
         Ok(RouteTable {
             router,
             entries,
             has_protected_routes,
             has_restricted_routes,
+            has_query_keys,
         })
     }
 
@@ -245,6 +258,17 @@ impl RouteTable {
     /// Match a request path. Returns the matched RouteEntry if found.
     pub fn at<'a>(&'a self, path: &str) -> Option<&'a RouteEntry> {
         self.router.at(path).ok().map(|m| m.value)
+    }
+
+    /// The query parameter names the matched route keeps in its cache key, or
+    /// an empty slice when the route lists none or is absent. The flag keeps
+    /// the common case — no route lists query keys — one comparison and no
+    /// route lookup.
+    pub fn query_key(&self, path: &str) -> &[String] {
+        if !self.has_query_keys {
+            return &[];
+        }
+        self.at(path).map(|e| e.query_key.as_slice()).unwrap_or(&[])
     }
 
     /// If `path` itself doesn't match but toggling its trailing slash would,
@@ -295,6 +319,7 @@ impl RouteTable {
                 require: require.map(str::to_string),
                 cache: None,
                 methods: Methods::ANY,
+                query_key: vec![],
             };
             router
                 .insert(path.to_string(), entry.clone())
@@ -307,6 +332,7 @@ impl RouteTable {
             entries,
             has_protected_routes,
             has_restricted_routes: false,
+            has_query_keys: false,
         }
     }
 
@@ -398,6 +424,7 @@ mod tests {
             require: None,
             cache: None,
             methods: None,
+            query_key: vec![],
         }
     }
 
@@ -423,6 +450,22 @@ mod tests {
         assert!(table.at("/admin/dashboard").is_some());
         assert!(table.at("/admin/settings").is_some());
         assert!(table.at("/other").is_none());
+    }
+
+    /// A route lists the query parameters that belong in its cache key, and
+    /// a route that lists none keeps none.
+    #[test]
+    fn a_route_lists_the_query_parameters_in_its_cache_key() {
+        let mut versioned = make_route("/x", "b");
+        versioned.query_key = vec!["v".to_string()];
+        let config = make_config(
+            vec![versioned, make_route("/", "b")],
+            vec![make_backend("b")],
+        );
+        let table = RouteTable::from_config(&config).unwrap();
+        assert_eq!(table.query_key("/x"), ["v".to_string()]);
+        assert!(table.query_key("/").is_empty());
+        assert!(table.query_key("/missing").is_empty());
     }
 
     fn conflict(paths: &[&str]) -> Option<String> {
@@ -517,6 +560,7 @@ mod tests {
             require: None,
             cache: None,
             methods: Some(methods.iter().map(|m| m.to_string()).collect()),
+            query_key: vec![],
         }
     }
 

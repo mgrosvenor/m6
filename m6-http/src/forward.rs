@@ -913,6 +913,10 @@ pub struct PendingUrlContext {
     /// `Cache-Control` on the reply before it is stored or sent. `None` leaves
     /// the backend's header alone.
     pub route_cache: Option<String>,
+    /// The query parameter names the matched route keeps in its cache key, so
+    /// the insert uses the same filtered query the lookup used. Empty keeps
+    /// none.
+    pub query_key: Vec<String>,
     /// Whether the response may enter the shared cache. False for
     /// `require`-protected routes (the cache key carries no identity, so a
     /// stored entry would later be served to anonymous callers) and for

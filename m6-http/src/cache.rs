@@ -599,6 +599,46 @@ pub fn make_lookup_key<'a>(
     buf.as_str()
 }
 
+/// Filter a request's query string down to the named parameters, in their
+/// original order and spelling, writing the result into `buf`. Returns the
+/// filtered query, or `None` when nothing remains.
+///
+/// A route that lists no parameters keeps none of the query, so a junk or UTM
+/// query cannot create a second entry for the same page. The filter splits the
+/// raw query on `&` and keeps only the pairs whose key is in `allowed`; it
+/// never re-encodes, so the surviving bytes are exactly the bytes the request
+/// sent. The buffer is reused across requests, so the hot path allocates
+/// nothing after the first use.
+pub fn filter_query<'a>(
+    query: Option<&str>,
+    allowed: &[String],
+    buf: &'a mut String,
+) -> Option<&'a str> {
+    let query = query?;
+    if query.is_empty() || allowed.is_empty() {
+        buf.clear();
+        return None;
+    }
+    buf.clear();
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let key = pair.split('=').next().unwrap_or(pair);
+        if allowed.iter().any(|a| a == key) {
+            if !buf.is_empty() {
+                buf.push('&');
+            }
+            buf.push_str(pair);
+        }
+    }
+    if buf.is_empty() {
+        None
+    } else {
+        Some(buf.as_str())
+    }
+}
+
 /// How far ahead of the advertised lifetime this cache refreshes an entry.
 ///
 /// An edge that expires at exactly `max-age` is always refreshing one step
@@ -2087,6 +2127,30 @@ mod tests {
         let k1 = CacheKey::new("/blog", None, "gzip");
         let k2 = CacheKey::new("/blog", None, "br");
         assert_ne!(k1, k2);
+    }
+
+    /// The query-key filter: a route that lists no parameters keeps none, so
+    /// junk and UTM queries collapse to one entry for the page, while a route
+    /// that lists `v` keeps each version as its own entry.
+    #[test]
+    fn query_key_keeps_one_entry_by_default_and_one_per_listed_parameter() {
+        let none: Vec<String> = vec![];
+        let mut buf = String::new();
+        let a = filter_query(Some("a=1"), &none, &mut buf);
+        let k1 = CacheKey::new("/", a, "");
+        let mut buf = String::new();
+        let b = filter_query(Some("b=2"), &none, &mut buf);
+        let k2 = CacheKey::new("/", b, "");
+        assert_eq!(k1, k2, "a junk or UTM query must not split the entry");
+
+        let versioned = ["v".to_string()];
+        let mut buf = String::new();
+        let v1 = filter_query(Some("v=1"), &versioned, &mut buf);
+        let k3 = CacheKey::new("/x", v1, "");
+        let mut buf = String::new();
+        let v2 = filter_query(Some("v=2"), &versioned, &mut buf);
+        let k4 = CacheKey::new("/x", v2, "");
+        assert_ne!(k3, k4, "each listed version is its own entry");
     }
 
     #[test]

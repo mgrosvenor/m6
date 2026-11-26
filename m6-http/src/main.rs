@@ -471,6 +471,9 @@ struct ServerState {
     /// Reused buffer a cache lookup builds its key into, so a lookup never
     /// allocates. Capacity 512 matches the old stack buffer's bound.
     lookup_key_buf: String,
+    /// Reused buffer a cache lookup filters its query into, so the query-key
+    /// filter allocates nothing after the first use.
+    query_key_buf: String,
     /// This node's `Via` entry for each protocol it can receive, formatted
     /// once at start. A forwarded request borrows one; building it per request
     /// cost two counted allocations per forwarded request, which the allocation
@@ -975,7 +978,15 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
 
     let cacheable =
         !state.route_table.requires_auth(path) && m6_http_lib::cache::method_may_read_cache(method);
-    let lookup_key = make_lookup_key(path, query, enc_str, &mut state.lookup_key_buf);
+    let filtered_query = match query {
+        Some(q) if !q.is_empty() => {
+            let allowed = state.route_table.query_key(path);
+            m6_http_lib::cache::filter_query(query, allowed, &mut state.query_key_buf)
+        }
+        _ => None,
+    };
+    let filtered_owned = filtered_query.map(str::to_string);
+    let lookup_key = make_lookup_key(path, filtered_query, enc_str, &mut state.lookup_key_buf);
     let req_cc = m6_http_lib::cache::RequestDirectives::parse(headers);
     let looked_up = if cacheable {
         state.cache.lookup_with(lookup_key, &req_cc)
@@ -995,7 +1006,7 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
     if let m6_http_lib::cache::Lookup::Stale(..) = looked_up {
         state.queue_refresh(Refresh {
             path: path.to_string(),
-            query: query.map(str::to_string),
+            query: filtered_owned,
             enc: enc_str.to_string(),
         });
     }
@@ -1801,6 +1812,7 @@ struct CheckPlan<'a> {
     content_backend: String,
     route_path: String,
     route_cache: Option<String>,
+    query_key: Vec<String>,
     cacheable: bool,
     is_prefetch: bool,
     from_internal: bool,
@@ -1880,6 +1892,7 @@ fn resolve_check(
         auth_gate: Some(plan.gate),
         from_internal: plan.from_internal,
         route_cache: plan.route_cache,
+        query_key: plan.query_key,
         cacheable: plan.cacheable,
         is_prefetch: plan.is_prefetch,
         start: m6_core::platform::now(),
@@ -2280,6 +2293,7 @@ fn handle_purge(
         auth_gate: None,
         from_internal,
         route_cache: None,
+        query_key: vec![],
         cacheable: false,
         is_prefetch: false,
         start: m6_core::platform::now(),
@@ -4203,8 +4217,16 @@ fn handle_h3_request(
     // Same method gate as the h1/h2 lookup sites above.
     let cacheable = !state.route_table.requires_auth(path_str)
         && m6_http_lib::cache::method_may_read_cache(method_str);
+    let filtered_query = match query_str {
+        Some(q) if !q.is_empty() => {
+            let allowed = state.route_table.query_key(path_str);
+            m6_http_lib::cache::filter_query(query_str, allowed, &mut state.query_key_buf)
+        }
+        _ => None,
+    };
+    let filtered_owned = filtered_query.map(str::to_string);
 
-    let lookup_key = make_lookup_key(path_str, query_str, enc_str, &mut state.lookup_key_buf);
+    let lookup_key = make_lookup_key(path_str, filtered_query, enc_str, &mut state.lookup_key_buf);
 
     let req_cc = m6_http_lib::cache::RequestDirectives::parse(&owned_headers_for_cc(&req.headers));
     let looked_up = if cacheable {
@@ -4275,7 +4297,7 @@ fn handle_h3_request(
     if let m6_http_lib::cache::Lookup::Stale(..) = looked_up {
         state.queue_refresh(Refresh {
             path: path_str.to_string(),
-            query: query_str.map(str::to_string),
+            query: filtered_owned,
             enc: enc_str.to_string(),
         });
     }
@@ -5396,6 +5418,7 @@ fn handle_request_inner(
                     content_backend: health::CONTROL_BACKEND.to_string(),
                     route_path: req.path.clone(),
                     route_cache: None,
+                    query_key: vec![],
                     cacheable: false,
                     is_prefetch: false,
                     from_internal,
@@ -5635,6 +5658,7 @@ fn handle_request_inner(
             content_backend: route.backend.clone(),
             route_path: route.path.clone(),
             route_cache: route.cache.clone(),
+            query_key: route.query_key.clone(),
             cacheable: false,
             is_prefetch,
             from_internal,
@@ -5749,6 +5773,7 @@ fn handle_request_inner(
             auth_gate: None,
             from_internal,
             route_cache: route.cache.clone(),
+            query_key: route.query_key.clone(),
             cacheable,
             is_prefetch,
             start: m6_core::platform::now(),
@@ -5855,6 +5880,7 @@ fn handle_request_inner(
         auth_gate: None,
         from_internal,
         route_cache: route.cache.clone(),
+        query_key: route.query_key.clone(),
         cacheable,
         is_prefetch,
         start: backend_start,
@@ -6044,6 +6070,7 @@ fn dispatch_custom_error_async(
             auth_gate: None,
             from_internal: false,
             route_cache: None,
+            query_key: vec![],
             cacheable: false,
             is_prefetch: false,
             start: m6_core::platform::now(),
@@ -6080,6 +6107,7 @@ fn dispatch_custom_error_async(
         auth_gate: None,
         from_internal: false,
         route_cache: None,
+        query_key: vec![],
         cacheable: false,
         is_prefetch: false,
         start: m6_core::platform::now(),
@@ -6548,7 +6576,12 @@ fn complete_socket_response(
             set_date(&mut http_resp.headers);
             apply_route_cache(&mut http_resp.headers, ctx.route_cache.as_deref());
             if should_store(ctx, http_resp.status, &http_resp.headers) {
-                let key = CacheKey::new(&req.path, req.query.as_deref(), content_encoding);
+                let filtered = m6_http_lib::cache::filter_query(
+                    req.query.as_deref(),
+                    &ctx.query_key,
+                    &mut state.query_key_buf,
+                );
+                let key = CacheKey::new(&req.path, filtered, content_encoding);
                 // On a node with a disk writer the insert sets the entry's
                 // queued flag in the same map write that stores it, so the
                 // request path copies no key and pushes nothing. Nothing is
@@ -6749,7 +6782,12 @@ fn finalize_url_response_inner(
             set_date(&mut http_resp.headers);
             apply_route_cache(&mut http_resp.headers, ctx.route_cache.as_deref());
             if should_store(ctx, http_resp.status, &http_resp.headers) {
-                let key = CacheKey::new(&req.path, req.query.as_deref(), enc);
+                let filtered = m6_http_lib::cache::filter_query(
+                    req.query.as_deref(),
+                    &ctx.query_key,
+                    &mut state.query_key_buf,
+                );
+                let key = CacheKey::new(&req.path, filtered, enc);
                 // The same store as the synchronous path: the flag rides
                 // the insert, and the disk write itself waits for the tick.
                 let response = CachedResponse {
@@ -6783,7 +6821,12 @@ fn finalize_url_response_inner(
         && !ctx.is_prefetch
         && matches!(state.registration, registration::Role::Cache(_))
     {
-        let key = CacheKey::new(&req.path, req.query.as_deref(), enc);
+        let filtered = m6_http_lib::cache::filter_query(
+            req.query.as_deref(),
+            &ctx.query_key,
+            &mut state.query_key_buf,
+        );
+        let key = CacheKey::new(&req.path, filtered, enc);
         if let Some((entry, age)) = state.cache.lookup_held(&key) {
             let mut headers = entry.headers.to_pairs();
             set_age(&mut headers, age);
@@ -8345,6 +8388,7 @@ fn run(args: Vec<String>) -> i32 {
         host,
         traffic: health::TrafficWindow::new(),
         lookup_key_buf: String::with_capacity(512),
+        query_key_buf: String::with_capacity(512),
         via,
         alt_svc_line,
         describedby_line,

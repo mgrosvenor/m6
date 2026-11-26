@@ -867,6 +867,12 @@ pub struct RouteConfig {
     /// Validated when the route table is built, so an unknown name stops the
     /// start with exit 2 rather than becoming a request-time 405.
     pub methods: Option<Vec<String>>,
+    /// The query parameter names that belong in this route's cache key, in
+    /// order of first appearance. Absent keeps none, so a junk or UTM query
+    /// cannot create a second entry for the same page. An asset route lists
+    /// `v`, so each asset version is its own entry.
+    #[serde(default)]
+    pub query_key: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -882,6 +888,9 @@ pub struct RouteGroupConfig {
     pub cache: Option<String>,
     /// See `RouteConfig::methods`.
     pub methods: Option<Vec<String>>,
+    /// See `RouteConfig::query_key`.
+    #[serde(default)]
+    pub query_key: Vec<String>,
 }
 
 /// A route's `cache` becomes a response header, so it must be a value a header
