@@ -19,13 +19,11 @@
 //! This file is that coverage. Every test names the RFC section it pins, and
 //! `tools/conformance.sh` fails the gate when one of them fails.
 //!
-//! **The lower-case defect (2026-11-15).** The generation-ID work began stamping
-//! every reply a source node serves with `M6-Genid`. The name was written
-//! title-cased, which is legal in HTTP/1.1 but not in HTTP/2 or HTTP/3: both
-//! require lower-case field names (RFC 9113 8.2.1, RFC 9114 4.2). A strict client
-//! (curl, and the `h2` crate used here) rejects the whole HEADERS frame as a
-//! protocol error, so it read zero body bytes where HTTP/1.1 read 2671. That is
-//! example 05's `expected 2671, got 0`, reproduced here without the examples.
+//! **The lower-case defect (2026-11-15).** The generation-ID work stamped every
+//! reply a source node serves with `M6-Genid`, written title-cased, which is
+//! legal in HTTP/1.1 but not in HTTP/2 or HTTP/3 (RFC 9113 8.2.1, RFC 9114
+//! 4.2). The header is gone now, but the lower-case rule stays and is checked
+//! against the response's own fields.
 //!
 //! The h2 client is deliberately the `h2` crate rather than m6's own client:
 //! m6's decoder is tolerant and would happily read the body, which is exactly why
@@ -146,10 +144,9 @@ impl Fixture {
             ),
         )
         .expect("write site.toml");
-        // No `[genid]` table on purpose. A node with no table is still the
-        // source (`Role::Source(Genid::new(0, ..))`), and it stamps every reply
-        // with the ID. That is what the examples' config does too, and it is why
-        // removing `[genid]` did not clear their failure.
+        // No `[registration]` table on purpose. A node with no table is still
+        // the source of the change counter, and it serves every reply without
+        // a generation header now.
         std::fs::write(
             d.join("system.toml"),
             format!(
@@ -907,8 +904,8 @@ fn rfc9113_8_2_1_h2_field_names_are_lower_case() {
         "HTTP/2 field names must be lower case (RFC 9113 8.2.1); got {upper:?} in {headers:?}"
     );
     assert!(
-        headers.iter().any(|(n, _)| n == "m6-genid"),
-        "the generation header must arrive as m6-genid, got {headers:?}"
+        headers.iter().any(|(n, _)| n == "content-type"),
+        "the response must carry a lower-case content-type, got {headers:?}"
     );
 }
 
@@ -932,8 +929,8 @@ fn rfc9114_4_2_h3_field_names_are_lower_case() {
         "HTTP/3 field names must be lower case (RFC 9114 4.2); got {upper:?} in {fields:?}"
     );
     assert!(
-        fields.iter().any(|(n, _)| n == "m6-genid"),
-        "the generation header must arrive as m6-genid, got {fields:?}"
+        fields.iter().any(|(n, _)| n == "content-type"),
+        "the response must carry a lower-case content-type, got {fields:?}"
     );
 }
 

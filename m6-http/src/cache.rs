@@ -24,9 +24,9 @@ use std::borrow::Borrow;
 /// with absolute `u32` offsets into the text. The slot area is fixed at
 /// construction (with spare slots for the headers a response gains on its way
 /// out), so appending a field only extends the text and bumps the count. A
-/// field whose name is `Set-Cookie` or `M6-Genid` is marked not-storable and is
-/// dropped when the block is stored, and that is the only per-field metadata,
-/// packed into the top bit of the name length.
+/// field whose name is `Set-Cookie` is marked not-storable and is dropped when
+/// the block is stored, and that is the only per-field metadata, packed into
+/// the top bit of the name length.
 ///
 /// The text buffer is built only from `&str`, so it is valid UTF-8 by
 /// construction. A field view is a `str` range, which checks two character
@@ -125,9 +125,9 @@ impl HeaderBlock {
 
     /// The storable subset, as a block.
     ///
-    /// A backend reply may carry `Set-Cookie` (one visitor's session) or a
-    /// stale `M6-Genid`; neither may be stored. When nothing is marked, this
-    /// is a refcount bump and allocates nothing, which is the ordinary case.
+    /// A backend reply may carry `Set-Cookie` (one visitor's session), which
+    /// must not be stored. When nothing is marked, this is a refcount bump and
+    /// allocates nothing, which is the ordinary case.
     pub fn storable(&self) -> HeaderBlock {
         let view = self.view();
         if view.iter(true).count() == view.count() {
@@ -293,15 +293,10 @@ impl HeaderBuilder {
 
     /// Append a field. The name is as sent; readers compare case-insensitively.
     ///
-    /// `Set-Cookie` and `M6-Genid` are marked not-storable here, once, so the
-    /// cache's strip step is a filter rather than a scan for magic names.
+    /// `Set-Cookie` is marked not-storable here, once, so the cache's strip
+    /// step is a filter rather than a scan for magic names.
     pub fn push(&mut self, name: &str, value: &str) {
-        self.push_marked(
-            name,
-            value,
-            !(name.eq_ignore_ascii_case("set-cookie")
-                || name.eq_ignore_ascii_case(crate::genid::GENID_HEADER)),
-        );
+        self.push_marked(name, value, !name.eq_ignore_ascii_case("set-cookie"));
     }
 
     fn push_marked(&mut self, name: &str, value: &str, stored: bool) {
@@ -471,9 +466,6 @@ pub struct CachedResponse {
     pub status: u16,
     pub headers: HeaderBlock,
     pub body: bytes::Bytes,
-    /// The source's site generation when the response was dispatched. Written
-    /// as `M6-Genid` on a hit, so a client can tell which generation it saw.
-    pub genid: u64,
 }
 // Conditional requests and preconditions live in `m6_core::conditional`.
 // They are version-independent semantics with two consumers, and the second
@@ -605,6 +597,46 @@ pub fn make_lookup_key<'a>(
     buf.push('\x01');
     buf.push_str(encoding);
     buf.as_str()
+}
+
+/// Filter a request's query string down to the named parameters, in their
+/// original order and spelling, writing the result into `buf`. Returns the
+/// filtered query, or `None` when nothing remains.
+///
+/// A route that lists no parameters keeps none of the query, so a junk or UTM
+/// query cannot create a second entry for the same page. The filter splits the
+/// raw query on `&` and keeps only the pairs whose key is in `allowed`; it
+/// never re-encodes, so the surviving bytes are exactly the bytes the request
+/// sent. The buffer is reused across requests, so the hot path allocates
+/// nothing after the first use.
+pub fn filter_query<'a>(
+    query: Option<&str>,
+    allowed: &[String],
+    buf: &'a mut String,
+) -> Option<&'a str> {
+    let query = query?;
+    if query.is_empty() || allowed.is_empty() {
+        buf.clear();
+        return None;
+    }
+    buf.clear();
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let key = pair.split('=').next().unwrap_or(pair);
+        if allowed.iter().any(|a| a == key) {
+            if !buf.is_empty() {
+                buf.push('&');
+            }
+            buf.push_str(pair);
+        }
+    }
+    if buf.is_empty() {
+        None
+    } else {
+        Some(buf.as_str())
+    }
 }
 
 /// How far ahead of the advertised lifetime this cache refreshes an entry.
@@ -977,18 +1009,18 @@ use std::sync::{Arc, RwLock};
 
 /// The two counters a cache keeps in step with its map.
 ///
-/// They share one allocation so a generation swap allocates the map and this,
-/// and nothing else. The queued count is what lets an idle tick skip the scan.
+/// They share one allocation, and the queued count is what lets an idle tick
+/// skip the scan.
 struct Counters {
     /// Total footprint of everything in `map`, maintained on insert and evict.
     bytes: std::sync::atomic::AtomicUsize,
     /// Entries whose `queued` flag is set, for the disk writer.
     queued: std::sync::atomic::AtomicUsize,
+    /// Entries the byte-bound eviction has dropped, cumulative since start.
+    evictions: std::sync::atomic::AtomicUsize,
 }
 
-/// Cache backed by `Arc<RwLock<HashMap>>`: a clone is cheap, and
-/// [`Cache::swap_generation`] publishes a whole new generation with one
-/// assignment.
+/// Cache backed by `Arc<RwLock<HashMap>>`: a clone is cheap.
 #[derive(Clone)]
 pub struct Cache {
     map: Arc<RwLock<CacheMap>>,
@@ -1020,6 +1052,7 @@ impl Cache {
             counters: Arc::new(Counters {
                 bytes: std::sync::atomic::AtomicUsize::new(0),
                 queued: std::sync::atomic::AtomicUsize::new(0),
+                evictions: std::sync::atomic::AtomicUsize::new(0),
             }),
             max_bytes,
             serve_held: false,
@@ -1042,6 +1075,30 @@ impl Cache {
         self.counters
             .bytes
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Entries the byte-bound eviction has dropped, cumulative since start.
+    pub fn evictions(&self) -> u64 {
+        self.counters
+            .evictions
+            .load(std::sync::atomic::Ordering::Relaxed) as u64
+    }
+
+    /// Expired entries still held in the map, current.
+    ///
+    /// This is a point-in-time figure the metrics tick asks for, never the
+    /// request path. It scans the map once rather than keep a timer: an entry
+    /// becomes expired by time passing alone, so the count cannot be
+    /// maintained incrementally without a background reaper, which the
+    /// architecture rules out.
+    pub fn expired(&self) -> u64 {
+        let Ok(map) = self.map.read() else {
+            return 0;
+        };
+        let now = m6_core::platform::now();
+        map.values()
+            .filter(|e| e.expires_at.is_some_and(|at| now >= at))
+            .count() as u64
     }
 
     /// A cache whose hasher is seeded deterministically. **Benchmarks only.**
@@ -1072,6 +1129,7 @@ impl Cache {
             counters: Arc::new(Counters {
                 bytes: std::sync::atomic::AtomicUsize::new(0),
                 queued: std::sync::atomic::AtomicUsize::new(0),
+                evictions: std::sync::atomic::AtomicUsize::new(0),
             }),
             max_bytes: DEFAULT_MAX_BYTES,
             serve_held: false,
@@ -1472,11 +1530,13 @@ impl Cache {
         }
     }
 
-    /// Drop least-recently-read entries until the cache is inside its bound.
+    /// Drop entries until the cache is inside its bound: expired entries
+    /// first, then the least recently read.
     ///
-    /// Called only from `insert`, and only when the bound is exceeded, so the
-    /// O(n) scan is off the read path entirely. It costs far less than the
-    /// origin round trip that produced the entry which tipped it over.
+    /// Called only from `insert`, and only when the bound is exceeded, so it
+    /// is off the read path entirely. The expired pass is one scan and the
+    /// least-recently-read pass is one sort of `(tick, footprint)` pairs, so
+    /// no key is cloned and no entry allocates.
     ///
     /// Least-recently-read rather than oldest-inserted on purpose: the flood
     /// this defends against writes entries and never reads them again, so read
@@ -1484,10 +1544,40 @@ impl Cache {
     /// the site's own.
     fn evict_until_under(&self, map: &mut CacheMap) {
         let target = self.max_bytes - self.max_bytes / 8; // drop to 87.5%
+        if self.bytes_held() <= target {
+            return;
+        }
+        let now = m6_core::platform::now();
+        let mut dropped = 0usize;
 
-        // One pass to collect `(last_read, footprint)`, sort by read order,
-        // and find the tick above which enough bytes survive. Then one
-        // `retain`.
+        // Expired entries first: one retain pass removes every entry past its
+        // freshness lifetime, which is the pass that used to be missing. An
+        // expired entry stayed in the map until an LRU sort happened to reach
+        // it, so expired entries now go before any fresh one.
+        if self.bytes_held() > target {
+            map.retain(|_, e| {
+                if self.bytes_held() <= target {
+                    return true;
+                }
+                if e.expires_at.is_some_and(|at| now >= at) {
+                    self.counters
+                        .bytes
+                        .fetch_sub(e.footprint, std::sync::atomic::Ordering::Relaxed);
+                    if e.queued {
+                        self.counters
+                            .queued
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    dropped += 1;
+                    return false;
+                }
+                true
+            });
+        }
+
+        // Then the least recently read. One pass to collect `(last_read,
+        // footprint)`, sort by read order, and find the tick above which
+        // enough bytes survive. Then one `retain`.
         //
         // The obvious version collects `(tick, key.clone())` and sorts that,
         // which clones every key in the map -- and a `CacheKey` is a
@@ -1534,6 +1624,7 @@ impl Cache {
             }
             keep
         });
+        dropped += before - map.len();
         if dropped_queued > 0 {
             self.counters
                 .queued
@@ -1547,64 +1638,75 @@ impl Cache {
         self.counters
             .bytes
             .store(now_held, std::sync::atomic::Ordering::Relaxed);
+        if dropped > 0 {
+            self.counters
+                .evictions
+                .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+        }
         m6_core::log::info!(
-            dropped = before - map.len(),
+            dropped,
             bytes_held = now_held,
             max_bytes = self.max_bytes,
             "cache: evicted to stay inside the byte bound"
         );
     }
 
-    /// Evict a specific path — every query and encoding variant of it.
+    /// Evict a specific path — every query and encoding variant of it — and
+    /// return whether anything was removed.
     ///
     /// Keys are `path\x01query\x01encoding`, so the `path\x01` prefix matches
-    /// all variants of that path and nothing else.
-    pub fn evict_path(&self, path: &str) {
-        if let Ok(mut map) = self.map.write() {
-            let path_stripped = &path[..path.find('?').unwrap_or(path.len())];
-            // Collect keys whose inner str starts with `path_stripped\x01`.
-            let prefix = {
-                let mut p = String::with_capacity(path_stripped.len() + 1);
-                p.push_str(path_stripped);
-                p.push('\x01');
-                p
-            };
-            let keys: Vec<CacheKey> = map
-                .keys()
-                .filter(|k| {
-                    let s: &str = (*k).borrow();
-                    s.starts_with(prefix.as_str())
-                })
-                .cloned()
-                .collect();
-            for k in &keys {
+    /// all variants of that path and nothing else. The one scan doubles as
+    /// the residency answer, so a purge needs no second pass.
+    pub fn evict_path(&self, path: &str) -> bool {
+        let Ok(mut map) = self.map.write() else {
+            return false;
+        };
+        let path_stripped = &path[..path.find('?').unwrap_or(path.len())];
+        // Collect keys whose inner str starts with `path_stripped\x01`.
+        let prefix = {
+            let mut p = String::with_capacity(path_stripped.len() + 1);
+            p.push_str(path_stripped);
+            p.push('\x01');
+            p
+        };
+        let keys: Vec<CacheKey> = map
+            .keys()
+            .filter(|k| {
                 let s: &str = (*k).borrow();
-                // Log the key's three parts for debugging.
-                let mut parts = s.split('\x01');
-                if let (Some(kpath), Some(query), Some(enc)) =
-                    (parts.next(), parts.next(), parts.next())
-                {
-                    m6_core::log::debug!(
-                        path = %kpath, query = %query, encoding = %enc,
-                        "cache: evicted"
-                    );
-                }
-                if let Some(e) = map.remove(k) {
-                    // Every removal path must return the bytes, or the counter
-                    // drifts up while the map shrinks and the cache evicts on
-                    // every insert forever. Deploys call this on every
-                    // invalidation, so the drift would be relentless.
+                s.starts_with(prefix.as_str())
+            })
+            .cloned()
+            .collect();
+        let mut removed_any = false;
+        for k in &keys {
+            let s: &str = (*k).borrow();
+            // Log the key's three parts for debugging.
+            let mut parts = s.split('\x01');
+            if let (Some(kpath), Some(query), Some(enc)) =
+                (parts.next(), parts.next(), parts.next())
+            {
+                m6_core::log::debug!(
+                    path = %kpath, query = %query, encoding = %enc,
+                    "cache: evicted"
+                );
+            }
+            if let Some(e) = map.remove(k) {
+                removed_any = true;
+                // Every removal path must return the bytes, or the counter
+                // drifts up while the map shrinks and the cache evicts on
+                // every insert forever. Deploys call this on every
+                // invalidation, so the drift would be relentless.
+                self.counters
+                    .bytes
+                    .fetch_sub(e.footprint, std::sync::atomic::Ordering::Relaxed);
+                if e.queued {
                     self.counters
-                        .bytes
-                        .fetch_sub(e.footprint, std::sync::atomic::Ordering::Relaxed);
-                    if e.queued {
-                        self.counters
-                            .queued
-                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    }
+                        .queued
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
+        removed_any
     }
 
     /// Evict all entries for a list of paths.
@@ -1625,36 +1727,6 @@ impl Cache {
                 .queued
                 .store(0, std::sync::atomic::Ordering::Relaxed);
         }
-    }
-
-    /// Replace the live generation with an empty cache in one assignment.
-    ///
-    /// The rule for a site generation change is a full flush (`DESIGN-genid`
-    /// point 8): no entry survives into the new generation, and the cache
-    /// refills on demand. This method is that whole rule. It builds the
-    /// replacement beside the live cache and publishes it with
-    /// `std::mem::replace`, which is read-copy-update's answer in one process
-    /// and the same publish rule a `Site` reload uses.
-    ///
-    /// Atomicity follows from ownership. `&mut self` means the loop cannot be
-    /// reading the cache while the swap runs, and one assignment means it
-    /// sees either the old generation or the new one, never a map that is
-    /// partly emptied. A request that already took an entry holds the
-    /// `CachedResponse` clone the hit path makes, so it finishes on the
-    /// content it holds. A holder of the old `Cache` (a clone) keeps that
-    /// generation whole, and it is freed when the last holder drops.
-    ///
-    /// `max_bytes` carries over, so a swap cannot change the bound. The
-    /// held-serving flag starts clear: the swap happens when the upstream has
-    /// answered with a new ID, which is the moment held content stops being
-    /// served.
-    ///
-    /// The old cache is returned so a caller that must keep an in-flight
-    /// reader's generation can, and so the drop is visible at the call site.
-    #[must_use = "the old generation is dropped at once unless the caller keeps it"]
-    pub fn swap_generation(&mut self) -> Cache {
-        let fresh = Cache::with_max_bytes(self.max_bytes);
-        std::mem::replace(self, fresh)
     }
 
     /// Sum of the footprints actually in the map.
@@ -1704,7 +1776,7 @@ fn entry_footprint(key: &CacheKey, response: &CachedResponse) -> usize {
 /// Determine whether a response should be cached.
 /// Returns true if Cache-Control: public and status is 2xx.
 pub fn should_cache(status: u16, headers: &(impl HeaderSource + ?Sized)) -> bool {
-    if !status_is_storable(status) {
+    if !status_is_storable(status, headers) {
         return false;
     }
 
@@ -1748,7 +1820,7 @@ pub fn should_cache(status: u16, headers: &(impl HeaderSource + ?Sized)) -> bool
 ///
 /// Split out from the status range so the reason is stated where the decision
 /// is made, rather than being implicit in an inequality.
-fn status_is_storable(status: u16) -> bool {
+fn status_is_storable(status: u16, headers: &(impl HeaderSource + ?Sized)) -> bool {
     // RFC 9111 3: the statuses a cache may store by default. Only 2xx was
     // accepted before, which made every 404, 301 and 410 permanently
     // uncacheable no matter what its headers said.
@@ -1762,13 +1834,32 @@ fn status_is_storable(status: u16) -> bool {
     // with the Range request that produced it, and the cache key carries no
     // Range component, so a stored 206 would be replayed to a client that
     // asked for the whole thing.
+    if status == 206 {
+        return false;
+    }
+    // RFC 9111 3 plus explicit freshness. A status outside the default list is
+    // still storable when the response declares its own lifetime with
+    // `max-age`, `s-maxage` or `Expires`. A 302 carrying `s-maxage` is the
+    // short-redirect case this enables: without the arm it could never be
+    // cached and every expansion paid the backend round trip.
     //
     // Storability is necessary, not sufficient -- `should_cache` still
     // applies Vary, no-store, private and the rest on top of this.
     matches!(
         status,
         200 | 203 | 204 | 300 | 301 | 308 | 404 | 405 | 410 | 414 | 501
-    )
+    ) || has_explicit_freshness(headers)
+}
+
+/// Whether a response declares its own freshness lifetime, which makes a
+/// status outside the RFC 9111 3 default list storable.
+///
+/// `max-age` and `s-maxage` come from `Cache-Control`; `Expires` is the older
+/// header with the same meaning. `no-cache` is not freshness: it forbids reuse
+/// without revalidation, so it does not make a 302 storable.
+fn has_explicit_freshness(headers: &(impl HeaderSource + ?Sized)) -> bool {
+    let cc = CacheControl::parse(headers);
+    cc.max_age.is_some() || cc.s_maxage.is_some() || expires_lifetime(headers).is_some()
 }
 
 /// Whether the REQUEST permits this response to be stored.
@@ -1910,19 +2001,11 @@ pub fn strip_set_cookie(headers: &[(String, String)]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Headers safe to store in a cache entry, with `Set-Cookie` and `M6-Genid`
-/// removed.
-///
-/// The entry carries its generation in `CachedResponse.genid`, and a hit
-/// writes it once. Keeping the upstream's copy as well would send the header
-/// twice on a cache node, where the upstream is another m6-http and stamps
-/// every reply.
+/// Headers safe to store in a cache entry, with `Set-Cookie` removed.
 pub fn strip_uncacheable(headers: &[(String, String)]) -> HeaderBlock {
     let mut b = HeaderBuilder::with_capacity(headers.len(), 0);
     for (k, v) in headers {
-        if k.eq_ignore_ascii_case("set-cookie")
-            || k.eq_ignore_ascii_case(crate::genid::GENID_HEADER)
-        {
+        if k.eq_ignore_ascii_case("set-cookie") {
             continue;
         }
         b.push(k, v);
@@ -2046,6 +2129,30 @@ mod tests {
         assert_ne!(k1, k2);
     }
 
+    /// The query-key filter: a route that lists no parameters keeps none, so
+    /// junk and UTM queries collapse to one entry for the page, while a route
+    /// that lists `v` keeps each version as its own entry.
+    #[test]
+    fn query_key_keeps_one_entry_by_default_and_one_per_listed_parameter() {
+        let none: Vec<String> = vec![];
+        let mut buf = String::new();
+        let a = filter_query(Some("a=1"), &none, &mut buf);
+        let k1 = CacheKey::new("/", a, "");
+        let mut buf = String::new();
+        let b = filter_query(Some("b=2"), &none, &mut buf);
+        let k2 = CacheKey::new("/", b, "");
+        assert_eq!(k1, k2, "a junk or UTM query must not split the entry");
+
+        let versioned = ["v".to_string()];
+        let mut buf = String::new();
+        let v1 = filter_query(Some("v=1"), &versioned, &mut buf);
+        let k3 = CacheKey::new("/x", v1, "");
+        let mut buf = String::new();
+        let v2 = filter_query(Some("v=2"), &versioned, &mut buf);
+        let k4 = CacheKey::new("/x", v2, "");
+        assert_ne!(k3, k4, "each listed version is its own entry");
+    }
+
     #[test]
     fn a_tape_survives_growing_past_its_reservation() {
         let pairs: Vec<(String, String)> = (0..40)
@@ -2074,7 +2181,6 @@ mod tests {
         let cache = Cache::new();
         let key = CacheKey::new("/hello", None, "");
         let resp = CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::empty(),
             body: bytes::Bytes::from_static(b"world"),
@@ -2101,7 +2207,6 @@ mod tests {
             vec![("cache-control".to_string(), cc.to_string())]
         };
         CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::from_pairs(headers),
             body: bytes::Bytes::from_static(b"world"),
@@ -2239,20 +2344,22 @@ mod tests {
         assert!(age >= std::time::Duration::ZERO);
     }
 
-    /// A cache node's upstream is another m6-http and stamps every reply, so
-    /// the stored copy must not carry the header: the entry's own `genid` is
-    /// the one the hit writer emits.
+    /// `Set-Cookie` is the one header a shared cache must never store. Every
+    /// other header is kept.
     #[test]
-    fn stored_headers_keep_neither_set_cookie_nor_the_generation() {
+    fn stored_headers_keep_everything_but_set_cookie() {
         let headers = vec![
             ("Content-Type".to_string(), "text/html".to_string()),
             ("Set-Cookie".to_string(), "_m6sid=abc".to_string()),
-            ("M6-Genid".to_string(), "7".to_string()),
+            ("Cache-Control".to_string(), "max-age=3600".to_string()),
         ];
         let stripped = strip_uncacheable(&headers);
         assert_eq!(
             stripped.to_pairs(),
-            vec![("Content-Type".to_string(), "text/html".to_string())]
+            vec![
+                ("Content-Type".to_string(), "text/html".to_string()),
+                ("Cache-Control".to_string(), "max-age=3600".to_string())
+            ]
         );
     }
 
@@ -2346,7 +2453,6 @@ mod tests {
         let k2 = CacheKey::new("/page", None, "br");
         let k3 = CacheKey::new("/other", None, "");
         let resp = CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::empty(),
             body: bytes::Bytes::new(),
@@ -2377,7 +2483,6 @@ mod tests {
         // key stored with no query
         let k = CacheKey::new("/page", None, "");
         let resp = CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::empty(),
             body: bytes::Bytes::new(),
@@ -2397,7 +2502,6 @@ mod tests {
         let cache = Cache::new();
         let key = CacheKey::new("/blog/hello", None, "");
         let resp = CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::from_pairs(vec![(
                 "cache-control".to_string(),
@@ -2439,7 +2543,6 @@ mod tests {
             headers.push(("content-encoding".to_string(), enc.to_string()));
         }
         CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::from_pairs(headers),
             body: bytes::Bytes::from_static(body),
@@ -2577,7 +2680,6 @@ mod tests {
     fn test_evict_path_removes_all_query_variants() {
         let cache = Cache::new();
         let resp = CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::empty(),
             body: bytes::Bytes::new(),
@@ -2703,7 +2805,6 @@ mod method_gate_tests {
         cache.insert(
             CacheKey::new("/page", None, "br"),
             CachedResponse {
-                genid: 0,
                 status: 200,
                 headers: HeaderBlock::empty(),
                 body: bytes::Bytes::from_static(b"full GET body"),
@@ -2932,7 +3033,6 @@ mod age_tests {
 
     fn resp(headers: &[(&str, &str)]) -> CachedResponse {
         CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::from_pairs(
                 headers
@@ -3028,7 +3128,6 @@ mod heuristic_freshness_tests {
 
     fn resp(cc: &str) -> CachedResponse {
         CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::from_pairs(vec![("cache-control".into(), cc.into())]),
             body: bytes::Bytes::from_static(b"x"),
@@ -3096,7 +3195,6 @@ mod expires_tests {
         c.insert(
             CacheKey::new("/e", None, ""),
             CachedResponse {
-                genid: 0,
                 status: 200,
                 headers: HeaderBlock::from_pairs(headers),
                 body: bytes::Bytes::from_static(b"x"),
@@ -3351,7 +3449,6 @@ mod request_directive_tests {
         let cache = Cache::new();
         let key = CacheKey::new("/p", None, "");
         let resp = CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::from_pairs(vec![("cache-control".into(), cc.into())]),
             body: bytes::Bytes::from_static(b"body"),
@@ -3411,7 +3508,6 @@ mod corrected_age_tests {
 
     fn resp_with(headers: &[(&str, &str)]) -> CachedResponse {
         CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::from_pairs(
                 headers
@@ -3519,13 +3615,17 @@ mod corrected_age_tests {
 mod storable_status_tests {
     use super::*;
 
+    fn empty() -> Vec<(String, String)> {
+        Vec::new()
+    }
+
     /// RFC 9111 3, in full. The list is short and fixed, so it is worth
     /// asserting exactly rather than by range.
     #[test]
     fn the_rfc_9111_set_is_storable() {
         for s in [200, 203, 204, 300, 301, 308, 404, 405, 410, 414, 501] {
             assert!(
-                status_is_storable(s),
+                status_is_storable(s, &empty()),
                 "{s} is heuristically cacheable per RFC 9111 3"
             );
         }
@@ -3535,7 +3635,7 @@ mod storable_status_tests {
     /// node every one was a round trip to the origin.
     #[test]
     fn a_404_is_now_storable() {
-        assert!(status_is_storable(404));
+        assert!(status_is_storable(404, &empty()));
     }
 
     /// 206 stays excluded. The cache key is (path, query, encoding) with no
@@ -3543,7 +3643,10 @@ mod storable_status_tests {
     /// client that asked for the whole resource.
     #[test]
     fn partial_content_is_never_storable() {
-        assert!(!status_is_storable(206));
+        assert!(!status_is_storable(206, &empty()));
+        // Not even explicit freshness can admit a partial representation.
+        let cc = vec![("Cache-Control".to_string(), "max-age=60".to_string())];
+        assert!(!status_is_storable(206, &cc));
     }
 
     /// Statuses outside the list must not creep in via a range check. 201 and
@@ -3552,8 +3655,33 @@ mod storable_status_tests {
     #[test]
     fn everything_else_is_refused() {
         for s in [201, 202, 205, 302, 303, 307, 400, 401, 403, 500, 502, 503] {
-            assert!(!status_is_storable(s), "{s} must not be storable");
+            assert!(!status_is_storable(s, &empty()), "{s} must not be storable");
         }
+    }
+
+    /// A 302 is storable only when the response declares its own lifetime.
+    /// Without freshness it is refused, so a redirect nobody gave a lifetime to
+    /// is never held forever.
+    #[test]
+    fn a_302_is_storable_with_explicit_freshness_only() {
+        assert!(!status_is_storable(302, &empty()));
+        for cc in [
+            "public, s-maxage=7776000",
+            "public, max-age=60",
+            "s-maxage=7776000, stale-while-revalidate=86400",
+        ] {
+            let headers = vec![("Cache-Control".to_string(), cc.to_string())];
+            assert!(status_is_storable(302, &headers), "{cc} must store a 302");
+        }
+        // `Expires` is the older explicit freshness spelling.
+        let headers = vec![(
+            "Expires".to_string(),
+            "Sun, 15 Nov 2026 00:00:00 GMT".to_string(),
+        )];
+        assert!(status_is_storable(302, &headers));
+        // `no-cache` is not a freshness lifetime and must not admit a 302.
+        let headers = vec![("Cache-Control".to_string(), "no-cache".to_string())];
+        assert!(!status_is_storable(302, &headers));
     }
 
     /// Storable is necessary, not sufficient: no-store still wins.
@@ -3573,7 +3701,6 @@ mod capacity_tests {
 
     fn resp(body_len: usize) -> CachedResponse {
         CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::from_pairs(vec![(
                 "cache-control".to_string(),
@@ -3669,7 +3796,6 @@ mod capacity_accounting_tests {
 
     fn resp(n: usize) -> CachedResponse {
         CachedResponse {
-            genid: 0,
             status: 200,
             headers: HeaderBlock::from_pairs(vec![(
                 "cache-control".to_string(),
@@ -3760,140 +3886,140 @@ mod capacity_accounting_tests {
     }
 }
 
-/// The generation swap: the rule, the atomic publish, and what an in-flight
-/// request keeps.
 #[cfg(test)]
-mod generation_swap_tests {
+mod eviction_policy_tests {
     use super::*;
 
-    fn resp(genid: u64, body: &[u8]) -> CachedResponse {
+    fn resp(cc: &str, body: usize) -> CachedResponse {
         CachedResponse {
-            genid,
+            status: 200,
+            headers: HeaderBlock::from_pairs(vec![("cache-control".to_string(), cc.to_string())]),
+            body: bytes::Bytes::from(vec![0u8; body]),
+        }
+    }
+
+    /// Whether the map holds `path` at any age, without evaluating freshness.
+    fn holds(cache: &Cache, path: &str) -> bool {
+        let mut buf = String::with_capacity(512);
+        let k = make_lookup_key(path, None, "", &mut buf);
+        cache.get_any(k).is_some()
+    }
+
+    /// The eviction policy, end to end: expired entries go first, and fresh
+    /// entries then go least-recently-read. The eviction counter records
+    /// exactly the entries the bound dropped.
+    ///
+    /// Break: evict by insertion order only, and the expired entries survive
+    /// while the read entry goes; or forget the expired-first pass, and the
+    /// read entry is evicted before an expired one.
+    #[test]
+    fn expired_entries_go_first_then_least_recently_read() {
+        let cache = Cache::with_max_bytes(100_000);
+        cache.insert(
+            CacheKey::new("/expired-a", None, ""),
+            resp("public, max-age=0", 10_000),
+        );
+        cache.insert(
+            CacheKey::new("/expired-b", None, ""),
+            resp("public, max-age=0", 10_000),
+        );
+        cache.insert(
+            CacheKey::new("/hot", None, ""),
+            resp("public, max-age=86400", 10_000),
+        );
+        cache.insert(
+            CacheKey::new("/cold", None, ""),
+            resp("public, max-age=86400", 10_000),
+        );
+        // Read the cold entry once, then the hot one: the cold entry is the
+        // least recently read of the two fresh entries.
+        assert!(holds(&cache, "/cold"));
+        for _ in 0..8 {
+            let mut buf = String::with_capacity(512);
+            let k = make_lookup_key("/hot", None, "", &mut buf);
+            assert!(!matches!(cache.lookup(k), Lookup::Miss));
+        }
+
+        // One insert tips the cache over its bound.
+        cache.insert(
+            CacheKey::new("/big", None, ""),
+            resp("public, max-age=86400", 70_000),
+        );
+
+        assert!(!holds(&cache, "/expired-a"), "expired entries go first");
+        assert!(!holds(&cache, "/expired-b"), "expired entries go first");
+        assert!(holds(&cache, "/hot"), "the read entry survives");
+        assert!(
+            !holds(&cache, "/cold"),
+            "the least-recently-read fresh entry is the LRU victim"
+        );
+        assert!(holds(&cache, "/big"), "the newest entry survives");
+        assert!(cache.bytes_held() <= 100_000);
+        assert_eq!(
+            cache.evictions(),
+            3,
+            "two expired plus one LRU entry were evicted"
+        );
+    }
+
+    /// An expired entry still in the map is reported, and a fresh entry is not.
+    /// The count is current, not cumulative, so it falls when the expired
+    /// entries are evicted or purged.
+    #[test]
+    fn expired_reports_only_entries_past_their_lifetime() {
+        let cache = Cache::new();
+        cache.insert(
+            CacheKey::new("/expired", None, ""),
+            resp("public, max-age=0", 10),
+        );
+        cache.insert(
+            CacheKey::new("/fresh", None, ""),
+            resp("public, max-age=86400", 10),
+        );
+        assert_eq!(cache.expired(), 1);
+
+        cache.evict_path("/expired");
+        assert_eq!(cache.expired(), 0);
+    }
+
+    /// Eviction is the only path that counts an eviction. A purge and a clear
+    /// are operator actions, not the cache running out of room, so they do not
+    /// raise the counter that m6-monitor faults on.
+    #[test]
+    fn purges_and_clears_do_not_count_as_evictions() {
+        let cache = Cache::with_max_bytes(64 * 1024);
+        cache.insert(
+            CacheKey::new("/held", None, ""),
+            resp("public, max-age=86400", 8_000),
+        );
+        cache.insert(
+            CacheKey::new("/gone", None, ""),
+            resp("public, max-age=86400", 8_000),
+        );
+        cache.evict_path("/gone");
+        assert_eq!(cache.evictions(), 0, "a purge is not an eviction");
+
+        cache.clear();
+        assert_eq!(cache.evictions(), 0, "a clear is not an eviction");
+    }
+
+    /// The byte accounting formula: body, headers, key and the fixed per-entry
+    /// overhead, so the bound counts total memory rather than bodies alone.
+    #[test]
+    fn footprint_counts_body_headers_key_and_fixed_overhead() {
+        let key = CacheKey::new("/abc/def", Some("q=1"), "gzip");
+        let response = CachedResponse {
             status: 200,
             headers: HeaderBlock::from_pairs(vec![(
-                "cache-control".to_string(),
-                "public, max-age=86400".to_string(),
+                "content-type".to_string(),
+                "text/html; charset=utf-8".to_string(),
             )]),
-            body: bytes::Bytes::copy_from_slice(body),
-        }
-    }
-
-    /// The plan's rule is a full flush, so the new generation holds nothing
-    /// and its accounting starts at zero.
-    ///
-    /// Break: make `swap_generation` a no-op, and every entry is still there.
-    #[test]
-    fn a_generation_swap_keeps_no_entry() {
-        let mut cache = Cache::with_max_bytes(1024 * 1024);
-        for i in 0..8 {
-            cache.insert(
-                CacheKey::new(&format!("/p{i}"), None, "gzip"),
-                resp(5, b"the old generation"),
-            );
-        }
-        let held_before = cache.bytes_held();
-        assert!(held_before > 0);
-
-        let old = cache.swap_generation();
-
-        assert_eq!(cache.len(), 0, "the new generation holds no entry");
-        assert_eq!(cache.bytes_held(), 0, "the new generation starts at zero");
-        assert_eq!(cache.footprint_sum(), 0);
-        assert_eq!(old.len(), 8, "the previous generation is returned whole");
-        assert_eq!(
-            old.bytes_held(),
-            held_before,
-            "the previous generation keeps its own accounting"
-        );
-        for i in 0..8 {
-            let key = CacheKey::new(&format!("/p{i}"), None, "gzip");
-            assert!(
-                matches!(cache.lookup(&key), Lookup::Miss),
-                "entry {i} survived the swap"
-            );
-            assert!(
-                old.get(&key).is_some(),
-                "the returned generation lost entry {i}"
-            );
-        }
-    }
-
-    /// A request in flight holds the response clone its lookup took, so it
-    /// finishes on the generation it started with. A holder of the old
-    /// `Cache` keeps that generation whole until it drops.
-    ///
-    /// Break: implement the swap as `self.clear()`. The live cache is empty
-    /// either way, but the old generation is then emptied under its holders,
-    /// and the assertions on `in_flight` and `old` fail.
-    #[test]
-    fn a_request_holding_the_old_generation_finishes_on_it() {
-        let mut cache = Cache::with_max_bytes(1024 * 1024);
-        let key = CacheKey::new("/held", None, "gzip");
-        cache.insert(key.clone(), resp(41, b"the old generation"));
-
-        // What a request in flight holds: the response clone from its lookup,
-        // and a clone of the cache it began on.
-        let held = cache.get(&key).expect("the entry is fresh");
-        let in_flight = cache.clone();
-
-        let old = cache.swap_generation();
-
-        assert!(
-            matches!(cache.lookup(&key), Lookup::Miss),
-            "the live cache serves the new generation only"
-        );
-        assert_eq!(held.genid, 41, "the held response keeps its generation");
-        assert_eq!(
-            &held.body[..],
-            b"the old generation",
-            "the held response keeps its body"
-        );
-        let still = in_flight
-            .get(&key)
-            .expect("an in-flight holder keeps the generation it began on");
-        assert_eq!(still.genid, 41);
-        assert_eq!(old.get(&key).map(|r| r.genid), Some(41));
-    }
-
-    /// The new generation keeps the old generation's bound, so a swap cannot
-    /// quietly raise a small cache to the default 128 MiB.
-    ///
-    /// Break: build the fresh cache with `Cache::new()`, and the 100 KB entry
-    /// stays in a 64 KB cache.
-    #[test]
-    fn a_swapped_cache_keeps_its_bound() {
-        let mut cache = Cache::with_max_bytes(64 * 1024);
-        cache.insert(CacheKey::new("/before", None, "gzip"), resp(5, b"x"));
-        let _old = cache.swap_generation();
-
-        cache.insert(
-            CacheKey::new("/big", None, "gzip"),
-            resp(6, &vec![0u8; 100 * 1024]),
-        );
-
-        assert!(
-            cache.bytes_held() <= 64 * 1024,
-            "the swapped cache ignored its bound: {} bytes held",
-            cache.bytes_held()
-        );
-        assert_eq!(cache.len(), 0, "the over-bound entry was evicted");
-    }
-
-    /// A swap is the moment held content stops being served, so the fresh
-    /// generation does not inherit the old one's serve-held policy.
-    ///
-    /// Break: copy `serve_held` into the fresh cache, and this fails.
-    #[test]
-    fn a_swapped_cache_does_not_serve_held() {
-        let mut cache = Cache::new();
-        cache.set_serve_held(true);
-        assert!(cache.serve_held());
-
-        let _old = cache.swap_generation();
-
-        assert!(
-            !cache.serve_held(),
-            "the new generation must not serve the old one's held content"
-        );
+            body: bytes::Bytes::from(vec![0u8; 1234]),
+        };
+        let expected = key.0.len()
+            + response.body.len()
+            + response.headers.footprint()
+            + std::mem::size_of::<CacheEntry>();
+        assert_eq!(entry_footprint(&key, &response), expected);
     }
 }

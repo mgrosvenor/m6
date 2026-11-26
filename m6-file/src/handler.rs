@@ -459,7 +459,7 @@ static MINIFY_CACHE_LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new
 
 /// Set the byte limit the minified-body cache follows. Start only.
 ///
-/// The caller passes the smaller of `[limits.cache_bytes]` max and
+/// The caller passes the smaller of `[limits.cache_bytes]` start and
 /// `[limits.heap_reserve]` start, so the cache is inside the reservation this
 /// service takes from the OS.
 pub fn set_minify_cache_limit(max_bytes: usize) {

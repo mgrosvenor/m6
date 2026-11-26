@@ -11,13 +11,14 @@ tls_key  = "@M6_DEV_HOME@/dev/dev-key.pem"
 h2c_bind = "127.0.0.1:9000"
 internal_binds = ["127.0.0.1:9000"]
 internal_peers = ["127.0.0.1"]
+registration_bind = "127.0.0.1:9003"
 
 [auth]
 backend = "m6-auth-check"
 
-[genid]
-read_require  = "role:genid-read"
-write_require = "role:genid-write"
+[registration]
+read_require  = "role:purge-read"
+write_require = "role:purge-write"
 
 [node]
 name = "origin"

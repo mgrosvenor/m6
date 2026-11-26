@@ -44,7 +44,30 @@ ROOT="$(cd "$HERE/.." && pwd)"
 # Per-account. A bare /tmp/m6-perfcheck is one directory shared by every
 # account, and a root-owned one is unwritable to the account that runs the gate
 # on a hardened build host.
-WORK="${PERFCHECK_WORK:-/tmp/m6-perfcheck-$(id -un)}"
+#
+# The check compiles perf_client into this directory and runs it, so it must be
+# on a mount that allows exec. A hardened host mounts /tmp noexec, and every
+# client there exits 126, so the first candidate a small script can run from is
+# used: /tmp, then /var/tmp, then the account's cache directory. This is the
+# rule m6_core::platform::scratch_dir applies.
+exec_dir() {
+  local base dir probe
+  for base in /tmp /var/tmp "${XDG_CACHE_HOME:-$HOME/.cache}"; do
+    dir="$base/m6-perfcheck-$(id -un)"
+    mkdir -p "$dir" 2>/dev/null || continue
+    probe="$dir/.exec-probe-$$"
+    if printf '#!/bin/sh\nexit 0\n' > "$probe" 2>/dev/null &&
+       chmod 700 "$probe" 2>/dev/null && "$probe" 2>/dev/null; then
+      rm -f "$probe"
+      echo "$dir"
+      return 0
+    fi
+    rm -f "$probe"
+  done
+  return 1
+}
+WORK="${PERFCHECK_WORK:-$(exec_dir)}" ||
+  { echo "perfcheck: no work directory allows exec; set PERFCHECK_WORK" >&2; exit 2; }
 
 # The examples directory of this repository holds the committed bytes both arms
 # render. PERFCHECK_EXAMPLES overrides its location.

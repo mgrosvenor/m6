@@ -16,7 +16,6 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use bench::JobStore;
-use genid_publisher::Publisher;
 use m6_core::client::Upstream;
 use m6_core::platform::process::raise_fd_limit;
 use m6_core::platform::ChildExit;
@@ -25,6 +24,7 @@ use m6_core::signal::{Action, Lifecycle};
 use m6_core::site::finish_reload;
 use m6_core::{genid_failed, genid_ok};
 use ops::ServiceConfig;
+use purge_publisher::Publisher;
 use render_admin::{bench, logs, ops, perf, system};
 use serde_json::{json, Value};
 
@@ -794,12 +794,15 @@ fn client_turn(
                         Ok(Answer::Now(response)) => site.finish(&req, response),
                         Ok(Answer::AfterPublish(response)) => {
                             let response = site.finish(&req, response);
-                            match state.publisher.start(&mut conn.up, now) {
-                                Ok(()) => {
-                                    conn.held = Some(response);
-                                    return Ok(Step::StartOutgoing);
-                                }
-                                Err(e) => not_published(&e.to_string()),
+                            match state.publisher.reload_backend() {
+                                Ok(()) => match state.publisher.start(&mut conn.up, now) {
+                                    Ok(()) => {
+                                        conn.held = Some(response);
+                                        return Ok(Step::StartOutgoing);
+                                    }
+                                    Err(e) => not_published(&e.to_string()),
+                                },
+                                Err(cause) => not_published(&cause),
                             }
                         }
                         Err(e) => site.finish(&req, m6_core::response::error_to_response(&e)),
@@ -875,7 +878,7 @@ fn publish_event(
                 .held
                 .take()
                 .expect("a publish in flight holds its answer");
-            let answer = match genid_publisher::outcome(&conn.up) {
+            let answer = match purge_publisher::outcome(&conn.up) {
                 Ok(()) => held,
                 Err(cause) => not_published(&cause),
             };

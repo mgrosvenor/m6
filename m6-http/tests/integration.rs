@@ -122,12 +122,10 @@ where
         let mut on_head = |_: &mut (), head: &RequestHead<'_>, buf: &[u8], ip: &str| {
             let req = match m6_core::h1::materialize(head, buf) {
                 m6_core::h1::ParseResult::Complete(r) => r,
-                _ => {
-                    return RequestOutcome::Ready(400, vec![], Vec::new(), "test".to_string(), None)
-                }
+                _ => return RequestOutcome::Ready(400, vec![], Vec::new(), "test".to_string()),
             };
             let (s, h, b, be) = handler(&req, ip);
-            RequestOutcome::Ready(s, h, b, be, None)
+            RequestOutcome::Ready(s, h, b, be)
         };
         let mut on_owned = |_: &mut (), req: m6_http_lib::http2::RequestRef<'_>, ip: &str| {
             let (s, h, b, be) = match req {
@@ -137,7 +135,7 @@ where
                     handler(&owned, ip)
                 }
             };
-            RequestOutcome::Ready(s, h, b, be, None)
+            RequestOutcome::Ready(s, h, b, be)
         };
         let mut on_head_early =
             |_: &mut (), _: &RequestHead<'_>, _: &str| -> Option<RequestOutcome> { None };

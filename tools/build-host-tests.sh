@@ -294,7 +294,18 @@ for tool in cc c++ python3 go; do
 done
 
 echo "### test build"
-echo "TESTBUILD_WARNINGS=$(cargo test --workspace --no-run 2>&1 | grep -c '^warning' || true)"
+# CI builds `--workspace --bins` before `cargo test --workspace --no-run`, and the
+# gate must run the same steps (AGENTS rule 5). It matters because `cargo test`
+# builds a package's plain binary only when that package has a tests/ directory,
+# and m6-md has none, so its binary was absent from target/debug and m6-core's
+# version_flag test failed with "no m6-md binary". A clean target showed it; a
+# stale target hid it. One log so a compile error is visible: the warning count
+# alone swallowed the failure.
+{ cargo build --workspace --bins && cargo test --workspace --no-run; } > "$T/testbuild.log" 2>&1
+TESTBUILD_STATUS=$?
+echo "TESTBUILD_WARNINGS=$(grep -c '^warning' "$T/testbuild.log" || true)"
+echo "TESTBUILD_STATUS=$TESTBUILD_STATUS"
+[ "$TESTBUILD_STATUS" -eq 0 ] || tail -30 "$T/testbuild.log"
 
 echo "### test run"
 # Strict mode for the backend examples: a missing runtime fails rather than skips.
@@ -443,7 +454,10 @@ EG_CONFIG_UNEXPLAINED=0
 for d in */; do
     name=$(basename "$d")
     case "$name" in
-        data) continue ;;   # shared fixtures, not an example
+        # The same skips as CI's "Every example's config parses" step in
+        # .github/workflows/ci.yml: shared fixtures, the shared publisher
+        # crate and the build output are not examples.
+        data|common|target) continue ;;
         06-systemd)
             printf '  %-24s not parsed: systemd units only, it has no site config\n' "$name"
             continue ;;
@@ -463,8 +477,10 @@ for d in */; do
         EG_CONFIG_UNEXPLAINED=$((EG_CONFIG_UNEXPLAINED + 1))
         continue
     fi
-    out=$("$M6_DIR/target/release/m6-http" "$(cd "$d" && pwd)" "$(cd "$(dirname "$sys")" && pwd)/$(basename "$sys")" --dump-config 2>&1 >/dev/null)
-    if [ -n "$out" ]; then
+    # The checked-in config names the key directory as @M6_DEV_HOME@; m6 reads
+    # the copy with the real path filled in, exactly as CI does.
+    sys=$(. ./dev-home.sh && m6_conf "$sys")
+    if ! out=$("$M6_DIR/target/release/m6-http" "$(cd "$d" && pwd)" "$sys" --dump-config 2>&1 >/dev/null) || [ -n "$out" ]; then
         printf '  %-24s %s\n' "$name" "$(echo "$out" | head -1)"
         EG_CONFIG_BAD=$((EG_CONFIG_BAD + 1))
     else
@@ -483,6 +499,15 @@ echo "### 05-cms end-to-end"
 # is reported as a stack that never came up.
 cargo build --release -p render-cms 2>&1 | tail -1
 (cd "$M6_DIR" && cargo build --workspace --release 2>&1 | tail -1)
+
+# dev.sh keeps the auth database between runs, which a fresh CI runner never
+# does, so the publisher's role has to be granted to a user that already exists
+# without it. A failure here explains the publish 502 the suite would report.
+if ! PATH="$M6_DIR/target/release:$PATH" ./dev-token-test.sh; then
+    echo "EG_CMS_STATUS=1"
+    echo "dev-token.sh does not grant its role to a user the auth database kept"
+    exit 0
+fi
 
 cd 05-cms || exit 1
 
@@ -604,6 +629,8 @@ read -r passed failed < <(awk '/^test result:/{p+=$4; f+=$6} END{print p+0, f+0}
 
 [[ "$rw" == "0" ]] || { echo "${RED}   $rw release warning(s) on Linux${RESET}" >&2; FAILED=1; }
 [[ "$tw" == "0" ]] || { echo "${RED}   $tw test-build warning(s) on Linux${RESET}" >&2; FAILED=1; }
+tbs=$(num_after TESTBUILD_STATUS "$LOG"); tbs="${tbs:-?}"
+[[ "$tbs" == "0" ]] || { echo "${RED}   the test build failed on Linux (see the build log)${RESET}" >&2; FAILED=1; }
 fg=$(num_after FEATURE_GATED_STATUS "$LOG"); fg="${fg:-?}"
 [[ "$fg" == "0" ]] || { echo "${RED}   feature-gated tests failed (the targets --workspace omits)${RESET}" >&2
                         sed -n '/^### feature-gated tests/,/^### conformance/p' "$LOG" >&2; FAILED=1; }

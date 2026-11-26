@@ -394,17 +394,6 @@ impl PoolManager {
         &mut self.url_backends[idx]
     }
 
-    /// Every socket member of every pool, in pool order and then in the order
-    /// the glob found them. A change sequence sends one `POST /genid` to each
-    /// of these on its own socket, which is the one place the pool's member
-    /// choice is deliberately bypassed.
-    pub fn socket_members(&self) -> Vec<PathBuf> {
-        self.pools
-            .iter()
-            .flat_map(|(_, pool)| pool.members.iter().cloned())
-            .collect()
-    }
-
     /// Total members across all socket pools, for stats reporting.
     pub fn total_members(&self) -> usize {
         self.pools.iter().map(|(_, p)| p.total_count()).sum()

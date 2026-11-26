@@ -13,7 +13,7 @@
 //! The test needs nothing else. It copies the site into a temporary directory
 //! and makes there its own self-signed certificate, its own auth key pair and
 //! auth database (with an `admin` user in the `editors` group and a publisher
-//! token), and a system config with a `[genid]` table. It starts every
+//! token), and a system config with a `[registration]` table. It starts every
 //! service against that copy, so it neither reads nor changes the development
 //! directory (`M6_DEV_HOME`) or the checked-in site. If a binary is absent the test fails and names the command
 //! that fixes it.
@@ -38,13 +38,15 @@ fn m6_root() -> PathBuf {
         .expect("m6 workspace root")
 }
 
+/// An m6 binary from the m6 workspace's release build, else its debug build,
+/// else `PATH`.
 fn m6_bin(name: &str) -> Option<PathBuf> {
-    let release = m6_root().join("target/release").join(name);
-    if release.exists() {
-        return Some(release);
-    }
-    // Fall back to PATH
-    which(name)
+    let target = m6_root().join("target");
+    ["release", "debug"]
+        .iter()
+        .map(|profile| target.join(profile).join(name))
+        .find(|p| p.exists())
+        .or_else(|| which(name))
 }
 
 fn which(name: &str) -> Option<PathBuf> {
@@ -457,7 +459,7 @@ impl ServerStack {
     /// because they live in the returned stack's `Drop`.
     fn start() -> Self {
         // Require all m6 binaries.
-        let missing = "Run `cargo build --release` in the m6 workspace";
+        let missing = "Run `cargo build --bins` in the m6 workspace";
         let m6_http = m6_bin("m6-http").unwrap_or_else(|| panic!("m6-http not found. {missing}"));
         let m6_html = m6_bin("m6-html").unwrap_or_else(|| panic!("m6-html not found. {missing}"));
         let m6_file = m6_bin("m6-file").unwrap_or_else(|| panic!("m6-file not found. {missing}"));
@@ -492,7 +494,7 @@ impl ServerStack {
         let check_sock = sock("check-m6-auth.sock");
 
         // The certificate m6-http serves, self-signed for localhost. The same
-        // file is what render-cms trusts when it sends `POST /genid`.
+        // file is what render-cms trusts when it sends the `PURGE`.
         let cert = rcgen::generate_simple_self_signed(vec![
             "localhost".to_string(),
             "127.0.0.1".to_string(),
@@ -533,25 +535,26 @@ impl ServerStack {
                 ("@M6_DEV_HOME@/dev/auth.pub", auth_pub.display().to_string()),
             ],
         );
-        let token_file = w.join("genid-write.token");
+        let token_file = w.join("purge-write.token");
         rewrite(
             "configs/render-cms.conf",
             &[
                 (
-                    "https://localhost:8443/genid",
-                    format!("https://localhost:{base_port}/genid"),
+                    "https://localhost:8443",
+                    format!("https://localhost:{base_port}"),
                 ),
                 ("127.0.0.1:8443", tls_addr.clone()),
                 (
-                    "@M6_DEV_HOME@/05-cms/genid-write.token",
+                    "@M6_DEV_HOME@/05-cms/purge-write.token",
                     token_file.display().to_string(),
                 ),
                 ("@M6_DEV_HOME@/dev/ca.pem", tls_cert.display().to_string()),
+                ("/tmp/m6/m6-html.sock", html_sock.display().to_string()),
             ],
         );
 
         // The auth database: an editor to log in with, and a publisher whose
-        // token render-cms sends with `POST /genid`.
+        // token render-cms sends with the `PURGE`.
         auth_cli(
             &m6_cli,
             &auth_conf,
@@ -571,7 +574,7 @@ impl ServerStack {
                 "add",
                 "publisher",
                 "--role",
-                "genid-write",
+                "purge-write",
                 "--password",
                 "publisher-pw",
             ],
@@ -584,7 +587,7 @@ impl ServerStack {
         std::fs::write(&token_file, token).expect("write the publisher token");
 
         // System config: the node's own bind, certificate, check backend and
-        // the claims that gate `/genid`.
+        // the claims that gate the `PURGE`.
         //
         // `lock_memory = false` because this test asserts the site's pages and
         // the CMS lifecycle, not memory pinning, and pinning needs an unlimited
@@ -599,7 +602,7 @@ impl ServerStack {
             format!(
                 "[server]\nbind     = \"{tls_addr}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\nlock_memory = false\n\n\
                  [auth]\nbackend = \"m6-auth-check\"\n\n\
-                 [genid]\nread_require  = \"role:genid-read\"\nwrite_require = \"role:genid-write\"\n\n\
+                 [registration]\nread_require  = \"role:purge-read\"\nwrite_require = \"role:purge-write\"\n\n\
                  [node]\nname = \"test\"\n",
                 tls_cert.display(),
                 tls_key.display(),
@@ -948,7 +951,8 @@ fn blog_site_end_to_end() {
     check_eq!(&format!("POST /api/publish/{stem} → 200"), r.status, 200);
     check_contains!("publish → published=true", r.body, "published");
 
-    // The publish answered after `POST /genid` finished, so the post is live.
+    // The publish answered after the reload and the purge finished, so the
+    // post is live.
     let r = get_with_cookie_str(addr, &format!("/blog/{stem}"), "", Arc::clone(&tls));
     check_eq!(
         &format!("GET /blog/{stem} → 200 after publish"),

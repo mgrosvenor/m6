@@ -270,7 +270,6 @@ fn finding_5_distinct_query_strings_must_not_share_a_cache_entry() {
     cache.insert(
         CacheKey::new("/search", Some("q=attacker"), ""),
         CachedResponse {
-            genid: 0,
             status: 200,
             headers: m6_http_lib::cache::HeaderBlock::from_pairs(vec![(
                 "cache-control".to_string(),

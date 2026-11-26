@@ -264,9 +264,6 @@ struct H2Response {
     status: u16,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
-    /// The source's site generation, written as `M6-Genid`. `None` for an
-    /// answer this node generated itself.
-    genid: Option<u64>,
 }
 
 /// One decoded request field: a name and a value, each a range into
@@ -2251,14 +2248,13 @@ impl Http2Conn {
 
         let req = H2Request::new(&headers, &self.decode_buf, body, self.forwarded_trust);
         match on_request(state, RequestRef::H2(req), client_ip) {
-            RequestOutcome::Ready(status, resp_headers, resp_body, _, genid) => {
+            RequestOutcome::Ready(status, resp_headers, resp_body, _) => {
                 self.dispatch_h2_response(
                     stream_id,
                     H2Response {
                         status,
                         headers: resp_headers,
                         body: resp_body,
-                        genid,
                     },
                     is_head,
                 );
@@ -2309,7 +2305,6 @@ impl Http2Conn {
             status,
             headers: resp_headers,
             body: resp_body,
-            genid,
         } = resp;
         // ── No server push, and no 103 Early Hints ───────────────────────
         //
@@ -2357,7 +2352,7 @@ impl Http2Conn {
         } else {
             bytes::Bytes::from(resp_body)
         };
-        self.push_response_headers(stream_id, status, &resp_headers, advertised_len, genid);
+        self.push_response_headers(stream_id, status, &resp_headers, advertised_len);
 
         // Store response body for flow-controlled delivery. An empty body sends
         // a bare DATA + END_STREAM, which closes the stream cleanly.
@@ -2383,7 +2378,6 @@ impl Http2Conn {
         headers: Vec<(String, String)>,
         body: Vec<u8>,
         method: &str,
-        genid: Option<u64>,
     ) {
         if !self.streams.get(&stream_id).is_some_and(|s| s.pending) {
             return;
@@ -2397,7 +2391,6 @@ impl Http2Conn {
                 status,
                 headers,
                 body,
-                genid,
             },
             method.eq_ignore_ascii_case("HEAD"),
         );
@@ -2631,7 +2624,6 @@ impl Http2Conn {
         status: u16,
         headers: &[(String, String)],
         body_len: usize,
-        genid: Option<u64>,
     ) {
         let mut scratch = std::mem::take(&mut self.hdr_scratch);
         scratch.clear();
@@ -2664,18 +2656,6 @@ impl Http2Conn {
             }
             let name = lower_part(&mut scratch, k.as_bytes());
             push_field(&mut plan, &mut n, name, FieldPart::Bytes(v.as_bytes()));
-        }
-        let mut genid_buf = itoa::Buffer::new();
-        if let Some(genid) = genid {
-            // Lower case: RFC 9113 8.2.1 allows no other spelling, and a client
-            // that enforces it rejects the whole header block. `GENID_HEADER_LOWER`
-            // is already lowercase, so `lower_part` borrows it with no copy.
-            push_field(
-                &mut plan,
-                &mut n,
-                lower_part(&mut scratch, crate::genid::GENID_HEADER_LOWER.as_bytes()),
-                FieldPart::Bytes(genid_buf.format(genid).as_bytes()),
-            );
         }
         // Applied at serialisation so every response carries them regardless
         // of which path produced it (cache hit, backend, error page). The
@@ -2826,13 +2806,6 @@ impl Http2Conn {
                 FieldPart::Bytes(cookie.as_bytes()),
             );
         }
-        let mut genid_buf = itoa::Buffer::new();
-        push_field(
-            &mut plan,
-            &mut n,
-            lower_part(&mut scratch, crate::genid::GENID_HEADER.as_bytes()),
-            FieldPart::Bytes(genid_buf.format(entry.genid).as_bytes()),
-        );
         let security = crate::security::read();
         if let Some(ref guard) = security {
             for (k, v) in guard.absent_from(&entry.headers) {
@@ -2930,7 +2903,6 @@ impl Http2Conn {
                 status,
                 headers,
                 body,
-                genid: None,
             },
             method.eq_ignore_ascii_case("HEAD"),
         );
@@ -3424,7 +3396,7 @@ mod frame_validation_tests {
         c.phase = Phase::Active;
         c.recv_buf.extend_from_slice(frames);
         let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(), None)
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string())
         };
         loop {
             match c.process_frame(&mut (), &mut on_request, "127.0.0.1", None) {
@@ -3510,7 +3482,7 @@ mod frame_validation_tests {
         frames.extend(frame(TYPE_DATA, FLAG_END_STREAM, 1, body));
         c.recv_buf.extend_from_slice(&frames);
         let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(), None)
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string())
         };
         let result = loop {
             match c.process_frame(&mut (), &mut on_request, "127.0.0.1", None) {
@@ -3633,7 +3605,7 @@ mod frame_validation_tests {
         c.phase = Phase::Active;
         c.recv_buf.extend_from_slice(&frame(TYPE_DATA, 0, 1, &[]));
         let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], vec![], "t".to_string(), None)
+            RequestOutcome::Ready(200, vec![], vec![], "t".to_string())
         };
         let _ = c.process_frame(&mut (), &mut on_request, "127.0.0.1", None);
 
@@ -3821,7 +3793,7 @@ mod stream_state_tests {
     fn run(c: &mut Http2Conn, bytes: &[u8]) -> Result<(), &'static str> {
         c.recv_buf.extend_from_slice(bytes);
         let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(), None)
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string())
         };
         loop {
             match c.process_frame(&mut (), &mut on_request, "127.0.0.1", None) {
@@ -4112,7 +4084,7 @@ mod stream_state_tests {
         c.phase = Phase::Active;
         c.recv_buf.extend_from_slice(&f);
         let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string(), None)
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string())
         };
         while let Ok(true) = c.process_frame(&mut (), &mut on_request, "127.0.0.1", None) {}
         assert_eq!(
@@ -4130,7 +4102,7 @@ mod stream_state_tests {
         let mut c = Http2Conn::new();
         c.phase = Phase::Active;
         let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string(), None)
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string())
         };
 
         // Open the stream first, then deliver a 16 KiB DATA frame in two reads.
@@ -4220,7 +4192,7 @@ mod f005_regression {
 
     fn drain_buf(c: &mut Http2Conn) -> Result<(), &'static str> {
         let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string(), None)
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string())
         };
         loop {
             match c.process_frame(&mut (), &mut on_request, "127.0.0.1", None) {
@@ -4633,7 +4605,7 @@ mod hpack_table_size_setting_tests {
         c.recv_buf
             .extend_from_slice(&settings(SETTING_HEADER_TABLE_SIZE, u32::MAX));
         let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string(), None)
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "t".to_string())
         };
         loop {
             match c.process_frame(&mut (), &mut on_request, "127.0.0.1", None) {
@@ -4704,7 +4676,7 @@ mod forwarded_client_ip_tests {
                     RequestRef::Owned(_) => unreachable!("this connection decodes h2"),
                 };
                 *seen.borrow_mut() = (ip.to_string(), survived);
-                RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(), None)
+                RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string())
             };
             while let Ok(true) = c.process_frame(&mut (), &mut on_request, peer_ip, None) {}
         }
@@ -5097,7 +5069,6 @@ mod server_push_tests {
                 status: 200,
                 headers: vec![],
                 body: vec![b'x'; ASSET],
-                genid: None,
             },
             false,
         );
@@ -5256,7 +5227,7 @@ mod header_list_size_tests {
         let mut reached = false;
         let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
             reached = true;
-            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string(), None)
+            RequestOutcome::Ready(200, vec![], b"ok".to_vec(), "test".to_string())
         };
         loop {
             match c.process_frame(&mut (), &mut on_request, "127.0.0.1", None) {
@@ -5450,7 +5421,6 @@ mod header_encoding_tests {
                 ("Keep-Alive".to_string(), "timeout=5".to_string()),
             ],
             2,
-            None,
         );
         let fields = headers_block(&c);
         assert!(
@@ -5487,7 +5457,6 @@ mod header_encoding_tests {
                 ("Alt-Svc".to_string(), "h3=\":1\"; ma=1".to_string()),
             ]),
             body: bytes::Bytes::from_static(b"cacheable"),
-            genid: 7,
         };
         let hit = HitHeaders {
             alt_svc: std::sync::Arc::from(&b"alt-svc: h3=\":8443\"; ma=86400"[..]),
@@ -5516,8 +5485,7 @@ mod header_encoding_tests {
         assert_eq!(value(&fields, "vary"), Some("Cookie, Accept-Encoding"));
         assert_eq!(value(&fields, "alt-svc"), Some("h3=\":8443\"; ma=86400"));
         assert_eq!(value(&fields, "set-cookie"), Some("sid=abc"));
-        assert_eq!(value(&fields, "m6-genid"), Some("7"));
-        for once in ["content-length", "age", "vary", "alt-svc", "m6-genid"] {
+        for once in ["content-length", "age", "vary", "alt-svc"] {
             assert_eq!(count(&fields, once), 1, "{once} appears more than once");
         }
         assert_eq!(count(&fields, "connection"), 0);
@@ -5561,7 +5529,7 @@ mod tests {
         c.conn_send_window = 0;
         for &(stream_id, priority, len) in streams {
             let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
-                RequestOutcome::Ready(200, vec![], vec![0x5a; len], "test".to_string(), None)
+                RequestOutcome::Ready(200, vec![], vec![0x5a; len], "test".to_string())
             };
             c.recv_buf
                 .extend_from_slice(&open_stream_with_header(stream_id, "priority", priority));
@@ -5607,7 +5575,7 @@ mod tests {
         let mut c = Http2Conn::new();
         c.phase = Phase::Active;
         let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| -> RequestOutcome {
-            RequestOutcome::Ready(200, vec![], vec![0x5a; len], "test".to_string(), None)
+            RequestOutcome::Ready(200, vec![], vec![0x5a; len], "test".to_string())
         };
         c.recv_buf.extend_from_slice(&open_stream(stream_id));
         c.process_frame(&mut (), &mut on_request, "127.0.0.1", None)
@@ -5784,7 +5752,7 @@ mod tests {
             &(1u32 << 20).to_be_bytes(),
         ));
         let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| {
-            RequestOutcome::Ready(200, vec![], vec![], String::new(), None)
+            RequestOutcome::Ready(200, vec![], vec![], String::new())
         };
         c.process_frame(&mut (), &mut on_request, "127.0.0.1", None)
             .expect("a window update is legal");
@@ -5841,7 +5809,7 @@ mod tests {
 
             c.recv_buf.extend_from_slice(&terminator);
             let mut on_request = |_: &mut (), _: RequestRef<'_>, _: &str| {
-                RequestOutcome::Ready(200, vec![], vec![], String::new(), None)
+                RequestOutcome::Ready(200, vec![], vec![], String::new())
             };
             c.process_frame(&mut (), &mut on_request, "127.0.0.1", None)
                 .expect("the peer's end is a legal frame");

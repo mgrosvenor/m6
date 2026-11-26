@@ -16,7 +16,6 @@ fn make_cache_with_entry() -> (Cache, &'static str, &'static str) {
     let key = CacheKey::new(path, None, enc);
     let resp = CachedResponse {
         status: 200,
-        genid: 0,
         headers: HeaderBlock::from_pairs(vec![
             (
                 "content-type".to_string(),

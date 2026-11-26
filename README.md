@@ -168,9 +168,10 @@ Tier 4 repeats tier 3 across N nodes, and each cache node reaches the origin thr
 
 ## 3. Components
 
-m6 ships seven binaries (`m6-http`, `m6-html`, `m6-file`, `m6-auth-server`, `m6-auth-cli`, `m6-monitor`, `m6-md`) and four libraries (`m6-core`, `m6-auth`, `m6-log`, `m6-platform`).
+m6 ships eight binaries (`m6-http`, `m6-html`, `m6-file`, `m6-auth-server`, `m6-auth-cli`, `m6-monitor`, `m6-md`, `m6-redirect`) and four libraries (`m6-core`, `m6-auth`, `m6-log`, `m6-platform`).
 Sections 3.1 to 3.7 cover the components a request meets.
-[`docs/m6-monitor.md`](docs/m6-monitor.md), [`docs/m6-md.md`](docs/m6-md.md), [`docs/m6-log.md`](docs/m6-log.md) and [`docs/m6-platform.md`](docs/m6-platform.md) cover the other four.
+[`docs/m6-monitor.md`](docs/m6-monitor.md), [`docs/m6-md.md`](docs/m6-md.md), [`docs/m6-log.md`](docs/m6-log.md), [`docs/m6-platform.md`](docs/m6-platform.md) and [`docs/m6-redirect.md`](docs/m6-redirect.md) cover the rest.
+`m6-redirect` is a static redirect engine in the Cloudflare Bulk Redirects shape: it exact-matches host and path against one JSON list and answers the rule's status and target, or 404.
 
 ### 3.1 m6-http
 

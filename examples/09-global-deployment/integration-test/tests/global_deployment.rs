@@ -35,25 +35,50 @@ fn m6_root() -> PathBuf {
         .expect("m6 workspace root")
 }
 
-fn m6_bin(name: &str) -> Option<PathBuf> {
-    let release = m6_root().join("target/release").join(name);
-    if release.exists() {
-        return Some(release);
-    }
-    which(name)
+/// The first of `<target>/release/<name>` and `<target>/debug/<name>` that
+/// exists, so a release build wins and a debug build is enough.
+fn built(target: &Path, name: &str) -> Option<PathBuf> {
+    ["release", "debug"]
+        .iter()
+        .map(|profile| target.join(profile).join(name))
+        .find(|p| p.exists())
 }
 
-fn render_cms_bin() -> Option<PathBuf> {
-    // integration-test/ → 09-global-deployment/ → examples/target/release/
-    let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/release/render-cms")
-        .canonicalize();
-    if let Ok(p) = bin {
-        if p.exists() {
-            return Some(p);
-        }
+/// An m6 binary: built in the m6 workspace, else on `PATH`.
+fn m6_bin(name: &str) -> Result<PathBuf, String> {
+    let target = m6_root().join("target");
+    built(&target, name).or_else(|| which(name)).ok_or_else(|| {
+        format!(
+            "no {name} in {}/{{release,debug}} or on PATH; build it with `cargo build --bins` in the m6 workspace",
+            target.display()
+        )
+    })
+}
+
+/// The render-cms binary: built in the examples workspace, else on `PATH`.
+fn render_cms_bin() -> Result<PathBuf, String> {
+    // integration-test/ → 09-global-deployment/ → examples/target/
+    let target = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target");
+    built(&target, "render-cms")
+        .or_else(|| which("render-cms"))
+        .ok_or_else(|| {
+            format!(
+                "no render-cms in {}/{{release,debug}} or on PATH; build it with `cargo build --release -p render-cms` in examples/",
+                target.display()
+            )
+        })
+}
+
+/// Name the step that failed, so every early exit from [`GlobalStack::start`]
+/// says why.
+trait Why<T> {
+    fn why(self, what: &str) -> Result<T, String>;
+}
+
+impl<T, E: std::fmt::Display> Why<T> for Result<T, E> {
+    fn why(self, what: &str) -> Result<T, String> {
+        self.map_err(|e| format!("{what}: {e}"))
     }
-    which("render-cms")
 }
 
 fn which(name: &str) -> Option<PathBuf> {
@@ -363,18 +388,42 @@ fn get(addr: &str, path: &str, tls: Arc<rustls::ClientConfig>) -> Response {
     https_get(addr, path, &[], tls).unwrap_or_else(|e| panic!("GET {path}: {e}"))
 }
 
-/// `POST /genid` on the origin with the publisher's token: the one request that
-/// advances the site's generation.
-fn publish_genid(addr: &str, token: &str, tls: Arc<rustls::ClientConfig>) -> Response {
+/// `PURGE` a path on the origin with the publisher's token: the one request
+/// that evicts the path from the origin and every registered cache.
+fn purge(addr: &str, path: &str, token: &str, tls: Arc<rustls::ClientConfig>) -> Response {
     let bearer = format!("Bearer {token}");
     https_request(
-        "POST",
+        "PURGE",
         addr,
-        "/genid",
+        path,
         &[("Authorization", &bearer), ("Content-Length", "0")],
         tls,
     )
-    .unwrap_or_else(|e| panic!("POST /genid: {e}"))
+    .unwrap_or_else(|e| panic!("PURGE {path}: {e}"))
+}
+
+/// `POST /genid` on a backend's own socket: its reload signal, which re-reads
+/// the site's files. m6-core reserves this path for exactly that.
+fn reload_backend(sock: &std::path::Path) {
+    use std::os::unix::net::UnixStream as StdUnixStream;
+    let mut stream = StdUnixStream::connect(sock).expect("connect to the backend socket");
+    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    stream
+        .write_all(b"POST /genid HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .expect("send the reload request");
+    let mut raw = Vec::new();
+    let _ = stream.read_to_end(&mut raw);
+    let text = String::from_utf8_lossy(&raw);
+    let status = text
+        .split("\r\n")
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    assert!(
+        (200..300).contains(&status),
+        "backend reload answered {status}, want 2xx"
+    );
 }
 
 // ── wait helpers ──────────────────────────────────────────────────────────────
@@ -500,14 +549,28 @@ struct GlobalStack {
     origin_h2c: String,       // H2C backbone (plain TCP)
     cache_addrs: Vec<String>, // [edge-a, edge-b, edge-c, edge-d, edge-e]
     site_dir: PathBuf,        // the copy of 07's site the origin serves
-    write_token: String,      // a token with the genid-write role
+    html_sock: PathBuf,       // the m6-html backend's socket, for its reload
+    write_token: String,      // a token with the purge-write role
     _processes: Children,
     _temp_dirs: Vec<tempfile::TempDir>,
 }
 impl GlobalStack {
-    /// Build and start the full 6-node topology.
-    /// Returns None if any required binary or site setup is missing.
+    /// Build and start the full 6-node topology, or print the `SKIP:` line
+    /// that names what was missing and return `None`.
     fn start() -> Option<Self> {
+        match Self::try_start() {
+            Ok(stack) => Some(stack),
+            Err(why) => {
+                eprintln!("SKIP: {why}");
+                None
+            }
+        }
+    }
+
+    /// Build and start the full 6-node topology. The error names the step
+    /// that failed: a missing binary, a site file, or a node that never came
+    /// up.
+    fn try_start() -> Result<Self, String> {
         let site09 = example09_dir();
 
         let m6_http = m6_bin("m6-http")?;
@@ -521,6 +584,7 @@ impl GlobalStack {
         let pid = std::process::id() as u16 % 5000;
         let h2c_port = 30000 + pid;
         let tls_port = 30100 + pid;
+        let control_port = 30300 + pid;
         // Cache nodes: 5 ports starting from 30200
         let cache_ports: Vec<u16> = (0..5).map(|i| 30200 + pid + i).collect();
 
@@ -532,19 +596,19 @@ impl GlobalStack {
             .collect();
 
         // Generate self-signed cert.
-        let cert_dir = tempfile::tempdir().ok()?;
+        let cert_dir = tempfile::tempdir().why("make the certificate directory")?;
         let (cert_path, key_path) = generate_test_cert(cert_dir.path());
 
         // A copy of 07's site, whose configs this run rewrites: keys, auth database and
         // tokens are made here, so the test needs no dev.sh and leaves the repo alone.
-        let work = tempfile::tempdir().ok()?;
+        let work = tempfile::tempdir().why("make the work directory")?;
         let w = work.path().to_path_buf();
         let site07 = w.join("site07");
         copy_site(&site07_dir(), &site07);
-        let signing = rcgen::KeyPair::generate().ok()?;
+        let signing = rcgen::KeyPair::generate().why("make the auth signing key")?;
         let (auth_pem, auth_pub) = (w.join("auth.pem"), w.join("auth.pub"));
-        std::fs::write(&auth_pem, signing.serialize_pem()).ok()?;
-        std::fs::write(&auth_pub, signing.public_key_pem()).ok()?;
+        std::fs::write(&auth_pem, signing.serialize_pem()).why("write auth.pem")?;
+        std::fs::write(&auth_pub, signing.public_key_pem()).why("write auth.pub")?;
         let rewrite = |file: &str, pairs: &[(&str, String)]| {
             let path = site07.join(file);
             let mut text = std::fs::read_to_string(&path)
@@ -555,7 +619,7 @@ impl GlobalStack {
             }
             std::fs::write(&path, text).expect("write a rewritten config");
         };
-        let (write_token, read_token) = (w.join("genid-write.token"), w.join("genid-read.token"));
+        let write_token = w.join("purge-write.token");
         rewrite(
             "configs/m6-auth.conf",
             &[
@@ -571,19 +635,20 @@ impl GlobalStack {
             "configs/render-cms.conf",
             &[
                 (
-                    "https://localhost:8443/genid",
-                    format!("https://localhost:{tls_port}/genid"),
+                    "https://localhost:8443",
+                    format!("https://localhost:{tls_port}"),
                 ),
                 ("127.0.0.1:8443", origin_tls_addr.clone()),
                 (
-                    "@M6_DEV_HOME@/07-dev-to-production/genid-write.token",
+                    "@M6_DEV_HOME@/07-dev-to-production/purge-write.token",
                     write_token.display().to_string(),
                 ),
                 ("@M6_DEV_HOME@/dev/ca.pem", cert_path.display().to_string()),
             ],
         );
-        // The auth database: an editor to log in with, a publisher for the CMS and a
-        // reader for the cache nodes.
+        // The auth database: an editor to log in with, and a publisher whose
+        // token carries the write claim for PURGE and the read claim for
+        // /m6/status.
         let auth_conf = site07.join("configs/m6-auth.conf");
         auth_cli(
             &m6_cli,
@@ -596,39 +661,36 @@ impl GlobalStack {
             &auth_conf,
             &["group", "member", "add", "editors", "admin"],
         );
-        for (user, role, file) in [
-            ("publisher", "genid-write", &write_token),
-            ("reader", "genid-read", &read_token),
-        ] {
-            auth_cli(
-                &m6_cli,
-                &auth_conf,
-                &[
-                    "user",
-                    "add",
-                    user,
-                    "--role",
-                    role,
-                    "--password",
-                    "pw-for-tests",
-                ],
-            );
-            let token = auth_cli(
-                &m6_cli,
-                &auth_conf,
-                &["token", "create", user, "--name", user],
-            );
-            std::fs::write(file, token).ok()?;
-        }
+        auth_cli(
+            &m6_cli,
+            &auth_conf,
+            &[
+                "user",
+                "add",
+                "publisher",
+                "--role",
+                "purge-write",
+                "--role",
+                "purge-read",
+                "--password",
+                "pw-for-tests",
+            ],
+        );
+        let token = auth_cli(
+            &m6_cli,
+            &auth_conf,
+            &["token", "create", "publisher", "--name", "publisher"],
+        );
+        std::fs::write(&write_token, token).why("write the publisher token")?;
         let logs = w.join("logs");
-        std::fs::create_dir_all(&logs).ok()?;
+        std::fs::create_dir_all(&logs).why("make the log directory")?;
         let state = w.join("state");
-        std::fs::create_dir_all(&state).ok()?;
+        std::fs::create_dir_all(&state).why("make the state directory")?;
 
         // ── Origin site dir ───────────────────────────────────────────────────
         // Write origin site.toml: full route table, socket paths in a temp dir.
 
-        let origin_sock_dir = tempfile::tempdir().ok()?;
+        let origin_sock_dir = tempfile::tempdir().why("make the origin directory")?;
         let html_sock = origin_sock_dir.path().join("m6-html.sock");
         let file_sock = origin_sock_dir.path().join("m6-file.sock");
         let auth_sock = origin_sock_dir.path().join("m6-auth.sock");
@@ -637,10 +699,10 @@ impl GlobalStack {
         // Copy site-origin/site.toml and patch socket paths.
         let origin_site_src = site09.join("site-origin/site.toml");
         if !origin_site_src.exists() {
-            eprintln!("SKIP: site-origin/site.toml not found");
-            return None;
+            return Err("site-origin/site.toml not found".to_string());
         }
-        let origin_site_toml = std::fs::read_to_string(&origin_site_src).ok()?;
+        let origin_site_toml =
+            std::fs::read_to_string(&origin_site_src).why("read site-origin/site.toml")?;
         let check_sock = origin_sock_dir.path().join("check-m6-auth.sock");
         let origin_site_toml = origin_site_toml
             .replace("/tmp/m6/m6-html*.sock", &html_sock.display().to_string())
@@ -652,7 +714,8 @@ impl GlobalStack {
             .replace("/tmp/m6/m6-auth*.sock", &auth_sock.display().to_string())
             .replace("/tmp/m6/render-cms*.sock", &cms_sock.display().to_string());
 
-        std::fs::write(origin_sock_dir.path().join("site.toml"), &origin_site_toml).ok()?;
+        std::fs::write(origin_sock_dir.path().join("site.toml"), &origin_site_toml)
+            .why("write the origin site.toml")?;
 
         // Symlink site subdirs so m6-http resolves template/asset paths correctly.
         for subdir in &["templates", "data", "assets", "configs", "keys", "content"] {
@@ -671,23 +734,24 @@ impl GlobalStack {
         // at its default, and m6-http's own suite covers that.
         let origin_sys_toml = origin_sock_dir.path().join("system.toml");
         std::fs::write(&origin_sys_toml, format!(
-            "[server]\nbind     = \"{origin_tls_addr}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\nh2c_bind = \"{origin_h2c_addr}\"\ninternal_binds = [\"{origin_h2c_addr}\"]\ninternal_peers = [\"127.0.0.1\"]\nlock_memory = false\n\n[auth]\nbackend = \"m6-auth-check\"\n\n[genid]\nread_require  = \"role:genid-read\"\nwrite_require = \"role:genid-write\"\n\n[node]\nname = \"origin\"\n",
+            "[server]\nbind     = \"{origin_tls_addr}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\nh2c_bind = \"{origin_h2c_addr}\"\ninternal_binds = [\"{origin_h2c_addr}\"]\ninternal_peers = [\"127.0.0.1\"]\nregistration_bind = \"127.0.0.1:{control_port}\"\nlock_memory = false\n\n[auth]\nbackend = \"m6-auth-check\"\n\n[registration]\nread_require  = \"role:purge-read\"\nwrite_require = \"role:purge-write\"\n\n[node]\nname = \"origin\"\n",
             cert_path.display(), key_path.display(),
-        )).ok()?;
+        )).why("write the origin system.toml")?;
 
         // ── Cache site dir ────────────────────────────────────────────────────
-        let cache_sock_dir = tempfile::tempdir().ok()?;
+        let cache_sock_dir = tempfile::tempdir().why("make the cache directory")?;
         let cache_site_src = site09.join("site-cache/site.toml");
         if !cache_site_src.exists() {
-            eprintln!("SKIP: site-cache/site.toml not found");
-            return None;
+            return Err("site-cache/site.toml not found".to_string());
         }
-        let cache_site_toml = std::fs::read_to_string(&cache_site_src).ok()?;
+        let cache_site_toml =
+            std::fs::read_to_string(&cache_site_src).why("read site-cache/site.toml")?;
         let cache_site_toml = cache_site_toml.replace(
             "h2c://127.0.0.1:9000",
             &format!("h2c://127.0.0.1:{h2c_port}"),
         );
-        std::fs::write(cache_sock_dir.path().join("site.toml"), &cache_site_toml).ok()?;
+        std::fs::write(cache_sock_dir.path().join("site.toml"), &cache_site_toml)
+            .why("write the cache site.toml")?;
 
         let mut processes = Children::new();
         let mut temp_dirs: Vec<tempfile::TempDir> = vec![cert_dir, work];
@@ -703,7 +767,7 @@ impl GlobalStack {
                 .stdout(log_file(&logs, "m6-html"))
                 .stderr(log_file(&logs, "m6-html"))
                 .spawn()
-                .ok()?,
+                .why("spawn a stack process")?,
         );
 
         processes.push(
@@ -716,7 +780,7 @@ impl GlobalStack {
                 .stdout(log_file(&logs, "m6-file"))
                 .stderr(log_file(&logs, "m6-file"))
                 .spawn()
-                .ok()?,
+                .why("spawn a stack process")?,
         );
 
         processes.push(
@@ -729,7 +793,7 @@ impl GlobalStack {
                 .stdout(log_file(&logs, "m6-auth"))
                 .stderr(log_file(&logs, "m6-auth"))
                 .spawn()
-                .ok()?,
+                .why("spawn a stack process")?,
         );
 
         processes.push(
@@ -742,15 +806,14 @@ impl GlobalStack {
                 .stdout(log_file(&logs, "render-cms"))
                 .stderr(log_file(&logs, "render-cms"))
                 .spawn()
-                .ok()?,
+                .why("spawn a stack process")?,
         );
 
         let to = Duration::from_secs(15);
         for sock in [&html_sock, &file_sock, &auth_sock, &check_sock, &cms_sock] {
             if !wait_socket(sock, to) {
-                eprintln!("SKIP: socket {} not ready", sock.display());
                 dump_logs(&logs);
-                return None;
+                return Err(format!("socket {} not ready", sock.display()));
             }
         }
 
@@ -765,18 +828,16 @@ impl GlobalStack {
                 .stdout(log_file(&logs, "origin"))
                 .stderr(log_file(&logs, "origin"))
                 .spawn()
-                .ok()?,
+                .why("spawn a stack process")?,
         );
 
         if !wait_tcp(&origin_tls_addr, to) {
-            eprintln!("SKIP: origin TLS not ready on {origin_tls_addr}");
             dump_logs(&logs);
-            return None;
+            return Err(format!("origin TLS not ready on {origin_tls_addr}"));
         }
         if !wait_tcp(&origin_h2c_addr, to) {
-            eprintln!("SKIP: origin H2C not ready on {origin_h2c_addr}");
             dump_logs(&logs);
-            return None;
+            return Err(format!("origin H2C not ready on {origin_h2c_addr}"));
         }
 
         // ── 5 cache nodes ─────────────────────────────────────────────────────
@@ -784,9 +845,9 @@ impl GlobalStack {
         for (i, &port) in cache_ports.iter().enumerate() {
             let sys = cache_sock_dir.path().join(format!("cache-{i}.toml"));
             std::fs::write(&sys, format!(
-                "# Cache node: {}\n[server]\nbind     = \"127.0.0.1:{port}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\nlock_memory = false\n\n[node]\nname = \"cache-{i}\"\n\n[genid]\nupstream       = \"origin\"\ntoken_file     = \"{}\"\nheartbeat_secs = 2\n",
-                node_names[i], cert_path.display(), key_path.display(), read_token.display(),
-            )).ok()?;
+                "# Cache node: {}\n[server]\nbind     = \"127.0.0.1:{port}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\nlock_memory = false\n\n[node]\nname = \"cache-{i}\"\n\n[registration]\norigin = \"127.0.0.1:{control_port}\"\n",
+                node_names[i], cert_path.display(), key_path.display(),
+            )).why("write a cache system.toml")?;
 
             processes.push(
                 Command::new(&m6_http)
@@ -797,28 +858,28 @@ impl GlobalStack {
                     .stdout(log_file(&logs, &format!("cache-{i}")))
                     .stderr(log_file(&logs, &format!("cache-{i}")))
                     .spawn()
-                    .ok()?,
+                    .why("spawn a cache node")?,
             );
         }
 
         for addr in &cache_addrs {
             if !wait_tcp(addr, to) {
-                eprintln!("SKIP: cache node not ready on {addr}");
                 dump_logs(&logs);
-                return None;
+                return Err(format!("cache node not ready on {addr}"));
             }
         }
 
         temp_dirs.push(origin_sock_dir);
         temp_dirs.push(cache_sock_dir);
 
-        Some(GlobalStack {
+        Ok(GlobalStack {
             origin_addr: origin_tls_addr,
             origin_h2c: origin_h2c_addr,
             cache_addrs,
             site_dir: site07,
+            html_sock,
             write_token: std::fs::read_to_string(&write_token)
-                .ok()?
+                .why("read the publisher token")?
                 .trim()
                 .to_string(),
             _processes: processes,
@@ -1013,16 +1074,16 @@ fn global_deployment_end_to_end() {
         );
     }
 
-    // ── §7 A new generation reaches every cache node ──────────────────────
+    // ── §7 A purge reaches every cache node ──────────────────────────────
     //
-    // The cache nodes follow the origin's generation ([genid] upstream). A publish
-    // is one POST /genid on the origin: it reloads the origin's backends, flushes
-    // its cache and advances the generation, and each cache node then drops what it
-    // holds and serves the new content.
+    // A publish is: reload the backend that renders the changed page (POST /genid
+    // on its own socket, m6-core's reserved reload signal), then PURGE the path on
+    // the origin. The origin evicts it and fans the purge to every registered
+    // cache, so each node drops what it holds and refetches the new content.
 
-    eprintln!("\n── §7 A publish at the origin reaches every cache node ──");
+    eprintln!("\n── §7 A purge at the origin reaches every cache node ──");
 
-    let marker = format!("generation-marker-{}", std::process::id());
+    let marker = format!("purge-marker-{}", std::process::id());
     for (i, addr) in stack.cache_addrs.iter().enumerate() {
         let r = get(addr, "/about", Arc::clone(&tls));
         check_eq!(
@@ -1044,22 +1105,62 @@ fn global_deployment_end_to_end() {
     )
     .expect("write the changed about.json");
 
-    // A publish without the right token is refused.
-    let r = publish_genid(origin, "not-a-token", Arc::clone(&tls));
+    // The backend re-reads its files on its own reload signal.
+    reload_backend(&stack.html_sock);
+    eprintln!("  PASS  the m6-html backend reloaded");
+
+    // A purge without the right token is refused.
+    let r = purge(origin, "/about", "not-a-token", Arc::clone(&tls));
     assert!(
         [401u16, 403].contains(&r.status),
-        "FAIL  POST /genid with a bad token → {}, expected 401/403",
+        "FAIL  PURGE /about with a bad token → {}, expected 401/403",
         r.status
     );
-    eprintln!("  PASS  POST /genid with a bad token → {}", r.status);
+    eprintln!("  PASS  PURGE /about with a bad token → {}", r.status);
 
-    let r = publish_genid(origin, &stack.write_token, Arc::clone(&tls));
-    check_eq!("POST /genid with the publisher token → 200", r.status, 200);
+    // Each cache registers over its control connection about a second after
+    // it starts, so wait until the origin lists all five: the purge below is
+    // then carried by the live fan-out, not by a later reconcile.
+    let bearer = format!("Bearer {}", stack.write_token);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let registered = |body: &str| (0..5).all(|i| body.contains(&format!("\"cache-{i}\"")));
+    let mut status = String::new();
+    while Instant::now() < deadline {
+        status = https_request(
+            "GET",
+            origin,
+            "/m6/status",
+            &[("Authorization", &bearer)],
+            Arc::clone(&tls),
+        )
+        .map(|r| r.body)
+        .unwrap_or_default();
+        if registered(&status) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert!(
+        registered(&status),
+        "FAIL  every cache node registers with the origin; /m6/status: {status}"
+    );
+    eprintln!("  PASS  all five cache nodes are registered");
+
+    let r = purge(origin, "/about", &stack.write_token, Arc::clone(&tls));
+    check_eq!("PURGE /about with the publisher token → 200", r.status, 200);
+    for i in 0..5 {
+        check_contains!(
+            &format!("PURGE /about reply carries cache-{i}'s answer"),
+            r.body,
+            &format!("\"cache-{i}\":{{\"resident\":")
+        );
+    }
 
     let r = get(origin, "/about", Arc::clone(&tls));
     check_contains!("origin /about → the new content", r.body, &marker);
 
-    // The heartbeat is 2 seconds, so a cache node follows within a few.
+    // The purge fans out over the registration channel, so a cache node drops
+    // the path and refetches it from the origin.
     for (i, addr) in stack.cache_addrs.iter().enumerate() {
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut r = get(addr, "/about", Arc::clone(&tls));
@@ -1068,7 +1169,7 @@ fn global_deployment_end_to_end() {
             r = get(addr, "/about", Arc::clone(&tls));
         }
         check_contains!(
-            &format!("{} /about → follows the new generation", node_names[i]),
+            &format!("{} /about → follows the purge", node_names[i]),
             r.body,
             &marker
         );

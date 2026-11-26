@@ -1234,7 +1234,7 @@ fn render(d: &digest::Digest) -> String {
          <th>node</th><th>role</th><th>status</th><th>rtt</th>\
          <th>reqs</th><th>hit rate</th><th>p50</th><th>p99</th>\
          <th>load</th><th>mem</th><th>disk</th><th>temp</th>\
-         <th>svc up</th><th>host up</th><th>tunnel</th></tr>",
+         <th>cache</th><th>svc up</th><th>host up</th><th>tunnel</th></tr>",
     );
     for n in &d.nodes {
         let load = match (n.load_one, n.cpus) {
@@ -1252,7 +1252,7 @@ fn render(d: &digest::Digest) -> String {
         h.push_str(&format!(
             "<tr><td>{}</td><td class=dim>{}</td><td>{}</td><td>{}</td>\
              <td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
-             <td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+             <td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             m6_core::util::html_escape(&n.name),
             m6_core::util::html_escape(&n.role),
             m6_core::util::html_escape(&n.status),
@@ -1274,6 +1274,12 @@ fn render(d: &digest::Digest) -> String {
             disk,
             n.thermal_max_c
                 .map(|c| format!("{c:.0}C"))
+                .unwrap_or_else(|| "-".into()),
+            // The same figures as /check's cache section, on one column.
+            n.cache
+                .as_ref()
+                .and_then(|c| c.fill)
+                .map(|f| format!("{:.0}%", f * 100.0))
                 .unwrap_or_else(|| "-".into()),
             n.uptime_s
                 .map(digest::fmt_uptime)

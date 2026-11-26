@@ -82,7 +82,6 @@ fn fixtures() -> Fixtures {
         ("content-language".to_string(), "en".to_string()),
     ];
     let entry = CachedResponse {
-        genid: 0,
         status: 200,
         headers: m6_http_lib::cache::HeaderBlock::from_pairs(headers.clone()),
         body: bytes::Bytes::from(vec![b'x'; BODY_LEN]),
@@ -212,7 +211,6 @@ fn the_hit_bytes_match_build_response(
         "link".to_string(),
         "</llms.txt>; rel=\"describedby\"".to_string(),
     ));
-    expected.push(("m6-genid".to_string(), entry.genid.to_string()));
     if status_may_have_content_length(200) {
         expected.push(("content-length".to_string(), entry.body.len().to_string()));
     }

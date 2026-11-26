@@ -156,6 +156,12 @@ use m6_http_lib::h2s_client::H2sTlsClientConn;
 // names and values in one byte arena with `Range<u32>` pairs, so
 // `strip_uncacheable`'s twelve clones per insert became one arena build.
 //
+// The second phase of the h1 work took h1_tls_miss_insert to 58,004 by removing
+// the per-header `format!` and the `String` per `Cache-Control` directive.
+// The header-arena change took it to 47,004: a cache entry stores its header
+// names and values in one byte arena with `Range<u32>` pairs, so
+// `strip_uncacheable`'s twelve clones per insert became one arena build.
+//
 // The new-connection row is a measure, not a budget: a full handshake per
 // connection read 122.859 to 123.849 per connection across the same runs, so a
 // per-connection ceiling would flake. It is reported.

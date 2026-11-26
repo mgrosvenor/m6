@@ -892,15 +892,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "genid-publisher"
-version = "0.1.0"
-dependencies = [
- "m6-core",
- "rustls-pemfile",
- "serde_json",
-]
-
-[[package]]
 name = "getrandom"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1552,7 +1543,7 @@ dependencies = [
 
 [[package]]
 name = "m6-core"
-version = "1.17.0"
+version = "1.18.0-rc.1"
 dependencies = [
  "aho-corasick 1.1.4",
  "anyhow",
@@ -1588,7 +1579,7 @@ dependencies = [
 
 [[package]]
 name = "m6-log"
-version = "1.17.0"
+version = "1.18.0-rc.1"
 dependencies = [
  "itoa",
  "m6-platform",
@@ -1598,7 +1589,7 @@ dependencies = [
 
 [[package]]
 name = "m6-platform"
-version = "1.17.0"
+version = "1.18.0-rc.1"
 dependencies = [
  "libc",
  "libproc",
@@ -2557,6 +2548,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "purge-publisher"
+version = "0.1.0"
+dependencies = [
+ "m6-core",
+ "rustls-pemfile",
+ "serde_json",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2721,9 +2721,9 @@ name = "render-admin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "genid-publisher",
  "m6-core",
  "m6-platform",
+ "purge-publisher",
  "serde_json",
  "sysinfo",
  "tempfile",
@@ -2737,9 +2737,9 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "comrak",
- "genid-publisher",
  "m6-core",
  "m6-platform",
+ "purge-publisher",
  "rcgen",
  "rustls",
  "rustls-pemfile",
@@ -2751,9 +2751,9 @@ dependencies = [
 name = "render-cms-prod"
 version = "0.1.0"
 dependencies = [
- "genid-publisher",
  "m6-core",
  "m6-platform",
+ "purge-publisher",
  "serde_json",
 ]
 

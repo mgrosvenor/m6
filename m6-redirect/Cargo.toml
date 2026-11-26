@@ -1,0 +1,31 @@
+[package]
+name    = "m6-redirect"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[[bin]]
+name = "m6-redirect"
+
+[lib]
+name = "m6_redirect"
+path = "src/lib.rs"
+
+[dependencies]
+# The one m6 crate. The redirect engine renders no templates and minifies
+# nothing, so it takes core with `default-features = false`: built on its own
+# (`cargo build -p m6-redirect`, `cargo install`) it links no template,
+# Markdown or CSS engine.
+m6-core    = { path = "../m6-core", default-features = false }
+anyhow     = "1"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+m6-platform = { path = "../m6-platform" }
+
+[dev-dependencies]
+m6-core  = { path = "../m6-core", default-features = false, features = ["testkit"] }
+tempfile = "3"

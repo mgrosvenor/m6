@@ -53,7 +53,6 @@ fn outcome(name: &str, failed: bool) -> Result<(), Failed> {
 
 fn response() -> CachedResponse {
     CachedResponse {
-        genid: 7,
         status: 200,
         headers: HeaderBlock::empty(),
         body: bytes::Bytes::from_static(b"cached body"),

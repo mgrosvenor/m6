@@ -110,10 +110,10 @@ fn main() -> Result<()> {
     let read_timeout = site.read_timeout();
     handler::set_tail_limit(site.limits().get(&m6_core::limits::TAIL_READ));
     // An explicit reservation below the cache is the one case where the cache
-    // is smaller than the max the record prints. The line names both keys and
-    // the value that would hold the whole cache.
+    // is smaller than the start the record prints. The line names both keys
+    // and the value that would hold the whole cache.
     let cache = site.limits().get(&m6_core::limits::CACHE_BYTES);
-    let cache_limit = cache.max().min(reserve);
+    let cache_limit = cache.start().min(reserve);
     if let Some(warning) = cache_warning {
         eprintln!("{}: {warning}", site.name());
     }

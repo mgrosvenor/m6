@@ -29,7 +29,7 @@ m6-md content/posts/ --output data/posts.json
 ./dev.sh
 ```
 
-To update content, re-run `m6-md content/posts/ --output data/posts.json`. m6-html reads `data/posts.json` once, at start, so restart the stack to see the change, or send `POST /genid` where the site has a generation (Example 05 does).
+To update content, re-run `m6-md content/posts/ --output data/posts.json`. m6-html reads `data/posts.json` once, at start, so restart the stack to see the change. Example 05 adds a CMS that reloads the backend and purges the cache without a restart.
 
 ## What's new
 
@@ -161,7 +161,7 @@ m6-md content/posts/ --output data/posts.json
 find content/posts/ -name '*.md' | entr m6-md content/posts/ --output data/posts.json
 ```
 
-m6-md has no watch mode of its own and does not signal the server. After it writes `data/posts.json`, the running m6-html still serves the file it read at start: restart it, or send `POST /genid` to m6-http where the site is a generation source.
+m6-md has no watch mode of its own and does not signal the server. After it writes `data/posts.json`, the running m6-html still serves the file it read at start: restart it. Example 05 adds a CMS that reloads the backend with `POST /genid` and purges the cache with `PURGE /*`, without a restart.
 
 ---
 

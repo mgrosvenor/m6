@@ -76,10 +76,20 @@ pub fn log_growth(limit: &Limit, before: usize, after: usize, what: &str) {
 ///
 /// The rule is [`m6_core::limits::heap_reserve`], shared with m6-file so the
 /// two services cannot drift: unless `start` is set, the reservation is
-/// `cache_bytes` max plus 64 MiB, rounded up to the huge page size, and the
-/// cache holds the max the record prints.
+/// `cache_bytes` start plus 64 MiB, rounded up to the huge page size, and the
+/// cache holds the start the record prints.
 pub fn heap_reserve(limits: &Limits) -> (usize, Option<String>) {
     m6_core::limits::heap_reserve(limits)
+}
+
+/// The byte bound the response cache is built with: the configured `start`,
+/// not the `max` ceiling.
+///
+/// A default config bounds the cache at 128 MiB, and a config may raise it up
+/// to the 4 GiB ceiling. Building the cache with `max` instead would make a
+/// default node grow to 4 GiB before its first eviction.
+pub fn cache_bound(limits: &Limits) -> usize {
+    limits.get(&CACHE_BYTES).start()
 }
 
 #[cfg(test)]
@@ -113,8 +123,26 @@ mod tests {
         assert_eq!(bytes, 64 * 1024 * 1024);
         let warning = warning.expect("the cache does not fit in 64 MiB");
         assert!(warning.contains("[limits.heap_reserve] start"), "{warning}");
-        assert!(warning.contains("[limits.cache_bytes] max"), "{warning}");
+        assert!(warning.contains("[limits.cache_bytes] start"), "{warning}");
         let (_, warning) = heap_reserve(&limits("[limits.heap_reserve]\nstart = \"256MiB\"\n"));
         assert!(warning.is_none());
+    }
+
+    /// The response cache is bounded by the configured `start`, not the
+    /// 4 GiB ceiling. A default config must bound the cache at 128 MiB, and a
+    /// raised `start` must be honoured, or a default node would run out of
+    /// memory before its first eviction.
+    #[test]
+    fn the_cache_bound_is_the_configured_start_not_the_ceiling() {
+        assert_eq!(cache_bound(&Limits::default()), 128 * 1024 * 1024);
+        assert_eq!(
+            Limits::default().get(&CACHE_BYTES).max(),
+            4 * 1024 * 1024 * 1024,
+            "the ceiling is 4 GiB, so a default must not build the cache from it"
+        );
+        assert_eq!(
+            cache_bound(&limits("[limits.cache_bytes]\nstart = \"512MiB\"\n")),
+            512 * 1024 * 1024
+        );
     }
 }
