@@ -128,6 +128,7 @@ struct Stack {
     _dir: tempfile::TempDir,
     _source_port: PortClaim,
     _control_port: PortClaim,
+    _h2c_port: PortClaim,
     cache_port: u16,
     cache_dir: PathBuf,
     cache: Option<Service>,
@@ -210,6 +211,7 @@ backend = "m6-file"
 
         let source_port = claim_port();
         let control_port = claim_port();
+        let h2c_port = claim_port();
         let cache_port = claim_port();
 
         let source_system = site.join("source-system.toml");
@@ -219,6 +221,9 @@ backend = "m6-file"
                 r#"
 [server]
 bind = "127.0.0.1:{source_port}"
+h2c_bind = "127.0.0.1:{h2c_port}"
+internal_binds = ["127.0.0.1:{h2c_port}"]
+internal_peers = ["127.0.0.1"]
 registration_bind = "127.0.0.1:{control_port}"
 tls_cert = "{cert}"
 tls_key = "{key}"
@@ -235,6 +240,7 @@ write_require = "role:writer"
 "#,
                 source_port = source_port.port(),
                 control_port = control_port.port(),
+                h2c_port = h2c_port.port(),
                 cert = site.join("cert.pem").display(),
                 key = site.join("key.pem").display(),
             ),
@@ -343,6 +349,7 @@ dir = "{cache_dir}"
             _dir: dir,
             _source_port: source_port,
             _control_port: control_port,
+            _h2c_port: h2c_port,
             cache_port: cache_port.port(),
             cache_dir,
             cache: None,
@@ -433,11 +440,11 @@ fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
 fn a_cache_node_writes_what_it_serves_to_disk() {
     let stack = Stack::start();
 
-    let served = stack.get_cache("/");
+    let served = stack.get_cache("/index.html");
     assert_eq!(served.status, 200, "{}", stack.cache_output());
     assert_eq!(served.body, "first");
     // The second GET is a memory hit, so the disk write is not on that path.
-    let hit = stack.get_cache("/");
+    let hit = stack.get_cache("/index.html");
     assert_eq!(hit.status, 200);
 
     assert!(
@@ -463,7 +470,7 @@ fn a_cache_node_writes_what_it_serves_to_disk() {
 #[test]
 fn a_restart_reads_the_file_the_node_wrote() {
     let mut stack = Stack::start();
-    assert_eq!(stack.get_cache("/").body, "first");
+    assert_eq!(stack.get_cache("/index.html").body, "first");
     assert!(
         wait_until(Duration::from_secs(5), || !stack.cache_files().is_empty()),
         "no file appeared:\n{}",
@@ -483,7 +490,7 @@ fn a_restart_reads_the_file_the_node_wrote() {
 #[test]
 fn a_restart_with_the_same_counter_starts_warm() {
     let mut stack = Stack::start();
-    assert_eq!(stack.get_cache("/").body, "first");
+    assert_eq!(stack.get_cache("/index.html").body, "first");
     assert!(
         wait_until(Duration::from_secs(5), || !stack.cache_files().is_empty()),
         "no file appeared:\n{}",
@@ -507,7 +514,7 @@ fn a_restart_with_the_same_counter_starts_warm() {
 
     assert!(
         wait_until(Duration::from_secs(10), || stack
-            .get_cache("/")
+            .get_cache("/index.html")
             .body
             .eq("first")),
         "the same counter must keep the disk copy:\n{}",
@@ -523,7 +530,7 @@ fn a_restart_with_the_same_counter_starts_warm() {
 #[test]
 fn a_restart_after_a_purge_starts_cold() {
     let mut stack = Stack::start();
-    assert_eq!(stack.get_cache("/").body, "first");
+    assert_eq!(stack.get_cache("/index.html").body, "first");
     assert!(
         wait_until(Duration::from_secs(5), || !stack.cache_files().is_empty()),
         "no file appeared:\n{}",
@@ -539,7 +546,7 @@ fn a_restart_after_a_purge_starts_cold() {
 
     assert!(
         wait_until(Duration::from_secs(10), || stack
-            .get_cache("/")
+            .get_cache("/index.html")
             .body
             .eq("second")),
         "a different counter must purge the disk copy and refill:\n{}",
