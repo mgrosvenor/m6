@@ -3,36 +3,36 @@
 //!
 //! The request path never touches a file. A stored entry carries a `queued`
 //! flag, set in the same insert that stores it, and a disk slice scans the
-//! cache for flagged entries and does all the disk work: up to
-//! [`WRITE_BUDGET`] bytes of current entries, and up to [`REMOVE_BUDGET`] files
-//! of an old generation's directory. Those two are upper bounds. The tick stops
-//! after [`TIME_BUDGET`] of loop time, checked between files, so a full queue
-//! costs the loop about a millisecond and the rest waits for the slices that
-//! follow. While [`DiskWriter::has_work`] is true the loop polls without
-//! blocking, so a slice rides each idle turn; when the queue is empty it
-//! returns to its normal wait. A slice that runs out of any budget leaves the
-//! remaining entries flagged, so the next slice continues where it stopped.
-//! Nothing is copied or pushed on the request path, so a store for the writer
-//! allocates nothing beyond the store it already made.
+//! cache for flagged entries and does all the disk work, up to
+//! [`WRITE_BUDGET`] bytes per tick. The tick stops after [`TIME_BUDGET`] of
+//! loop time, checked between files, so a full queue costs the loop about a
+//! millisecond and the rest waits for the slices that follow. While
+//! [`DiskWriter::has_work`] is true the loop polls without blocking, so a slice
+//! rides each idle turn; when the queue is empty it returns to its normal wait.
+//! A slice that runs out of any budget leaves the remaining entries flagged, so
+//! the next slice continues where it stopped. Nothing is copied or pushed on
+//! the request path, so a store for the writer allocates nothing beyond the
+//! store it already made.
 //!
-//! The layout is `<dir>/<genid decimal>/<sha256 of the key>`, one subdirectory
-//! per generation, so an ID change needs no per-file rewrite. A file is written
-//! to `<name>.tmp` with one `write_all`, then renamed. No `fsync`: a crash can
-//! leave a short or torn file, and the check value catches it at load.
+//! The layout is one folder: each entry is `<dir>/<sha256 of the key>`, and the
+//! change counter is `<dir>/change-counter`, a decimal u64 and a newline. A
+//! file is written to `<name>.tmp` with one `write_all`, then renamed. No
+//! `fsync`: a crash can leave a short or torn file, and the check value catches
+//! it at load. The counter is not a generation: it reconciles a disk copy after
+//! a cache missed purges while away. On reconnect a cache presents its saved
+//! counter and the origin answers its current one. Equal keeps the disk copy;
+//! different, or a missing file, purges the folder and refills.
 //!
-//! A restart reads the newest generation's files with [`load`], before the loop
-//! serves. The decoded entries go into a fresh [`Cache`] bounded like the live
-//! one, and the copy is held until the first heartbeat answers: the same ID
-//! installs it, another ID drops it, and an upstream that does not answer
-//! installs it unverified. A file that is short, fails its check value or
-//! carries another generation is deleted and counted, never served and never a
-//! reason to refuse to start.
+//! A restart reads the folder with [`load`], before the loop serves. The
+//! decoded entries go into a fresh [`Cache`] bounded like the live one, and
+//! the copy is held until the first registration answer decides whether to
+//! keep or purge it. A file that is short or fails its check value is deleted
+//! and counted, never served and never a reason to refuse to start.
 //!
 //! The format, all integers little-endian:
 //!
 //! ```text
-//! b"M6DC" , u8 version = 1
-//! u64 genid
+//! b"M6DC" , u8 version = 2
 //! u32 meta_len, meta: JSON {"key": "...", "status": ..., "headers": [[...]]}
 //! u64 body_len, body
 //! [u8; 32] SHA-256 of every byte before it
@@ -58,11 +58,8 @@ pub const TIME_BUDGET: Duration = Duration::from_millis(1);
 /// written on its own, because a file is never split.
 pub const WRITE_BUDGET: u64 = 4 * 1024 * 1024;
 
-/// Files one tick may remove from old generation directories.
-pub const REMOVE_BUDGET: usize = 512;
-
 const MAGIC: &[u8; 4] = b"M6DC";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 
 /// The change-counter file name, one decimal u64 and a newline.
 ///
@@ -104,6 +101,30 @@ pub fn write_change_counter(dir: &Path, counter: u64) -> std::io::Result<()> {
     result
 }
 
+/// Delete every cache file in `dir`, leaving the change-counter file alone.
+///
+/// This is the purge half of the counter reconciliation: a cache that
+/// reconnects with a different or missing counter drops its disk copy and
+/// refills on demand. It runs off the request path, on the counter change.
+pub fn purge_files(dir: &Path) -> std::io::Result<usize> {
+    let mut removed = 0usize;
+    for entry in std::fs::read_dir(dir)? {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        if entry.file_name() == CHANGE_COUNTER {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(removed)
+}
+
 /// What one tick of the writer did, for the metrics document and the tests.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct TickStats {
@@ -137,24 +158,22 @@ pub enum DecodeError {
 /// waiting to be removed.
 pub struct DiskWriter {
     dir: PathBuf,
-    /// The current ID and its subdirectory. `None` means the node has no ID
-    /// yet, and nothing is written.
-    current: Option<(u64, PathBuf)>,
+    /// The change counter this folder's files were saved under. It is a
+    /// reconciliation marker, not a generation: the layout is one folder and
+    /// the counter lives in the `change-counter` file beside the files.
+    counter: u64,
     /// One encode buffer for every file, reserved at start. Grown only when an
     /// entry does not fit, which is table growth rather than a per-entry
     /// allocation.
     buf: Vec<u8>,
-    /// Size of each file in the current subdirectory, by key hash.
+    /// Size of each file in the folder, by key hash.
     sizes: HashMap<[u8; 32], u64>,
-    /// Bytes of files in the current subdirectory.
+    /// Bytes of files in the folder.
     bytes_on_disk: u64,
     /// The bound, taken from the memory cache's own.
     max_bytes: u64,
-    /// Old generation directories waiting to be removed, a bounded amount per
-    /// tick.
-    removals: Vec<PathBuf>,
-    /// The byte bound has been logged for this ID, so a flood of junk keys
-    /// does not log once per entry.
+    /// The byte bound has been logged for this counter, so a flood of junk
+    /// keys does not log once per entry.
     full_logged: bool,
     /// Entries skipped because writing one would pass the byte bound.
     skipped_full: u64,
@@ -183,14 +202,14 @@ impl DiskWriter {
     /// validation is what makes an unwritable path a startup error.
     pub fn new(dir: PathBuf, max_bytes: usize) -> std::io::Result<Self> {
         std::fs::create_dir_all(&dir)?;
+        let counter = read_change_counter(&dir)?.unwrap_or(0);
         Ok(DiskWriter {
             dir,
-            current: None,
+            counter,
             buf: Vec::with_capacity(1024 * 1024),
             sizes: HashMap::new(),
             bytes_on_disk: 0,
             max_bytes: max_bytes as u64,
-            removals: Vec::new(),
             full_logged: false,
             skipped_full: 0,
             write_error_logged: false,
@@ -211,46 +230,45 @@ impl DiskWriter {
         self.time_budget = budget;
     }
 
-    /// Follow `id`: a new subdirectory from the next write, and every other
-    /// subdirectory under the root queued for removal over later ticks.
+    /// Follow `counter`: write the change-counter file, and when the counter
+    /// differs from the one the folder holds, purge the folder so the next
+    /// writes start a fresh disk copy.
     ///
-    /// Called on the first ID and on a change. On a change the caller has
+    /// Called on the first answer and on a change. On a change the caller has
     /// already swapped the memory cache for an empty one, so no entry's
     /// queued flag survives and the scan starts from an empty map.
-    pub fn use_id(&mut self, id: u64) {
-        if self.current.as_ref().is_some_and(|(cur, _)| *cur == id) {
+    pub fn use_id(&mut self, counter: u64) {
+        if self.counter == counter {
+            let _ = write_change_counter(&self.dir, counter);
             return;
+        }
+        if let Err(e) = purge_files(&self.dir) {
+            m6_core::log::warn!(
+                path = %self.dir.display(),
+                error = %e,
+                "disk cache: purge failed"
+            );
         }
         self.sizes.clear();
         self.bytes_on_disk = 0;
         self.full_logged = false;
-        let subdir = self.dir.join(id.to_string());
-        if let Err(e) = std::fs::create_dir_all(&subdir) {
-            self.log_write_error(&subdir, &e);
-        }
-        self.current = Some((id, subdir));
-        // Every other generation's directory goes, so a change needs no
-        // per-file rewrite and the old content does not stay on disk.
-        let keep = id.to_string();
-        if let Ok(entries) = std::fs::read_dir(&self.dir) {
-            for entry in entries.flatten() {
-                if entry.file_name() == keep.as_str() {
-                    continue;
-                }
-                if entry.file_type().is_ok_and(|t| t.is_dir()) {
-                    self.removals.push(entry.path());
-                }
-            }
+        self.counter = counter;
+        if let Err(e) = write_change_counter(&self.dir, counter) {
+            m6_core::log::warn!(
+                path = %self.dir.display(),
+                error = %e,
+                "disk cache: change-counter write failed"
+            );
         }
     }
 
-    /// Count the files a start-time [`load`] found under the current
-    /// generation, so the byte bound covers a directory this process did not
-    /// write and a rewrite of one of those keys replaces its file.
+    /// Count the files a start-time [`load`] found in the folder, so the byte
+    /// bound covers a directory this process did not write and a rewrite of
+    /// one of those keys replaces its file.
     ///
     /// Called once at start, right after [`DiskWriter::use_id`] and before the
-    /// loop serves. A later ID change resets the map, and the loaded
-    /// directory's files go with it.
+    /// loop serves. A later counter change resets the map, and the loaded
+    /// files go with it.
     pub fn adopt(&mut self, files: impl IntoIterator<Item = ([u8; 32], u64)>) {
         for (hash, len) in files {
             let old = self.sizes.insert(hash, len).unwrap_or(0);
@@ -275,18 +293,14 @@ impl DiskWriter {
         self.written_bytes_last_tick = 0;
         self.ticks += 1;
         let started = m6_core::platform::now();
-        let Some((id, dir)) = self.current.clone() else {
-            self.tick_last_ns = elapsed_ns(started);
-            return stats;
-        };
-        stats.removed = self.remove_old(started);
+        let dir = self.dir.clone();
         let budget = self.time_budget;
         let mut written_bytes = 0u64;
         // One entry is attempted before the budget is checked, the same
-        // guarantee `remove_old` makes: a host that deschedules the process
-        // inside the budget would otherwise write nothing on every tick and the
-        // queue would never drain. The attempt advances the scan by one entry,
-        // whether it wrote, skipped a full cache, or failed.
+        // guarantee the removal sweep made: a host that deschedules the
+        // process inside the budget would otherwise write nothing on every
+        // tick and the queue would never drain. The attempt advances the scan
+        // by one entry, whether it wrote, skipped a full cache, or failed.
         let mut attempted = false;
         // The scan visits entries in map order. An entry the budget cannot
         // take stops the scan and keeps its flag, so the next tick sees it.
@@ -299,7 +313,7 @@ impl DiskWriter {
             }
             attempted = true;
             let key_str: &str = std::borrow::Borrow::borrow(key);
-            encode_into(&mut self.buf, id, key_str, response);
+            encode_into(&mut self.buf, key_str, response);
             let len = self.buf.len() as u64;
             if written_bytes > 0 && written_bytes.saturating_add(len) > WRITE_BUDGET {
                 return false;
@@ -316,7 +330,7 @@ impl DiskWriter {
                     m6_core::log::info!(
                         dir = %dir.display(),
                         max_bytes = self.max_bytes,
-                        "disk cache: byte bound reached; skipping writes until the ID changes"
+                        "disk cache: byte bound reached; skipping writes until the counter changes"
                     );
                 }
                 self.skipped_full += 1;
@@ -383,13 +397,12 @@ impl DiskWriter {
         self.tick_last_ns
     }
 
-    /// Whether the writer has a slice to run: entries the cache has flagged,
-    /// or an old generation directory waiting for removal.
+    /// Whether the writer has a slice to run: entries the cache has flagged.
     ///
     /// The loop polls without blocking while this is true, so one slice runs
     /// on each idle turn, and goes back to its normal wait when it is false.
     pub fn has_work(&self, cache: &Cache) -> bool {
-        cache.queued() > 0 || !self.removals.is_empty()
+        cache.queued() > 0
     }
 
     /// Write the encode buffer to `path` through `path.tmp` and a rename.
@@ -422,86 +435,12 @@ impl DiskWriter {
         );
     }
 
-    /// Remove up to [`REMOVE_BUDGET`] files from the oldest queued directory,
-    /// or fewer when `started` is more than the time budget ago.
-    ///
-    /// A directory is removed only on a visit that found it empty, so a
-    /// thousand files take two ticks to empty and a third to remove the
-    /// directory itself.
-    fn remove_old(&mut self, started: Instant) -> usize {
-        let mut removed = 0usize;
-        // One unit of removal work is always attempted before the budget is
-        // checked. Without this a host that deschedules the process between
-        // `started` and the first check removes nothing, every tick, and a
-        // loaded server never frees a cache generation. The test
-        // `removal_stops_at_the_time_budget_and_continues_next_tick` failed on
-        // exactly that on 2026-11-16 under 16 CPU burners.
-        let mut did_work = false;
-        while removed < REMOVE_BUDGET {
-            if did_work && over_budget(started, self.time_budget) {
-                break;
-            }
-            let Some(dir) = self.removals.first().cloned() else {
-                break;
-            };
-            let mut visited = 0usize;
-            match std::fs::read_dir(&dir) {
-                Ok(entries) => {
-                    for entry in entries {
-                        if removed >= REMOVE_BUDGET {
-                            break;
-                        }
-                        if did_work && over_budget(started, self.time_budget) {
-                            break;
-                        }
-                        let Ok(entry) = entry else { continue };
-                        let path = entry.path();
-                        match std::fs::remove_file(&path) {
-                            Ok(()) => {
-                                removed += 1;
-                                visited += 1;
-                                did_work = true;
-                            }
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                                visited += 1;
-                                did_work = true;
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    if visited == 0 {
-                        match std::fs::remove_dir(&dir) {
-                            Ok(()) => {
-                                self.removals.remove(0);
-                                did_work = true;
-                            }
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                                self.removals.remove(0);
-                                did_work = true;
-                            }
-                            Err(_) => break,
-                        }
-                    } else {
-                        // This visit removed files, so the directory is left
-                        // for a later tick even when budget remains: an empty
-                        // directory goes on the tick that found it empty.
-                        break;
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    self.removals.remove(0);
-                    did_work = true;
-                }
-                Err(_) => break,
-            }
-        }
-        removed
-    }
 }
 
-/// What a start-time load read, held aside until the first heartbeat answers.
+/// What a start-time load read, held aside until the first registration answer.
 pub struct Loaded {
-    /// The generation every loaded file carried, which is its directory's name.
+    /// The change counter the folder was saved under, read from the
+    /// `change-counter` file. It is a reconciliation marker, not a generation.
     pub id: u64,
     /// The decoded entries, bounded like the live cache.
     pub cache: Cache,
@@ -509,10 +448,10 @@ pub struct Loaded {
     pub entries: usize,
     /// Files deleted because they could not be read.
     pub bad: usize,
-    /// The key hash and file length of every file left in the generation's
-    /// directory, including the ones beyond the memory bound and the ones this
-    /// process did not write. [`DiskWriter::adopt`] counts them, so the byte
-    /// bound covers the directory a restart inherits.
+    /// The key hash and file length of every file left in the folder,
+    /// including the ones beyond the memory bound and the ones this process
+    /// did not write. [`DiskWriter::adopt`] counts them, so the byte bound
+    /// covers the directory a restart inherits.
     pub files: Vec<([u8; 32], u64)>,
 }
 
@@ -545,50 +484,30 @@ impl LoadState {
     }
 }
 
-/// Read the newest generation's files under `dir` into a fresh cache.
+/// Read the files under `dir` into a fresh cache.
 ///
 /// This is the start-time half of the disk cache: it runs once, before the
-/// loop serves, and never on the request path. The subdirectory with the
-/// largest decimal name is the generation to read, because the source's IDs
-/// only grow. Every other subdirectory is left for the writer to remove when
-/// the first heartbeat names the ID.
+/// loop serves, and never on the request path. The layout is one folder, so
+/// every file is read and the change counter is taken from the
+/// `change-counter` file beside them.
 ///
 /// A file is read and decoded one at a time. The entries that fit `max_bytes`
 /// are inserted and the rest stay on disk under their keys, so a node whose
 /// disk copy is larger than its memory bound still starts with a cache of the
 /// first entries in file-name order, and the writer's bound covers the files
-/// that were left. A file that is short, fails its check value, carries
-/// another generation or names a key the store could not have written is
-/// deleted and counted in `bad`, with one log line naming the path and the
-/// error. A `.tmp` file is an interrupted write and is deleted without being
-/// counted.
+/// that were left. A file that is short, fails its check value or names a key
+/// the store could not have written is deleted and counted in `bad`, with one
+/// log line naming the path and the error. A `.tmp` file is an interrupted
+/// write and is deleted without being counted. The `change-counter` file is
+/// left alone.
 ///
-/// `Ok(None)` means there is nothing to load: an empty `dir`, or no
-/// subdirectory with a decimal name. A directory that cannot be listed is an
+/// `Ok(None)` means there are no cache files to load: an empty `dir`, or one
+/// holding only the change counter. A directory that cannot be listed is an
 /// error, because a cache node whose `[cache] dir` cannot be read is a
 /// configuration fault the operator must see at start.
 pub fn load(dir: &Path, max_bytes: usize) -> std::io::Result<Option<Loaded>> {
     let started = m6_core::platform::now();
-    let mut newest: Option<(u64, PathBuf)> = None;
-    for entry in std::fs::read_dir(dir)? {
-        let Ok(entry) = entry else { continue };
-        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
-            continue;
-        }
-        let Ok(name) = entry.file_name().into_string() else {
-            continue;
-        };
-        let Ok(id) = name.parse::<u64>() else {
-            continue;
-        };
-        if newest.as_ref().is_none_or(|(best, _)| id > *best) {
-            newest = Some((id, entry.path()));
-        }
-    }
-    let Some((id, gen_dir)) = newest else {
-        return Ok(None);
-    };
-
+    let id = read_change_counter(dir)?.unwrap_or(0);
     let cache = Cache::with_max_bytes(max_bytes);
     let mut entries = 0usize;
     let mut bad = 0usize;
@@ -596,12 +515,16 @@ pub fn load(dir: &Path, max_bytes: usize) -> std::io::Result<Option<Loaded>> {
     let mut files: Vec<([u8; 32], u64)> = Vec::new();
     // Name order, so the entries that win the bound and the ones left on disk
     // are the same on every start.
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&gen_dir)?
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
         .flatten()
         .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter(|e| e.file_name() != CHANGE_COUNTER)
         .map(|e| e.path())
         .collect();
     paths.sort();
+    if paths.is_empty() {
+        return Ok(None);
+    }
 
     for path in paths {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
@@ -644,7 +567,7 @@ pub fn load(dir: &Path, max_bytes: usize) -> std::io::Result<Option<Loaded>> {
                 continue;
             }
         };
-        let (file_id, stored_key, response) = match decode(&data) {
+        let (stored_key, response) = match decode(&data) {
             Ok(decoded) => decoded,
             Err(e) => {
                 bad += 1;
@@ -657,18 +580,6 @@ pub fn load(dir: &Path, max_bytes: usize) -> std::io::Result<Option<Loaded>> {
                 continue;
             }
         };
-        if file_id != id {
-            bad += 1;
-            m6_core::log::warn!(
-                path = %path.display(),
-                error = "the file carries another generation",
-                file_id,
-                dir_id = id,
-                "disk cache: deleting a file from another generation"
-            );
-            let _ = std::fs::remove_file(&path);
-            continue;
-        }
         let Some(key) = key_from_stored(&stored_key) else {
             bad += 1;
             m6_core::log::warn!(
@@ -754,7 +665,7 @@ fn elapsed_ns(started: Instant) -> u64 {
 ///
 /// The buffer is cleared first. The metadata is serialised straight into it, so
 /// no scratch `Vec` or `String` is built per entry.
-pub fn encode_into(buf: &mut Vec<u8>, id: u64, key: &str, r: &CachedResponse) {
+pub fn encode_into(buf: &mut Vec<u8>, key: &str, r: &CachedResponse) {
     #[derive(serde::Serialize)]
     struct Meta<'a> {
         key: &'a str,
@@ -765,7 +676,6 @@ pub fn encode_into(buf: &mut Vec<u8>, id: u64, key: &str, r: &CachedResponse) {
     buf.clear();
     buf.extend_from_slice(MAGIC);
     buf.push(VERSION);
-    buf.extend_from_slice(&id.to_le_bytes());
     let len_at = buf.len();
     buf.extend_from_slice(&[0u8; 4]);
     let meta_start = buf.len();
@@ -786,10 +696,10 @@ pub fn encode_into(buf: &mut Vec<u8>, id: u64, key: &str, r: &CachedResponse) {
     buf.extend_from_slice(check.as_slice());
 }
 
-/// Decode one file into the generation ID, the cache key and the response.
+/// Decode one file into the cache key and the response.
 ///
 /// This is the function a restarted node reads its disk cache with.
-pub fn decode(bytes: &[u8]) -> Result<(u64, String, CachedResponse), DecodeError> {
+pub fn decode(bytes: &[u8]) -> Result<(String, CachedResponse), DecodeError> {
     #[derive(serde::Deserialize)]
     struct Meta {
         key: String,
@@ -805,7 +715,6 @@ pub fn decode(bytes: &[u8]) -> Result<(u64, String, CachedResponse), DecodeError
     if version != VERSION {
         return Err(DecodeError::Version(version));
     }
-    let id = u64::from_le_bytes(r.take(8)?.try_into().expect("8 bytes"));
     let meta_len = u32::from_le_bytes(r.take(4)?.try_into().expect("4 bytes")) as usize;
     let meta: Meta =
         serde_json::from_slice(r.take(meta_len)?).map_err(|e| DecodeError::Meta(e.to_string()))?;
@@ -827,10 +736,9 @@ pub fn decode(bytes: &[u8]) -> Result<(u64, String, CachedResponse), DecodeError
         return Err(DecodeError::Check);
     }
     Ok((
-        id,
         meta.key,
         CachedResponse {
-            genid: id,
+            genid: 0,
             status: meta.status,
             headers: crate::cache::HeaderBlock::from_pairs(meta.headers),
             body: bytes::Bytes::from(body),
@@ -871,6 +779,7 @@ impl<'a> Reader<'a> {
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -880,9 +789,9 @@ mod tests {
     use bytes::Bytes;
 
     /// A response with one header and a body of `body_len` zero bytes.
-    fn response(genid: u64, body: &[u8]) -> CachedResponse {
+    fn response(body: &[u8]) -> CachedResponse {
         CachedResponse {
-            genid,
+            genid: 0,
             status: 200,
             headers: HeaderBlock::from_pairs(vec![(
                 "content-type".to_string(),
@@ -902,7 +811,7 @@ mod tests {
     /// its queued flag set, in the same map write.
     fn stored_queued(cache: &mut Cache, path: &str, body: &[u8]) -> CacheKey {
         let key = CacheKey::new(path, None, "");
-        cache.insert_queued(key.clone(), response(7, body));
+        cache.insert_queued(key.clone(), response(body));
         key
     }
 
@@ -910,15 +819,15 @@ mod tests {
         let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
             .expect("read_dir")
             .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
             .map(|e| e.path())
-            .filter(|p| p.is_file())
             .collect();
         out.sort();
         out
     }
 
-    /// Every field survives the round trip: the ID, the key, the status, every
-    /// header and the body.
+    /// Every field survives the round trip: the key, the status, every header
+    /// and the body.
     ///
     /// Break: write the body length in big-endian while the reader takes
     /// little-endian, and the decoded body is empty or the check fails.
@@ -926,7 +835,7 @@ mod tests {
     fn encode_then_decode_round_trips() {
         let body = b"hello, disk";
         let r = CachedResponse {
-            genid: 7,
+            genid: 0,
             status: 203,
             headers: HeaderBlock::from_pairs(vec![
                 ("content-type".to_string(), "text/plain".to_string()),
@@ -942,11 +851,9 @@ mod tests {
             body: Bytes::from_static(body),
         };
         let mut buf = Vec::new();
-        encode_into(&mut buf, 42, "/hello\u{1}a=1\u{1}gzip", &r);
-        let (id, key, decoded) = decode(&buf).expect("decode");
-        assert_eq!(id, 42);
+        encode_into(&mut buf, "/hello\u{1}a=1\u{1}gzip", &r);
+        let (key, decoded) = decode(&buf).expect("decode");
         assert_eq!(key, "/hello\u{1}a=1\u{1}gzip");
-        assert_eq!(decoded.genid, 42);
         assert_eq!(decoded.status, 203);
         assert_eq!(decoded.headers, r.headers);
         assert_eq!(&decoded.body[..], body);
@@ -960,7 +867,7 @@ mod tests {
     #[test]
     fn a_flipped_byte_fails_the_check() {
         let mut buf = Vec::new();
-        encode_into(&mut buf, 7, "/", &response(7, b"body"));
+        encode_into(&mut buf, "/", &response(b"body"));
         let body_at = buf.len() - 32 - 4;
         buf[body_at] ^= 0x01;
         assert!(matches!(decode(&buf), Err(DecodeError::Check)));
@@ -973,7 +880,7 @@ mod tests {
     #[test]
     fn a_short_file_fails() {
         let mut buf = Vec::new();
-        encode_into(&mut buf, 7, "/", &response(7, b"body"));
+        encode_into(&mut buf, "/", &response(b"body"));
         for cut in [0, 3, 5, 10, buf.len() - 1] {
             assert!(
                 matches!(decode(&buf[..cut]), Err(DecodeError::Short)),
@@ -1011,18 +918,18 @@ mod tests {
         let third = w.tick(&mut cache);
         assert_eq!(third.written, 2, "the third tick writes the rest");
         assert_eq!(cache.queued(), 0);
-        assert_eq!(files(&dir.path().join("7")).len(), 10);
+        assert_eq!(files(dir.path()).len(), 11, "ten files plus the counter");
     }
 
-    /// The writer has work while the cache holds a flagged entry or an old
-    /// generation directory waits for removal, and not a slice after both are
-    /// empty. That is the condition the loop polls a zero timeout on: true
-    /// keeps one slice per idle turn, false returns the normal wait.
+    /// The writer has work while the cache holds a flagged entry, and not a
+    /// slice after the queue is empty. That is the condition the loop polls a
+    /// zero timeout on: true keeps one slice per idle turn, false returns the
+    /// normal wait.
     ///
     /// Break: return false always, and the loop waits a second between
     /// slices; return true always, and it spins at a zero timeout.
     #[test]
-    fn the_writer_has_work_until_the_queue_and_removals_are_empty() {
+    fn the_writer_has_work_until_the_queue_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let mut cache = Cache::new();
         let mut w = DiskWriter::new(dir.path().to_path_buf(), 128 * 1024 * 1024).unwrap();
@@ -1041,21 +948,6 @@ mod tests {
             !w.has_work(&cache),
             "the loop returns to its normal wait once the queue is empty"
         );
-        // A generation change queues the old directory for removal, which is
-        // work even with an empty cache.
-        let old = dir.path().join("8");
-        std::fs::create_dir_all(&old).unwrap();
-        std::fs::write(old.join("file"), b"old").unwrap();
-        w.use_id(9);
-        assert!(
-            w.has_work(&cache),
-            "an old generation is work for an idle turn"
-        );
-        while w.has_work(&cache) {
-            w.tick(&mut cache);
-        }
-        assert!(!old.exists());
-        assert!(!w.has_work(&cache));
     }
 
     /// The tick stops when its loop-time budget is used, between files, and
@@ -1082,7 +974,7 @@ mod tests {
             assert_eq!(cache.queued(), 8 - i - 1, "the rest stay flagged");
         }
         assert_eq!(w.tick(&mut cache).written, 0, "the queue is empty");
-        assert_eq!(files(&dir.path().join("7")).len(), 8);
+        assert_eq!(files(dir.path()).len(), 9, "eight files plus the counter");
     }
 
     /// The tick writes the entry as it is now, not as it was when queued.
@@ -1097,12 +989,15 @@ mod tests {
         let key = stored_queued(&mut cache, "/changing", b"old");
         // Re-store before the tick: the replacement keeps the queued flag, so
         // the key is still queued exactly once.
-        cache.insert(key.clone(), response(7, b"new"));
+        cache.insert(key.clone(), response(b"new"));
         assert_eq!(cache.queued(), 1);
 
         assert_eq!(w.tick(&mut cache).written, 1);
-        let file = files(&dir.path().join("7")).pop().expect("one file");
-        let (_, _, decoded) = decode(&std::fs::read(file).unwrap()).expect("decode");
+        let file = files(dir.path())
+            .into_iter()
+            .find(|p| p.file_name().is_some_and(|n| n.to_string_lossy() != CHANGE_COUNTER))
+            .expect("one cache file");
+        let (_, decoded) = decode(&std::fs::read(file).unwrap()).expect("decode");
         assert_eq!(&decoded.body[..], b"new");
     }
 
@@ -1123,9 +1018,12 @@ mod tests {
 
         let stats = w.tick(&mut cache);
         assert_eq!(stats.written, 1);
-        let names = files(&dir.path().join("7"));
+        let names: Vec<PathBuf> = files(dir.path())
+            .into_iter()
+            .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy() != CHANGE_COUNTER))
+            .collect();
         assert_eq!(names.len(), 1);
-        let (_, key, _) = decode(&std::fs::read(&names[0]).unwrap()).expect("decode");
+        let (key, _) = decode(&std::fs::read(&names[0]).unwrap()).expect("decode");
         assert_eq!(key, "/kept\u{1}\u{1}");
     }
 
@@ -1146,243 +1044,125 @@ mod tests {
         let stats = w.tick(&mut cache);
         assert_eq!(stats.written, 3, "three files fit the bound");
         assert_eq!(w.skipped_full(), 2, "the other two are skipped and counted");
-        assert_eq!(files(&dir.path().join("7")).len(), 3);
+        assert_eq!(
+            files(dir.path())
+                .into_iter()
+                .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy() != CHANGE_COUNTER))
+                .count(),
+            3
+        );
     }
 
-    /// A new ID moves writes to its own subdirectory and queues the old one
-    /// for removal: 1,000 files empty over two ticks, the directory goes on the
-    /// third.
+    /// A counter change purges the folder and writes the new counter, so a
+    /// cache that missed purges while away never serves its old disk copy.
     ///
-    /// Break: never queue the old directory, and it still holds 1,000 files.
+    /// Break: keep the old files, and the restart serves them.
     #[test]
-    fn a_new_id_removes_the_old_directory_over_ticks() {
-        let dir = tempfile::tempdir().unwrap();
-        let old = dir.path().join("6");
-        std::fs::create_dir_all(&old).unwrap();
-        for i in 0..1000 {
-            std::fs::write(old.join(format!("{i:064x}")), b"x").unwrap();
-        }
-        let mut cache = Cache::new();
-        let mut w = writer(dir.path(), 128 * 1024 * 1024);
-        // The 512-file bound is measured on its own here.
-        w.time_budget = Duration::from_secs(60);
-
-        assert_eq!(w.tick(&mut cache).removed, 512, "first tick removes 512");
-        assert!(old.is_dir(), "and leaves the directory");
-        assert_eq!(w.tick(&mut cache).removed, 488, "second tick empties it");
-        assert!(old.is_dir(), "the empty directory waits for its own tick");
-        assert_eq!(w.tick(&mut cache).removed, 0);
-        assert!(!old.exists(), "third tick removes the directory");
-    }
-
-    /// A removal tick stops at the time budget like a write tick, and the
-    /// directory drains over the ticks that follow. Without the check, one
-    /// generation change would unlink a thousand files in a single iteration.
-    ///
-    /// Break: drop the time check from `remove_old`, and the first tick takes
-    /// REMOVE_BUDGET files, not a budget's worth.
-    #[test]
-    fn removal_stops_at_the_time_budget_and_continues_next_tick() {
-        let dir = tempfile::tempdir().unwrap();
-        let old = dir.path().join("6");
-        std::fs::create_dir_all(&old).unwrap();
-        for i in 0..2_000 {
-            std::fs::write(old.join(format!("{i:064x}")), b"x").unwrap();
-        }
-        let mut cache = Cache::new();
-        let mut w = writer(dir.path(), 128 * 1024 * 1024);
-        // A zero budget makes the guarantee exact: one file of progress, then
-        // the budget stops the tick. A wall-clock budget cannot promise that
-        // on a loaded host, which is what made this test fail under 16 CPU
-        // burners on 2026-11-16.
-        w.time_budget = Duration::ZERO;
-
-        let first = w.tick(&mut cache).removed;
-        assert_eq!(first, 1, "a tick always makes one file of progress");
-        let mut ticks = 1u32;
-        while old.exists() {
-            let removed = w.tick(&mut cache).removed;
-            ticks += 1;
-            assert!(removed <= 1, "the budget removes one file per tick");
-            assert!(
-                removed == 1 || !old.exists(),
-                "a tick that removed no file must have removed the empty directory"
-            );
-            assert!(ticks <= 2_002, "removal stopped making progress");
-        }
-        assert!(ticks > 1, "the directory takes more than one tick");
-    }
-
-    /// Two stores of one key before a tick write one file.
-    ///
-    /// Break: dedup with a second ring entry instead of the entry's queued
-    /// flag, and the tick writes the same file twice.
-    #[test]
-    fn a_key_is_queued_once() {
+    fn a_counter_change_purges_the_folder() {
         let dir = tempfile::tempdir().unwrap();
         let mut cache = Cache::new();
         let mut w = writer(dir.path(), 128 * 1024 * 1024);
-        let key = stored_queued(&mut cache, "/once", b"first");
-        cache.insert(key.clone(), response(7, b"second"));
-        assert_eq!(cache.queued(), 1);
+        w.use_id(7);
+        stored_queued(&mut cache, "/kept", b"kept");
         assert_eq!(w.tick(&mut cache).written, 1);
-        assert_eq!(files(&dir.path().join("7")).len(), 1);
+        assert_eq!(
+            files(dir.path())
+                .into_iter()
+                .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy() != CHANGE_COUNTER))
+                .count(),
+            1
+        );
+
+        w.use_id(9);
+        assert_eq!(
+            files(dir.path())
+                .into_iter()
+                .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy() != CHANGE_COUNTER))
+                .count(),
+            0,
+            "a counter change purges the folder"
+        );
+        assert_eq!(read_change_counter(dir.path()).unwrap(), Some(9));
     }
 
-    /// What the writer leaves behind reads back after it is gone: a fresh
-    /// writer on the same directory, which is what a restart starts with,
-    /// decodes every file. The file is complete without the writer.
-    ///
-    /// Break: drop the check value from the encode, and the file no longer
-    /// decodes on its own.
+    /// A written counter round-trips, and the write is atomic: a temp file is
+    /// never left behind and the value is a decimal u64 plus a newline.
     #[test]
-    fn a_restart_reads_what_the_writer_wrote() {
+    fn a_written_counter_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let mut cache = Cache::new();
-        let mut w = writer(dir.path(), 128 * 1024 * 1024);
-        stored_queued(&mut cache, "/restart", b"warm");
-        assert_eq!(w.tick(&mut cache).written, 1);
-        drop(w);
-
-        let subdir = dir.path().join("7");
-        let files = files(&subdir);
-        assert_eq!(files.len(), 1);
-        // No writer is alive: the file itself carries everything a restart
-        // needs, and the check value proves it was not torn.
-        let (id, key, response) = decode(&std::fs::read(&files[0]).unwrap()).expect("decode");
-        assert_eq!(id, 7);
-        assert_eq!(key, "/restart\u{1}\u{1}");
-        assert_eq!(&response.body[..], b"warm");
-        // A fresh writer over the same root follows the same ID with no work.
-        let mut fresh = DiskWriter::new(dir.path().to_path_buf(), 128 * 1024 * 1024).unwrap();
-        fresh.use_id(7);
-        assert_eq!(fresh.tick(&mut Cache::new()).written, 0);
-        assert_eq!(fresh.dir_bytes(), 0);
+        write_change_counter(dir.path(), 42).unwrap();
+        assert_eq!(read_change_counter(dir.path()).unwrap(), Some(42));
+        let text = std::fs::read_to_string(dir.path().join(CHANGE_COUNTER)).unwrap();
+        assert_eq!(text, "42\n");
     }
 
-    /// The tick is a no-op while the ID is unknown, because there is nothing
-    /// to write under.
-    ///
-    /// Break: write into the root directory, and a file appears after a tick
-    /// with no ID.
+    /// A missing counter reads as none, and garbage reads as missing, so a
+    /// torn or hand-edited counter reconciles by purging rather than by
+    /// trusting a value that was never saved.
     #[test]
-    fn no_id_means_no_write() {
+    fn a_missing_or_garbage_counter_reads_as_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let mut cache = Cache::new();
-        let mut w = DiskWriter::new(dir.path().to_path_buf(), 128 * 1024 * 1024).unwrap();
-        stored_queued(&mut cache, "/early", b"body");
-        assert_eq!(w.tick(&mut cache).written, 0);
-        assert_eq!(files(dir.path()).len(), 0);
-    }
-
-    /// The budget is per tick and a slow entry that cannot fit after earlier
-    /// writes is left queued, not dropped.
-    ///
-    /// Break: drop a key that does not fit the remaining budget, and the
-    /// second tick writes nothing.
-    #[test]
-    fn a_leftover_key_waits_for_the_next_tick() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut cache = Cache::new();
-        let mut w = writer(dir.path(), 128 * 1024 * 1024);
-        // The two writes are three MiB each, so the byte budget is what splits
-        // them. Pin the loop-time budget so a loaded host cannot end the tick
-        // before the first file, as the other byte-budget tests do.
-        w.time_budget = Duration::from_secs(60);
-        // Three MiB, then three again: the first fills most of a tick and the
-        // second cannot fit beside it.
-        let big = vec![0u8; 3 * 1024 * 1024 - 4096];
-        for i in 0..2 {
-            stored_queued(&mut cache, &format!("/big{i}"), &big);
-        }
-        assert_eq!(w.tick(&mut cache).written, 1);
-        assert_eq!(cache.queued(), 1, "the second key is still waiting");
-        assert_eq!(w.tick(&mut cache).written, 1);
-        assert_eq!(cache.queued(), 0);
+        assert_eq!(read_change_counter(dir.path()).unwrap(), None);
+        std::fs::write(dir.path().join(CHANGE_COUNTER), b"not-a-counter\n").unwrap();
+        assert_eq!(read_change_counter(dir.path()).unwrap(), None);
     }
 
     // ── The start-time load ──────────────────────────────────────────────────
 
-    /// Write one encoded entry under `<root>/<id>/<hash of key>`.
-    fn write_entry(root: &Path, id: u64, key: &str, body: &[u8]) {
-        let subdir = root.join(id.to_string());
-        std::fs::create_dir_all(&subdir).unwrap();
+    /// Write one encoded entry under `root`.
+    fn write_entry(root: &Path, key: &str, body: &[u8]) {
         let mut buf = Vec::new();
-        encode_into(&mut buf, id, key, &response(id, body));
-        std::fs::write(subdir.join(hex(&key_hash(key))), buf).unwrap();
+        encode_into(&mut buf, key, &response(body));
+        std::fs::write(root.join(hex(&key_hash(key))), buf).unwrap();
     }
 
-    /// The largest decimal directory name is the generation to read. String
-    /// order would take `9` over `10`, so this proves the comparison is the
-    /// number.
-    ///
-    /// Break: compare the other way, and directory `2` loads instead.
-    #[test]
-    fn load_picks_the_newest_id_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        for id in [2u64, 9, 10] {
-            write_entry(dir.path(), id, "/page\u{1}\u{1}", &[id as u8]);
-        }
-        let loaded = load(dir.path(), 1024 * 1024)
-            .unwrap()
-            .expect("a generation directory");
-        assert_eq!(
-            loaded.id, 10,
-            "the ID grows, so the largest number is newest"
-        );
-        assert_eq!(loaded.entries, 1);
-        assert_eq!(loaded.bad, 0);
-        let entry = loaded
-            .cache
-            .get(&CacheKey::new("/page", None, ""))
-            .expect("the newest generation's entry");
-        assert_eq!(&entry.body[..], &[10], "the body is the newest one's");
-        assert_eq!(entry.genid, 10, "the entry carries the file's ID");
-    }
-
-    /// One good file survives. A flipped byte, a truncated file and a file
-    /// stamped with another ID are deleted and counted, and a `.tmp` from an
-    /// interrupted write is deleted without being counted.
+    /// One good file survives. A flipped byte and a truncated file are deleted
+    /// and counted, and a `.tmp` from an interrupted write is deleted without
+    /// being counted. The change-counter file is skipped.
     ///
     /// Break: skip a file that does not decode without counting or deleting
     /// it, and `bad` is 0 and the corrupt file stays on disk.
     #[test]
     fn load_deletes_bad_files_and_counts_them() {
         let dir = tempfile::tempdir().unwrap();
-        let gen = dir.path().join("7");
-        write_entry(dir.path(), 7, "/good\u{1}\u{1}", b"good");
+        write_entry(dir.path(), "/good\u{1}\u{1}", b"good");
 
         let mut buf = Vec::new();
-        encode_into(&mut buf, 7, "/flip\u{1}\u{1}", &response(7, b"flipped"));
+        encode_into(&mut buf, "/flip\u{1}\u{1}", &response(b"flipped"));
         let at = buf.len() - 32 - 1;
         buf[at] ^= 0x01;
-        std::fs::write(gen.join(hex(&key_hash("/flip\u{1}\u{1}"))), &buf).unwrap();
+        std::fs::write(dir.path().join(hex(&key_hash("/flip\u{1}\u{1}"))), &buf).unwrap();
 
         let mut buf = Vec::new();
-        encode_into(&mut buf, 7, "/short\u{1}\u{1}", &response(7, b"short"));
+        encode_into(&mut buf, "/short\u{1}\u{1}", &response(b"short"));
         let cut = buf.len() / 2;
-        std::fs::write(gen.join(hex(&key_hash("/short\u{1}\u{1}"))), &buf[..cut]).unwrap();
+        std::fs::write(dir.path().join(hex(&key_hash("/short\u{1}\u{1}"))), &buf[..cut]).unwrap();
 
-        let mut buf = Vec::new();
-        encode_into(&mut buf, 8, "/other\u{1}\u{1}", &response(8, b"other"));
-        std::fs::write(gen.join(hex(&key_hash("/other\u{1}\u{1}"))), &buf).unwrap();
-
-        std::fs::write(gen.join("junk.tmp"), b"partial").unwrap();
+        std::fs::write(dir.path().join("junk.tmp"), b"partial").unwrap();
+        write_change_counter(dir.path(), 7).unwrap();
 
         let loaded = load(dir.path(), 1024 * 1024)
             .unwrap()
-            .expect("a generation directory");
+            .expect("a folder");
         assert_eq!(loaded.entries, 1, "only the good file loads");
         assert_eq!(
-            loaded.bad, 3,
-            "the flipped byte, the short file and the other generation"
+            loaded.bad, 2,
+            "the flipped byte and the short file are counted"
         );
-        assert_eq!(files(&gen).len(), 1, "every bad file and the tmp are gone");
+        assert_eq!(loaded.id, 7, "the change counter is the load's id");
+        assert_eq!(
+            files(dir.path())
+                .into_iter()
+                .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy() != CHANGE_COUNTER))
+                .count(),
+            1,
+            "every bad file and the tmp are gone"
+        );
         assert!(loaded
             .cache
             .get(&CacheKey::new("/good", None, ""))
             .is_some());
-        for key in ["/flip", "/short", "/other"] {
+        for key in ["/flip", "/short"] {
             assert!(
                 loaded.cache.get(&CacheKey::new(key, None, "")).is_none(),
                 "{key} was not served"
@@ -1401,12 +1181,12 @@ mod tests {
         let body = vec![b'x'; 4096];
         let total = 40usize;
         for i in 0..total {
-            write_entry(dir.path(), 7, &format!("/p{i}\u{1}\u{1}"), &body);
+            write_entry(dir.path(), &format!("/p{i}\u{1}\u{1}"), &body);
         }
         let bound = 64 * 1024;
         let loaded = load(dir.path(), bound)
             .unwrap()
-            .expect("a generation directory");
+            .expect("a folder");
         assert!(
             loaded.cache.bytes_held() <= bound,
             "the cache holds {} bytes against a {bound} bound",
@@ -1419,107 +1199,17 @@ mod tests {
         );
         assert!(loaded.entries > 0, "some entries fit");
         assert_eq!(loaded.bad, 0, "an entry that does not fit is not corrupt");
-        assert_eq!(
-            files(&dir.path().join("7")).len(),
-            total,
-            "the rest is left on disk and stays addressable"
-        );
-        assert_eq!(
-            loaded.files.len(),
-            total,
-            "every file counts towards the writer's byte bound"
-        );
+        assert_eq!(loaded.files.len(), total, "every file counts towards the bound");
     }
 
-    /// An empty root and a root with no decimal subdirectory both mean nothing
-    /// to load, so the node starts exactly as it did before the disk cache.
+    /// An empty root means nothing to load, so the node starts exactly as it
+    /// did before the disk cache.
     ///
-    /// Break: return a load with ID 0, and the node believes it read
-    /// generation 0 from an empty directory.
+    /// Break: return a load with ID 0, and the node believes it read a
+    /// counter from an empty directory.
     #[test]
     fn load_of_nothing_is_none() {
         let dir = tempfile::tempdir().unwrap();
         assert!(load(dir.path(), 1024).unwrap().is_none());
-        std::fs::create_dir(dir.path().join("not-a-generation")).unwrap();
-        assert!(load(dir.path(), 1024).unwrap().is_none());
-    }
-
-    /// A full 4 MiB cache of 4 KiB pages is 1,024 files. This is the start
-    /// time an operator waits for: the load runs once, before the loop serves,
-    /// and its `elapsed_ms` is the line the log carries.
-    ///
-    /// Break: drop the bound check, and `entries` is the whole directory.
-    #[test]
-    fn load_a_full_cache_measures_its_start_time() {
-        let dir = tempfile::tempdir().unwrap();
-        let body = vec![b'x'; 4096];
-        let total = 1024usize;
-        for i in 0..total {
-            write_entry(dir.path(), 7, &format!("/p{i}\u{1}\u{1}"), &body);
-        }
-        let bound = 4 * 1024 * 1024;
-        let started = m6_core::platform::now();
-        let loaded = load(dir.path(), bound)
-            .unwrap()
-            .expect("a generation directory");
-        let elapsed = started.elapsed();
-        println!(
-            "disk cache load: {total} files of 4 KiB, {} entries, {} bytes held, {} ms",
-            loaded.entries,
-            loaded.cache.bytes_held(),
-            elapsed.as_millis()
-        );
-        assert!(
-            loaded.cache.bytes_held() <= bound,
-            "the cache holds {} bytes against a {bound} bound",
-            loaded.cache.bytes_held()
-        );
-        assert!(loaded.entries > 0);
-        assert!(
-            loaded.entries < total,
-            "the whole directory fit the bound, so the test measures nothing"
-        );
-        assert_eq!(loaded.files.len(), total);
-    }
-}
-
-#[cfg(test)]
-mod change_counter_tests {
-    use super::*;
-
-    /// A missing file reads as no counter, so a fresh disk copy reconciles by
-    /// purging rather than by trusting a value that was never saved.
-    #[test]
-    fn a_missing_counter_reads_as_none() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(read_change_counter(dir.path()).unwrap(), None);
-    }
-
-    /// A written counter round-trips, and the write is atomic: a temp file is
-    /// never left behind and the value is a decimal u64 plus a newline.
-    #[test]
-    fn a_written_counter_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        write_change_counter(dir.path(), 42).unwrap();
-        assert_eq!(read_change_counter(dir.path()).unwrap(), Some(42));
-        let text = std::fs::read_to_string(dir.path().join(CHANGE_COUNTER)).unwrap();
-        assert_eq!(text, "42\n");
-        assert!(
-            std::fs::read_dir(dir.path()).unwrap().all(|e| !e
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".tmp")),
-            "the temp file is renamed away"
-        );
-    }
-
-    /// Garbage in the counter file reads as missing, never as a number that
-    /// would keep a disk copy the operator did not save.
-    #[test]
-    fn garbage_reads_as_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(CHANGE_COUNTER), b"not-a-counter\n").unwrap();
-        assert_eq!(read_change_counter(dir.path()).unwrap(), None);
     }
 }
