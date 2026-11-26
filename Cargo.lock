@@ -2790,6 +2790,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "m6-redirect"
+version = "1.17.0"
+dependencies = [
+ "anyhow",
+ "m6-core",
+ "m6-platform",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "matches"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
