@@ -1594,12 +1594,10 @@ pub fn load_traced(
                     }
                 }
             } else {
-                for (key, present) in [("origin", raw.origin.is_some())] {
-                    if present {
-                        anyhow::bail!(
-                            "config error: [registration] {key} applies only to a cache node, which has no claims"
-                        );
-                    }
+                if raw.origin.is_some() {
+                    anyhow::bail!(
+                        "config error: [registration] origin applies only to a cache node, which has no claims"
+                    );
                 }
             }
 
