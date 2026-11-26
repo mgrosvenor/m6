@@ -98,9 +98,9 @@ Cache miss path:
 
 **What gets cached:** Responses with `Cache-Control: public`. `no-store` and `private` are not cached. A 5xx and most 4xx responses are never cached, whatever their headers say.
 
-**Invalidation is one number.** A cached entry leaves the cache in one of four ways: a successful state-changing request evicts the entry for its own path, its freshness lifetime ends (a page with no explicit `max-age` lives at most 24 hours), the site's generation changes and empties the whole cache, or the process restarts. A change to a file behind a page therefore does not reach readers until the generation changes.
+**Invalidation is a purge.** A cached entry leaves the cache in one of four ways: a successful state-changing request evicts the entry for its own path, its freshness lifetime ends (a page with no explicit `max-age` lives at most 24 hours), a `PURGE` removes the path or a `PURGE /*` clears the whole cache, or the process restarts. A change to a file behind a page therefore does not reach readers until a purge.
 
-The generation is a counter the source node owns. A publish is one `POST /genid` to m6-http: it reloads every backend on a Unix socket, flushes the cache and advances the counter, then answers with the new value. Tools that change content (a CMS renderer, a deploy script) send that request when they finish. There is no per-path map and nothing to keep in step with the files.
+A publish is two steps. The changed backend is reloaded with `POST /genid` on its own Unix socket, and then `PURGE /*` goes to m6-http, which empties its cache, fans the purge out to every registered cache, and raises the change counter. Tools that change content (a CMS renderer, a deploy script) do both when they finish. There is no per-path map and nothing to keep in step with the files: a purge removes every cached path, and the counter reconciles a cache's disk copy.
 
 ## Backend pools and socket discovery
 
@@ -131,7 +131,7 @@ m6-http asks m6-auth's check socket about the caller's token before the request 
 
 ## Reading files once
 
-Every m6 process reads its configuration, `site.toml`, templates, params files and keys once, at start. A change to a configuration file takes a restart. A change to content does not: a publish is one `POST /genid`, which re-runs the start path in every backend and swaps the new site in only if it loads, so the old one keeps serving when it does not. A certificate renewal takes a restart of m6-http, which a certbot deploy hook does after each renewal.
+Every m6 process reads its configuration, `site.toml`, templates, params files and keys once, at start. A change to a configuration file takes a restart. A change to content does not: a publish reloads the changed backend with `POST /genid`, which re-runs its start path and swaps the new site in only if it loads, so the old one keeps serving when it does not, then clears the cache with `PURGE /*`. A certificate renewal takes a restart of m6-http, which a certbot deploy hook does after each renewal.
 
 ## Logging
 
@@ -143,7 +143,7 @@ You could build something equivalent from separate tools — nginx as the proxy,
 
 The cost is the integration surface. Each tool has its own config format, its own concept of a route, its own caching model, its own log format. Getting them to work together means writing glue, and debugging means knowing which layer handled (or dropped) each request.
 
-m6 trades that flexibility for coherence. Because all the pieces share a common design — the same socket convention, the same config format, the same model of what a route is — the integration just works. A publish can be one request because every backend answers to the same site generation, and a cache that follows one number needs no glue. None of this requires configuration or glue.
+m6 trades that flexibility for coherence. Because all the pieces share a common design — the same socket convention, the same config format, the same model of what a route is — the integration just works. A publish is one reload and one purge because every backend answers the same reload signal and the caches share one change counter, so nothing needs glue. None of this requires configuration or glue.
 
 ## Why Unix processes rather than a monolith?
 

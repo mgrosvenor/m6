@@ -8,7 +8,7 @@ cover   = "https://picsum.photos/seed/quickstart/1200/500"
 
 m6 is an integrated system for building and serving websites. It covers the whole stack — from authoring content in Markdown to writing bytes to a network socket — under one roof, with a single config format and a unified set of concepts.
 
-Under the hood it's a family of small Unix processes, each with one job, communicating over Unix sockets. What makes it more than a collection of parts is that the pieces are designed to work together: the renderer produces output the cache can serve directly, and one request, `POST /genid`, makes every backend read new content and empties the cache. The result is a system that's simpler to reason about than a stack assembled from separate tools, and fast because none of the layers work against each other.
+Under the hood it's a family of small Unix processes, each with one job, communicating over Unix sockets. What makes it more than a collection of parts is that the pieces are designed to work together: the renderer produces output the cache can serve directly, and a publish reloads the changed backend and sends `PURGE /*` to m6-http, which empties the cache. The result is a system that's simpler to reason about than a stack assembled from separate tools, and fast because none of the layers work against each other.
 
 There's no framework to install, no build pipeline to configure, and no daemon to babysit — systemd handles process management in production, and a shell script handles it in development.
 

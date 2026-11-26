@@ -56,9 +56,9 @@ name = "origin"
 [auth]
 backend = "m6-auth-check"
 
-[genid]
-read_require  = "role:genid-read"
-write_require = "role:genid-write"
+[registration]
+read_require  = "role:purge-read"
+write_require = "role:purge-write"
 TOML
 chown root:m6 /etc/m6/my-blog.toml
 chmod 640 /etc/m6/my-blog.toml
@@ -239,9 +239,9 @@ ExecStart=/var/www/my-blog/bin/render-cms \
     /var/www/my-blog \
     /etc/m6/render-cms.conf
 
-# The token that lets render-cms publish with POST /genid. It arrives as
-# /run/credentials/render-cms.service/genid-write.token
-LoadCredential=genid-write.token:/etc/m6/genid-write.token
+# The token that lets render-cms purge with PURGE. It arrives as
+# /run/credentials/render-cms.service/purge-write.token
+LoadCredential=purge-write.token:/etc/m6/purge-write.token
 
 Restart=on-failure
 RestartSec=2
@@ -283,10 +283,6 @@ ExecStart=/usr/local/bin/m6-http /var/www/my-blog /etc/m6/my-blog.toml
 LoadCredential=tls-cert.pem:/etc/letsencrypt/live/example.com/fullchain.pem
 LoadCredential=tls-key.pem:/etc/letsencrypt/live/example.com/privkey.pem
 
-# The source node writes the site's generation ID here
-StateDirectory=m6-http
-StateDirectoryMode=0700
-
 Restart=on-failure
 RestartSec=2
 StandardOutput=journal
@@ -304,20 +300,21 @@ ReadOnlyPaths=/var/www/my-blog /etc/m6
 WantedBy=multi-user.target
 ```
 
-`After=` orders the start: m6-http expands each pool's socket glob once, at start, and a glob that matches no socket stops it with exit 2, so the backends must have bound their sockets first. m6-auth-server binds two sockets, `m6-auth.sock` for login and `check-m6-auth.sock` for the token check m6-http asks on every protected route and on `/genid`.
+`After=` orders the start: m6-http expands each pool's socket glob once, at start, and a glob that matches no socket stops it with exit 2, so the backends must have bound their sockets first. m6-auth-server binds two sockets, `m6-auth.sock` for login and `check-m6-auth.sock` for the token check m6-http asks on every protected route and on `PURGE`.
 
-`StateDirectory=m6-http` gives m6-http `/var/lib/m6-http`, where the source node writes the site's generation ID, because `ProtectSystem=strict` makes the rest of the disk read-only.
+m6-http keeps the origin's change counter in memory and writes no state file, so its unit needs no `StateDirectory=`.
 
-The `render-cms` unit delivers the publisher token with `LoadCredential`, as `/run/credentials/render-cms.service/genid-write.token`, and starts from `/etc/m6/render-cms.conf`. The site's `configs/render-cms.conf` is the development config: its `[genid]` table names the development token and CA. Build the production copy from it, keeping the routes and replacing only that table, which is the last one in the file:
+The `render-cms` unit delivers the publisher token with `LoadCredential`, as `/run/credentials/render-cms.service/purge-write.token`, and starts from `/etc/m6/render-cms.conf`. The site's `configs/render-cms.conf` is the development config: its `[publish]` table names the development token, CA and backend socket. Build the production copy from it, keeping the routes and replacing only that table, which is the last one in the file:
 
 ```bash
-sed '/^\[genid\]/,$d' /var/www/my-blog/configs/render-cms.conf > /etc/m6/render-cms.conf
+sed '/^\[publish\]/,$d' /var/www/my-blog/configs/render-cms.conf > /etc/m6/render-cms.conf
 cat >> /etc/m6/render-cms.conf << 'CONF'
-[genid]
-url        = "https://example.com/genid"
+[publish]
+url        = "https://example.com"
 connect    = "127.0.0.1:443"
-token_file = "/run/credentials/render-cms.service/genid-write.token"
+token_file = "/run/credentials/render-cms.service/purge-write.token"
 timeout_ms = 10000
+reload     = "/run/m6/m6-html.sock"
 CONF
 chown root:m6 /etc/m6/render-cms.conf
 chmod 640 /etc/m6/render-cms.conf
@@ -328,12 +325,12 @@ Production leaves `ca_file` out, so the system's certificate store is trusted.
 Mint the publisher token once the auth database exists, after the first start of `m6-auth`:
 
 ```bash
-m6-auth-cli /etc/m6/m6-auth.conf user add publisher --role genid-write --password "$(openssl rand -hex 16)"
-m6-auth-cli /etc/m6/m6-auth.conf token create publisher --name publish --ttl-days 90 > /etc/m6/genid-write.token
-chmod 600 /etc/m6/genid-write.token
+m6-auth-cli /etc/m6/m6-auth.conf user add publisher --role purge-write --password "$(openssl rand -hex 16)"
+m6-auth-cli /etc/m6/m6-auth.conf token create publisher --name publish --ttl-days 90 > /etc/m6/purge-write.token
+chmod 600 /etc/m6/purge-write.token
 ```
 
-Without `--ttl-days` a token lasts 365 days. This one expires 90 days after it is minted. From then on `/genid` answers 401 to it, and the CMS can no longer publish. To rotate it before that, mint a new token the same way into a new file, move it over `/etc/m6/genid-write.token`, run `systemctl restart render-cms` (systemd copies the credential in when the unit starts), then revoke the old one: `m6-auth-cli /etc/m6/m6-auth.conf token ls publisher` lists the tokens with their ids, and `token revoke <id>` ends one. A cache node follows the site with a reader token of its own, one user per node (`reader-edge-a`, and so on, with the `genid-read` role), minted the same way and rotated the same way with `systemctl restart m6-http-cache`. See example 09's `setup-origin.sh`.
+Without `--ttl-days` a token lasts 365 days. This one expires 90 days after it is minted. From then on `PURGE` answers 401 to it, and the CMS can no longer publish. To rotate it before that, mint a new token the same way into a new file, move it over `/etc/m6/purge-write.token`, run `systemctl restart render-cms` (systemd copies the credential in when the unit starts), then revoke the old one: `m6-auth-cli /etc/m6/m6-auth.conf token ls publisher` lists the tokens with their ids, and `token revoke <id>` ends one. A cache node reads `GET /m6/status` with a token of its own, one user per node (`reader-edge-a`, and so on, with the `purge-read` role), minted the same way and rotated the same way with `systemctl restart m6-http-cache`. See example 09's `setup-origin.sh`.
 
 ## Install and start
 
@@ -389,8 +386,9 @@ journalctl -u m6-http --since "2024-01-15 09:00" --until "2024-01-15 10:00"
 
 ```bash
 # Template, data or content changes — rsync, then publish
-# m6 reads its files at start, so the site is told to read them again with one
-# POST /genid (loopback, with the publisher token); a site.toml edit needs a restart
+# m6 reads its files at start, so after the rsync reload each backend with
+# POST /genid on its socket and send PURGE /* (loopback, with the publisher
+# token); a site.toml edit needs a restart
 rsync -av --delete \
   --exclude 'content/drafts/' \
   --exclude 'keys/' \

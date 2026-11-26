@@ -1,7 +1,7 @@
 +++
 title   = "Guide 05: CMS Blog"
 date    = "2025-01-03"
-summary = "The full system: a public blog cached in RAM, an auth-protected CMS renderer, and a publish flow that advances the site's generation to go live."
+summary = "The full system: a public blog cached in RAM, an auth-protected CMS renderer, and a publish flow that purges the cache to go live."
 tags    = ["guide", "tutorial", "cms", "custom-renderer"]
 cover   = "https://picsum.photos/seed/guide05/1200/500"
 +++
@@ -168,7 +168,7 @@ backend = "render-cms"
 require = "group:editors"
 ```
 
-`[[route_group]]` with `content/posts/*.json` handles routing for individual posts. m6-http expands the glob when it builds its route table at start. A post file a publish adds is routed because the publish ends with `POST /genid`, and `site.toml` itself is read once, at start: an edit to it takes a restart.
+`[[route_group]]` with `content/posts/*.json` handles routing for individual posts. m6-http expands the glob when it builds its route table at start. A post file a publish adds is served because m6-http routes `/blog/{stem}` to m6-html, and `site.toml` itself is read once, at start: an edit to it takes a restart.
 
 `site.toml` has no `[auth]` because the backend it names belongs to one node. It goes in the system config.
 
@@ -183,15 +183,15 @@ tls_key  = "@M6_DEV_HOME@/dev/dev-key.pem"
 [auth]
 backend = "m6-auth-check"
 
-[genid]
-read_require  = "role:genid-read"
-write_require = "role:genid-write"
+[registration]
+read_require  = "role:purge-read"
+write_require = "role:purge-write"
 
 [node]
 name = "dev"
 ```
 
-`[auth]` names the backend m6-http asks who a caller is: the check socket of m6-auth, declared as the `m6-auth-check` backend in `site.toml` (`sockets = "/tmp/m6/check-m6-auth*.sock"`). `[genid]` makes this node the source of the site's generation ID and names the claims that gate `/genid`: a token with the `genid-write` role may publish. Declare each table in one file only. A key in the file that does not own it stops m6-http at start with exit 2.
+`[auth]` names the backend m6-http asks who a caller is: the check socket of m6-auth, declared as the `m6-auth-check` backend in `site.toml` (`sockets = "/tmp/m6/check-m6-auth*.sock"`). `[registration]` makes this node the origin of the cache and names the claims that gate `PURGE`: a token with the `purge-write` role may purge, and `purge-read` gates `GET /m6/status`. Declare each table in one file only. A key in the file that does not own it stops m6-http at start with exit 2.
 
 ## `render-cms/Cargo.toml`
 
@@ -231,9 +231,9 @@ const ROUTES: &[CodeRoute] = &[
 ];
 ```
 
-`main` is the service's own event loop: start, run, stop. It loads the site, binds the socket, opens the signal descriptor, and then waits on one poll for the listener, the signals and every connection. Nothing in the run phase blocks. `docs/m6-app-anatomy.md` in the m6 repository walks through the loop line by line, and `main.rs` in this example is that loop with one addition: a publish waits on a `POST /genid`, which the same loop drives.
+`main` is the service's own event loop: start, run, stop. It loads the site, binds the socket, opens the signal descriptor, and then waits on one poll for the listener, the signals and every connection. Nothing in the run phase blocks. `docs/m6-app-anatomy.md` in the m6 repository walks through the loop line by line, and `main.rs` in this example is that loop with one addition: a publish waits on a `PURGE /*` to m6-http, which the same loop drives.
 
-A handler answers `Answer::Now(response)`, or `Answer::AfterPublish(response)` when it changed the site's files. The loop holds an `AfterPublish` answer, sends `POST /genid` to m6-http on the connection slot's own client, and writes the answer when m6-http has replied:
+A handler answers `Answer::Now(response)`, or `Answer::AfterPublish(response)` when it changed the site's files. The loop holds an `AfterPublish` answer, reloads the blog backend with `POST /genid` on its own socket, then sends `PURGE /*` to m6-http on the connection slot's own client, and writes the answer when m6-http has replied:
 
 ```rust
 fn handle_publish(req: &Request) -> Result<Answer> {
@@ -268,7 +268,7 @@ fn handle_unpublish(req: &Request) -> Result<Answer> {
 }
 ```
 
-The handlers do not touch `site.toml`: m6 services read their files once, at start, and a touch reloads nothing. The `POST /genid` is what makes every backend read the new content.
+The handlers do not touch `site.toml`: m6 services read their files once, at start, and a touch reloads nothing. The `POST /genid` on m6-html's socket is what makes the backend read the new content, and the `PURGE /*` is what empties the cache.
 
 ## `configs/render-cms.conf`
 
@@ -280,15 +280,16 @@ path  = "/cms"
 cache = "no-store"
 # ... one entry per route above
 
-[genid]
-url        = "https://localhost:8443/genid"
+[publish]
+url        = "https://localhost:8443"
 connect    = "127.0.0.1:8443"
-token_file = "@M6_DEV_HOME@/05-cms/genid-write.token"
+token_file = "@M6_DEV_HOME@/05-cms/purge-write.token"
 ca_file    = "@M6_DEV_HOME@/dev/ca.pem"
 timeout_ms = 10000
+reload     = "/tmp/m6/m6-html.sock"
 ```
 
-`[genid]` names the publish URL, the address to connect to, the file holding a token with the `genid-write` role (`dev.sh` mints it with `m6-auth-cli ... token create`), the certificate to trust (a development node signs its own; in production leave `ca_file` out and the system's certificate store is used) and how long a publish may take. A missing or empty token file stops the renderer at start.
+`[publish]` names the origin's URL, the address to connect to, the file holding a token with the `purge-write` role (`dev.sh` mints it with `m6-auth-cli ... token create`), the certificate to trust (a development node signs its own; in production leave `ca_file` out and the system's certificate store is used), how long a publish may take, and the backend socket to reload with `POST /genid` before the purge. A missing or empty token file stops the renderer at start.
 
 ## CMS API
 
@@ -297,7 +298,7 @@ timeout_ms = 10000
 | `POST` | `/api/drafts` | Create draft → returns `{"stem":"..."}` |
 | `PATCH` | `/api/drafts/{stem}` | Update draft fields |
 | `DELETE` | `/api/drafts/{stem}` | Delete draft permanently |
-| `POST` | `/api/publish/{stem}` | Publish draft → moves to posts, then `POST /genid` |
+| `POST` | `/api/publish/{stem}` | Publish draft → moves to posts, reloads the backend, then `PURGE /*` |
 | `POST` | `/api/unpublish/{stem}` | Move published post back to drafts |
 | `DELETE` | `/api/posts/{stem}` | Delete published post permanently |
 
@@ -309,7 +310,7 @@ The dashboard shows **Edit / Delete** for drafts and **View / Edit / Unpublish /
 2. Editor clicks **Publish** → `POST /api/publish/{stem}`:
    - render-cms renders markdown → HTML, writes `content/posts/{stem}.json`
    - render-cms rebuilds `data/posts.json` index
-   - render-cms sends `POST /genid` to m6-http, which reloads every backend, flushes its cache and advances the generation — `/blog/{stem}` becomes live
+   - render-cms reloads m6-html with `POST /genid` on its socket, then sends `PURGE /*` to m6-http, which empties the cache, so `/blog/{stem}` becomes live
    - the answer to the editor waits for that request, so a post reported as published is live
    - render-cms deletes `content/drafts/{stem}.json`
 3. Browser goes to `/blog/{stem}`
@@ -328,9 +329,9 @@ sequenceDiagram
     Editor->>rcms: PATCH /api/drafts/my-post (save draft)
     Editor->>rcms: POST /api/publish/my-post
     rcms->>Disk: write content/posts/my-post.json
-    rcms->>mhttp: POST /genid (write token)
-    mhttp->>mhtml: reload
-    mhttp-->>rcms: 200, new generation (cache flushed)
+    rcms->>mhtml: POST /genid (reload)
+    rcms->>mhttp: PURGE /* (write token)
+    mhttp-->>rcms: 200 (cache purged)
     rcms->>Editor: {"published": true}
     Editor->>Browser: open /blog/my-post
     Browser->>mhttp: GET /blog/my-post
@@ -346,7 +347,7 @@ sequenceDiagram
 | Public post (cached) | < 1 ms — RAM only |
 | Public post (cache miss) | ~5 ms — m6-html reads JSON, renders, caches |
 | CMS dashboard | one check of the token by m6-auth, then render-cms reads the posts and drafts directories |
-| Publish | one atomic file write, then one `POST /genid` whose answer the editor waits for |
+| Publish | one atomic file write, one backend reload, then one `PURGE /*` whose answer the editor waits for |
 
 The public blog path never touches disk after the first request.
 
@@ -363,8 +364,7 @@ m6-html        "$SITE" "$SITE/configs/m6-html.conf" &
 m6-file        "$SITE" "$SITE/configs/m6-file.conf" &
 m6-auth-server "$SITE" "$(m6_conf "$SITE/configs/m6-auth.conf")" &   # login and check sockets
 "$EXAMPLES/target/release/render-cms" "$SITE" "$(m6_conf "$SITE/configs/render-cms.conf")" &
-# the source node writes its generation ID under STATE_DIRECTORY
-STATE_DIRECTORY="$M6_DEV_HOME/05-cms/state" m6-http "$SITE" "$(m6_conf "$SITE/configs/system-dev.toml")" &
+m6-http "$SITE" "$(m6_conf "$SITE/configs/system-dev.toml")" &
 
 echo "Running at https://localhost:8443"
 echo "CMS at    https://localhost:8443/cms"

@@ -83,13 +83,14 @@ tls_key  = "/run/credentials/m6-http-origin.service/tls-key.pem"
 h2c_bind = "10.0.0.1:80"
 internal_binds = ["10.0.0.1:80"]
 internal_peers = ["10.0.0.2", "10.0.0.3", "10.0.0.4", "10.0.0.5", "10.0.0.6"]
+registration_bind = "10.0.0.1:8081"
 
 [auth]
 backend = "m6-auth-check"
 
-[genid]
-read_require  = "role:genid-read"
-write_require = "role:genid-write"
+[registration]
+read_require  = "role:purge-read"
+write_require = "role:purge-write"
 
 [node]
 name = "origin"
@@ -100,7 +101,7 @@ name = "origin"
 - `internal_binds`: declares the h2c listener internal, so m6-http trusts the client address a cache node forwards. m6-http refuses to start with `h2c_bind` set and no `internal_binds`.
 - `internal_peers`: the addresses the cache nodes connect from. m6-http closes a connection from any other address, so trust does not depend on the firewall alone.
 - `[auth]`: the check backend m6-http asks who a caller is belongs to this node, so it lives in its system config.
-- `[genid]`: the origin is the source of the site's generation ID. A publish is one `POST /genid` to it. It needs `StateDirectory=` in its unit, and a cache node follows the ID on its heartbeat.
+- `[registration]`: the origin owns the cache and the change counter, and answers `PURGE` and `GET /m6/status`. Set `[server] registration_bind` to a WireGuard address so the caches connect there, and give each cache node `[registration] origin` pointing at it. A publish sends `PURGE /*` with a token that has the `purge-write` role. The counter is in memory, so the unit needs no `StateDirectory=`.
 
 Both listeners share the same site config and backend Unix sockets in `/run/m6/*.sock`.
 
@@ -119,6 +120,9 @@ tls_key  = "/run/credentials/m6-http-cache.service/tls-key.pem"
 
 [node]
 name = "edge-d"
+
+[registration]
+origin = "10.0.0.1:8081"
 ```
 
 **`configs/cache-site.toml`** is identical on every cache node:
