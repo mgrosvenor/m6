@@ -609,7 +609,8 @@ impl GlobalStack {
             ],
         );
         // The auth database: an editor to log in with, and a publisher whose
-        // token carries the write claim for PURGE.
+        // token carries the write claim for PURGE and the read claim for
+        // /m6/status.
         let auth_conf = site07.join("configs/m6-auth.conf");
         auth_cli(
             &m6_cli,
@@ -631,6 +632,8 @@ impl GlobalStack {
                 "publisher",
                 "--role",
                 "purge-write",
+                "--role",
+                "purge-read",
                 "--password",
                 "pw-for-tests",
             ],
@@ -1079,8 +1082,43 @@ fn global_deployment_end_to_end() {
     );
     eprintln!("  PASS  PURGE /about with a bad token → {}", r.status);
 
+    // Each cache registers over its control connection about a second after
+    // it starts, so wait until the origin lists all five: the purge below is
+    // then carried by the live fan-out, not by a later reconcile.
+    let bearer = format!("Bearer {}", stack.write_token);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let registered = |body: &str| (0..5).all(|i| body.contains(&format!("\"cache-{i}\"")));
+    let mut status = String::new();
+    while Instant::now() < deadline {
+        status = https_request(
+            "GET",
+            origin,
+            "/m6/status",
+            &[("Authorization", &bearer)],
+            Arc::clone(&tls),
+        )
+        .map(|r| r.body)
+        .unwrap_or_default();
+        if registered(&status) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert!(
+        registered(&status),
+        "FAIL  every cache node registers with the origin; /m6/status: {status}"
+    );
+    eprintln!("  PASS  all five cache nodes are registered");
+
     let r = purge(origin, "/about", &stack.write_token, Arc::clone(&tls));
     check_eq!("PURGE /about with the publisher token → 200", r.status, 200);
+    for i in 0..5 {
+        check_contains!(
+            &format!("PURGE /about reply carries cache-{i}'s answer"),
+            r.body,
+            &format!("\"cache-{i}\":{{\"resident\":")
+        );
+    }
 
     let r = get(origin, "/about", Arc::clone(&tls));
     check_contains!("origin /about → the new content", r.body, &marker);

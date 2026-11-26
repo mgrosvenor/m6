@@ -351,6 +351,7 @@ The change counter is the guard a purge leaves behind.
 The origin raises it by one on every purge, and it exists only to reconcile a cache's disk copy after the cache missed purges while it was away.
 A cache saves the counter with its disk copy and presents it on `REGISTER`.
 An equal counter keeps the disk copy, and a different counter, or a missing file, discards the copy and refills on demand (section 8.4).
+A different counter also clears the cache's memory, because entries it filled while it was not registered may predate a purge it missed.
 
 The origin keeps its counter in memory and has no state file, so a restart starts it at 0.
 A cache reconciles by the counter it presents, so a counter that moved covers an origin restart as it covers a purge.

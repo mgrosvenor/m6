@@ -2,9 +2,10 @@
 //!
 //! A real `m6-http`, a real `m6-file` content backend, and a threaded
 //! `CheckServer` as the authority. The origin purges itself and answers a
-//! per-node result; a cache node's registration and the fan-out are covered by
-//! the unit tests in `registration.rs`, and the address rule by the unit tests
-//! in `health.rs`.
+//! per-node result. One test registers a cache by hand on the control channel
+//! and reads the fan-out from it; the registration state is covered by the unit
+//! tests in `registration.rs`, and the address rule by the unit tests in
+//! `health.rs`.
 
 #![allow(
     clippy::disallowed_methods,
@@ -94,6 +95,11 @@ struct Fixture {
     _check: ServingCheck,
     _dir: tempfile::TempDir,
     _port: m6_core::testkit::PortClaim,
+    /// The origin's control listener, where a cache node registers.
+    control: m6_core::testkit::PortClaim,
+    /// The internal h2c listener: the control listener's peers are the
+    /// internal peers, which need an internal listener.
+    _h2c: m6_core::testkit::PortClaim,
 }
 
 impl Fixture {
@@ -178,6 +184,8 @@ root = "."
 
         let claim = claim_port();
         let port = claim.port();
+        let control = claim_port();
+        let h2c = claim_port();
         let system = site.join("system.toml");
         std::fs::write(
             &system,
@@ -187,6 +195,10 @@ root = "."
 bind = "127.0.0.1:{port}"
 tls_cert = "{cert}"
 tls_key = "{key}"
+h2c_bind = "{h2c}"
+internal_binds = ["{h2c}"]
+internal_peers = ["127.0.0.1"]
+registration_bind = "{control}"
 
 [node]
 name = "origin"
@@ -200,6 +212,8 @@ write_require = "role:writer"
 "#,
                 cert = site.join("cert.pem").display(),
                 key = site.join("key.pem").display(),
+                control = control.addr(),
+                h2c = h2c.addr(),
             ),
         )
         .unwrap();
@@ -229,6 +243,8 @@ write_require = "role:writer"
             _check: check,
             _dir: dir,
             _port: claim,
+            control,
+            _h2c: h2c,
         }
     }
 
@@ -361,4 +377,60 @@ fn status_needs_the_read_claim() {
         "no cache has registered yet: {}",
         ok.body
     );
+}
+
+/// Read one `\n`-terminated line from a control connection.
+fn read_line(reader: &mut std::io::BufReader<TcpStream>) -> String {
+    use std::io::BufRead;
+    let mut line = String::new();
+    let _ = reader.read_line(&mut line);
+    line
+}
+
+/// A registered cache's control connection is long-lived and mostly idle. Left
+/// idle past every request deadline the origin keeps (the 30 s read deadline
+/// among them), it still carries the purge fan-out: the cache reads the
+/// `PURGE` line, answers `RESIDENT`, and the origin's reply names it.
+#[test]
+fn a_purge_reaches_a_cache_whose_control_connection_sat_idle() {
+    let fixture = Fixture::start();
+    let warm = request(
+        fixture.port,
+        "GET",
+        "/index.html",
+        None,
+        tls_config(&fixture.cert_der),
+    );
+    assert_eq!(warm.status, 200, "body: {}", warm.body);
+
+    let stream = TcpStream::connect(fixture.control.addr()).expect("connect the control channel");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = std::io::BufReader::new(stream);
+    writer.write_all(b"REGISTER lon 0\n").unwrap();
+    let counter = read_line(&mut reader);
+    assert!(counter.starts_with("COUNTER "), "got {counter:?}");
+
+    // Idle well past the request read deadline (30 s), which is what a real
+    // cache's connection does between publishes.
+    std::thread::sleep(Duration::from_secs(35));
+
+    std::thread::scope(|s| {
+        let purge = s.spawn(|| fixture.purge("/index.html", Some("writer")));
+        let line = read_line(&mut reader);
+        assert!(
+            line.starts_with("PURGE /index.html "),
+            "the idle cache must receive the fan-out, got {line:?}"
+        );
+        writer.write_all(b"RESIDENT true\n").unwrap();
+        let reply = purge.join().unwrap();
+        assert_eq!(reply.status, 200, "body: {}", reply.body);
+        assert!(
+            reply.body.contains("\"lon\":{\"resident\":true}"),
+            "the reply must carry the cache's answer: {}",
+            reply.body
+        );
+    });
 }

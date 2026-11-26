@@ -189,3 +189,71 @@ fn a_cache_node_serves_held_when_its_origin_drops() {
         cache.output()
     );
 }
+
+/// A cache node whose control connection is closed by the origin connects
+/// again and registers again, so it is back in the fan-out within seconds.
+/// The origin here is the test itself, so it can close the connection.
+#[test]
+fn a_cache_node_whose_connection_closes_registers_again() {
+    let control = claim_port();
+    let listener = std::net::TcpListener::bind(control.addr()).expect("bind the fake origin");
+    // Nothing listens on the h2c backbone: the control channel needs no
+    // content.
+    let h2c = claim_port();
+
+    let cache_dir = tempfile::Builder::new()
+        .prefix("m6-rereg-cache-")
+        .tempdir_in(m6_core::testkit::socket_scratch_root())
+        .unwrap();
+    cert(cache_dir.path());
+    let mut cache = start_cache(cache_dir.path(), &h2c.addr(), &control.addr());
+    cache.wait_for_started(m6_core::testkit::STARTUP_BOUND);
+
+    // A blocking accept would hang the test if the cache never connects, so
+    // the listener is polled to a bound instead.
+    listener.set_nonblocking(true).unwrap();
+    let accept = |listener: &std::net::TcpListener| {
+        let mut got = None;
+        let ok = wait::until(m6_core::testkit::STARTUP_BOUND, || {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    got = Some(stream);
+                    true
+                }
+                Err(_) => false,
+            }
+        });
+        assert!(ok, "the cache must connect; log:\n{}", cache.output());
+        got.unwrap()
+    };
+    let read_register = |stream: TcpStream| -> (TcpStream, String) {
+        use std::io::BufRead;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut line = String::new();
+        let _ = std::io::BufReader::new(stream.try_clone().unwrap()).read_line(&mut line);
+        (stream, line)
+    };
+
+    let (mut first, line) = read_register(accept(&listener));
+    assert!(line.starts_with("REGISTER lon "), "got {line:?}");
+    first.write_all(b"COUNTER 0\n").unwrap();
+
+    // The origin closes the connection. The cache sees the close, serves held
+    // content, and registers again on a new connection.
+    first.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(first);
+    let (_second, line) = read_register(accept(&listener));
+    assert!(
+        line.starts_with("REGISTER lon "),
+        "the cache must register again after its connection closed, got {line:?}; log:\n{}",
+        cache.output()
+    );
+    assert!(
+        cache.output().contains("serving held content"),
+        "the close must be seen as a drop; log:\n{}",
+        cache.output()
+    );
+}

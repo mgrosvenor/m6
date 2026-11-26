@@ -380,6 +380,34 @@ dir = "{cache_dir}"
         request(self._source_port.port(), "PURGE", path, Some("writer"))
     }
 
+    /// Whether the origin lists the cache node as registered.
+    fn cache_registered(&self) -> bool {
+        request(
+            self._source_port.port(),
+            "GET",
+            "/m6/status",
+            Some("reader"),
+        )
+        .body
+        .contains("\"disk-cache-node\"")
+    }
+
+    /// Stop the origin and start it again on the same ports. Its change
+    /// counter starts again at 0, and the cache node's control connection
+    /// drops.
+    fn restart_source(&mut self) {
+        self._source.kill();
+        let site = self._dir.path();
+        let mut source = Service::spawn(
+            "m6-http-origin",
+            Command::new(binary("m6-http"))
+                .arg(site)
+                .arg(site.join("source-system.toml")),
+        );
+        source.wait_for_tcp(self._source_port.port(), m6_core::testkit::STARTUP_BOUND);
+        self._source = source;
+    }
+
     /// The cache node's saved change counter, read from its disk folder.
     fn saved_counter(&self) -> Option<u64> {
         m6_http_lib::disk_cache::read_change_counter(&self.cache_dir)
@@ -550,6 +578,72 @@ fn a_restart_after_a_purge_starts_cold() {
             .body
             .eq("second")),
         "a different counter must purge the disk copy and refill:\n{}",
+        stack.cache_output()
+    );
+}
+
+/// A purge on the origin reaches a registered cache node over its control
+/// connection at once, so the node serves the new content on the next request.
+///
+/// Break: queue the fan-out's `PURGE` line without writing it, and the node
+/// keeps serving the old entry until its max-age runs out.
+#[test]
+fn a_purge_on_the_origin_reaches_a_registered_cache_node() {
+    let stack = Stack::start();
+    assert_eq!(stack.get_cache("/index.html").body, "first");
+    assert!(
+        wait_until(Duration::from_secs(10), || stack.cache_registered()),
+        "the cache node never registered:\n{}",
+        stack.cache_output()
+    );
+
+    std::fs::write(stack._dir.path().join("index.html"), b"second").unwrap();
+    let purged = stack.purge_origin("/index.html");
+    assert_eq!(purged.status, 200, "body: {}", purged.body);
+    assert!(
+        purged
+            .body
+            .contains("\"disk-cache-node\":{\"resident\":true}"),
+        "the cache node must answer the fan-out: {}",
+        purged.body
+    );
+    assert_eq!(stack.get_cache("/index.html").body, "second");
+}
+
+/// A cache node whose control connection drops registers again once the
+/// origin is back, and a counter that moved while it was away (here, the
+/// origin restarted at 0 after a purge raised it to 1) clears what it holds in
+/// memory, so it refills from the origin.
+///
+/// Break: reconcile only the disk copy on `COUNTER`, and the node keeps
+/// serving the entry it filled before the drop.
+#[test]
+fn a_cache_node_reconciles_its_memory_when_it_registers_again() {
+    let mut stack = Stack::start();
+    assert_eq!(stack.get_cache("/index.html").body, "first");
+    assert!(
+        wait_until(Duration::from_secs(10), || stack.cache_registered()),
+        "the cache node never registered:\n{}",
+        stack.cache_output()
+    );
+    // A purge moves both counters to 1, and the node fills again.
+    let purged = stack.purge_origin("/*");
+    assert_eq!(purged.status, 200, "body: {}", purged.body);
+    assert_eq!(stack.get_cache("/index.html").body, "first");
+
+    std::fs::write(stack._dir.path().join("index.html"), b"second").unwrap();
+    stack.restart_source();
+    assert!(
+        wait_until(Duration::from_secs(10), || stack.cache_registered()),
+        "the cache node must register again after its connection dropped:\n{}",
+        stack.cache_output()
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || stack
+            .get_cache("/index.html")
+            .body
+            .eq("second")),
+        "a counter that moved must clear the memory cache:\n{}",
         stack.cache_output()
     );
 }

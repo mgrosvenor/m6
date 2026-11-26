@@ -496,6 +496,11 @@ struct ServerState {
     /// A cache node's control connection token, while it is open. `None` when
     /// it dropped and has not reconnected, or on an origin.
     cache_control: Option<Token>,
+    /// A fan-out queued `PURGE` lines on control connections this turn. They
+    /// were queued outside the connections' own events, so the descriptors are
+    /// armed for read only, and [`control_pump`] writes them before the turn
+    /// ends.
+    control_unsent: bool,
     /// The origin's control-channel address a cache node connects to,
     /// resolved at start. `None` on every other node.
     control_origin: Option<SocketAddr>,
@@ -2113,12 +2118,23 @@ fn purge_local(state: &mut ServerState, target: &str) -> bool {
     }
 }
 
-/// Reconcile a cache node's held disk copy against the origin's counter. An
-/// equal counter installs the copy; a different one drops it and refills on
-/// demand. Runs only when the origin answers the cache's REGISTER, never on
-/// the request path.
+/// Reconcile a cache node's held disk copy and memory cache against the
+/// origin's counter. An equal counter installs the copy; a different one drops
+/// it and refills on demand. Runs only when the origin answers the cache's
+/// REGISTER, never on the request path.
 fn reconcile_disk(state: &mut ServerState, counter: u64) {
     let saved = state.registration.cache().map(|f| f.counter()).unwrap_or(0);
+    // A counter that moved means purges ran while this node was not
+    // registered: before its first registration, or while its connection was
+    // down. Any entry it filled in that time may be one of them, so the memory
+    // cache starts again too.
+    if counter != saved {
+        state.cache.clear();
+        info!(
+            counter,
+            saved, "memory cache cleared: the counter moved while this node was not registered"
+        );
+    }
     if let Some(loaded) = state.pending_disk.take() {
         if loaded.id == counter {
             let id = loaded.id;
@@ -2141,7 +2157,6 @@ fn reconcile_disk(state: &mut ServerState, counter: u64) {
     if let Some(f) = state.registration.cache_mut() {
         f.set_counter(counter);
     }
-    let _ = saved;
 }
 
 /// Write the running fan-out's `PURGE` line to every registered cache.
@@ -2158,6 +2173,7 @@ fn write_fanout_purge(state: &mut ServerState) {
     for conn in conns {
         state.controls.get_mut(conn.0).send_line(&line);
     }
+    state.control_unsent = true;
 }
 
 /// The `PURGE` reply body, one entry per node: the origin and every registered
@@ -2306,10 +2322,35 @@ fn handle_purge(
     }
 }
 
-/// The control work a loop turn owes: complete a fan-out that just finished or
-/// hit its deadline. Reconnection is on the accounting tick, not here, so a
-/// downed origin is retried once a second rather than every turn.
+/// The control work a loop turn owes: write the `PURGE` lines a fan-out queued,
+/// and complete a fan-out that just finished or hit its deadline. Reconnection
+/// is on the accounting tick, not here, so a downed origin is retried once a
+/// second rather than every turn.
 fn control_pump(cx: &mut CompletionCtx<'_>) {
+    // A registered cache's connection sits armed for read only, so a line
+    // queued from a request handler is not written until its descriptor fires
+    // again, which an idle cache never makes it do. Drive each connection that
+    // holds unsent bytes now: the drive writes them and re-arms for write if
+    // the socket is full. A drive that completes a fan-out can start a queued
+    // one, which queues lines again, so this runs until none are left.
+    while std::mem::take(&mut cx.state.control_unsent) {
+        let unsent: Vec<usize> = cx
+            .state
+            .registration
+            .source()
+            .map(|s| {
+                s.registered()
+                    .iter()
+                    .map(|r| r.conn.0)
+                    .filter(|slot| cx.state.controls.get(*slot).has_unsent())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for slot in unsent {
+            let token = cx.state.controls.get(slot).token();
+            drive_control(token, slot, cx);
+        }
+    }
     let complete = cx
         .state
         .registration
@@ -2352,6 +2393,7 @@ fn control_reconnect(cx: &mut CompletionCtx<'_>) {
                 return;
             }
             *cx.state.sources.get_mut(token.0) = Source::Control(taken.key);
+            cx.state.controls.get_mut(taken.key).set_token(token);
             cx.state.cache_control = Some(token);
         }
         Err(e) => {
@@ -2532,6 +2574,7 @@ fn accept_controls(state: &mut ServerState, registry: &m6_core::platform::Regist
             return;
         }
         *state.sources.get_mut(token.0) = Source::Control(taken.key);
+        state.controls.get_mut(taken.key).set_token(token);
     }
 }
 
@@ -8396,6 +8439,7 @@ fn run(args: Vec<String>) -> i32 {
         control_listener,
         controls: Slots::new(initial_connections, ceiling, ControlConn::empty),
         cache_control: None,
+        control_unsent: false,
         control_origin,
     };
 

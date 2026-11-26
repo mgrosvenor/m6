@@ -136,6 +136,9 @@ enum Phase {
 /// kernel mechanism on the socket.
 pub struct ControlConn {
     stream: Option<TcpStream>,
+    /// The event-loop token the descriptor is registered under, so a write
+    /// queued outside the connection's own event can be driven.
+    token: Token,
     phase: Phase,
     read_buf: Vec<u8>,
     write_buf: Vec<u8>,
@@ -154,6 +157,7 @@ impl ControlConn {
         let connected = state == m6_core::platform::net::Connect::Connected;
         Ok(Self {
             stream: Some(stream),
+            token: Token(usize::MAX),
             phase: if connected {
                 Phase::Open
             } else {
@@ -172,6 +176,7 @@ impl ControlConn {
     pub fn empty() -> Self {
         ControlConn {
             stream: None,
+            token: Token(usize::MAX),
             phase: Phase::Done,
             read_buf: Vec::new(),
             write_buf: Vec::new(),
@@ -188,6 +193,7 @@ impl ControlConn {
         set_keepalive(&stream)?;
         Ok(Self {
             stream: Some(stream),
+            token: Token(usize::MAX),
             phase: Phase::Open,
             read_buf: Vec::with_capacity(MAX_LINE),
             write_buf: Vec::with_capacity(MAX_LINE),
@@ -199,6 +205,20 @@ impl ControlConn {
     /// Queue one line to write. Nothing is sent until the next drive.
     pub fn send_line(&mut self, line: &str) {
         self.write_buf.extend_from_slice(line.as_bytes());
+    }
+
+    /// The event-loop token the descriptor is registered under.
+    pub fn set_token(&mut self, token: Token) {
+        self.token = token;
+    }
+
+    pub fn token(&self) -> Token {
+        self.token
+    }
+
+    /// Whether queued bytes are waiting to be written.
+    pub fn has_unsent(&self) -> bool {
+        !self.write_buf.is_empty()
     }
 
     /// Whether the connect finished since the last call. The cache side sends
