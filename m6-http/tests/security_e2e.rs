@@ -540,10 +540,10 @@ impl Server {
     fn kill_backend(&mut self) {
         self.file.kill();
         // The signal that m6-http has stopped reaching the backend is a cache
-        // miss answering 502. A fresh query string is a miss, because the cache
-        // key includes the query.
+        // miss answering 502. A path nothing has requested is a miss; a query
+        // string is not, because a route keys only on the parameters it lists.
         let ready = m6_core::testkit::wait::until(m6_core::testkit::STARTUP_BOUND, || {
-            https_get(self, "/public/open.txt?kill_backend_probe", &[], self.tls()).status == 502
+            https_get(self, "/public/kill-backend-probe.txt", &[], self.tls()).status == 502
         });
         assert!(
             ready,

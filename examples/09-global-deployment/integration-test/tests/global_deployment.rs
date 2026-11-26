@@ -581,7 +581,7 @@ impl GlobalStack {
             }
             std::fs::write(&path, text).expect("write a rewritten config");
         };
-        let write_token = w.join("genid-write.token");
+        let write_token = w.join("purge-write.token");
         rewrite(
             "configs/m6-auth.conf",
             &[
@@ -597,12 +597,12 @@ impl GlobalStack {
             "configs/render-cms.conf",
             &[
                 (
-                    "https://localhost:8443/genid",
-                    format!("https://localhost:{tls_port}/genid"),
+                    "https://localhost:8443",
+                    format!("https://localhost:{tls_port}"),
                 ),
                 ("127.0.0.1:8443", origin_tls_addr.clone()),
                 (
-                    "@M6_DEV_HOME@/07-dev-to-production/genid-write.token",
+                    "@M6_DEV_HOME@/07-dev-to-production/purge-write.token",
                     write_token.display().to_string(),
                 ),
                 ("@M6_DEV_HOME@/dev/ca.pem", cert_path.display().to_string()),
