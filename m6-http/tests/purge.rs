@@ -309,8 +309,28 @@ fn a_purge_needs_the_write_claim() {
 fn purge_all_and_a_malformed_target() {
     let fixture = Fixture::start();
 
+    // Warm a file so the purge-all has an entry to remove, and so the reply's
+    // residency proves the purge actually evicted it.
+    let warm = request(
+        fixture.port,
+        "GET",
+        "/index.html",
+        None,
+        tls_config(&fixture.cert_der),
+    );
+    assert_eq!(
+        warm.status, 200,
+        "the warm fetch serves the file: {}",
+        warm.body
+    );
+
     let all = fixture.purge("/*", Some("writer"));
     assert_eq!(all.status, 200, "body: {}", all.body);
+    assert!(
+        all.body.contains("\"origin\":{\"resident\":true}"),
+        "a purge-all evicts the warmed entry: {}",
+        all.body
+    );
 
     let malformed = fixture.purge("*", Some("writer"));
     assert_eq!(malformed.status, 400, "body: {}", malformed.body);

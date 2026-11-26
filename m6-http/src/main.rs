@@ -155,8 +155,8 @@ use m6_core::platform::{Events, Interest, Poll, Token};
 use m6_http_lib::h2c_client::H2cClientPool;
 use m6_http_lib::h2s_client::H2sTlsClientPool;
 use m6_http_lib::http11::{
-    make_tls_server_config, resolve_bind, ConnDrive, H2cListener, HitHeaders, Http11Listener,
-    ParseResult, RequestHead, RequestOutcome, VaryMerge, H2_IDLE_TIMEOUT_SECS,
+    admit, make_tls_server_config, resolve_bind, ConnDrive, H2cListener, HitHeaders,
+    Http11Listener, ParseResult, RequestHead, RequestOutcome, VaryMerge, H2_IDLE_TIMEOUT_SECS,
     MAX_ACCEPTS_PER_WAKE, READ_TIMEOUT_SECS,
 };
 use m6_http_lib::pool::{self, PoolManager};
@@ -200,9 +200,9 @@ enum Source {
     /// An in-loop upstream in the shared table: a socket member or a URL
     /// backend request.
     Upstream(usize),
-    /// A cache control-channel connection, indexed by the same token in
+    /// A cache control-channel connection, by its slot in
     /// `ServerState::controls`.
-    Control,
+    Control(usize),
 }
 
 /// The [`LoopTrace`] trigger index for an iteration's first event, and the
@@ -210,14 +210,20 @@ enum Source {
 fn trigger_index(token: Option<Token>, sources: &Slots<Source>) -> usize {
     match token {
         Some(TOKEN_UDP) => 3,
-        Some(TOKEN_TLS_LISTENER) | Some(TOKEN_H2C_LISTENER) | Some(TOKEN_STATUS_LISTENER) => 0,
+        Some(TOKEN_TLS_LISTENER)
+        | Some(TOKEN_H2C_LISTENER)
+        | Some(TOKEN_STATUS_LISTENER)
+        | Some(TOKEN_CONTROL_LISTENER) => 0,
         Some(TOKEN_SIGNAL) => 4,
         // A log drain is the loop's own bookkeeping, named so the metrics
         // document does not report it as a timeout that did not happen.
         Some(TOKEN_LOG) => 6,
         Some(Token(k)) => match sources.get(k) {
             Source::TlsConn(_) | Source::H2cConn(_) => 1,
-            Source::H2cUpstream | Source::H2sUpstream | Source::Upstream(_) | Source::Control => 2,
+            Source::H2cUpstream
+            | Source::H2sUpstream
+            | Source::Upstream(_)
+            | Source::Control(_) => 2,
             Source::Vacant => 5,
         },
         None => 5,
@@ -1628,9 +1634,14 @@ fn park(
         }
         // A `PURGE` has no upstream: it purges this node and then waits on
         // the fan-out, which the next loop turn drives. The context's request
-        // path is the purge target.
+        // path is the purge target. The HTTP form `/*` is the purge-all
+        // target, normalised to `*` for the control channel and the cache.
         UpstreamId::Purge => {
-            let target = ctx.req.path.clone();
+            let target = if ctx.req.path == "/*" {
+                registration::PURGE_ALL.to_string()
+            } else {
+                ctx.req.path.clone()
+            };
             let resident = purge_local(state, &target);
             let timeout = std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
             let started = state
@@ -2328,7 +2339,7 @@ fn control_reconnect(cx: &mut CompletionCtx<'_>) {
                 *cx.state.sources.get_mut(token.0) = Source::Vacant;
                 return;
             }
-            *cx.state.sources.get_mut(token.0) = Source::Control;
+            *cx.state.sources.get_mut(token.0) = Source::Control(taken.key);
             cx.state.cache_control = Some(token);
         }
         Err(e) => {
@@ -2342,14 +2353,14 @@ fn control_reconnect(cx: &mut CompletionCtx<'_>) {
 
 /// Drive the one control connection whose descriptor fired. Returns true when
 /// the connection is gone and its token and slot were freed.
-fn drive_control(token: Token, cx: &mut CompletionCtx<'_>) -> bool {
-    let fd = cx.state.controls.get(token.0).fd();
-    let alive = cx.state.controls.get_mut(token.0).drive();
-    let lines = cx.state.controls.get_mut(token.0).drain_lines();
-    let connected = cx.state.controls.get_mut(token.0).take_connected();
+fn drive_control(token: Token, slot: usize, cx: &mut CompletionCtx<'_>) -> bool {
+    let fd = cx.state.controls.get(slot).fd();
+    let alive = cx.state.controls.get_mut(slot).drive();
+    let lines = cx.state.controls.get_mut(slot).drain_lines();
+    let connected = cx.state.controls.get_mut(slot).take_connected();
 
     // A cache node that just connected sends its register line and marks its
-    // origin up.
+    // origin up, so the cache serves fresh again rather than held entries.
     if connected && matches!(cx.state.registration, registration::Role::Cache(_)) {
         let name = cx.state.config.node.name.clone();
         let counter = cx
@@ -2359,10 +2370,11 @@ fn drive_control(token: Token, cx: &mut CompletionCtx<'_>) -> bool {
             .map(|f| f.counter())
             .unwrap_or(0);
         let line = registration::register_line(&name, counter);
-        cx.state.controls.get_mut(token.0).send_line(&line);
+        cx.state.controls.get_mut(slot).send_line(&line);
         if let Some(f) = cx.state.registration.cache_mut() {
             f.set_up(true);
         }
+        cx.state.cache.set_serve_held(false);
     }
 
     // Apply every line the drive read. The origin reads a cache's lines, and
@@ -2380,7 +2392,7 @@ fn drive_control(token: Token, cx: &mut CompletionCtx<'_>) -> bool {
                         f.set_counter(counter);
                     }
                     let reply = registration::resident_line(resident);
-                    cx.state.controls.get_mut(token.0).send_line(&reply);
+                    cx.state.controls.get_mut(slot).send_line(&reply);
                 }
                 registration::OriginLine::Unknown => {}
             }
@@ -2396,7 +2408,7 @@ fn drive_control(token: Token, cx: &mut CompletionCtx<'_>) -> bool {
                         None => None,
                     };
                     if let Some(reply) = reply {
-                        cx.state.controls.get_mut(token.0).send_line(&reply);
+                        cx.state.controls.get_mut(slot).send_line(&reply);
                     }
                 }
                 registration::CacheLine::Resident(resident) => {
@@ -2417,23 +2429,27 @@ fn drive_control(token: Token, cx: &mut CompletionCtx<'_>) -> bool {
     // Re-arm the descriptor with the interest the connection now needs. A
     // reregister runs only on a change, which the edge-triggered poll needs.
     if alive {
-        let interest = cx.state.controls.get(token.0).interest();
+        let interest = cx.state.controls.get(slot).interest();
         let _ = cx.registry.reregister_fd(fd, token, interest);
         return false;
     }
 
     // The connection dropped. Free its token and slot.
     let _ = cx.registry.deregister_fd(fd);
-    cx.state.controls.get_mut(token.0).close();
-    cx.state.controls.free(token.0);
+    cx.state.controls.get_mut(slot).close();
+    cx.state.controls.free(slot);
     *cx.state.sources.get_mut(token.0) = Source::Vacant;
     cx.state.sources.free(token.0);
     if cx.state.cache_control == Some(token) {
         cx.state.cache_control = None;
         if let Some(f) = cx.state.registration.cache_mut() {
             f.set_up(false);
-            warn!("control: connection to the origin dropped");
         }
+        // The origin is gone: a working site with old pages beats an error
+        // page, so the cache serves held entries past every freshness window
+        // until the connection is re-registered.
+        cx.state.cache.set_serve_held(true);
+        warn!("control: connection to the origin dropped; serving held content");
     } else if let Some(name) = cx
         .state
         .registration
@@ -2450,10 +2466,23 @@ fn drive_control(token: Token, cx: &mut CompletionCtx<'_>) -> bool {
 fn accept_controls(state: &mut ServerState, registry: &m6_core::platform::Registry, max: usize) {
     for _ in 0..max {
         // Accept first, so no borrow of the listener outlives the mutations
-        // of `controls` and `sources` below.
+        // of `controls` and `sources` below. The control channel is internal,
+        // so it admits only the peers `[server] internal_peers` names, exactly
+        // as the h2c listener does: a peer not on the list is refused before
+        // it can register a fake cache.
         let accepted = match state.control_listener.as_ref().map(|l| l.accept()) {
             None => return,
-            Some(Ok((stream, _))) => Some(stream),
+            Some(Ok((stream, peer))) => {
+                if admit(Some(&state.config.server.internal_peers), peer.ip()).is_none() {
+                    warn!(
+                        peer = %peer.ip(),
+                        "control: refused a connection from a peer not in [server] internal_peers"
+                    );
+                    drop(stream);
+                    continue;
+                }
+                Some(stream)
+            }
             Some(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => return,
             Some(Err(_)) => return,
         };
@@ -2490,7 +2519,7 @@ fn accept_controls(state: &mut ServerState, registry: &m6_core::platform::Regist
             *state.sources.get_mut(token.0) = Source::Vacant;
             return;
         }
-        *state.sources.get_mut(token.0) = Source::Control;
+        *state.sources.get_mut(token.0) = Source::Control(taken.key);
     }
 }
 
@@ -3207,7 +3236,7 @@ fn event_loop(
                             drive_upstream_one(Token(k), &mut cx);
                         }
                     }
-                    Source::Control => {
+                    Source::Control(slot) => {
                         let mut cx = CompletionCtx::new(
                             &mut *state,
                             &mut tcp,
@@ -3220,7 +3249,7 @@ fn event_loop(
                             &mut connections,
                             now,
                         );
-                        drive_control(Token(k), &mut cx);
+                        drive_control(Token(k), slot, &mut cx);
                     }
                     Source::Vacant => {}
                 },

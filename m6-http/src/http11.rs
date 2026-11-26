@@ -1088,10 +1088,11 @@ impl RefusalLog {
     }
 }
 
-/// What a connection from `peer` gets on an h2c listener: `None` refuses it.
-/// `peers` is `None` for a listener that is not internal, which serves
-/// everyone and trusts no one.
-fn admit(
+/// What a connection from `peer` gets on an internal listener: `None` refuses
+/// it. `peers` is `None` for a listener that is not internal, which serves
+/// everyone and trusts no one. Shared by the h2c listener and the cache
+/// control listener, so one rule admits a backbone peer everywhere.
+pub fn admit(
     peers: Option<&[std::net::IpAddr]>,
     peer: std::net::IpAddr,
 ) -> Option<crate::forward::ForwardedTrust> {

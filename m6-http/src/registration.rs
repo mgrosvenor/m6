@@ -184,6 +184,7 @@ impl ControlConn {
     /// flag stays false: only a cache node's own outbound connect reports it,
     /// so an accepted connection is never mistaken for a just-connected cache.
     pub fn accepted(stream: TcpStream) -> io::Result<Self> {
+        stream.set_nonblocking(true)?;
         set_keepalive(&stream)?;
         Ok(Self {
             stream: Some(stream),
