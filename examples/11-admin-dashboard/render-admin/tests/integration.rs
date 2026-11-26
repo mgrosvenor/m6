@@ -513,6 +513,17 @@ mod bench_tests {
             path
         }
 
+        // A temp dir on a filesystem that permits exec. The bench script is
+        // executed, and a hardened host mounts `/tmp` `noexec`, where spawning
+        // a script there fails with EACCES and `start_bench` returns None. A
+        // plain `tempfile::tempdir()` follows `TMPDIR` into `/tmp`, so the
+        // script lands on the noexec mount. `scratch_dir` probes for a
+        // writable, exec-capable base and skips a `noexec` `/tmp`, which is
+        // the case the platform helper exists for.
+        fn exec_tmp() -> TempDir {
+            tempfile::tempdir_in(m6_core::platform::scratch_dir()).expect("exec scratch dir")
+        }
+
         // Drive a running bench the way the service loop does, with a socket
         // registered beside it as the other request. The per-event work and
         // the job's finish are `bench_event`, the function the service calls,
@@ -594,7 +605,7 @@ mod bench_tests {
         }
 
         pub(super) fn a_silent_child_does_not_stop_the_loop() {
-            let dir = tmp();
+            let dir = exec_tmp();
             // The child closes its stdout at once and then sleeps: end of file
             // arrives while the child is alive, so the loop must keep serving.
             let script = bench_script(&dir, "exec 1>&-\nsleep 2\nexit 0");
@@ -611,7 +622,7 @@ mod bench_tests {
         }
 
         pub(super) fn a_failing_child_reports_its_status() {
-            let dir = tmp();
+            let dir = exec_tmp();
             let script = bench_script(&dir, "echo boom\nexit 7");
             let (job_id, run, mut store) = start(&script);
             drive(run, &mut store);

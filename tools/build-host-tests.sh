@@ -294,7 +294,18 @@ for tool in cc c++ python3 go; do
 done
 
 echo "### test build"
-echo "TESTBUILD_WARNINGS=$(cargo test --workspace --no-run 2>&1 | grep -c '^warning' || true)"
+# CI builds `--workspace --bins` before `cargo test --workspace --no-run`, and the
+# gate must run the same steps (AGENTS rule 5). It matters because `cargo test`
+# builds a package's plain binary only when that package has a tests/ directory,
+# and m6-md has none, so its binary was absent from target/debug and m6-core's
+# version_flag test failed with "no m6-md binary". A clean target showed it; a
+# stale target hid it. One log so a compile error is visible: the warning count
+# alone swallowed the failure.
+{ cargo build --workspace --bins && cargo test --workspace --no-run; } > "$T/testbuild.log" 2>&1
+TESTBUILD_STATUS=$?
+echo "TESTBUILD_WARNINGS=$(grep -c '^warning' "$T/testbuild.log" || true)"
+echo "TESTBUILD_STATUS=$TESTBUILD_STATUS"
+[ "$TESTBUILD_STATUS" -eq 0 ] || tail -30 "$T/testbuild.log"
 
 echo "### test run"
 # Strict mode for the backend examples: a missing runtime fails rather than skips.
@@ -604,6 +615,8 @@ read -r passed failed < <(awk '/^test result:/{p+=$4; f+=$6} END{print p+0, f+0}
 
 [[ "$rw" == "0" ]] || { echo "${RED}   $rw release warning(s) on Linux${RESET}" >&2; FAILED=1; }
 [[ "$tw" == "0" ]] || { echo "${RED}   $tw test-build warning(s) on Linux${RESET}" >&2; FAILED=1; }
+tbs=$(num_after TESTBUILD_STATUS "$LOG"); tbs="${tbs:-?}"
+[[ "$tbs" == "0" ]] || { echo "${RED}   the test build failed on Linux (see the build log)${RESET}" >&2; FAILED=1; }
 fg=$(num_after FEATURE_GATED_STATUS "$LOG"); fg="${fg:-?}"
 [[ "$fg" == "0" ]] || { echo "${RED}   feature-gated tests failed (the targets --workspace omits)${RESET}" >&2
                         sed -n '/^### feature-gated tests/,/^### conformance/p' "$LOG" >&2; FAILED=1; }
