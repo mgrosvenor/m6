@@ -21,7 +21,7 @@ fi
 
 # ── Publisher token ───────────────────────────────────────────────────────────
 # The renderer sends POST /genid with it (see [genid] in its config).
-"$SITE/../dev-token.sh" "$(m6_conf "$SITE/configs/m6-auth.conf")" publisher purge-write $M6_DEV_HOME/11-admin-dashboard/genid-write.token
+"$SITE/../dev-token.sh" "$(m6_conf "$SITE/configs/m6-auth.conf")" publisher purge-write $M6_DEV_HOME/11-admin-dashboard/purge-write.token
 
 # ── Clean up stale state ──────────────────────────────────────────────────────
 mkdir -p /tmp/m6

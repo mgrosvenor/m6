@@ -492,7 +492,7 @@ impl ServerStack {
         let check_sock = sock("check-m6-auth.sock");
 
         // The certificate m6-http serves, self-signed for localhost. The same
-        // file is what render-cms trusts when it sends `POST /genid`.
+        // file is what render-cms trusts when it sends the `PURGE`.
         let cert = rcgen::generate_simple_self_signed(vec![
             "localhost".to_string(),
             "127.0.0.1".to_string(),
@@ -533,25 +533,26 @@ impl ServerStack {
                 ("@M6_DEV_HOME@/dev/auth.pub", auth_pub.display().to_string()),
             ],
         );
-        let token_file = w.join("genid-write.token");
+        let token_file = w.join("purge-write.token");
         rewrite(
             "configs/render-cms.conf",
             &[
                 (
-                    "https://localhost:8443/genid",
-                    format!("https://localhost:{base_port}/genid"),
+                    "https://localhost:8443",
+                    format!("https://localhost:{base_port}"),
                 ),
                 ("127.0.0.1:8443", tls_addr.clone()),
                 (
-                    "@M6_DEV_HOME@/05-cms/genid-write.token",
+                    "@M6_DEV_HOME@/05-cms/purge-write.token",
                     token_file.display().to_string(),
                 ),
                 ("@M6_DEV_HOME@/dev/ca.pem", tls_cert.display().to_string()),
+                ("/tmp/m6/m6-html.sock", html_sock.display().to_string()),
             ],
         );
 
         // The auth database: an editor to log in with, and a publisher whose
-        // token render-cms sends with `POST /genid`.
+        // token render-cms sends with the `PURGE`.
         auth_cli(
             &m6_cli,
             &auth_conf,
@@ -584,7 +585,7 @@ impl ServerStack {
         std::fs::write(&token_file, token).expect("write the publisher token");
 
         // System config: the node's own bind, certificate, check backend and
-        // the claims that gate `/genid`.
+        // the claims that gate the `PURGE`.
         //
         // `lock_memory = false` because this test asserts the site's pages and
         // the CMS lifecycle, not memory pinning, and pinning needs an unlimited
@@ -948,7 +949,8 @@ fn blog_site_end_to_end() {
     check_eq!(&format!("POST /api/publish/{stem} → 200"), r.status, 200);
     check_contains!("publish → published=true", r.body, "published");
 
-    // The publish answered after `POST /genid` finished, so the post is live.
+    // The publish answered after the reload and the purge finished, so the
+    // post is live.
     let r = get_with_cookie_str(addr, &format!("/blog/{stem}"), "", Arc::clone(&tls));
     check_eq!(
         &format!("GET /blog/{stem} → 200 after publish"),

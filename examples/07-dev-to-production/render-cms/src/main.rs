@@ -9,7 +9,7 @@ use std::fs;
 use std::io;
 use std::time::{Duration, Instant};
 
-use genid_publisher::Publisher;
+use purge_publisher::Publisher;
 
 /// The name the service passes to `Site::load`. It is also the configuration file's
 /// stem, the socket's name and the `[[backend]]` name in site.toml.
@@ -402,12 +402,15 @@ fn client_turn(
                         Ok(Answer::Now(response)) => site.finish(&req, response),
                         Ok(Answer::AfterPublish(response)) => {
                             let response = site.finish(&req, response);
-                            match publisher.start(&mut conn.up, now) {
-                                Ok(()) => {
-                                    conn.held = Some(response);
-                                    return Ok(Step::StartOutgoing);
-                                }
-                                Err(e) => not_published(&e.to_string()),
+                            match publisher.reload_backend() {
+                                Ok(()) => match publisher.start(&mut conn.up, now) {
+                                    Ok(()) => {
+                                        conn.held = Some(response);
+                                        return Ok(Step::StartOutgoing);
+                                    }
+                                    Err(e) => not_published(&e.to_string()),
+                                },
+                                Err(cause) => not_published(&cause),
                             }
                         }
                         Err(e) => site.finish(&req, m6_core::response::error_to_response(&e)),
@@ -483,7 +486,7 @@ fn publish_event(
                 .held
                 .take()
                 .expect("a publish in flight holds its answer");
-            let answer = match genid_publisher::outcome(&conn.up) {
+            let answer = match purge_publisher::outcome(&conn.up) {
                 Ok(()) => held,
                 Err(cause) => not_published(&cause),
             };
