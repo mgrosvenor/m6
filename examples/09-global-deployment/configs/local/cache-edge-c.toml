@@ -8,8 +8,6 @@ tls_key  = "@M6_DEV_HOME@/dev/dev-key.pem"
 [node]
 name = "edge-c"
 
-# The cache node follows the origin's site generation (see configs/cache-edge-a.toml).
-[genid]
-upstream       = "origin"
-token_file     = "@M6_DEV_HOME@/09-global-deployment/genid-read-edge-c.token"
-heartbeat_secs = 2
+# The cache node registers with the origin over the control channel.
+[registration]
+origin = "127.0.0.1:9003"

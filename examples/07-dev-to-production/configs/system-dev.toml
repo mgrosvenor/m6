@@ -6,9 +6,9 @@ tls_key  = "@M6_DEV_HOME@/dev/dev-key.pem"
 [auth]
 backend = "m6-auth-check"
 
-[genid]
-read_require  = "role:genid-read"
-write_require = "role:genid-write"
+[registration]
+read_require  = "role:purge-read"
+write_require = "role:purge-write"
 
 [node]
 name = "dev"

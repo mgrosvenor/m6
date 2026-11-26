@@ -13,7 +13,7 @@
 //! The test needs nothing else. It copies the site into a temporary directory
 //! and makes there its own self-signed certificate, its own auth key pair and
 //! auth database (with an `admin` user in the `editors` group and a publisher
-//! token), and a system config with a `[genid]` table. It starts every
+//! token), and a system config with a `[registration]` table. It starts every
 //! service against that copy, so it neither reads nor changes the development
 //! directory (`M6_DEV_HOME`) or the checked-in site. If a binary is absent the test fails and names the command
 //! that fixes it.
@@ -571,7 +571,7 @@ impl ServerStack {
                 "add",
                 "publisher",
                 "--role",
-                "genid-write",
+                "purge-write",
                 "--password",
                 "publisher-pw",
             ],
@@ -599,7 +599,7 @@ impl ServerStack {
             format!(
                 "[server]\nbind     = \"{tls_addr}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\nlock_memory = false\n\n\
                  [auth]\nbackend = \"m6-auth-check\"\n\n\
-                 [genid]\nread_require  = \"role:genid-read\"\nwrite_require = \"role:genid-write\"\n\n\
+                 [registration]\nread_require  = \"role:purge-read\"\nwrite_require = \"role:purge-write\"\n\n\
                  [node]\nname = \"test\"\n",
                 tls_cert.display(),
                 tls_key.display(),
