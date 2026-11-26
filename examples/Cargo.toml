@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "03-contact/render-contact",
-    "common/genid-publisher",
+    "common/purge-publisher",
     "05-cms/render-cms",
     "07-dev-to-production/render-cms",
     "09-global-deployment/integration-test",

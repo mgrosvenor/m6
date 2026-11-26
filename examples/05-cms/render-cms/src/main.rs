@@ -10,7 +10,7 @@ use std::fs;
 use std::io;
 use std::time::{Duration, Instant};
 
-use genid_publisher::Publisher;
+use purge_publisher::Publisher;
 
 /// The name the service passes to `Site::load`. It is also the configuration file's
 /// stem, the socket's name and the `[[backend]]` name in site.toml.
@@ -76,16 +76,16 @@ const ROUTES: &[CodeRoute] = &[
 // is fine again.
 //
 // A publish is the one request that waits on something else. Its answer is
-// built and held while a `POST /genid` runs on the connection slot's own
-// `Upstream`, and goes out when m6-http has answered, so a reader that sees
-// "published" can fetch the page.
+// built and held while the backend reloads and the `PURGE` runs on the
+// connection slot's own `Upstream`, and goes out when m6-http has answered, so
+// a reader that sees "published" can fetch the page.
 
 /// What a handler asks the loop to do with its answer.
 enum Answer {
     /// Send it now.
     Now(Response),
-    /// The site's files changed: hold the answer, advance the site's
-    /// generation with `POST /genid`, then send it.
+    /// The site's files changed: hold the answer, reload the backend, purge
+    /// the cache, then send it.
     AfterPublish(Response),
 }
 
@@ -95,7 +95,7 @@ enum Step {
     Keep,
     /// Close the connection.
     Close,
-    /// A `POST /genid` was started: watch its socket and start its deadline.
+    /// A `PURGE` was started: watch its socket and start its deadline.
     StartOutgoing,
 }
 
@@ -419,20 +419,23 @@ fn client_turn(
                         Ok(Answer::Now(response)) => site.finish(&req, response),
                         Ok(Answer::AfterPublish(response)) => {
                             let response = site.finish(&req, response);
-                            match publisher.start(&mut conn.up, now) {
-                                Ok(()) => {
-                                    conn.held = Some(response);
-                                    return Ok(Step::StartOutgoing);
-                                }
-                                Err(e) => not_published(&e.to_string()),
+                            match publisher.reload_backend() {
+                                Ok(()) => match publisher.start(&mut conn.up, now) {
+                                    Ok(()) => {
+                                        conn.held = Some(response);
+                                        return Ok(Step::StartOutgoing);
+                                    }
+                                    Err(e) => not_published(&e.to_string()),
+                                },
+                                Err(cause) => not_published(&cause),
                             }
                         }
                         Err(e) => site.finish(&req, m6_core::response::error_to_response(&e)),
                     },
                     // `POST /genid` on this service: read config, templates and
                     // params again through the start path, and keep the old
-                    // site if that fails. m6-http sends it to every backend
-                    // when the site's generation advances.
+                    // site if that fails. This is the backend's own reload
+                    // signal, which the publish sends before the purge.
                     Handled::Reload(reload) => {
                         let response = match site.reload(ROUTES, &[], &TeraFactory) {
                             Ok(next) => {
@@ -471,8 +474,8 @@ fn not_published(cause: &str) -> Response {
     )
 }
 
-/// One step of a slot's `POST /genid`. m6-http answering 200 sends the held
-/// answer, and any other result answers 502 with the cause.
+/// One step of a slot's `PURGE`. m6-http answering 200 sends the held answer,
+/// and any other result answers 502 with the cause.
 fn publish_event(
     poll: &mut Poll,
     conns: &mut Slots<Conn>,
@@ -500,7 +503,7 @@ fn publish_event(
                 .held
                 .take()
                 .expect("a publish in flight holds its answer");
-            let answer = match genid_publisher::outcome(&conn.up) {
+            let answer = match purge_publisher::outcome(&conn.up) {
                 Ok(()) => held,
                 Err(cause) => not_published(&cause),
             };
@@ -734,10 +737,10 @@ fn handle_publish(req: &Request) -> Result<Answer> {
 
     req.write_json_atomic(&publish_path, &post)?;
     update_index(req)?;
-    // The files are written. m6 services read them once, at start, and a touch of
-    // site.toml reloads nothing, so the answer is `AfterPublish`: the loop sends
-    // `POST /genid` to m6-http, which reloads every backend and flushes its
-    // cache, and only then tells the editor it is published.
+    // The files are written. m6 services read them once, at start, so the
+    // answer is `AfterPublish`: the loop reloads the backend that renders the
+    // blog and then purges the cache, and only then tells the editor it is
+    // published.
     let _ = fs::remove_file(req.site_path(&draft_path));
 
     Ok(Answer::AfterPublish(Response::json(
