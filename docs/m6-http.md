@@ -4,7 +4,7 @@ Reverse proxy, cache, and router.
 The only process in an m6 deployment that listens on a public port, unless `[server] reuse_port` asks several of them to share it.
 
 The sections run from the process's surface to its protocols.
-§1 to §13 cover the CLI, startup, pools, routing, forwarding, limits, caching, the generation ID, errors, auth, monitoring, signals and exit codes.
+§1 to §13 cover the CLI, startup, pools, routing, forwarding, limits, caching, cache control, errors, auth, monitoring, signals and exit codes.
 §14 to §16 cover H2C, H2S and the HTTP/2 denial-of-service bounds.
 §17 to §19 cover the event loop, logging and dependencies, and §20 closes with where to read next.
 
@@ -17,7 +17,7 @@ The sections run from the process's surface to its protocols.
 5. [Request Forwarding](#5-request-forwarding)
 6. [Request Header Limits](#6-request-header-limits)
 7. [Caching](#7-caching)
-8. [Site generation ID](#8-site-generation-id)
+8. [Cache control: purge and registration](#8-cache-control-purge-and-registration)
 9. [Error Handling](#9-error-handling)
 10. [Auth Enforcement](#10-auth-enforcement)
 11. [Monitoring](#11-monitoring)
@@ -40,7 +40,7 @@ m6-http <site-dir> <system-config>
 ```
 
 Both arguments are required to serve.
-The system config holds the node's own state: the `[server]` node keys (bind address and TLS paths), `[node]`, `[auth]`, `[genid]`, `[cache]` and `[limits]`.
+The system config holds the node's own state: the `[server]` node keys (bind address and TLS paths), `[node]`, `[auth]`, `[registration]`, `[cache]` and `[limits]`.
 Everything else comes from `site.toml`, including `[health]` and `[stats]`, which describe the site every node serves.
 In one-file mode the same file serves as both, and every key is read from it.
 
@@ -66,7 +66,7 @@ m6-http starts in this order, before it serves a request.
 
 1. Load `site.toml` from the site directory.
 2. Load `<system-config>`.
-   It carries `[node]`, the `[server]` node keys, `[auth]`, `[genid]`, `[cache]` and `[limits]`, and nothing else.
+   It carries `[node]`, the `[server]` node keys, `[auth]`, `[registration]`, `[cache]` and `[limits]`, and nothing else.
    A key in the wrong file is exit 2.
 3. Validate the merged config, exiting 2 on error before binding.
 4. Open the log and write the start-up record, the `type=startup` lines that [`m6-log.md`](m6-log.md) §9 gives.
@@ -75,8 +75,9 @@ m6-http starts in this order, before it serves a request.
 5. If `[auth]` is declared, take the check backend it names.
    `backend` is required and names the socket backend that answers `/check` (`AuthConfig` in `m6-http/src/config.rs`).
    Step 9 probes it.
-6. Read the generation state.
-   A source with `[genid]` reads `$STATE_DIRECTORY/genid`, and a cache node holds no file.
+6. Load the disk copy and the change counter, on a cache node with `[cache] dir`.
+   The counter is read with the copy and held until the first registration answer reconciles it (section 8).
+   A source starts its counter at 0 and keeps no file.
 7. Build the route table: insert each `[[route]]`, then expand each `[[route_group]]` glob against the site directory and add one route per matched file.
 8. Resolve every URL backend host once.
    A name that does not resolve is exit 2.
@@ -89,6 +90,7 @@ m6-http starts in this order, before it serves a request.
 10. Bind the TLS and QUIC sockets on `[server].bind`.
    If `h2c_bind` is set, bind the H2C (plain-TCP HTTP/2) listener on that address.
    The listener is internal when `internal_binds` names it, and then accepts only the peers in `internal_peers`.
+   If `registration_bind` is set, bind the control-channel listener on that address, and it accepts only the peers in `internal_peers` (section 8).
 11. Start the event loop.
 
 With `[server] reuse_port`, only the public 443 port is shared: its TLS listener and its QUIC UDP socket are bound together through `m6_core::platform::net::listen_shared`, before the TLS configuration is built.
@@ -242,18 +244,19 @@ An upstream that sends `stale-while-revalidate` is honoured: the cache serves st
 An entry leaves the cache in one of four ways.
 
 1. A successful state-changing request evicts the entry for its path, and for a same-origin `Location` and `Content-Location` (RFC 9111 4.4).
-2. The entry's freshness lifetime ends.
+2. A `PURGE` removes it at once, on this node and on every registered cache (section 8).
+3. The entry's freshness lifetime ends.
    A response with no explicit `max-age` lives at most 24 hours, the heuristic ceiling.
-3. A generation change empties the cache.
-   The source swaps it in step 3 of a `POST /genid`, and a cache node flushes it when the upstream's ID changes.
 4. The process restarts, because the cache is in memory.
 
-A file change behind a page therefore does not reach the cache until one of those happens, and a publish through `/genid` makes it happen at once.
+A file change behind a page therefore does not reach the cache until one of those happens, and a `PURGE` of the changed path makes it happen at once.
 
 ### 7.3 Which statuses are stored
 
-Storability starts from the statuses RFC 9111 3 lists, and Table 1 gives the set this cache accepts.
-A status outside Table 1 is answered to the client and not stored, whatever its `Cache-Control` says.
+Storability starts from the statuses RFC 9111 3 lists, and Table 1 gives the set this cache accepts by default.
+A status outside Table 1 is still storable when its response declares its own freshness with `max-age`, `s-maxage` or `Expires`.
+This is the RFC 9111 explicit-freshness arm, and it is what lets a short-link backend's `302` carrying `s-maxage` be cached, where before no `302` could be and every expansion paid a backend round trip.
+A `206` is never stored, because the key has no `Range` component and a partial representation would replay as a whole one.
 
 | Status | Stored when public |
 |---|---|
@@ -261,183 +264,153 @@ A status outside Table 1 is answered to the client and not stored, whatever its 
 | `300`, `301`, `308` | Yes |
 | `404`, `405`, `410`, `414` | Yes |
 | `501` | Yes |
-| `206` | Never, because the key has no `Range` component and a partial representation would replay as a whole one |
-| Every other 4xx, and every 5xx | Never |
+| `302`, and any other status off this list | When it carries `max-age`, `s-maxage` or `Expires` |
+| `206` | Never |
+| `5xx` | Never |
 
-**Table 1: the statuses the cache stores, from RFC 9111 3.**
-A public 404 is stored, a 206 never is, and no 5xx is.
+**Table 1: the statuses the cache stores, from RFC 9111 3 plus explicit freshness.**
+A public 404 is stored, a 302 that declares its own freshness is stored, and a 206 never is.
 
+The store still needs `Cache-Control: public`, and it refuses `no-store`, `private` and a `Vary` that names any field other than `Accept-Encoding`.
 Table 1 also decides what reaches the disk cache, because only a stored response is written there.
+
+### 7.4 Eviction and the bound
+
+The cache is bounded by `[limits.cache_bytes]`, 128 MiB by default and raisable through the limit.
+An entry's footprint is its body, its header block, its key and one fixed per-entry overhead, so the bound counts the memory the cache holds rather than the body alone.
+
+When an insert takes the cache past its bound, it evicts down to 87.5% of the bound, in two passes.
+The first pass drops every expired entry, so a response past its freshness lifetime frees memory instead of waiting for a later eviction.
+The second pass drops the least recently read entries, ordered by a read counter that every hit updates, so a flood that writes entries and never reads them is discarded before the site's own hot pages.
+Eviction runs only on an insert that crosses the bound, never on a read, so no hit pays for it.
+A hit updates one counter under the shared lock, which is the only work a read does for eviction.
 
 ---
 
-## 8. Site generation ID
+## 8. Cache control: purge and registration
 
-A source node holds a site generation ID.
-The ID is a `u64` counter that names the content the backends are serving at one moment.
-A node is a source because its system config carries a `[genid]` table.
-A node with no `[genid]` has no endpoint at `/genid` and answers that path as it answers any other unknown path.
+A node is one of two roles, and its system config's `[registration]` table names which.
+An origin owns the cache and the change counter, answers `PURGE` and `GET /m6/status`, and holds a control-channel listener that caches register with.
+A cache node sets `[registration] origin`, the `host:port` of its origin's control-channel listener, and follows it over one open connection.
+Nothing polls: one open control connection per cache carries every purge, and the change counter reconciles a disk copy after a cache was away.
 
-The endpoint answers three methods, as Table 2 lists.
+An origin answers the two HTTP endpoints in Table 2.
 
-| Method | Claim | Answer |
+| Method and target | Claim | Answer |
 |---|---|---|
-| `GET` | `[genid] read_require` | `200` with `{"genid":"<decimal>"}` and `M6-Genid: <decimal>` |
-| `HEAD` | `[genid] read_require` | The `GET` status and headers, with no body |
-| `POST` | `[genid] write_require` | Runs the change sequence, then `200` with the same shape for the new ID |
+| `PURGE /<path>` | `[registration] write_require` | `200` with the per-node residency body, after purging that path |
+| `PURGE /*` | `[registration] write_require` | `200` with the per-node residency body, after purging every entry |
+| `GET /m6/status` | `[registration] read_require` | `200` with `{"counter":"<decimal>","registered":["<name>", ...]}` |
+| `HEAD /m6/status` | `[registration] read_require` | The `GET` status and headers, with no body |
 
-**Table 2: the methods `/genid` answers on a source.**
-`GET` and `HEAD` need the read claim, `POST` needs the write claim, and each 200 answer carries the ID in `M6-Genid`.
+**Table 2: the control endpoints an origin answers.**
+`PURGE` needs the write claim and the status read needs the read claim.
 
-All three methods in Table 2 require a loopback peer or an internal listener, checked before any token is read.
+Both endpoints answer only a loopback peer or a request that arrived on an internal listener, checked before any token is read.
 Anyone else gets the 404 an unknown path gets.
-Both claims absent is also a 404, so the endpoint exists only when it can answer.
-The `[genid]` keys are system config only.
-A source needs the unit's `StateDirectory=`.
+A node with no `[registration]` claims has no endpoint: `PURGE` is the 501 the method check gives, and `/m6/status` is a route miss.
+A `PURGE` target that does not start with `/` is 400.
 
-### 8.1 The change sequence
+### 8.1 The purge and its reply
 
-A `POST /genid` runs four steps in the source's loop.
+A `PURGE` runs three steps on the origin, in this order.
 
-1. Send `POST /genid` with an empty body to every member of every socket pool, on that member's own socket, outside the pool's member choice.
-   Each member gets its own upstream slot and the `backend_timeout_secs` deadline.
-2. Wait for every member.
-   A 204 is done.
-   A 404 or 405 is a backend with nothing to refresh and is logged at debug.
-   Any other status, a connect failure or the deadline is logged at error with the member's socket path and the reason.
-   A failed member does not stop the sequence, and it does not count as refreshed.
-3. In one step, rebuild the route table from the config loaded at start, swap the cache and the held error pages for empty ones, advance the ID and write it.
-   Each swap is one assignment, so a request sees the old generation or the new one, and a request already holding an entry finishes on the content it took.
-   A route-table build error keeps the old table and is logged.
-   The route table is built from `site.toml` as loaded at start, so a publish that adds a file a `[[route_group]]` glob matches gains its route, and a `site.toml` edit needs a restart.
-4. Answer every covered POST with the new ID.
-   A state write failure answers those POSTs 500 and is logged with the path.
+1. The origin purges itself.
+   `PURGE /<path>` evicts that path and every query and encoding variant, and `PURGE /*` clears the whole cache.
+2. The origin raises its change counter by one and sends `PURGE <target> <counter>` to every registered cache over its control connection.
+3. The origin answers when every registered cache has answered or the `[server] backend_timeout_secs` deadline passes.
 
-The ID changes only after every backend has the new content, because a cache could otherwise refill from a backend still serving the old bytes under the new number.
-A POST that arrives while a sequence runs is parked, and the sequence that answers it started after it arrived.
+The reply is one entry per node, the origin and each registered cache:
 
-The ID advances only in step 3 of a POST, never at start.
-It lives in `$STATE_DIRECTORY/genid` as the decimal ID and a newline, written to `genid.tmp` and renamed over the file before the POST is answered.
-A restart reads that file, so a generation survives a restart.
-A source with `[genid]` and no `STATE_DIRECTORY`, or an existing state file that cannot be read or does not hold a `u64`, stops the start with exit 2.
-A missing state file starts the ID at 0, so a first start needs no file.
-`--dump-config` prints and exits 0 without one.
+```json
+{"nodes": {"origin": {"resident": true}, "lon": {"resident": false}, "chi": {"pending": true}}}
+```
 
-A publisher that is itself a backend of the source drives this POST from its own event loop, never as a blocking call, so its loop stays free to answer the source's refresh.
+`resident` says whether the path was present when the node purged it, so purging a path no node holds is success with `resident` false everywhere.
+`pending` marks a cache that did not answer before the deadline.
+A purge that arrives while another is fanned out is queued and answered after it, so two purges never interleave.
+The reply carries `Content-Type: application/json` and `Cache-Control: no-store`.
 
-### 8.2 The ID on content
+### 8.2 Registration and the control channel
 
-Every response the source receives from a backend carries the ID that was current when the request was dispatched, written as `M6-Genid: <decimal>` when the response head is serialised.
-HTTP/2 and HTTP/3 write the name in lower case, which RFC 9113 8.2.1 and RFC 9114 4.2 require.
-A cached response carries the ID stored with it.
-A response whose dispatch ID is no longer current is not stored, so the cache cannot refill from a backend that is one generation behind.
-A locally built answer, such as a health check or an error page, carries no ID.
+Each cache node holds one plain TCP connection open to its origin's control-channel listener, `[server] registration_bind`, on a private-backbone address.
+The connection carries a line protocol, one line per message.
+The cache announces itself with `REGISTER <name> <counter>`, and the origin answers `COUNTER <decimal>`.
+The origin pushes `PURGE <target> <counter>` down the same connection, and the cache answers `RESIDENT true` or `RESIDENT false`.
+A line with no newline inside the bound is malformed and drops the connection.
 
-The generation is also reported on the metrics line, under a `genid` object with `role`, `id`, `sequence_running` and the peers that read it.
-An operator watching a publish sees one `genid advanced` line at info with `genid`, `members`, `failed` and `elapsed_ms`, and one `genid: member refresh failed` line at error naming the socket path of each member that did not refresh.
-The POST still answers 200 when a member failed, and the `failed` count is what says the generation is not uniform.
+The control listener admits only peers named in `[server] internal_peers`, the same list the internal h2c listener uses, so a peer off the private backbone cannot register a fake cache.
+An empty `internal_peers` refuses every control connection, so an operator connects the caches by naming them there.
+The origin learns the registered set from the connections themselves: a cache registers when its connection opens, and the origin unregisters it when the connection drops, so nothing polls and no cache count is read from config.
+TCP keepalive on the socket closes a peer that vanishes with no FIN or RST, so a silent partition is detected by the kernel and not by a timer.
+A cache reconnects on the accounting tick, once a second, while its connection is down.
 
-### 8.3 A cache node follows the source
+### 8.3 The change counter and serving held content
 
-A node whose `[genid]` sets `upstream` is a cache node.
-It names a `[[backend]]` with a `url` and holds no state file.
-It asks that upstream for the ID and follows it.
+The change counter is the guard a purge leaves behind.
+The origin raises it by one on every purge, and it exists only to reconcile a cache's disk copy after the cache missed purges while it was away.
+A cache saves the counter with its disk copy and presents it on `REGISTER`.
+An equal counter keeps the disk copy, and a different counter, or a missing file, discards the copy and refills on demand (section 8.4).
 
-1. **Heartbeat.**
-   At start, and then once `heartbeat_secs` (default 10) have passed since the last one finished, the node sends `GET /genid` to the upstream with `Authorization: Bearer <token from token_file>`.
-   The heartbeat takes the transport the upstream's URL scheme names: an h2 stream for `h2c://` and `h2s://`, and an HTTP/1.1 upstream slot for `http://` and `https://`.
-   One heartbeat is in flight at most, on the accounting tick, under the backend's `backend_timeout_secs` deadline.
-   The address is the one resolved at start, so an address change needs a restart.
-2. **A new ID is a full flush.**
-   The node rebuilds the route table from the config loaded at start, swaps the cache and the held error pages for empty ones in one assignment each, and logs `genid changed` at info with `from` and `to`.
-   No entry survives into the new generation, and the cache refills on demand.
-   A first answer sets the ID with no flush, because the node held nothing the new ID makes old.
-3. **The store rule.**
-   A response from any URL backend enters the cache only when its `M6-Genid` parses and equals the ID the node holds, and the entry carries that ID.
-   A response with no header, no current ID, or another ID is sent to the client unchanged and not stored.
-   Another ID also makes the next heartbeat due at once, so a node that learns of a publish from a response follows it without waiting out the interval.
-   On a cache node the ID reaches a client from the upstream's own header on a miss, and from the cached entry on a hit.
-4. **Serving while the upstream is down.**
-   While the upstream does not answer, an entry past its freshness and stale windows is served as `STALE` with its `Age`.
-   A forward that ends in 502, 503 or 504 answers with the held entry for its key when there is one, at any age.
-   The operator sees one `genid: upstream down` line at warn on the transition, and the metrics line reports `upstream_down: true`.
-   The first answer after an outage logs `genid: upstream up` at info and clears the flag.
-5. **Background fetches wait.**
-   Prefetch, warm-on-start and stale-while-revalidate fetches are not drained while the node has no ID or the upstream is down.
-   The queue holds up to `[limits.refresh_queue] max`, 4096 by default, and drains once the upstream answers. A refresh past the maximum is refused with an error that names the key.
-6. **`/genid` is forwarded.**
-   `GET`, `HEAD` and `POST /genid` reach the upstream backend after the loopback or internal-listener address check, with the request's own headers, bypassing routing and the cache.
-   The cache node checks no token: the source authorises the caller.
-   A forwarded POST waits under `backend_timeout_secs` and is answered 504 if the deadline passes while the source is still completing the publish.
-   `GET /genid` then shows whether the advance happened.
+The origin keeps its counter in memory and has no state file, so a restart starts it at 0.
+A cache reconciles by the counter it presents, so a counter that moved covers an origin restart as it covers a purge.
 
-A cache node reports its own `genid` object on the metrics line: `role` is `cache`, `id` is the ID it holds or `null`, and `upstream`, `upstream_down`, `upstream_rtt_ms` and `last_ok_s` describe the node it follows.
-A source restart keeps its ID, so a cache node sees no change when it comes back.
+A cache whose control connection drops treats its origin as down and serves what it holds.
+An entry past its freshness and stale windows is served at any age, flagged stale with its `Age`, rather than missed.
+A forward that ends in 502, 503 or 504 is answered with the held entry for its key at any age, in place of the error page, so a working site with old pages beats an error page while the origin is unreachable.
+A re-established connection serves fresh again: the cache clears the held flag the moment it reconnects, before the first answer.
+The access and metrics lines mark a held entry `STALE`, and `/health` on the cache reports the origin as a failing dependency until it reconnects (section 11).
 
 ### 8.4 Disk cache (cache nodes)
 
 A cache node with `[cache] dir` in its system config writes the responses it caches to disk, and the request path never touches a file.
-A source keeps its cache in memory and is refused at start when it sets `dir`, with `config error: [cache].dir is for a cache node ([genid] upstream)`.
+A source keeps its cache in memory and is refused at start when it sets `dir`.
 
-The layout is `<dir>/<genid decimal>/<64 hex characters>`, the file name being the SHA-256 of the cache key's bytes.
-A file holds the generation ID, the key, the status and headers as JSON, the body, and a SHA-256 check value over every byte before it.
+The layout is one flat folder: each entry is `<dir>/<sha256 of the key>`, and the change counter is `<dir>/change-counter`, a decimal `u64` and a newline.
+A file holds the key, the status and headers as JSON, the body, and a SHA-256 check value over every byte before it.
 The writer writes `<name>.tmp` with one write and renames it into place, with no `fsync`.
 A crash can leave a short or torn file, and the check value catches it.
 
 **Writing.**
 A stored entry is flagged `queued` in the same insert that stores it, and the insert writes nothing.
-The writer works in slices on idle turns: while an entry is flagged or an old directory waits for removal, the loop polls with a zero timeout and runs one slice per turn.
+The writer works in slices on idle turns: while an entry is flagged, the loop polls with a zero timeout and runs one slice per turn.
 Table 3 gives the bounds on one slice.
-Removals run first, so their bytes are available to the write bound.
-Whichever limit is reached first ends the slice, and an entry the slice could not reach keeps its flag for the next one.
-The writer reads each entry again at the slice, so an entry replaced since it was queued is written as it is now, and an entry evicted since is skipped.
 
 | Bound | Value |
 |---|---|
 | Loop time per slice, checked between files | 1 ms |
 | Bytes written per slice | 4 MiB, and a single larger entry is written on its own |
-| Files removed per slice | 512 |
-| Total size of the directory | `[limits.cache_bytes] max`, 128 MiB by default |
+| Total size of the folder | the memory cache bound, `[limits.cache_bytes]` |
 
 **Table 3: the bounds on the disk writer.**
-A full queue costs the loop about 1 ms per turn, and a write that would pass the size bound is skipped.
+A full queue costs the loop about 1 ms per turn, and a write that would pass the size bound is skipped and counted.
 
-The disk copy is bounded by the memory cache's size, as the last row of Table 3 says.
-A skipped write is logged once per generation at info.
+The disk copy is bounded by the memory cache's bound, so it cannot outgrow the memory it shadows.
+A skipped write is logged at info and counted in `cache.disk_full` (section 11).
 A write failure is logged once per episode with the path and the error, and the entry is dropped without a retry.
-While the node has no current ID nothing is written, because nothing is stored in memory then either.
-
-**Generation change.**
-The queue is cleared, the new subdirectory is used from the next write, and every other subdirectory is removed over the slices that follow, then the empty directory.
 
 **Restart.**
 The node reads the disk copy at start, before the loop serves, and never on the request path.
-It reads the subdirectory with the largest decimal name and decodes that generation's files one at a time in file-name order.
 Each entry is inserted into a fresh cache with the live bound, so a disk copy larger than the memory bound fills the cache with the entries that fit first and leaves the rest on disk.
-A file that is short, fails its check value or carries another generation is deleted and counted, with one log line naming the path and the error.
+A file that is short or fails its check value is deleted and counted, with one log line naming the path and the error, and never stops the start or is served.
 A `.tmp` file is an interrupted write and is deleted without being counted.
-A damaged file never stops the start and is never served.
 
-The decoded entries are held aside until the first heartbeat answers, and the ID decides by the store rule's equality.
-A matching ID installs the copy as the live cache, so the node starts warm.
-Another ID drops it, because the site changed while the node was down.
-When the upstream does not answer, the copy is installed marked unverified, so the node serves the pages it held before the restart.
-The first later success clears the mark, keeps the copy when the ID is unchanged and runs the usual flush when it has moved.
-The start cost is one directory listing, one read and one SHA-256 per file, up to `[limits.cache_bytes] max`.
-The `disk cache loaded` line reports `elapsed_ms` beside the ID, the entry count (`entries`) and the damaged-file count (`bad`).
+The decoded entries are held until the first `COUNTER` answer, and the counter decides: an equal counter installs the copy as the live cache, so the node starts warm, and a different counter drops it and refills.
+The start cost is one directory listing, one read and one SHA-256 per file, up to the memory bound.
+The `disk cache loaded` line reports `elapsed_ms` beside the entry count (`entries`) and the damaged-file count (`bad`).
 
 **Metrics.**
 A node with a cache directory adds a `disk_cache` object to the metrics line, with the fields in Table 4.
 
 | Field | Meaning |
 |---|---|
-| `dir_bytes` | Bytes of the files in the current generation's directory |
+| `dir_bytes` | Bytes of the files in the folder |
 | `queued` | Entries whose flag is set |
 | `written_last_tick`, `written_bytes_last_tick` | Files and encoded bytes of the last slice, including a single entry over 4 MiB |
 | `skipped_full` | Writes skipped for the size bound |
 | `ticks`, `tick_last_ns` | Slices taken since start, and the loop time the last one took |
 | `loaded_entries`, `loaded_bad` | Entries the start-time load inserted, and files it deleted |
-| `state` | `kept`, `discarded`, `unverified` or `none`, and `none` until the first heartbeat answers |
+| `state` | `kept` when the counter matched, `discarded` when it did not, and `none` before the first answer |
 
 **Table 4: the `disk_cache` fields on the metrics line.**
 
@@ -470,7 +443,7 @@ Table 5 gives the three modes.
 
 `[errors] path` is required when `mode = "custom"`.
 Startup validation exits 2 if mode is `"custom"` and path is absent.
-m6-http holds each fetched error page by status, apart from the response cache, and a generation change empties them.
+m6-http holds each fetched error page by status, apart from the response cache, for the life of the process, and a restart empties them.
 `[errors] mode` defaults to `"internal"`.
 The error path is declared as a route in `site.toml` like any other.
 
@@ -493,14 +466,14 @@ If a route declares `require`, m6-http asks the authority before forwarding:
 An API request with no credential is answered 401 locally, and no check is sent.
 No decision is cached: every protected request makes its own call, so a removed role or a deleted user counts from the next request.
 
-A source node's `GET`, `HEAD` and `POST /genid` take the same path, under `[genid] read_require` and `write_require`.
+A source node's `PURGE` and `GET` and `HEAD /m6/status` take the same path, under `[registration] write_require` for the purge and `read_require` for the status.
 A refusal is the authority's 401 or 403, and a checker that does not answer is 503 with `Retry-After: 1`.
 
-A route's `require` and a source's `/genid` claims are the two credential consumers of `[auth] backend`.
+A route's `require` and a source's `[registration]` claims are the two credential consumers of `[auth] backend`.
 
 `m6_core::auth` owns the shapes: `Identity`, `Answer`, `Decision`, the `require` matcher, the answer parser and the one `X-Auth-Claims` encoder.
 `m6_core::http::token_refusal` is the one definition of the 401 and 403 bytes, and every route answers it unchanged for an API client: 401 `{"error":"unauthorised"}` with `WWW-Authenticate: Bearer` (RFC 9110 section 11.6.1), 403 `{"error":"forbidden"}` without it.
-`[auth]` needs `backend`. Config validation refuses a `require` route or a genid claim without `[auth]`, and refuses `[auth]` without a `backend`, so a running node cannot reach a gated path with no authority.
+`[auth]` needs `backend`. Config validation refuses a `require` route or a `[registration]` claim without `[auth]`, and refuses `[auth]` without a `backend`, so a running node cannot reach a gated path with no authority.
 
 `[auth] backend` names the `[[backend]]` whose members answer `POST /check`.
 Its `sockets` glob must match at least one socket, and a `url` backend is refused by name (`m6-http/src/config.rs`, the `[auth].backend ... is a URL backend` error).
@@ -532,8 +505,8 @@ These two answers fit the monitor's four states: `ok`, `degraded`, `unknown` and
 The degraded status is 503 so a reader that only looks at the code sees it, and m6-monitor reads a non-200 as `degraded`.
 
 `/health` reads flags and probes nothing.
-The origin flag is the cache node's own follower state, set where a heartbeat or a forwarded client request already observes the origin failing and cleared by the next successful heartbeat.
-A successful client request clears nothing: the heartbeat observes the recovery, and it is due immediately after a failure, so a recovered origin is reported within one heartbeat interval.
+The origin flag is the cache node's own registration state: it is set when the control connection to the origin drops and cleared when the cache reconnects, so a re-established connection reports the origin healthy at once.
+The cache reconnects on the accounting tick, once a second, so a recovered origin is reported within a second.
 A cache whose last success is an hour old and whose origin has no observed failure still answers `ok`, and a node that has just started answers `ok` until the first failure.
 
 The degraded body carries the node name and, when the node sets one, the process index.
@@ -545,7 +518,7 @@ With `[server] reuse_port`, `/health` is answered on the shared port, so the pro
 That listener answers `[health].path` and nothing else, and every other path gets the 404 of a disabled endpoint (`is_status_path` and `status_refusal` in `m6-http/src/main.rs`).
 
 `/health` is the only built-in monitoring endpoint, and a request for `/perf` or `/traffic` is routed like any other path.
-`/genid` is the other path m6-http answers itself, on a node whose system config carries `[genid]` (section 8).
+`PURGE` and `GET /m6/status` are the other paths m6-http answers itself, on a node whose system config carries `[registration]` (section 8).
 The metrics document and the traffic document are log lines, as Table 6 gives, so a monitor reads them from the journal.
 Table 6 also gives the interval key that writes each line.
 
@@ -563,6 +536,9 @@ With `[server] reuse_port`, each process writes its own metrics line to the jour
 Each line is one JSON object with `type`, `target` and `fields`.
 `fields.perf` holds the whole metrics document from `perf_document` in `m6-http/src/health.rs`, and `fields.traffic` holds the traffic document from `build_report` in the same file.
 The metrics document holds the request, cache and latency figures, the pool and TLS state, the build as `build.version` (the full SemVer string with its commit), and the host's figures.
+It adds a top-level `cache` object with the memory and eviction figures, and a `registration` object with the role and counter.
+The `cache` object carries `bytes`, `limit`, `entries`, `disk_bytes`, `evictions`, `disk_full` and `expired`, so m6-monitor reads fill, entries and any eviction from one place.
+The `registration` object reports the source's `counter` and `registered` list, or a cache node's `counter`, `origin` and `origin_down`.
 The traffic document summarises the last 60 minutes of requests, described at the end of this section.
 The metrics document is the largest document m6 writes, and `m6-log.md` section 2 gives its recorded size and the log buffer limits.
 The `host` section reports that machine's load, CPU count, memory, disks, interfaces and thermal zones, so a node with more of them writes a longer line.
@@ -878,7 +854,7 @@ The wait is bounded by a 1 s accounting tick, every deadline table and quiche's 
 m6-http writes one structured JSON line per event to its one log stream: stdout, or journald's native socket under systemd (`m6-log/src/sink.rs`).
 `m6-log.md` owns the line format and the buffer limits.
 
-Emitted events: `m6-http listeners bound` at info on start, `request complete` at debug with `path`, `status`, `version`, `backend`, `latency_ns` and `cache_hit`, `genid advanced` at info, `auth: no token`, `auth: insufficient claims`, `auth: refused` and `auth check returned no decision` at warn, `pool: socket added` and `pool: socket found` at info, and `cache: evicted` at debug.
+Emitted events: `m6-http listeners bound` at info on start, `request complete` at debug with `path`, `status`, `version`, `backend`, `latency_ns` and `cache_hit`, `disk cache kept` and `disk cache discarded` at info, `control: cache disconnected` at info, `auth: no token`, `auth: insufficient claims`, `auth: refused` and `auth check returned no decision` at warn, `control: connection to the origin dropped` and `control: connect to the origin failed` at warn, `pool: socket added` and `pool: socket found` at info, and `cache: evicted` at debug.
 
 Three periodic lines follow, each reporting the window since the last line.
 The operational line carries `requests`, `rps_avg`, `rps_peak`, `cache_hits`, `cache_misses`, `cache_hit_rate`, `backend_errors`, `pool_members`, `hit_samples`, `hit_p0_ns`, `hit_p50_ns`, `hit_p99_ns`, `hit_max_ns`, `miss_samples`, `miss_p0_ns`, `miss_p50_ns`, `miss_p99_ns`, `miss_max_ns`, `monitor_requests`, `monitor_p50_ns` and `monitor_p99_ns`.
@@ -904,6 +880,6 @@ The edge decodes no token, so m6-http has no JWT dependency, and `[auth] backend
 
 m6-http is the one process on the public port: it terminates TLS on all three HTTP versions, routes to backend pools, caches by path, query and encoding, and asks `POST /check` at every credential gate.
 It reads its two config files once, writes its start-up record, and refuses to start on any setting it cannot honour.
-While it runs, `/health` and `/genid` are the only paths it answers itself, and the metrics and traffic documents leave as log lines.
+While it runs, `/health`, `PURGE` and `GET /m6/status` are the only paths it answers itself, and the metrics and traffic documents leave as log lines.
 [`m6-site-toml.md`](m6-site-toml.md) gives every key, [`m6-log.md`](m6-log.md) the log stream, and [`m6-architecture.md`](m6-architecture.md) the reasons.
 

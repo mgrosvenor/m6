@@ -13,6 +13,7 @@ The heading is the version, and a number would break the pattern `tag.sh` and CI
 
 The released versions, newest first:
 
+- [1.18.0-rc.1, 2026-11-26](#1180-rc1-2026-11-26)
 - [1.17.0, 2026-11-24](#1170-2026-11-24)
 - [1.15.0, 2026-10-29](#1150-2026-10-29)
 - [1.14.0, 2026-10-27](#1140-2026-10-27)
@@ -36,6 +37,64 @@ The released versions, newest first:
 - [1.1.0, 2026-09-15](#110-2026-09-15)
 - [1.0.0, 2026-09-14](#100-2026-09-14)
 - [0.2.0 and earlier, 2026-03-15 and before](#020-and-earlier-2026-03-15-and-before)
+
+## 1.18.0-rc.1, 2026-11-26
+
+**The site generation ID is gone, replaced by the standard `PURGE` method, cache registration over one open connection, and a change counter.**
+m6 also gains `m6-redirect`, a generic static redirect engine.
+The cache evicts expired entries first and then the least recently read, reports its fill, entries and evictions on the metrics line, and stores a response that declares its own freshness, so a short-link `302` carrying `s-maxage` is cached.
+This is a release candidate, a develop build on staging and not a release.
+
+### Migration
+
+Every node whose system config carries `[genid]` must move to `[registration]`, and every publisher that sent `POST /genid` must send `PURGE` instead.
+Table 1 maps each use.
+
+| # | the old generation ID | its replacement |
+|---|---|---|
+| 1 | The `[genid]` system-config table | `[registration]`, with `read_require` and `write_require` on an origin |
+| 2 | `POST /genid` to flush the caches and reload the backends | `PURGE /<path>` or `PURGE /*`. The backends' own `POST /genid` reload signal is unchanged |
+| 3 | `GET /genid` to read the ID | `GET /m6/status`, the change counter and the registered caches |
+| 4 | The `$STATE_DIRECTORY/genid` state file | gone. The counter is in memory and a cache reconciles by the counter it saved |
+| 5 | The ten-second cache heartbeat | one open control connection per cache |
+| 6 | The `M6-Genid` store rule | a purge plus the change counter |
+| 7 | The generation-keyed disk directory | one flat folder with a `<dir>/change-counter` file |
+
+**Table 1: every generation-ID use and what replaces it.**
+A publisher now sends each backend its own reload signal, then `PURGE` for the changed paths or `PURGE /*` for a full deploy, in that order.
+
+### Added
+
+- **`m6-redirect`**, a generic static redirect engine in the Cloudflare Bulk Redirects shape.
+  It exact-matches host and path against one JSON list, answers the rule's status and target, and answers 404 otherwise.
+  The list is replaced over the internal listener with a `POST /m6-redirect/rules`, or re-read on the backend reload signal.
+  [`docs/m6-redirect.md`](docs/m6-redirect.md) gives the list and the endpoints, and its behaviour and lifecycle suites run the binary over a real socket.
+- **`PURGE` and `PURGE /*`**, the standard cache-purge method Varnish, Fastly and Squid answer, plus `GET /m6/status`.
+  The origin purges itself, fans the purge out to every registered cache over its control channel, and answers one entry per node saying whether the path was resident.
+  [`docs/m6-http.md`](docs/m6-http.md) section 8 gives the reply and the reachability rule, and the purge and status integration tests prove it.
+- **Cache registration and the change counter.**
+  Each cache holds one plain TCP connection open to its origin, announces itself and the counter it saved, and the origin pushes each purge down it.
+  The origin raises the counter by one on every purge, and a cache whose counter differs, or whose disk copy is missing, purges and refills.
+  TCP keepalive and a re-register on the accounting tick replace the polling heartbeat, so nothing polls.
+  `m6-http/tests/control_channel.rs` proves the round-trip and the internal-peers admission.
+- **Cache figures on the metrics line.**
+  The perf document gains a top-level `cache` object (`bytes`, `limit`, `entries`, `disk_bytes`, `evictions`, `disk_full`, `expired`), a `registration` object and a `disk_cache` object.
+  m6-monitor reports each node's fill, entries and evictions, and marks any eviction a fault.
+
+### Changed
+
+- **Cache eviction** now drops expired entries first, then the least recently read, when an insert passes the `[limits.cache_bytes]` bound, and only on insert, never on a read.
+  An expired entry is served no longer and frees memory instead of waiting for a later eviction.
+- **The cache bound is raisable.** `[limits.cache_bytes]` defaults to 128 MiB and its maximum is 4 GiB, so an operator raises the bound through the limit rather than a built-in ceiling.
+- **Storability** follows RFC 9111 explicit freshness: a status off the default list, such as a `302` carrying `s-maxage`, is storable, and a `206` stays excluded.
+- **The disk cache** is one flat folder with a `change-counter` file, with no generation subdirectory.
+
+### Removed
+
+- The site generation ID: the `[genid]` table, the `/genid` endpoints, the state file, the heartbeat, the `M6-Genid` header and its store rule, and the generation-keyed disk layout.
+  Each use is replaced by Table 1.
+
+---
 
 ## 1.17.0, 2026-11-24
 
