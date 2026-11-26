@@ -16,6 +16,13 @@ use crate::poll::{HeaderCheckResult, NodeReading};
 pub struct Thresholds {
     pub disk_used: f64,
     pub memory_used: f64,
+    /// Cache fill fraction above which the check warns. Fill is `bytes /
+    /// limit` from the metrics document's `cache` object; a limit of zero has
+    /// no fraction and is reported as absent rather than as full.
+    pub cache_fill_warn: f64,
+    /// Cache fill fraction above which the check faults. Fill is the same
+    /// figure the warning reads.
+    pub cache_fill_fault: f64,
     /// Load average per CPU. Load is a queue length, so the only meaningful
     /// comparison is against the number of CPUs.
     pub load_per_cpu: f64,
@@ -98,6 +105,8 @@ impl Default for Thresholds {
         Self {
             disk_used: 0.80,
             memory_used: 0.90,
+            cache_fill_warn: 0.80,
+            cache_fill_fault: 0.90,
             load_per_cpu: 2.0,
             thermal_celsius: 80.0,
             cert_expiry_days: 21,
@@ -347,6 +356,26 @@ pub struct NodeDigest {
     /// node with no traffic summary and a node whose summary is empty must not
     /// look the same, the rule `perf_error` already follows.
     pub traffic_error: Option<String>,
+    /// The node's cache figures, from the metrics document's `cache` object.
+    /// `None` on a node older than the field, and on a process whose binary
+    /// has no cache. The fill fraction is derived here from `bytes` and
+    /// `limit`, so the digest carries one fact and every reader agrees.
+    pub cache: Option<CacheDigest>,
+}
+
+/// One node's cache, as the check and the history report it.
+#[derive(Debug, Clone, Serialize)]
+pub struct CacheDigest {
+    pub bytes: u64,
+    pub limit: u64,
+    pub entries: u64,
+    pub disk_bytes: u64,
+    pub evictions: u64,
+    pub disk_full: u64,
+    pub expired: u64,
+    /// `bytes / limit`, `None` when `limit` is zero so a zero limit is not
+    /// divided by.
+    pub fill: Option<f64>,
 }
 
 /// One node's tunnel, as figures and states.
@@ -932,6 +961,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
             tunnel: r.tunnel.as_ref().map(tunnel_digest),
             traffic: r.traffic.as_ref().map(traffic_digest),
             traffic_error: r.traffic_error.clone(),
+            cache: None,
         };
 
         // Before the unreachable `continue` below: a node whose HTTPS poll
@@ -1156,6 +1186,76 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
                     node: r.name.clone(),
                     text,
                 });
+            }
+
+            // ── the cache's own figures ────────────────────────────────────────
+            //
+            // Every value is unsigned, so `bytes` or `limit` being absent on an
+            // old node cannot be told from zero on this arm, and the fields are
+            // reported only when the node carries the object. Any eviction is a
+            // fault and a full disk copy is a fault, because both mean the
+            // cached path a visitor relies on has already missed. Fill is the
+            // same `bytes / limit` fraction every view reads, derived once here.
+            if let Some(c) = &p.cache {
+                let fill = (c.limit > 0).then(|| c.bytes as f64 / c.limit as f64);
+                d.cache = Some(CacheDigest {
+                    bytes: c.bytes,
+                    limit: c.limit,
+                    entries: c.entries,
+                    disk_bytes: c.disk_bytes,
+                    evictions: c.evictions,
+                    disk_full: c.disk_full,
+                    expired: c.expired,
+                    fill,
+                });
+                // The eviction fault comes before the fill fault, so a cache
+                // that filled to the limit and evicted says both and the
+                // reader sees the cause and the consequence in order.
+                if c.evictions > 0 {
+                    findings.push(Finding {
+                        level: Level::Fault,
+                        node: r.name.clone(),
+                        text: format!(
+                            "cache evicted {} entr{} since start",
+                            c.evictions,
+                            if c.evictions == 1 { "y" } else { "ies" }
+                        ),
+                    });
+                }
+                if c.disk_full > 0 {
+                    findings.push(Finding {
+                        level: Level::Fault,
+                        node: r.name.clone(),
+                        text: format!(
+                            "cache disk copy skipped {} write{} for being full",
+                            c.disk_full,
+                            if c.disk_full == 1 { "" } else { "s" }
+                        ),
+                    });
+                }
+                if let Some(fill) = fill {
+                    if fill >= t.cache_fill_fault {
+                        findings.push(Finding {
+                            level: Level::Fault,
+                            node: r.name.clone(),
+                            text: format!(
+                                "cache {:.0}% full, at or over the {:.0}% fault threshold",
+                                fill * 100.0,
+                                t.cache_fill_fault * 100.0
+                            ),
+                        });
+                    } else if fill >= t.cache_fill_warn {
+                        findings.push(Finding {
+                            level: Level::Warn,
+                            node: r.name.clone(),
+                            text: format!(
+                                "cache {:.0}% full, at or over the {:.0}% warning threshold",
+                                fill * 100.0,
+                                t.cache_fill_warn * 100.0
+                            ),
+                        });
+                    }
+                }
             }
 
             let h = &p.host;
@@ -1649,7 +1749,7 @@ pub fn build(readings: &[NodeReading], t: &Thresholds, now: String) -> Digest {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use m6_core::monitoring::{HealthReport, PerfReport, PoolHealth};
+    use m6_core::monitoring::{CacheMetrics, HealthReport, PerfReport, PoolHealth};
     use m6_core::platform::host::{Disk, HostSnapshot, LoadAverage, Memory, MemorySource};
     use m6_core::telemetry::StatsSnapshot;
 
@@ -1669,6 +1769,7 @@ pub(crate) mod tests {
             tls_unreadable: 0,
             metrics: StatsSnapshot::default(),
             host,
+            cache: None,
         }
     }
 
@@ -1803,6 +1904,152 @@ pub(crate) mod tests {
         assert!(d.process_groups.is_empty());
         let json = serde_json::to_string(&d).unwrap();
         assert!(!json.contains("process_groups"), "{json}");
+    }
+
+    /// A reading whose metrics document carries the cache object.
+    fn cache_reading(name: &str, c: CacheMetrics) -> NodeReading {
+        let mut p = perf(plain_host(), vec![]);
+        p.cache = Some(c);
+        reading(name, "ok", Some(p))
+    }
+
+    fn cache(bytes: u64, limit: u64) -> CacheMetrics {
+        CacheMetrics {
+            bytes,
+            limit,
+            entries: 0,
+            disk_bytes: 0,
+            evictions: 0,
+            disk_full: 0,
+            expired: 0,
+        }
+    }
+
+    /// Any eviction is a fault: the cache exists so a visitor hits, and an
+    /// evicted entry is a visitor that already missed.
+    #[test]
+    fn any_cache_eviction_is_a_fault() {
+        let d = build(
+            &[cache_reading(
+                "edge-a",
+                CacheMetrics {
+                    evictions: 3,
+                    ..cache(0, 0)
+                },
+            )],
+            &Thresholds::default(),
+            now(),
+        );
+        let faults: Vec<_> = d
+            .findings
+            .iter()
+            .filter(|f| f.level == Level::Fault && f.text.contains("evicted"))
+            .collect();
+        assert_eq!(faults.len(), 1, "{:?}", d.findings);
+        assert!(
+            faults[0].text.contains("3 entries since start"),
+            "{:?}",
+            faults[0].text
+        );
+    }
+
+    /// A full disk copy is a fault: a restarted cache with an incomplete disk
+    /// copy misses.
+    #[test]
+    fn a_full_disk_copy_is_a_fault() {
+        let d = build(
+            &[cache_reading(
+                "edge-a",
+                CacheMetrics {
+                    disk_full: 2,
+                    ..cache(0, 0)
+                },
+            )],
+            &Thresholds::default(),
+            now(),
+        );
+        let faults: Vec<_> = d
+            .findings
+            .iter()
+            .filter(|f| f.level == Level::Fault && f.text.contains("disk copy skipped"))
+            .collect();
+        assert_eq!(faults.len(), 1, "{:?}", d.findings);
+    }
+
+    /// Fill at or over the fault threshold is a fault, and fill at or over the
+    /// warning threshold but under the fault one is a warning. Both read the
+    /// same derived fraction, so they can never disagree about the number.
+    #[test]
+    fn cache_fill_warns_at_the_warning_threshold_and_faults_at_the_fault_one() {
+        let warn = build(
+            &[cache_reading("edge-a", cache(800, 1000))],
+            &Thresholds::default(),
+            now(),
+        );
+        let warns: Vec<_> = warn
+            .findings
+            .iter()
+            .filter(|f| f.level == Level::Warn && f.text.contains("cache"))
+            .collect();
+        assert_eq!(warns.len(), 1, "{:?}", warn.findings);
+        assert!(warns[0].text.contains("80% full"), "{:?}", warns[0].text);
+
+        let fault = build(
+            &[cache_reading("edge-a", cache(900, 1000))],
+            &Thresholds::default(),
+            now(),
+        );
+        let faults: Vec<_> = fault
+            .findings
+            .iter()
+            .filter(|f| f.level == Level::Fault && f.text.contains("cache"))
+            .collect();
+        assert_eq!(faults.len(), 1, "{:?}", fault.findings);
+        assert!(faults[0].text.contains("90% full"), "{:?}", faults[0].text);
+
+        let quiet = build(
+            &[cache_reading("edge-a", cache(500, 1000))],
+            &Thresholds::default(),
+            now(),
+        );
+        assert!(
+            !quiet.findings.iter().any(|f| f.text.contains("cache")),
+            "{:?}",
+            quiet.findings
+        );
+    }
+
+    /// The digest carries the cache object and the one derived fill fraction,
+    /// and a node without the object reports none rather than a zero.
+    #[test]
+    fn the_digest_carries_the_cache_figures_and_derives_fill_once() {
+        let d = build(
+            &[
+                cache_reading(
+                    "edge-a",
+                    CacheMetrics {
+                        bytes: 50,
+                        limit: 100,
+                        entries: 7,
+                        disk_bytes: 20,
+                        evictions: 0,
+                        disk_full: 0,
+                        expired: 1,
+                    },
+                ),
+                reading("origin", "ok", None),
+            ],
+            &Thresholds::default(),
+            now(),
+        );
+        let c = d.nodes[0].cache.as_ref().expect("edge-a reports its cache");
+        assert_eq!(c.bytes, 50);
+        assert_eq!(c.limit, 100);
+        assert_eq!(c.entries, 7);
+        assert_eq!(c.disk_bytes, 20);
+        assert_eq!(c.expired, 1);
+        assert_eq!(c.fill, Some(0.5));
+        assert!(d.nodes[1].cache.is_none());
     }
 
     fn now() -> String {

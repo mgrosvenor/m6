@@ -405,6 +405,7 @@ Table 7 gives each part of the digest and the input it came from.
 | `uptime_s`, `host_uptime_s` | the metrics document |
 | `requests_total`, `hit_rate`, the hit and miss percentiles, `backend_errors`, `pools` | the metrics document's `metrics` and `pools` |
 | `load_one`, `cpus`, `memory_used`, `disk_used`, `thermal_max_c` | the metrics document's `host` |
+| `cache` | the metrics document's `cache` object, with `fill` derived from `bytes` and `limit` |
 | `cert_not_after_unix`, `cert_fingerprint`, `cert_expires_in_seconds` | the metrics document's `tls` |
 | `traffic`, `traffic_error` | the traffic document |
 | `tunnel` | the TCP probe and the WireGuard handshake file |
@@ -418,7 +419,7 @@ Version drift compares the release part of `version`, before the `+`, because Se
 Build drift compares the metadata, which is the commit the node's binary was built from.
 Two nodes on one release built from different commits show build drift and no version drift, and a node whose version carries no metadata counts as build drift.
 
-`Thresholds` carries the limits the build judges against: load per CPU 2.0, memory 0.9, disk 0.8, thermal 80 C, certificate expiry 21 days, the tunnel handshake age, and the age of the last 200.
+`Thresholds` carries the limits the build judges against: load per CPU 2.0, memory 0.9, disk 0.8, cache fill 0.8 warning and 0.9 fault, thermal 80 C, certificate expiry 21 days, the tunnel handshake age, and the age of the last 200.
 
 `check::render` prints the same reading as text.
 HEALTH comes first, one line per node with this poll's `/health` answer and the age of its last 200 from the history, and a node past the age limit reads `FAULT` on its line and in the verdict.
@@ -438,6 +439,8 @@ One run with two config files, a clean shutdown and an expected restart before i
 A record that never closed reads `FAULT` on its line with the number of lines it received.
 The section also says when the journal tail cut records and when shutdown lines named no run.
 The rest is sections A to I: A LOGGING, B PERFORMANCE, C HOST, D SECURITY AND TRAFFIC, E CRAWLERS, F CACHE HEADERS, G CONNECTION SETUP, H TUNNELS, and I HISTORY.
+Section B also prints a cache line per node: fill, entries, bytes, limit, evictions, expired and disk-full.
+Any eviction is a FAULT, a disk-copy-full is a FAULT, fill at or over 0.9 faults, and fill at or over 0.8 warns.
 Section A judges the node's own log from the traffic document's `logging`, and `LoggingHealth::is_blind` faults a log silent for more than 40 seconds.
 
 `m6-monitor --check <config>` prints the same report and exits 1 on a fault and 0 otherwise.
@@ -499,6 +502,7 @@ With `[monitor] history_file` set, every finished poll is kept in one SQLite fil
 
 `history::start` opens the file, applies the migrations, and returns a `History` the loop owns.
 A batch is one poll: one row in `health` per node, with `health_channel` and `health_net` rows under it, the findings in `poll_finding`, and one `crawl_window` per node window with its sightings.
+Each `health` row also carries the cache's `bytes`, `limit`, `entries`, `disk_bytes`, `evictions`, `disk_full` and `expired`, nullable on a node older than the field, and `/history` derives the `fill` fraction on the read.
 
 When the file's used bytes pass `history_max_mb`, the oldest `poll` rows are deleted 256 at a time until the file is 5% under the cap.
 Nothing expires by age, and the file is never vacuumed.

@@ -309,6 +309,33 @@ impl HealthReport {
     }
 }
 
+/// The cache's own figures, reported per process on the metrics line.
+///
+/// Every value is an unsigned integer. `limit` is the configured byte bound,
+/// `bytes` the current in-memory footprint, and `disk_bytes` the disk copy's
+/// size on disk. `evictions` and `disk_full` are cumulative since start, and
+/// `expired` is the count of expired entries still held in the map now.
+///
+/// Absent from a node older than this field, and absent from a process whose
+/// binary has no cache, so the whole document still parses for an aggregator.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct CacheMetrics {
+    /// Bytes held in memory, total footprint.
+    pub bytes: u64,
+    /// The configured `[limits] cache_bytes`.
+    pub limit: u64,
+    /// The number of entries held.
+    pub entries: u64,
+    /// The disk copy's bytes on disk.
+    pub disk_bytes: u64,
+    /// Evictions since start, cumulative.
+    pub evictions: u64,
+    /// Times the disk writer skipped a write for being full, cumulative.
+    pub disk_full: u64,
+    /// Expired entries still in the map, current.
+    pub expired: u64,
+}
+
 /// The metrics document: the numbers, plus the detail `/health` must not leak.
 ///
 /// Carries `node` and `uptime_s` so a dashboard scraping several nodes can
@@ -394,6 +421,11 @@ pub struct PerfReport {
     #[serde(default)]
     pub logging: Option<LoggingHealth>,
     pub metrics: StatsSnapshot,
+    /// The cache's figures. `None` when the node did not report a cache
+    /// object: a node older than this field, or a process whose binary has no
+    /// cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheMetrics>,
     /// The machine underneath: load, memory, disk, temperature, uptime. m6-http
     /// reads it once a minute and repeats it on the lines between.
     ///
@@ -447,6 +479,7 @@ impl PerfReport {
             logging: Some(LoggingHealth::read()),
             metrics,
             host,
+            cache: None,
         }
     }
 }
@@ -1341,6 +1374,15 @@ mod perf_line_size_tests {
             }),
             metrics,
             host: crate::platform::host::snapshot(std::path::Path::new("/")),
+            cache: Some(CacheMetrics {
+                bytes: u64::MAX,
+                limit: u64::MAX,
+                entries: u64::MAX,
+                disk_bytes: u64::MAX,
+                evictions: u64::MAX,
+                disk_full: u64::MAX,
+                expired: u64::MAX,
+            }),
         }
     }
 
