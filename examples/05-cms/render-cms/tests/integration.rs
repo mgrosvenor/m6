@@ -38,13 +38,15 @@ fn m6_root() -> PathBuf {
         .expect("m6 workspace root")
 }
 
+/// An m6 binary from the m6 workspace's release build, else its debug build,
+/// else `PATH`.
 fn m6_bin(name: &str) -> Option<PathBuf> {
-    let release = m6_root().join("target/release").join(name);
-    if release.exists() {
-        return Some(release);
-    }
-    // Fall back to PATH
-    which(name)
+    let target = m6_root().join("target");
+    ["release", "debug"]
+        .iter()
+        .map(|profile| target.join(profile).join(name))
+        .find(|p| p.exists())
+        .or_else(|| which(name))
 }
 
 fn which(name: &str) -> Option<PathBuf> {
@@ -457,7 +459,7 @@ impl ServerStack {
     /// because they live in the returned stack's `Drop`.
     fn start() -> Self {
         // Require all m6 binaries.
-        let missing = "Run `cargo build --release` in the m6 workspace";
+        let missing = "Run `cargo build --bins` in the m6 workspace";
         let m6_http = m6_bin("m6-http").unwrap_or_else(|| panic!("m6-http not found. {missing}"));
         let m6_html = m6_bin("m6-html").unwrap_or_else(|| panic!("m6-html not found. {missing}"));
         let m6_file = m6_bin("m6-file").unwrap_or_else(|| panic!("m6-file not found. {missing}"));
