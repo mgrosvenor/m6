@@ -434,7 +434,6 @@ impl DiskWriter {
             "disk cache: write failed; dropping the entry and not retrying"
         );
     }
-
 }
 
 /// What a start-time load read, held aside until the first registration answer.
@@ -779,7 +778,6 @@ impl<'a> Reader<'a> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -995,7 +993,10 @@ mod tests {
         assert_eq!(w.tick(&mut cache).written, 1);
         let file = files(dir.path())
             .into_iter()
-            .find(|p| p.file_name().is_some_and(|n| n.to_string_lossy() != CHANGE_COUNTER))
+            .find(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy() != CHANGE_COUNTER)
+            })
             .expect("one cache file");
         let (_, decoded) = decode(&std::fs::read(file).unwrap()).expect("decode");
         assert_eq!(&decoded.body[..], b"new");
@@ -1020,7 +1021,10 @@ mod tests {
         assert_eq!(stats.written, 1);
         let names: Vec<PathBuf> = files(dir.path())
             .into_iter()
-            .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy() != CHANGE_COUNTER))
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy() != CHANGE_COUNTER)
+            })
             .collect();
         assert_eq!(names.len(), 1);
         let (key, _) = decode(&std::fs::read(&names[0]).unwrap()).expect("decode");
@@ -1047,7 +1051,9 @@ mod tests {
         assert_eq!(
             files(dir.path())
                 .into_iter()
-                .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy() != CHANGE_COUNTER))
+                .filter(|p| p
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy() != CHANGE_COUNTER))
                 .count(),
             3
         );
@@ -1068,7 +1074,9 @@ mod tests {
         assert_eq!(
             files(dir.path())
                 .into_iter()
-                .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy() != CHANGE_COUNTER))
+                .filter(|p| p
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy() != CHANGE_COUNTER))
                 .count(),
             1
         );
@@ -1077,7 +1085,9 @@ mod tests {
         assert_eq!(
             files(dir.path())
                 .into_iter()
-                .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy() != CHANGE_COUNTER))
+                .filter(|p| p
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy() != CHANGE_COUNTER))
                 .count(),
             0,
             "a counter change purges the folder"
@@ -1136,14 +1146,16 @@ mod tests {
         let mut buf = Vec::new();
         encode_into(&mut buf, "/short\u{1}\u{1}", &response(b"short"));
         let cut = buf.len() / 2;
-        std::fs::write(dir.path().join(hex(&key_hash("/short\u{1}\u{1}"))), &buf[..cut]).unwrap();
+        std::fs::write(
+            dir.path().join(hex(&key_hash("/short\u{1}\u{1}"))),
+            &buf[..cut],
+        )
+        .unwrap();
 
         std::fs::write(dir.path().join("junk.tmp"), b"partial").unwrap();
         write_change_counter(dir.path(), 7).unwrap();
 
-        let loaded = load(dir.path(), 1024 * 1024)
-            .unwrap()
-            .expect("a folder");
+        let loaded = load(dir.path(), 1024 * 1024).unwrap().expect("a folder");
         assert_eq!(loaded.entries, 1, "only the good file loads");
         assert_eq!(
             loaded.bad, 2,
@@ -1153,7 +1165,9 @@ mod tests {
         assert_eq!(
             files(dir.path())
                 .into_iter()
-                .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy() != CHANGE_COUNTER))
+                .filter(|p| p
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy() != CHANGE_COUNTER))
                 .count(),
             1,
             "every bad file and the tmp are gone"
@@ -1184,9 +1198,7 @@ mod tests {
             write_entry(dir.path(), &format!("/p{i}\u{1}\u{1}"), &body);
         }
         let bound = 64 * 1024;
-        let loaded = load(dir.path(), bound)
-            .unwrap()
-            .expect("a folder");
+        let loaded = load(dir.path(), bound).unwrap().expect("a folder");
         assert!(
             loaded.cache.bytes_held() <= bound,
             "the cache holds {} bytes against a {bound} bound",
@@ -1199,7 +1211,11 @@ mod tests {
         );
         assert!(loaded.entries > 0, "some entries fit");
         assert_eq!(loaded.bad, 0, "an entry that does not fit is not corrupt");
-        assert_eq!(loaded.files.len(), total, "every file counts towards the bound");
+        assert_eq!(
+            loaded.files.len(),
+            total,
+            "every file counts towards the bound"
+        );
     }
 
     /// An empty root means nothing to load, so the node starts exactly as it

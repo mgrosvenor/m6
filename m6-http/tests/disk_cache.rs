@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use rustls::StreamOwned;
 
 use m6_core::auth::Identity;
-use m6_core::testkit::{binary, claim_port, PortClaim, Reply, ServingCheck, Service};
+use m6_core::testkit::{binary, claim_port, PortClaim, Reply, Service, ServingCheck};
 
 fn identity(role: &str) -> Identity {
     Identity {
@@ -152,14 +152,8 @@ impl Stack {
         let check = ServingCheck::start(
             &check_path,
             vec![
-                (
-                    "writer".to_string(),
-                    Reply::Identity(identity("writer")),
-                ),
-                (
-                    "reader".to_string(),
-                    Reply::Identity(identity("reader")),
-                ),
+                ("writer".to_string(), Reply::Identity(identity("writer"))),
+                ("reader".to_string(), Reply::Identity(identity("reader"))),
             ],
         )
         .expect("the check server starts");
@@ -336,7 +330,9 @@ dir = "{cache_dir}"
 
         let mut source = Service::spawn(
             "m6-http-origin",
-            Command::new(binary("m6-http")).arg(site).arg(&source_system),
+            Command::new(binary("m6-http"))
+                .arg(site)
+                .arg(&source_system),
         );
         source.wait_for_tcp(source_port.port(), m6_core::testkit::STARTUP_BOUND);
 
@@ -379,7 +375,9 @@ dir = "{cache_dir}"
 
     /// The cache node's saved change counter, read from its disk folder.
     fn saved_counter(&self) -> Option<u64> {
-        m6_http_lib::disk_cache::read_change_counter(&self.cache_dir).ok().flatten()
+        m6_http_lib::disk_cache::read_change_counter(&self.cache_dir)
+            .ok()
+            .flatten()
     }
 
     /// The cache files under the one folder, excluding the change counter and
@@ -391,8 +389,7 @@ dir = "{cache_dir}"
                     .map(|e| e.path())
                     .filter(|p| {
                         p.is_file()
-                            && p.file_name()
-                                .is_some_and(|n| n != "change-counter")
+                            && p.file_name().is_some_and(|n| n != "change-counter")
                             && !p
                                 .file_name()
                                 .is_some_and(|n| n.to_string_lossy().ends_with(".tmp"))
@@ -475,9 +472,8 @@ fn a_restart_reads_the_file_the_node_wrote() {
 
     stack.stop_cache();
     let files = stack.cache_files();
-    let (_key, response) =
-        m6_http_lib::disk_cache::decode(&std::fs::read(&files[0]).unwrap())
-            .expect("the stopped node left a complete file");
+    let (_key, response) = m6_http_lib::disk_cache::decode(&std::fs::read(&files[0]).unwrap())
+        .expect("the stopped node left a complete file");
     assert_eq!(&response.body[..], b"first");
 }
 
