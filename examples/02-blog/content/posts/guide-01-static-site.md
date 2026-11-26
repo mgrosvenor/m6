@@ -263,7 +263,7 @@ The cleanup is the part worth copying. The script records every pid it starts in
 
 m6 reads its configuration, `site.toml`, templates and params files once, at start. After you change `data/site.json` or a template, stop the stack with `Ctrl-C` and run `./dev.sh` again. m6-http keeps its cache in memory, so a restart also empties it.
 
-A site that must show a change without a restart gives m6-http a `[genid]` table, and whatever changes the content sends `POST /genid` when it finishes: m6-http reloads every backend, empties its cache and answers with the new generation. [Example 05](/blog/guide-05-cms) does this when an editor publishes.
+A site that must show a change without a restart gives m6-http a `[registration]` table, and whatever changes the content reloads the backend with `POST /genid` and sends `PURGE /*` when it finishes: the backend re-reads its files and m6-http empties its cache. [Example 05](/blog/guide-05-cms) does this when an editor publishes.
 
 ---
 

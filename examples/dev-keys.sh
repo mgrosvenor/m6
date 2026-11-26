@@ -52,7 +52,7 @@ fi
 
 # The certificate a client trusts to reach this node: mkcert's local CA when
 # mkcert made the certificate, else the self-signed certificate itself. A
-# renderer that publishes with `POST /genid` names this file as `ca_file`.
+# renderer that publishes with `PURGE /*` names this file as `ca_file`.
 if [ "$new_cert" = 1 ] || [ ! -f "$DEV/ca.pem" ]; then
     if command -v mkcert &>/dev/null && [ -f "$(mkcert -CAROOT)/rootCA.pem" ]; then
         cp "$(mkcert -CAROOT)/rootCA.pem" "$DEV/ca.pem"

@@ -8,7 +8,7 @@ cover   = "https://picsum.photos/seed/guide00/1200/500"
 
 This is the start of a seven-part guide that walks through every m6 example, from a bare static site to a full CMS running under systemd.
 
-m6 is an integrated system for building and serving websites. It covers the whole journey — from writing content in Markdown, through template rendering, to an in-memory cache that serves pre-compressed responses directly from RAM. Each part is designed to work with the others: the renderer produces output the cache can serve directly, and one request to m6-http, `POST /genid`, reloads every backend and empties the cache when content changes. You could assemble something similar from nginx, Varnish, a template engine, and a Markdown converter, but you'd be managing four mental models and four integration surfaces. m6 is one system with one config format and one set of concepts across the whole stack.
+m6 is an integrated system for building and serving websites. It covers the whole journey — from writing content in Markdown, through template rendering, to an in-memory cache that serves pre-compressed responses directly from RAM. Each part is designed to work with the others: the renderer produces output the cache can serve directly, and a publish reloads the changed backend and sends `PURGE /*` to m6-http, which empties the cache when content changes. You could assemble something similar from nginx, Varnish, a template engine, and a Markdown converter, but you'd be managing four mental models and four integration surfaces. m6 is one system with one config format and one set of concepts across the whole stack.
 
 **In this guide:**
 

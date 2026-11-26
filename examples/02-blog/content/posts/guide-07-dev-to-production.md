@@ -60,9 +60,9 @@ tls_key  = "@M6_DEV_HOME@/dev/dev-key.pem"
 [auth]
 backend = "m6-auth-check"
 
-[genid]
-read_require  = "role:genid-read"
-write_require = "role:genid-write"
+[registration]
+read_require  = "role:purge-read"
+write_require = "role:purge-write"
 
 [node]
 name = "dev"
@@ -82,12 +82,12 @@ tls_key  = "/run/credentials/m6-http.service/tls-key.pem"
 [auth]
 backend = "m6-auth-check"
 
-[genid]
-read_require  = "role:genid-read"
-write_require = "role:genid-write"
+[registration]
+read_require  = "role:purge-read"
+write_require = "role:purge-write"
 ```
 
-The system config holds the state of one node: its identity (`[node]`), its binds and TLS paths (`[server]`), its check backend (`[auth]`) and the claims that gate `/genid` (`[genid]`). Each table goes in one file only, and a key in the file that does not own it stops m6-http at start with exit 2. Everything else comes from `site.toml` unchanged.
+The system config holds the state of one node: its identity (`[node]`), its binds and TLS paths (`[server]`), its check backend (`[auth]`) and the claims that gate `PURGE` (`[registration]`). Each table goes in one file only, and a key in the file that does not own it stops m6-http at start with exit 2. Everything else comes from `site.toml` unchanged.
 
 **`configs/render-contact.conf` — version controlled, uses local mock values:**
 
@@ -157,9 +157,9 @@ tls_key  = "/run/credentials/m6-http.service/tls-key.pem"
 [auth]
 backend = "m6-auth-check"
 
-[genid]
-read_require  = "role:genid-read"
-write_require = "role:genid-write"
+[registration]
+read_require  = "role:purge-read"
+write_require = "role:purge-write"
 TOML
 chown root:m6 /etc/m6/my-blog.toml
 chmod 640 /etc/m6/my-blog.toml
@@ -229,10 +229,10 @@ if [[ "$1" == "--binary" ]]; then
 fi
 
 echo "Deployed."
-# new content is read when the site's generation advances (POST /genid)
+# new content is read when each backend is reloaded (POST /genid) and the cache is purged (PURGE /*)
 ```
 
-For template, data and content changes: `./deploy.sh`, then one `POST /genid` (the CMS sends it when an editor publishes), which reloads every backend and empties the cache. A `site.toml` or system config change takes a restart of m6-http. For renderer binary changes: `./deploy.sh --binary` — only render-cms restarts; all other units and the m6-http cache are unaffected.
+For template, data and content changes: `./deploy.sh`, then a publish, which reloads each backend with `POST /genid` and sends `PURGE /*` (the CMS does this when an editor publishes) and so empties the cache. A `site.toml` or system config change takes a restart of m6-http. For renderer binary changes: `./deploy.sh --binary` — only render-cms restarts; all other units and the m6-http cache are unaffected.
 
 ## Dev vs production at a glance
 
@@ -244,7 +244,7 @@ For template, data and content changes: `./deploy.sh`, then one `POST /genid` (t
 | SMTP | `localhost:2525` (mock) | `smtp.postmarkapp.com:587` |
 | SMTP credentials | inline in renderer config | `/etc/m6/contact-secrets.toml` via `secrets_file` |
 | `[auth] backend` | `m6-auth-check` | `m6-auth-check` |
-| publisher token (`[genid] token_file` in the renderer config) | `@M6_DEV_HOME@/07-dev-to-production/genid-write.token` | `/run/credentials/render-cms.service/genid-write.token` |
+| publisher token (`[publish] token_file` in the renderer config) | `@M6_DEV_HOME@/07-dev-to-production/purge-write.token` | `/run/credentials/render-cms.service/purge-write.token` |
 | System config | `configs/system-dev.toml` (in repo) | `/etc/m6/my-blog.toml` (on server) |
 | Process manager | `dev.sh` | systemd |
 | Logs | terminal stdout | journald |

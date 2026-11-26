@@ -38,26 +38,28 @@ On a cache hit, m6-http does nothing except call `write()` on the socket. No tem
 
 **What gets cached:** Responses with `Cache-Control: public`. `no-store` and `private` are not cached. A 5xx and most 4xx responses are never cached, whatever their headers say.
 
-**The cache is stored behind an `Arc`**, swapped for an empty one when the generation advances. The swap is non-blocking. In-flight requests that hold a reference to the old cache complete normally — they're reading from an immutable snapshot. The new snapshot is built and swapped in; the old one is freed when the last reader drops it.
+**The cache is stored behind an `Arc`.** A `PURGE` removes the changed paths under the write lock, and `PURGE /*` clears the map. A request that already holds an entry finishes on it, because the entry is reference-counted and outlives its slot.
 
-### Invalidation is one number
+### Invalidation is a purge
 
 <pre class="mermaid">
 flowchart LR
-    Publisher["publisher\n(CMS, deploy script)"] --"POST /genid"--> mhttp["m6-http\n(source node)"]
-    mhttp --"POST /genid"--> Backends["every backend\non a Unix socket"]
-    Backends --"204: reloaded"--> mhttp
-    mhttp --> Swap["swap in an empty cache,\nadvance the generation ID"]
+    Publisher["publisher\n(CMS, deploy script)"] --"POST /genid"--> Backend["the changed backend\non its Unix socket"]
+    Backend --"204: reloaded"--> Publisher
+    Publisher --"PURGE /*"--> mhttp["m6-http\n(origin)"]
+    mhttp --"PURGE to each\nregistered cache"--> Caches["cache nodes"]
+    mhttp --> Purged["evict every cached path"]
 </pre>
 
-A cached entry leaves the cache in one of four ways: a successful state-changing request evicts the entry for its own path, its freshness lifetime ends, the site's generation changes and empties the cache, or the process restarts. A change to a file behind a page therefore does not reach the cache until one of those happens.
+A cached entry leaves the cache in one of four ways: a successful state-changing request evicts the entry for its own path, its freshness lifetime ends, a `PURGE` removes the path (or `PURGE /*` clears the cache), or the process restarts. A change to a file behind a page therefore does not reach the cache until one of those happens.
 
-The generation is a counter the source node owns, written to `$STATE_DIRECTORY/genid`. A publish is one `POST /genid`, which needs a token with the claim `[genid] write_require` names, from a caller on loopback or an internal listener. m6-http runs four steps in its loop:
+A publish is two steps. The publisher reloads the changed backend with `POST /genid` on that backend's own Unix socket, the backend's reload signal, which reads its files again and keeps the old site if the new one does not load. Then the publisher sends `PURGE /*` to m6-http, which needs a token with the claim `[registration] write_require` names, from a caller on loopback or an internal listener. m6-http runs three steps for the purge:
 
-1. Send `POST /genid` to every member of every socket pool. Each backend reads its config, templates and params again through its start path, keeps the old site if the new one does not load, and answers 204.
-2. Wait for every member, each under the backend timeout. A member that fails is logged at error with its socket path, and does not stop the sequence.
-3. In one step, rebuild the route table from the config loaded at start, swap the cache and the held error pages for empty ones, advance the ID and write it.
-4. Answer the POST with the new ID.
+1. Purge itself. `PURGE /<path>` evicts that path and every query and encoding variant, and `PURGE /*` clears the whole cache.
+2. Raise its change counter by one and send `PURGE <target> <counter>` to every registered cache over its control connection.
+3. Answer with one entry per node saying whether the path was resident, once every registered cache has answered or the backend timeout passes.
+
+Caches register over the origin's control channel, so the origin learns the cache set from the connections and needs no cache count from config. A cache saves the change counter with its disk copy and reconciles it on reconnect, so a disk copy that missed a purge is dropped and refilled.
 
 The ID changes only after every backend has the new content, so the cache cannot refill from a backend that still serves the old bytes under the new number. There is no per-path map and no sweep, and a request already holding an entry finishes on the content it took.
 
@@ -131,7 +133,7 @@ In custom mode, m6-http makes a `GET <errors-path>?status=N&from=<original-path>
 
 ## Reading files once
 
-m6-http reads its configuration, `site.toml`, keys and certificates once, at start. A change to any of them takes a restart, and a certificate renewal takes a restart too, which the certbot deploy hook does. Content is different: a `POST /genid` rebuilds the route table from the config loaded at start (so a publish that adds a file a `[[route_group]]` glob matches gains its route), empties the cache and reloads every backend, with no restart. In-flight requests finish on the generation they started on.
+m6-http reads its configuration, `site.toml`, keys and certificates once, at start. A change to any of them takes a restart, and a certificate renewal takes a restart too, which the certbot deploy hook does. Content is different: a publish reloads the changed backend with `POST /genid` on its socket and clears the cache with `PURGE /*`, all without a restart. In-flight requests finish on the entries they already hold.
 
 ## Observability
 
@@ -147,7 +149,7 @@ journald captures everything. `journalctl -u m6-http -f` is all you need.
 m6-http <site-dir> <system-config>
 ```
 
-The system config holds the state of one node: its identity (`[node]`), its bind addresses and TLS paths (`[server]`), its check backend (`[auth]`) and the claims that gate `/genid` (`[genid]`). `site.toml` holds the settings every node shares, such as routes, backends, site identity and log level, and it lives alongside the content. m6-http logs a warning at start for each node key it finds in `site.toml`, naming the key and the file it belongs in.
+The system config holds the state of one node: its identity (`[node]`), its bind addresses and TLS paths (`[server]`), its check backend (`[auth]`) and the claims that gate `PURGE` (`[registration]`). `site.toml` holds the settings every node shares, such as routes, backends, site identity and log level, and it lives alongside the content. m6-http logs a warning at start for each node key it finds in `site.toml`, naming the key and the file it belongs in.
 
 ```bash
 # Development
