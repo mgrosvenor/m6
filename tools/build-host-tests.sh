@@ -454,7 +454,10 @@ EG_CONFIG_UNEXPLAINED=0
 for d in */; do
     name=$(basename "$d")
     case "$name" in
-        data) continue ;;   # shared fixtures, not an example
+        # The same skips as CI's "Every example's config parses" step in
+        # .github/workflows/ci.yml: shared fixtures, the shared publisher
+        # crate and the build output are not examples.
+        data|common|target) continue ;;
         06-systemd)
             printf '  %-24s not parsed: systemd units only, it has no site config\n' "$name"
             continue ;;
@@ -474,8 +477,10 @@ for d in */; do
         EG_CONFIG_UNEXPLAINED=$((EG_CONFIG_UNEXPLAINED + 1))
         continue
     fi
-    out=$("$M6_DIR/target/release/m6-http" "$(cd "$d" && pwd)" "$(cd "$(dirname "$sys")" && pwd)/$(basename "$sys")" --dump-config 2>&1 >/dev/null)
-    if [ -n "$out" ]; then
+    # The checked-in config names the key directory as @M6_DEV_HOME@; m6 reads
+    # the copy with the real path filled in, exactly as CI does.
+    sys=$(. ./dev-home.sh && m6_conf "$sys")
+    if ! out=$("$M6_DIR/target/release/m6-http" "$(cd "$d" && pwd)" "$sys" --dump-config 2>&1 >/dev/null) || [ -n "$out" ]; then
         printf '  %-24s %s\n' "$name" "$(echo "$out" | head -1)"
         EG_CONFIG_BAD=$((EG_CONFIG_BAD + 1))
     else
