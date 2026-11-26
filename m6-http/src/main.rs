@@ -32,11 +32,11 @@ use m6_http_lib::disk_cache::{self, DiskWriter};
 use m6_http_lib::error::{self as error, ErrorMode};
 use m6_http_lib::fields::validate_request_header_bytes;
 use m6_http_lib::forward::{self, UpstreamId, Waiter};
-use m6_http_lib::genid;
 use m6_http_lib::h2_client::H2Completion;
 use m6_http_lib::health;
 use m6_http_lib::http2::{H2Request, RequestRef};
 use m6_http_lib::rate_limit::RateLimiter;
+use m6_http_lib::registration::{self, ControlConn};
 use m6_http_lib::stats::Stats;
 
 /// The global allocator: mimalloc, which also counts calls when the
@@ -175,6 +175,8 @@ const TOKEN_SIGNAL: Token = Token(usize::MAX - 3);
 const TOKEN_LOG: Token = Token(usize::MAX - 4);
 /// The per-process status listener, `[server] status_bind`.
 const TOKEN_STATUS_LISTENER: Token = Token(usize::MAX - 5);
+/// The cache control-channel listener, `[server] registration_bind`.
+const TOKEN_CONTROL_LISTENER: Token = Token(usize::MAX - 6);
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
 /// The largest payload one UDP GSO `sendmsg` carries. A segmented send is one
@@ -198,6 +200,9 @@ enum Source {
     /// An in-loop upstream in the shared table: a socket member or a URL
     /// backend request.
     Upstream(usize),
+    /// A cache control-channel connection, indexed by the same token in
+    /// `ServerState::controls`.
+    Control,
 }
 
 /// The [`LoopTrace`] trigger index for an iteration's first event, and the
@@ -212,7 +217,7 @@ fn trigger_index(token: Option<Token>, sources: &Slots<Source>) -> usize {
         Some(TOKEN_LOG) => 6,
         Some(Token(k)) => match sources.get(k) {
             Source::TlsConn(_) | Source::H2cConn(_) => 1,
-            Source::H2cUpstream | Source::H2sUpstream | Source::Upstream(_) => 2,
+            Source::H2cUpstream | Source::H2sUpstream | Source::Upstream(_) | Source::Control => 2,
             Source::Vacant => 5,
         },
         None => 5,
@@ -358,14 +363,14 @@ struct ServerState {
     /// The disk copy of the cache on a cache node with `[cache] dir`.
     /// `None` everywhere else, so a hit and a store gain one `Option` test.
     disk: Option<DiskWriter>,
-    /// The disk copy read at start, held aside until the first heartbeat
-    /// answers. `None` once it is kept, discarded or installed unverified.
+    /// The disk copy read at start, held aside until the first registration
+    /// answer reconciles the counter. `None` once it is kept or discarded.
     pending_disk: Option<disk_cache::Loaded>,
     /// How many entries the start-time load inserted, and how many files it
     /// deleted, for the metrics document.
     loaded_entries: usize,
     loaded_bad: usize,
-    /// What the first heartbeat decided about the load, for the metrics
+    /// What the counter reconciliation decided about the load, for the metrics
     /// document.
     disk_state: disk_cache::LoadState,
     error_mode: ErrorMode,
@@ -470,20 +475,21 @@ struct ServerState {
     /// The `link` header line advertising the site description, when configured.
     /// `None` means the site configures none, so no line is written.
     describedby_line: Option<std::sync::Arc<[u8]>>,
-    /// The site generation ID this node holds. Present on every node: a source
-    /// owns it, and a cache node follows another node's. Only a node with
-    /// `[genid]` answers `/genid`; a cache node forwards it upstream.
-    genid: genid::Role,
-    /// The `[[backend]]` a cache node's heartbeat asks, by URL-backend index.
-    /// `None` on every other node. Resolved at start, like every URL backend.
-    heartbeat_backend: Option<usize>,
-    /// The encoded `GET /genid` a heartbeat sends, built once at start so a
-    /// tick neither formats nor allocates. Empty when this node has no
-    /// heartbeat.
-    heartbeat_request: Vec<u8>,
-    /// The same `GET /genid` as a request, for a backend reached over h2c or
-    /// h2s, built once at start. `None` when this node has no heartbeat.
-    heartbeat_h2_request: Option<forward::HttpRequest>,
+    /// The cache control state: a source owns the change counter and the
+    /// registered caches, and a cache node follows its origin's counter.
+    registration: registration::Role,
+    /// The origin's control-channel listener, when this node is an origin with
+    /// `[server] registration_bind`.
+    control_listener: Option<std::net::TcpListener>,
+    /// One control connection per token, on both sides: a cache node's one
+    /// outbound connection, or an origin's accepted inbound ones.
+    controls: Slots<ControlConn>,
+    /// A cache node's control connection token, while it is open. `None` when
+    /// it dropped and has not reconnected, or on an origin.
+    cache_control: Option<Token>,
+    /// The origin's control-channel address a cache node connects to,
+    /// resolved at start. `None` on every other node.
+    control_origin: Option<SocketAddr>,
 }
 
 /// One cache entry to fetch in the background.
@@ -566,18 +572,18 @@ impl ServerState {
         )
     }
 
-    /// Write the metrics line: the report, and this node's generation and
+    /// Write the metrics line: the report, and this node's registration and
     /// disk blocks, serialised straight into the log buffer.
     fn log_perf(&self) {
         let report = self.perf_report();
-        let genid = self
+        let registration = self
             .config
-            .genid
+            .registration
             .as_ref()
-            .map(|genid_config| (&self.genid, genid_config, self.disk_perf()));
+            .map(|reg| (&self.registration, reg, self.disk_perf()));
         m6_http_lib::stats::log_perf(&health::perf_document(
             &report,
-            genid,
+            registration,
             &self.cache,
             self.disk.as_ref(),
         ));
@@ -1626,12 +1632,19 @@ fn park(
         UpstreamId::H2s { conn, stream } => {
             state.h2s_pool.set_waiter(conn, stream, waiter, ctx);
         }
-        // A `POST /genid` has no upstream yet: it waits on the change
-        // sequence, which the next loop turn starts. The context is unused.
-        UpstreamId::Genid => {
-            let _ = ctx;
-            if let Some(g) = state.genid.source_mut() {
-                g.post(waiter);
+        // A `PURGE` has no upstream: it purges this node and then waits on
+        // the fan-out, which the next loop turn drives. The context's request
+        // path is the purge target.
+        UpstreamId::Purge => {
+            let target = ctx.req.path.clone();
+            let resident = purge_local(state, &target);
+            let timeout = std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
+            let started = state
+                .registration
+                .source_mut()
+                .is_some_and(|s| s.post_purge(target.clone(), resident, waiter, timeout));
+            if started {
+                write_fanout_purge(state);
             }
         }
     }
@@ -1668,7 +1681,6 @@ fn write_waiter(
     body: Vec<u8>,
     method: &str,
     priority: priority::Priority,
-    genid: Option<u64>,
     cx: &mut CompletionCtx<'_>,
 ) {
     match waiter {
@@ -1681,7 +1693,7 @@ fn write_waiter(
             if let Source::TlsConn(slot) = *cx.state.sources.get(conn.0) {
                 if let Some(t) = cx.tcp {
                     let drive =
-                        t.complete_h1(slot, status, &headers, body, method, genid, cx.registry);
+                        t.complete_h1(slot, status, &headers, body, method, None, cx.registry);
                     after_conn_drive(conn, &drive, cx.state, cx.tcp, cx.h2c, cx.registry, cx.now);
                 }
             }
@@ -1697,7 +1709,7 @@ fn write_waiter(
                         stream,
                         (status, headers, body),
                         method,
-                        genid,
+                        None,
                         cx.registry,
                     )
                 }),
@@ -1707,7 +1719,7 @@ fn write_waiter(
                         stream,
                         (status, headers, body),
                         method,
-                        genid,
+                        None,
                         cx.registry,
                     )
                 }),
@@ -1727,21 +1739,12 @@ fn write_waiter(
                     &headers,
                     Bytes::from(body),
                     method.eq_ignore_ascii_case("HEAD"),
-                    genid,
                 );
                 flush_conn(cx.udp, cx.batch, &mut cx.out[..], qconn);
             }
         }
         Waiter::Background => {
             // The finalize step already filled the cache; there is no client.
-        }
-        Waiter::Genid { .. } => {
-            // Intercepted in `complete_waiter`: a member's answer is a status
-            // for the sequence, not a response for a client.
-        }
-        Waiter::Heartbeat => {
-            // Intercepted in `complete_waiter`: a heartbeat's answer is an ID
-            // and a round trip, not a response for anyone.
         }
     }
 }
@@ -1761,86 +1764,7 @@ fn complete_waiter(
         complete_auth(result, ctx, waiter, cx);
         return;
     }
-    // A member's answer to a change sequence's `POST /genid` is not a client
-    // response: it is a verdict on that member. 204 is done, 404 and 405 say
-    // the backend has nothing to refresh, and anything else is a failure the
-    // advance still runs past. The failure is named against the member's
-    // socket, which is the one thing an operator needs to find it.
-    if let Waiter::Genid { member } = waiter {
-        let path = cx
-            .state
-            .genid
-            .source()
-            .and_then(|g| g.member_path(member))
-            .map(|p| p.display().to_string());
-        let ok = match &result {
-            Ok(response) => match response.status {
-                204 => true,
-                404 | 405 => {
-                    debug!(
-                        member = path.as_deref().unwrap_or(""),
-                        status = response.status,
-                        "genid: member has nothing to refresh"
-                    );
-                    true
-                }
-                status => {
-                    error!(
-                        member = path.as_deref().unwrap_or(""),
-                        status, "genid: member refresh failed"
-                    );
-                    false
-                }
-            },
-            Err(e) => {
-                error!(
-                    member = path.as_deref().unwrap_or(""),
-                    error = %e,
-                    "genid: member refresh failed"
-                );
-                false
-            }
-        };
-        if cx
-            .state
-            .genid
-            .source_mut()
-            .is_some_and(|g| g.member_done(ok))
-        {
-            genid_finish(cx);
-        }
-        return;
-    }
-    // A heartbeat's answer is an ID and a round trip, not a response: it
-    // updates the follower and is never finalised or written to anyone.
-    if let Waiter::Heartbeat = waiter {
-        let rtt = ctx.start.elapsed();
-        let outcome = match &result {
-            Ok(response) if response.status == 200 => {
-                match m6_core::headers::get(&response.headers[..], genid::GENID_HEADER)
-                    .and_then(|value| value.trim().parse::<u64>().ok())
-                {
-                    Some(id) => Ok((id, rtt)),
-                    None => Err("no M6-Genid"),
-                }
-            }
-            Ok(_) => Err("status"),
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Err("timed out"),
-            Err(_) => Err("connect failed"),
-        };
-        follower_answered(cx.state, outcome, cx.now, false);
-        return;
-    }
     let method = &ctx.req.method;
-    // The generation this reply carries is the one current when it was
-    // dispatched, not the one after a later advance. A synthesised 502 has no
-    // backend reply behind it, so it carries none. A cache node passes none:
-    // the upstream's own `M6-Genid` travels in the headers it forwards, and a
-    // cache hit writes the entry's ID through its own writer.
-    let genid = match &cx.state.genid {
-        genid::Role::Cache(_) => None,
-        genid::Role::Source(_) => result.as_ref().ok().map(|_| ctx.genid),
-    };
     match finalize_url_response(result, &ctx, cx.quic_port, cx.state, cx.registry) {
         Completion::Ready((status, headers, body, _)) => {
             // A cache miss answered by a backend is counted here, where the
@@ -1870,7 +1794,7 @@ fn complete_waiter(
             } else {
                 priority::Priority::default()
             };
-            write_waiter(waiter, status, headers, body, method, priority, genid, cx);
+            write_waiter(waiter, status, headers, body, method, priority, cx);
         }
         Completion::Pending { id, ctx } => {
             park(cx.state, id, ctx, waiter);
@@ -1971,8 +1895,6 @@ fn resolve_check(
         start: m6_core::platform::now(),
         error_status_override: None,
         extra_headers: Vec::new(),
-        genid: state.genid.dispatched(),
-        genid_forward: false,
     };
     CheckResolution::Pending(RequestOutcome::Pending {
         id: UpstreamId::Slot(slot),
@@ -2063,7 +1985,7 @@ fn complete_auth(
         priority::Priority::default()
     };
     match outcome {
-        RequestOutcome::Ready(status, mut headers, body, backend, genid) => {
+        RequestOutcome::Ready(status, mut headers, body, backend, _) => {
             // The re-entry writes its answer here, not through `finish_miss`,
             // so it runs the two steps that tail runs. Without them the
             // authority's 401, the browser's 302, the 403 and the 503 are the
@@ -2079,16 +2001,7 @@ fn complete_auth(
                     &backend,
                 );
             }
-            write_waiter(
-                waiter,
-                status,
-                headers,
-                body,
-                &ctx.req.method,
-                priority,
-                genid,
-                cx,
-            );
+            write_waiter(waiter, status, headers, body, &ctx.req.method, priority, cx);
         }
         // Allowing the request dispatches it to its own backend. The same
         // waiter waits for that reply, and this is the one place it is
@@ -2104,7 +2017,6 @@ fn complete_auth(
                 entry.body.to_vec(),
                 &ctx.req.method,
                 priority,
-                Some(entry.genid),
                 cx,
             );
         }
@@ -2116,14 +2028,14 @@ fn complete_auth(
 ///
 /// The same lookup `write_waiter` uses to deliver the reply, so the figures are
 /// attributed to the connection that is actually answered. `None` for a waiter
-/// that is not a client request at all: a background refresh, a heartbeat or a
-/// change sequence, none of which is traffic.
+/// that is not a client request at all: a background refresh, which is not
+/// traffic.
 fn waiter_channel(waiter: &Waiter, state: &ServerState) -> Option<Channel> {
     let (version, iface) = match waiter {
         Waiter::H1 { conn, .. } => (HttpVersion::Http11, connection_iface(*conn, state)),
         Waiter::H2 { conn, .. } => (HttpVersion::Http2, connection_iface(*conn, state)),
         Waiter::H3 { .. } => (HttpVersion::Http3, state.tls_iface),
-        Waiter::Background | Waiter::Heartbeat | Waiter::Genid { .. } => return None,
+        Waiter::Background => return None,
     };
     Some(Channel::new(version, iface))
 }
@@ -2169,532 +2081,439 @@ fn complete_h2_streams(
     }
 }
 
-/// Start one change sequence: collect every socket member, tell `Genid` how
-/// many owe an answer, and `POST /genid` to each on its own upstream slot.
+/// Decide whether a backend reply may enter the shared cache.
 ///
-/// A member whose connect fails before it is registered is counted as failed
-/// here, with its socket path in the log, so the sequence still finishes.
-fn start_genid_sequence(state: &mut ServerState, registry: &m6_core::platform::Registry) {
-    let members = state.pool_manager.socket_members();
-    if let Some(g) = state.genid.source_mut() {
-        g.start(&members);
-    }
-    let host = state.config.site.domain.clone();
-    for (index, path) in members.iter().enumerate() {
-        if launch_genid_member(state, registry, index as u32, path, &host).is_err() {
-            error!(
-                member = %path.display(),
-                "genid: member refresh failed to start"
-            );
-            if state
-                .genid
-                .source_mut()
-                .is_some_and(|g| g.member_done(false))
-            {
-                break;
-            }
-        }
-    }
-}
-
-/// Encode and start `POST /genid` on one member's own socket, outside the
-/// pool's member choice and in-flight count, and register it under its own
-/// token and deadline. The completion is a `Waiter::Genid`.
-fn launch_genid_member(
-    state: &mut ServerState,
-    registry: &m6_core::platform::Registry,
-    member: u32,
-    path: &std::path::Path,
-    host: &str,
-) -> Result<(), ()> {
-    let deadline = m6_core::platform::now()
-        + std::time::Duration::from_secs(state.config.server.backend_timeout_secs);
-    let Some(owner) = state.upstreams.take() else {
-        return Err(());
-    };
-    let Some(token) = take_token(state) else {
-        state.upstreams.free(owner.key);
-        return Err(());
-    };
-    let req = forward::HttpRequest {
-        method: "POST".to_string(),
-        path: m6_core::site::GENID_PATH.to_string(),
-        query: None,
-        version: "HTTP/1.1".to_string(),
-        headers: Vec::new(),
-        body: Vec::new(),
-    };
-    let encoded = {
-        let entry = state.upstreams.get_mut(owner.key);
-        forward::encode_request(entry.upstream.request_buf(), &req, "127.0.0.1", host, None)
-    };
-    if encoded.is_err() {
-        state.upstreams.free(owner.key);
-        *state.sources.get_mut(token.0) = Source::Vacant;
-        state.sources.free(token.0);
-        return Err(());
-    }
-    let started = {
-        let entry = state.upstreams.get_mut(owner.key);
-        entry.addr = m6_core::client::Addr::Unix(path.to_path_buf());
-        entry.upstream.start(&entry.addr, None, false, deadline)
-    };
-    if started.is_err() {
-        state.upstreams.free(owner.key);
-        *state.sources.get_mut(token.0) = Source::Vacant;
-        state.sources.free(token.0);
-        return Err(());
-    }
-    let interest = {
-        let entry = state.upstreams.get_mut(owner.key);
-        let interest = entry.upstream.interest();
-        if registry
-            .register_fd(entry.upstream.fd(), token, interest)
-            .is_err()
-        {
-            entry.upstream.close();
-            state.upstreams.free(owner.key);
-            *state.sources.get_mut(token.0) = Source::Vacant;
-            state.sources.free(token.0);
-            return Err(());
-        }
-        interest
-    };
-    state
-        .upstream_timeouts
-        .touch(token, m6_core::platform::now());
-    *state.sources.get_mut(token.0) = Source::Upstream(owner.key);
-    let entry = state.upstreams.get_mut(owner.key);
-    entry.kind = UpstreamKind::Member;
-    entry.token = token;
-    entry.waiter = Some(Waiter::Genid { member });
-    entry.ctx = Some(forward::PendingUrlContext::for_genid());
-    entry.registered_interest = interest;
-    Ok(())
-}
-
-/// The change step, run in one turn once every member has answered or failed:
-/// rebuild the route table from the config loaded at start, swap the cache and
-/// the held error pages for empty ones in one step each, advance the ID, write
-/// it, and answer the covered POSTs.
-///
-/// The swap is the whole flush: no entry survives into the new generation. One
-/// assignment publishes each replacement, so a request sees the old generation
-/// or the new one and never a half-emptied cache. A request already holding an
-/// entry finishes on the clone it took.
-///
-/// A route-table build error keeps the old table and is logged. The ID is
-/// written before any POST is answered, so a publisher that sees 200 knows the
-/// new generation survives a restart.
-fn genid_finish(cx: &mut CompletionCtx<'_>) {
-    loop {
-        // A `[[route_group]]` glob is re-expanded here, so a publish that adds
-        // a file a glob matches gains its route. The config is the one loaded
-        // at start: a `site.toml` edit needs a restart.
-        match RouteTable::from_config(&cx.state.config) {
-            Ok(table) => cx.state.route_table = table,
-            Err(e) => error!(
-                error = %e,
-                "genid: route table rebuild failed; keeping the old table"
-            ),
-        }
-        drop(cx.state.cache.swap_generation());
-        cx.state.error_pages = HashMap::new();
-
-        let Some(finished) = cx.state.genid.source_mut().map(|g| g.finish()) else {
-            return;
-        };
-        let state_path = cx
-            .state
-            .genid
-            .source()
-            .and_then(|g| g.state_path())
-            .map(std::path::Path::to_path_buf);
-        let mut write_error = None;
-        if let Some(path) = state_path {
-            if let Err(e) = genid::write_state(&path, finished.id) {
-                error!(path = %path.display(), error = %e, "genid: state write failed");
-                write_error = Some(format!("{}: {e}", path.display()));
-            }
-        }
-        info!(
-            genid = finished.id,
-            members = finished.members,
-            failed = finished.failed,
-            elapsed_ms = finished.elapsed_ms,
-            "genid advanced"
-        );
-
-        let headers = vec![
-            ("Content-Type".to_string(), "application/json".to_string()),
-            ("Cache-Control".to_string(), "no-store".to_string()),
-        ];
-        let mut body = Vec::with_capacity(32);
-        body.extend_from_slice(b"{\"genid\":\"");
-        body.extend_from_slice(itoa::Buffer::new().format(finished.id).as_bytes());
-        body.extend_from_slice(b"\"}");
-        for waiter in finished.covered {
-            match &write_error {
-                None => write_waiter(
-                    waiter,
-                    200,
-                    headers.clone(),
-                    body.clone(),
-                    "POST",
-                    priority::Priority::default(),
-                    Some(finished.id),
-                    cx,
-                ),
-                Some(path) => {
-                    let body = format!("genid state write failed: {path}");
-                    write_waiter(
-                        waiter,
-                        500,
-                        headers.clone(),
-                        body.into_bytes(),
-                        "POST",
-                        priority::Priority::default(),
-                        Some(finished.id),
-                        cx,
-                    );
-                }
-            }
-        }
-
-        if !finished.again {
-            break;
-        }
-        start_genid_sequence(cx.state, cx.registry);
-        if !cx.state.genid.source().is_some_and(|g| g.finish_due()) {
-            break;
-        }
-    }
-}
-
-/// Run the sequence work a loop turn owes: start one when a POST asked for it,
-/// and complete one whose members have all answered without an event of their
-/// own (no members at all, or every connect failed at start).
-fn genid_pump(cx: &mut CompletionCtx<'_>) {
-    let start = cx
-        .state
-        .genid
-        .source_mut()
-        .is_some_and(|g| g.take_start_requested());
-    if start {
-        start_genid_sequence(cx.state, cx.registry);
-    }
-    if cx.state.genid.source().is_some_and(|g| g.finish_due()) {
-        genid_finish(cx);
-    }
-}
-
-/// What to do with one backend reply: store it under an ID, wake the heartbeat
-/// because it names a newer generation, or nothing.
-enum ReplyRule {
-    Store(u64),
-    Behind,
-    Nothing,
-}
-
-/// The ID an upstream stamped on a reply, parsed in place from the borrowed
-/// header value. No copy and no allocation.
-fn reply_id(headers: &[(String, String)]) -> Option<u64> {
-    m6_core::headers::get(headers, genid::GENID_HEADER)
-        .and_then(|value| value.trim().parse::<u64>().ok())
-}
-
-/// Apply the store rule to one reply. The rule itself lives on the
-/// [`genid::Role`]: the source stores under the ID it dispatched under, and a
-/// cache node stores only a reply that carries the ID it holds.
-///
-/// A cache node also reads every reply's `M6-Genid` here, so a reply under
-/// another ID wakes the heartbeat at once. That is one borrowed header lookup
-/// and one parse for a reply, the cost the latency budget allows.
-fn reply_rule(
-    state: &ServerState,
+/// The generation store rule is gone. The reply is stored when the route is
+/// cacheable, the request permits storage, and the response is cacheable by
+/// its status and headers. Purge and the change counter are the guard against
+/// stale content, not a per-reply stamp.
+fn should_store(
     ctx: &forward::PendingUrlContext,
     status: u16,
     headers: &[(String, String)],
-) -> ReplyRule {
-    let id = reply_id(headers);
-    if let Some(f) = state.genid.cache() {
-        if let Some(id) = id {
-            if Some(id) != f.current() {
-                return ReplyRule::Behind;
-            }
-        }
-        if !ctx.cacheable
-            || !request_permits_storage(&ctx.req.headers)
-            || !should_cache(status, headers)
-        {
-            return ReplyRule::Nothing;
-        }
-        return state
-            .genid
-            .may_store_parsed(ctx.genid, id)
-            .map_or(ReplyRule::Nothing, ReplyRule::Store);
-    }
-    if !ctx.cacheable
-        || !request_permits_storage(&ctx.req.headers)
-        || !should_cache(status, headers)
-    {
-        return ReplyRule::Nothing;
-    }
-    if let Some(g) = state.genid.source() {
-        if ctx.genid == g.current() {
-            return ReplyRule::Store(ctx.genid);
-        }
-    }
-    ReplyRule::Nothing
+) -> bool {
+    ctx.cacheable && request_permits_storage(&ctx.req.headers) && should_cache(status, headers)
 }
 
-/// Encode the heartbeat's `GET /genid` once, at start. The authority is the
-/// backend's, as every URL forward is, and the token is the one from
-/// `[genid] token_file`.
-fn encode_heartbeat_request(host: &str, token: &str, out: &mut Vec<u8>) {
-    out.extend_from_slice(b"GET ");
-    out.extend_from_slice(m6_core::site::GENID_PATH.as_bytes());
-    out.extend_from_slice(b" HTTP/1.1\r\nHost: ");
-    out.extend_from_slice(host.as_bytes());
-    out.extend_from_slice(b"\r\nAuthorization: Bearer ");
-    out.extend_from_slice(token.as_bytes());
-    out.extend_from_slice(b"\r\n\r\n");
-}
+// ── Cache control: purge, fan-out and registration ──────────────────────────
 
-/// Encode the heartbeat's `GET /genid` once, at start, for an h2 backend. The
-/// authority is the backend's URL host, which the h2 client sets itself.
-fn heartbeat_h2_request(token: &str) -> forward::HttpRequest {
-    forward::HttpRequest {
-        method: "GET".to_string(),
-        path: m6_core::site::GENID_PATH.to_string(),
-        query: None,
-        version: "HTTP/2".to_string(),
-        headers: vec![("authorization".to_string(), format!("Bearer {token}"))],
-        body: Vec::new(),
+/// Purge one path or all from this node's cache, returning whether anything
+/// was resident. This is the origin purging itself, and the same step a cache
+/// node runs when the origin pushes a purge down the control channel.
+fn purge_local(state: &mut ServerState, target: &str) -> bool {
+    if target == registration::PURGE_ALL {
+        let resident = !state.cache.is_empty();
+        state.cache.clear();
+        resident
+    } else {
+        let resident = state.cache.path_resident(target);
+        state.cache.evict_path(target);
+        resident
     }
 }
 
-/// Start one heartbeat on the transport the backend's scheme names, from the
-/// request fixed at start: an h2 stream for h2c and h2s, an upstream slot for
-/// http and https. The same split `dispatch_url_backend` makes.
-///
-/// `NoSlot` is the node being busy, not the upstream being down, so the caller
-/// leaves the heartbeat due and tries on the next turn.
-fn launch_heartbeat(
-    state: &mut ServerState,
-    registry: &m6_core::platform::Registry,
-) -> Result<(), UrlDispatchError> {
-    let Some(backend_idx) = state.heartbeat_backend else {
-        return Err(UrlDispatchError::NoSlot);
-    };
-    let id = match state.pool_manager.url_backend(backend_idx).scheme {
-        pool::UrlScheme::H2c | pool::UrlScheme::H2s => {
-            // Taken out for the dispatch, which needs `state` whole, and put
-            // back whatever happens: nothing is built per beat.
-            let Some(req) = state.heartbeat_h2_request.take() else {
-                return Err(UrlDispatchError::NoSlot);
-            };
-            let host = state.pool_manager.url_backend(backend_idx).host.clone();
-            let id = dispatch_h2(state, registry, backend_idx, &req, "", &host, ViaHop::None);
-            state.heartbeat_h2_request = Some(req);
-            id?
-        }
-        pool::UrlScheme::Http | pool::UrlScheme::Https => {
-            let (key, token, watched) = take_url_slot(state, backend_idx)?;
-            {
-                // Disjoint fields: the bytes copied from are fixed at start
-                // and this never allocates the slot's buffer beyond its first
-                // use.
-                let entry = state.upstreams.get_mut(key);
-                entry
-                    .upstream
-                    .request_buf()
-                    .extend_from_slice(&state.heartbeat_request);
-            }
-            begin_url_slot(state, registry, backend_idx, key, token, watched, false)?;
-            UpstreamId::Slot(key)
-        }
-    };
-    park(
-        state,
-        id,
-        forward::PendingUrlContext::for_heartbeat(),
-        Waiter::Heartbeat,
-    );
-    Ok(())
-}
-
-/// Start a cache node's heartbeat when one is due. One in flight at most, on
-/// the tick, with no timer of its own.
-fn heartbeat_pump(cx: &mut CompletionCtx<'_>) {
-    let due = cx
-        .state
-        .genid
-        .cache()
-        .is_some_and(|f| f.heartbeat_due(cx.now));
-    if !due {
-        return;
-    }
-    match launch_heartbeat(cx.state, cx.registry) {
-        Ok(()) => {
-            if let Some(f) = cx.state.genid.cache_mut() {
-                f.sent();
-            }
-        }
-        // A full upstream table retries on the next turn: the heartbeat is
-        // still due and nothing was started.
-        Err(UrlDispatchError::NoSlot) => {}
-        Err(UrlDispatchError::Failed(e)) => {
-            warn!(error = %e, "genid: heartbeat failed to start");
-            follower_answered(cx.state, Err("connect failed"), cx.now, true);
-        }
-    }
-}
-
-/// Apply one heartbeat or forwarded-request answer: the log line on the
-/// transition, the held flag, and on a new ID the flush.
-fn follower_answered(
-    state: &mut ServerState,
-    result: Result<(u64, std::time::Duration), &'static str>,
-    now: Instant,
-    behind: bool,
-) {
-    let (outcome, recovered) = {
-        let Some(f) = state.genid.cache_mut() else {
-            return;
-        };
-        let was_down = f.down();
-        let outcome = f.answered(result, now);
-        if behind {
-            f.behind(now);
-        }
-        (outcome, was_down && !f.down())
-    };
-    // The first answer settles a disk copy read at start. It is held aside
-    // rather than installed so the node never serves a generation the site
-    // has already left; the same equality the store rule uses decides it.
+/// Reconcile a cache node's held disk copy against the origin's counter. An
+/// equal counter installs the copy; a different one drops it and refills on
+/// demand. Runs only when the origin answers the cache's REGISTER, never on
+/// the request path.
+fn reconcile_disk(state: &mut ServerState, counter: u64) {
+    let saved = state.registration.cache().map(|f| f.counter()).unwrap_or(0);
     if let Some(loaded) = state.pending_disk.take() {
-        match genid::settle(loaded.id, &outcome) {
-            genid::Settle::Keep => {
-                let id = loaded.id;
-                state.cache = loaded.cache;
-                state.disk_state = disk_cache::LoadState::Kept;
-                info!(genid = id, "disk cache kept");
+        if loaded.id == counter {
+            let id = loaded.id;
+            state.cache = loaded.cache;
+            state.disk_state = disk_cache::LoadState::Kept;
+            info!(counter = id, "disk cache kept");
+        } else {
+            state.disk_state = disk_cache::LoadState::Discarded;
+            if let Some(disk) = state.disk.as_mut() {
+                disk.use_id(counter);
             }
-            genid::Settle::Discard => {
-                state.disk_state = disk_cache::LoadState::Discarded;
-                info!("disk cache discarded: the site changed while this node was down");
-            }
-            genid::Settle::Unverified => {
-                let id = loaded.id;
-                state.cache = loaded.cache;
-                state.disk_state = disk_cache::LoadState::Unverified;
-                if let Some(f) = state.genid.cache_mut() {
-                    f.install_unverified(id);
-                }
-                if let Some(disk) = state.disk.as_mut() {
-                    disk.use_id(id);
-                }
-                warn!(
-                    genid = id,
-                    "disk cache served unverified: the upstream did not answer"
-                );
-            }
-        }
-    }
-    match outcome {
-        genid::Outcome::Down(reason) => {
-            state.cache.set_serve_held(true);
-            warn!(
-                reason,
-                "genid: upstream down; serving held content stale until it answers"
+            info!(
+                counter,
+                "disk cache discarded: the counter moved while this node was down"
             );
         }
-        genid::Outcome::StillDown => {}
-        genid::Outcome::First(id) => {
-            state.cache.set_serve_held(false);
-            // The disk copy starts with the first ID. Nothing was stored
-            // before it, so this only creates the generation's directory. On
-            // a kept load the directory is the one already read, and this
-            // call leaves it alone.
-            if let Some(disk) = state.disk.as_mut() {
-                disk.use_id(id);
-            }
-            info!(genid = id, "genid: upstream answered; following its ID");
-        }
-        genid::Outcome::Same => {
-            state.cache.set_serve_held(false);
-            // A success after an unverified install confirms the disk copy:
-            // the ID is unchanged, so nothing is flushed. The operator saw the
-            // "served unverified" warning when the first answer timed out, so
-            // this transition writes the same "kept" line the settle path
-            // writes. Without it the metrics document says kept and the log
-            // never does.
-            if state.disk_state == disk_cache::LoadState::Unverified {
-                state.disk_state = disk_cache::LoadState::Kept;
-                if let Some(id) = state.genid.cache().and_then(|f| f.current()) {
-                    info!(genid = id, "disk cache kept");
-                }
-            }
-        }
-        genid::Outcome::Changed { from, to } => {
-            state.cache.set_serve_held(false);
-            // The change flushes the cache, so a load that was installed is
-            // no longer the content the node serves.
-            if matches!(
-                state.disk_state,
-                disk_cache::LoadState::Kept | disk_cache::LoadState::Unverified
-            ) {
-                state.disk_state = disk_cache::LoadState::Discarded;
-            }
-            follower_change(state, from, to);
-        }
+    } else if let Some(disk) = state.disk.as_mut() {
+        disk.use_id(counter);
     }
-    if recovered {
-        info!("genid: upstream up");
+    if let Some(f) = state.registration.cache_mut() {
+        f.set_counter(counter);
+    }
+    let _ = saved;
+}
+
+/// Write the running fan-out's `PURGE` line to every registered cache.
+fn write_fanout_purge(state: &mut ServerState) {
+    let line = match state.registration.source().and_then(|s| s.fanout_purge()) {
+        Some((target, counter)) => registration::purge_line(target, counter),
+        None => return,
+    };
+    let conns: Vec<Token> = state
+        .registration
+        .source()
+        .map(|s| s.fanout_conns().into_iter().map(|(_, c)| c).collect())
+        .unwrap_or_default();
+    for conn in conns {
+        state.controls.get_mut(conn.0).send_line(&line);
     }
 }
 
-/// A forwarded client request could not reach the upstream: mark it down, log
-/// the transition once, and serve held content from here on.
-fn follower_failed(state: &mut ServerState, reason: &'static str, now: Instant) {
-    let first = state.genid.cache_mut().is_some_and(|f| f.failed(now));
-    if !first {
+/// The `PURGE` reply body, one entry per node: the origin and every registered
+/// cache, each resident or pending.
+fn purge_reply_body(origin_name: &str, finished: &registration::Finished) -> Vec<u8> {
+    let mut body = Vec::with_capacity(128);
+    body.extend_from_slice(b"{\"nodes\":{\"");
+    body.extend_from_slice(origin_name.as_bytes());
+    body.extend_from_slice(b"\":{\"resident\":");
+    body.extend_from_slice(if finished.self_resident {
+        b"true"
+    } else {
+        b"false"
+    });
+    body.push(b'}');
+    for (name, answer) in &finished.nodes {
+        body.extend_from_slice(b",\"");
+        body.extend_from_slice(name.as_bytes());
+        body.extend_from_slice(b"\":");
+        match answer {
+            registration::NodeAnswer::Resident(r) => {
+                body.extend_from_slice(b"{\"resident\":");
+                body.extend_from_slice(if *r { b"true" } else { b"false" });
+                body.push(b'}');
+            }
+            registration::NodeAnswer::Pending => {
+                body.extend_from_slice(b"{\"pending\":true}");
+            }
+        }
+    }
+    body.extend_from_slice(b"}}");
+    body
+}
+
+/// Complete the running fan-out, write its reply, and start the next queued
+/// purge.
+fn finish_fanout(cx: &mut CompletionCtx<'_>) {
+    let Some(finished) = cx
+        .state
+        .registration
+        .source_mut()
+        .and_then(|s| s.finish_fanout())
+    else {
+        return;
+    };
+    let origin = cx.state.config.node.name.clone();
+    let body = purge_reply_body(&origin, &finished);
+    let headers = vec![
+        ("Content-Type".to_string(), "application/json".to_string()),
+        ("Cache-Control".to_string(), "no-store".to_string()),
+    ];
+    for waiter in finished.waiters {
+        write_waiter(
+            waiter,
+            200,
+            headers.clone(),
+            body.clone(),
+            registration::PURGE_METHOD,
+            priority::Priority::default(),
+            cx,
+        );
+    }
+    // Start queued purges one at a time.
+    let timeout = std::time::Duration::from_secs(cx.state.config.server.backend_timeout_secs);
+    loop {
+        let next = cx
+            .state
+            .registration
+            .source_mut()
+            .and_then(|s| s.take_queued());
+        let Some(q) = next else { break };
+        cx.state
+            .registration
+            .source_mut()
+            .expect("a source")
+            .start_fanout(q.target, q.self_resident, q.waiters, timeout);
+        write_fanout_purge(cx.state);
+    }
+}
+
+/// The `/m6/status` body: the change counter and the registered cache names.
+fn status_body(state: &ServerState) -> Vec<u8> {
+    let counter = state
+        .registration
+        .source()
+        .map(|s| s.counter())
+        .unwrap_or(0);
+    let mut body = Vec::with_capacity(64);
+    body.extend_from_slice(b"{\"counter\":\"");
+    body.extend_from_slice(itoa::Buffer::new().format(counter).as_bytes());
+    body.extend_from_slice(b"\",\"registered\":[");
+    if let Some(s) = state.registration.source() {
+        for (i, r) in s.registered().iter().enumerate() {
+            if i > 0 {
+                body.push(b',');
+            }
+            body.push(b'"');
+            body.extend_from_slice(r.name.as_bytes());
+            body.push(b'"');
+        }
+    }
+    body.extend_from_slice(b"]}");
+    body
+}
+
+/// The `PURGE` handler: the target is the request path, `/*` purges all, and
+/// any other malformed target is a 400. The purge itself parks on the fan-out,
+/// which [`park`] drives when it stores the waiter.
+fn handle_purge(
+    req: &forward::HttpRequest,
+    client_ip: &str,
+    from_internal: bool,
+) -> RequestOutcome {
+    // `/*` purges all; `*` alone is valid only for OPTIONS (RFC 9113), so it
+    // and any non-path target are malformed.
+    if !req.path.starts_with('/') {
+        let headers = vec![("Cache-Control".to_string(), "no-store".to_string())];
+        return RequestOutcome::Ready(
+            400,
+            headers,
+            Vec::new(),
+            health::CONTROL_BACKEND.to_string(),
+            None,
+        );
+    }
+    let ctx = forward::PendingUrlContext {
+        req: req.clone(),
+        client_ip: client_ip.to_string(),
+        enc: String::new(),
+        backend_name: health::CONTROL_BACKEND.to_string(),
+        kind: forward::PendingKind::Socket,
+        route_path: None,
+        auth_require: None,
+        auth_gate: None,
+        from_internal,
+        route_cache: None,
+        cacheable: false,
+        is_prefetch: false,
+        start: m6_core::platform::now(),
+        error_status_override: None,
+        extra_headers: Vec::new(),
+    };
+    RequestOutcome::Pending {
+        id: UpstreamId::Purge,
+        ctx: Box::new(ctx),
+    }
+}
+
+/// The control work a loop turn owes: complete a fan-out that just finished or
+/// hit its deadline. Reconnection is on the accounting tick, not here, so a
+/// downed origin is retried once a second rather than every turn.
+fn control_pump(cx: &mut CompletionCtx<'_>) {
+    let complete = cx
+        .state
+        .registration
+        .source()
+        .is_some_and(|s| s.fanout_running() && (s.fanout_due(cx.now) || s.fanout_complete()));
+    if complete {
+        finish_fanout(cx);
+    }
+}
+
+/// Reconnect a cache node whose control connection dropped. Called once an
+/// accounting tick while the connection is down, so a downed origin is retried
+/// at that cadence and never tight-looped.
+fn control_reconnect(cx: &mut CompletionCtx<'_>) {
+    if !matches!(cx.state.registration, registration::Role::Cache(_))
+        || cx.state.cache_control.is_some()
+    {
         return;
     }
-    state.cache.set_serve_held(true);
-    warn!(
-        reason,
-        "genid: upstream down; serving held content stale until it answers"
-    );
+    let Some(addr) = cx.state.control_origin else {
+        return;
+    };
+    let Some(taken) = cx.state.controls.take() else {
+        return;
+    };
+    let Some(token) = take_token(cx.state) else {
+        cx.state.controls.free(taken.key);
+        return;
+    };
+    match ControlConn::connect(addr) {
+        Ok(conn) => {
+            let fd = conn.fd();
+            *cx.state.controls.get_mut(taken.key) = conn;
+            if let Err(e) = cx.registry.register_fd(fd, token, Interest::WRITABLE) {
+                error!(error = %e, "control: register failed");
+                cx.state.controls.get_mut(taken.key).close();
+                cx.state.controls.free(taken.key);
+                cx.state.sources.free(token.0);
+                *cx.state.sources.get_mut(token.0) = Source::Vacant;
+                return;
+            }
+            *cx.state.sources.get_mut(token.0) = Source::Control;
+            cx.state.cache_control = Some(token);
+        }
+        Err(e) => {
+            warn!(error = %e, "control: connect to the origin failed");
+            cx.state.controls.free(taken.key);
+            cx.state.sources.free(token.0);
+            *cx.state.sources.get_mut(token.0) = Source::Vacant;
+        }
+    }
 }
 
-/// The change on a cache node: the route table rebuilt from the config loaded
-/// at start, the cache and the held error pages swapped for empty ones in one
-/// assignment each, then the log line an operator reads a publish as. The
-/// cache refills on demand.
-///
-/// The swap and the reason for it are in [`Cache::swap_generation`]: no entry
-/// survives the generation, and a request already holding one finishes on its
-/// clone.
-fn follower_change(state: &mut ServerState, from: u64, to: u64) {
-    match RouteTable::from_config(&state.config) {
-        Ok(table) => state.route_table = table,
-        Err(e) => error!(
-            error = %e,
-            "genid: route table rebuild failed; keeping the old table"
-        ),
+/// Drive the one control connection whose descriptor fired. Returns true when
+/// the connection is gone and its token and slot were freed.
+fn drive_control(token: Token, cx: &mut CompletionCtx<'_>) -> bool {
+    let fd = cx.state.controls.get(token.0).fd();
+    let alive = cx.state.controls.get_mut(token.0).drive();
+    let lines = cx.state.controls.get_mut(token.0).drain_lines();
+    let connected = cx.state.controls.get_mut(token.0).take_connected();
+
+    // A cache node that just connected sends its register line and marks its
+    // origin up.
+    if connected && matches!(cx.state.registration, registration::Role::Cache(_)) {
+        let name = cx.state.config.node.name.clone();
+        let counter = cx
+            .state
+            .registration
+            .cache()
+            .map(|f| f.counter())
+            .unwrap_or(0);
+        let line = registration::register_line(&name, counter);
+        cx.state.controls.get_mut(token.0).send_line(&line);
+        if let Some(f) = cx.state.registration.cache_mut() {
+            f.set_up(true);
+        }
     }
-    drop(state.cache.swap_generation());
-    state.error_pages = HashMap::new();
-    // The new generation gets its own directory. The queue and the size map
-    // are cleared and every other subdirectory is queued for removal over the
-    // ticks that follow. The swap above already emptied the memory cache, so
-    // no queued flag survives on a key this writer still holds.
-    if let Some(disk) = state.disk.as_mut() {
-        disk.use_id(to);
+
+    // Apply every line the drive read. The origin reads a cache's lines, and
+    // a cache node reads the origin's lines.
+    let is_cache = matches!(cx.state.registration, registration::Role::Cache(_));
+    for line in lines {
+        if is_cache {
+            match registration::parse_origin_line(&line) {
+                registration::OriginLine::Counter(counter) => {
+                    reconcile_disk(cx.state, counter);
+                }
+                registration::OriginLine::Purge { target, counter } => {
+                    let resident = purge_local(cx.state, target);
+                    if let Some(f) = cx.state.registration.cache_mut() {
+                        f.set_counter(counter);
+                    }
+                    let reply = registration::resident_line(resident);
+                    cx.state.controls.get_mut(token.0).send_line(&reply);
+                }
+                registration::OriginLine::Unknown => {}
+            }
+        } else {
+            match registration::parse_cache_line(&line) {
+                registration::CacheLine::Register { name, counter: _ } => {
+                    let reply = match cx.state.registration.source_mut() {
+                        Some(src) => {
+                            src.register(name.to_string(), token);
+                            let reply = registration::counter_line(src.counter());
+                            Some(reply)
+                        }
+                        None => None,
+                    };
+                    if let Some(reply) = reply {
+                        cx.state.controls.get_mut(token.0).send_line(&reply);
+                    }
+                }
+                registration::CacheLine::Resident(resident) => {
+                    let done = cx
+                        .state
+                        .registration
+                        .source_mut()
+                        .is_some_and(|s| s.resident(token, resident));
+                    if done {
+                        finish_fanout(cx);
+                    }
+                }
+                registration::CacheLine::Unknown => {}
+            }
+        }
     }
-    info!(from, to, "genid changed");
+
+    // Re-arm the descriptor with the interest the connection now needs. A
+    // reregister runs only on a change, which the edge-triggered poll needs.
+    if alive {
+        let interest = cx.state.controls.get(token.0).interest();
+        let _ = cx.registry.reregister_fd(fd, token, interest);
+        return false;
+    }
+
+    // The connection dropped. Free its token and slot.
+    let _ = cx.registry.deregister_fd(fd);
+    cx.state.controls.get_mut(token.0).close();
+    cx.state.controls.free(token.0);
+    *cx.state.sources.get_mut(token.0) = Source::Vacant;
+    cx.state.sources.free(token.0);
+    if cx.state.cache_control == Some(token) {
+        cx.state.cache_control = None;
+        if let Some(f) = cx.state.registration.cache_mut() {
+            f.set_up(false);
+            warn!("control: connection to the origin dropped");
+        }
+    } else if let Some(name) = cx
+        .state
+        .registration
+        .source_mut()
+        .and_then(|s| s.unregister(token))
+    {
+        info!(cache = %name, "control: cache disconnected");
+    }
+    true
+}
+
+/// Accept control connections the listener queued, up to the descriptor
+/// budget, and register each for its first read.
+fn accept_controls(state: &mut ServerState, registry: &m6_core::platform::Registry, max: usize) {
+    for _ in 0..max {
+        // Accept first, so no borrow of the listener outlives the mutations
+        // of `controls` and `sources` below.
+        let accepted = match state.control_listener.as_ref().map(|l| l.accept()) {
+            None => return,
+            Some(Ok((stream, _))) => Some(stream),
+            Some(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+            Some(Err(_)) => return,
+        };
+        let Some(taken) = state.controls.take() else {
+            return;
+        };
+        let Some(token) = take_token(state) else {
+            state.controls.free(taken.key);
+            return;
+        };
+        let Some(stream) = accepted else {
+            state.controls.free(taken.key);
+            state.sources.free(token.0);
+            *state.sources.get_mut(token.0) = Source::Vacant;
+            return;
+        };
+        let conn = match ControlConn::accepted(stream) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "control: accepted connection setup failed");
+                state.controls.free(taken.key);
+                state.sources.free(token.0);
+                *state.sources.get_mut(token.0) = Source::Vacant;
+                return;
+            }
+        };
+        let fd = conn.fd();
+        *state.controls.get_mut(taken.key) = conn;
+        if let Err(e) = registry.register_fd(fd, token, Interest::READABLE) {
+            warn!(error = %e, "control: register failed");
+            state.controls.get_mut(taken.key).close();
+            state.controls.free(taken.key);
+            state.sources.free(token.0);
+            *state.sources.get_mut(token.0) = Source::Vacant;
+            return;
+        }
+        *state.sources.get_mut(token.0) = Source::Control;
+    }
 }
 
 /// Drive the one upstream whose descriptor fired.
@@ -3100,6 +2919,17 @@ fn event_loop(
             .registry()
             .register_fd(h.raw_fd(), TOKEN_H2C_LISTENER, Interest::READABLE);
     }
+    // The cache control listener, on the origin only.
+    if let Some(ref listener) = state.control_listener {
+        if let Err(e) = poll.registry().register_fd(
+            listener.as_raw_fd(),
+            TOKEN_CONTROL_LISTENER,
+            Interest::READABLE,
+        ) {
+            eprintln!("registering the control listener: {e}");
+            return 1;
+        }
+    }
     // Signals arrive on their own descriptor, under the number the wake pipe
     // used to hold.
     if let Err(e) = poll
@@ -3325,6 +3155,9 @@ fn event_loop(
                     }
                     rearm_listeners(&poll, tcp.as_mut(), h2c.as_mut(), accepting);
                 }
+                TOKEN_CONTROL_LISTENER => {
+                    accept_controls(state, poll.registry(), MAX_ACCEPTS_PER_WAKE);
+                }
                 Token(k) => match *state.sources.get(k) {
                     Source::TlsConn(_) | Source::H2cConn(_) => {
                         drive_conn_token(
@@ -3395,6 +3228,21 @@ fn event_loop(
                             );
                             drive_upstream_one(Token(k), &mut cx);
                         }
+                    }
+                    Source::Control => {
+                        let mut cx = CompletionCtx::new(
+                            &mut *state,
+                            &mut tcp,
+                            &mut h2c,
+                            poll.registry(),
+                            quic_port,
+                            &udp,
+                            udp_batch,
+                            &mut flush_buf,
+                            &mut connections,
+                            now,
+                        );
+                        drive_control(Token(k), &mut cx);
                     }
                     Source::Vacant => {}
                 },
@@ -3483,9 +3331,9 @@ fn event_loop(
             &mut connections,
         );
 
-        // The change sequence a POST asked for, and a sequence whose members
-        // have all answered without an event of their own. Nothing here blocks:
-        // it starts upstreams and hands their answers to the same loop.
+        // Control work a turn owes: an in-progress purge fan-out that just
+        // completed or hit its deadline, and a cache node's reconnect when its
+        // control connection dropped. Nothing here blocks.
         {
             let mut cx = CompletionCtx::new(
                 &mut *state,
@@ -3499,8 +3347,7 @@ fn event_loop(
                 &mut connections,
                 now,
             );
-            genid_pump(&mut cx);
-            heartbeat_pump(&mut cx);
+            control_pump(&mut cx);
         }
 
         // A slot came free while the token table was full: accept again.
@@ -3530,6 +3377,23 @@ fn event_loop(
             // One host source a tick: one small file, never the whole block.
             state.host.step();
             last_log_tick = now2;
+            // A cache node whose control connection dropped retries here,
+            // once a second, never on the request path.
+            {
+                let mut cx = CompletionCtx::new(
+                    &mut *state,
+                    &mut tcp,
+                    &mut h2c,
+                    poll.registry(),
+                    quic_port,
+                    &udp,
+                    udp_batch,
+                    &mut flush_buf,
+                    &mut connections,
+                    now2,
+                );
+                control_reconnect(&mut cx);
+            }
         }
 
         // The disk cache's work: one slice of at most 1 ms per idle turn,
@@ -3577,14 +3441,13 @@ fn event_loop(
             m6_http_lib::stats::log_traffic(&report);
         }
 
-        // Drain one background fetch per loop iteration, unless this node has
-        // no ID yet or its upstream is down. A cache node with nothing to
-        // compare a reply against would store none of it, and a fetch while
-        // the source is unreachable is a guaranteed failure. The queue keeps
-        // its cap and drains once the upstream answers.
-        let drain = match &state.genid {
-            genid::Role::Cache(f) => f.current().is_some() && !f.down(),
-            genid::Role::Source(_) => true,
+        // Drain one background fetch per loop iteration, unless a cache
+        // node's control connection to its origin is down. A fetch while the
+        // source is unreachable is a guaranteed failure. The queue keeps its
+        // cap and drains once the connection returns.
+        let drain = match &state.registration {
+            registration::Role::Cache(f) => f.up(),
+            registration::Role::Source(_) => true,
         };
         if drain {
             if let Some(r) = state.prefetch_queue.pop_front() {
@@ -4164,7 +4027,6 @@ fn handle_h3_request(
             &headers,
             Bytes::from(m6_http_lib::error::refusal_body(status)),
             is_head,
-            None,
         );
         return;
     }
@@ -4224,7 +4086,6 @@ fn handle_h3_request(
             &headers,
             Bytes::new(),
             false,
-            None,
         );
         debug!(
             stream_id,
@@ -4261,7 +4122,6 @@ fn handle_h3_request(
                 &headers,
                 Bytes::from(body),
                 method_bytes.eq_ignore_ascii_case(b"HEAD"),
-                None,
             );
             return;
         }
@@ -4288,7 +4148,6 @@ fn handle_h3_request(
                 &www_redirect_headers(location),
                 Bytes::new(),
                 false,
-                None,
             );
             return;
         }
@@ -4308,7 +4167,6 @@ fn handle_h3_request(
                 &www_redirect_headers(location),
                 Bytes::new(),
                 false,
-                None,
             );
             return;
         }
@@ -4330,7 +4188,6 @@ fn handle_h3_request(
             &headers,
             Bytes::from(body),
             method_str.eq_ignore_ascii_case("HEAD"),
-            None,
         );
         return;
     }
@@ -4361,7 +4218,6 @@ fn handle_h3_request(
             &headers,
             Bytes::new(),
             false,
-            None,
         );
         return;
     }
@@ -4397,7 +4253,6 @@ fn handle_h3_request(
             &headers,
             Bytes::new(),
             false,
-            None,
         );
         debug!(
             stream_id,
@@ -4466,7 +4321,6 @@ fn handle_h3_request(
                 &headers,
                 Bytes::new(),
                 false,
-                None,
             );
             return;
         }
@@ -4515,7 +4369,6 @@ fn handle_h3_request(
                 &headers,
                 Bytes::new(),
                 false,
-                None,
             );
             return;
         }
@@ -4574,7 +4427,6 @@ fn handle_h3_request(
             resp_headers,
             cached.body,
             method_str.eq_ignore_ascii_case("HEAD"),
-            Some(cached.genid),
         );
         return;
     } // end cache hit
@@ -4626,7 +4478,7 @@ fn handle_h3_request(
         h3.registry,
         None,
     ) {
-        RequestOutcome::Ready(status, mut resp_headers, body, backend_name, genid) => {
+        RequestOutcome::Ready(status, mut resp_headers, body, backend_name, _) => {
             // Add alt-svc header.
             set_alt_svc(&mut resp_headers, h3.quic_port);
 
@@ -4661,7 +4513,6 @@ fn handle_h3_request(
                 &resp_headers,
                 Bytes::from(body),
                 http_req.method.eq_ignore_ascii_case("HEAD"),
-                genid,
             );
         }
         RequestOutcome::Cached { .. } => {
@@ -4705,7 +4556,7 @@ fn quiche_priority(priority: priority::Priority) -> quiche::h3::Priority {
     quiche::h3::Priority::new(priority.urgency, priority.incremental)
 }
 
-#[allow(clippy::too_many_arguments)] // one response's fields plus the stream, its priority and the generation
+#[allow(clippy::too_many_arguments)] // one response's fields plus the stream and its priority
 fn send_h3_response(
     stream_id: u64,
     qconn: &mut QuicConn,
@@ -4714,7 +4565,6 @@ fn send_h3_response(
     headers: &[(String, String)],
     body: Bytes,
     is_head: bool,
-    genid: Option<u64>,
 ) {
     let h3 = match qconn.h3_conn.as_mut() {
         Some(h) => h,
@@ -4768,16 +4618,6 @@ fn send_h3_response(
             continue;
         }
         h3_headers.push(quiche::h3::Header::new(k.as_bytes(), v.as_bytes()));
-    }
-    if let Some(genid) = genid {
-        // quiche lower-cases a header name when it encodes the field section,
-        // so this spelling is not what made an h3 response valid. Writing the
-        // lower-case constant here means neither serialiser depends on a
-        // library's normalisation for RFC 9114 4.2.
-        h3_headers.push(quiche::h3::Header::new(
-            genid::GENID_HEADER_LOWER.as_bytes(),
-            itoa::Buffer::new().format(genid).as_bytes(),
-        ));
     }
     // RFC 9110 8.6: never on a 1xx/204, and on a 304 only if it equals the
     // 200's length. m6 emitted `content-length: 0` on every 304 across all
@@ -5030,15 +4870,7 @@ fn dispatch_url_backend(
     match state.pool_manager.url_backend(backend_idx).scheme {
         pool::UrlScheme::H2c | pool::UrlScheme::H2s => {
             let original_host = origin_host(req, &state.config).to_string();
-            dispatch_h2(
-                state,
-                registry,
-                backend_idx,
-                req,
-                client_ip,
-                &original_host,
-                ViaHop::ThisNode,
-            )
+            dispatch_h2(state, registry, backend_idx, req, client_ip, &original_host)
         }
         pool::UrlScheme::Http | pool::UrlScheme::Https => {
             launch_url_upstream(state, registry, req, client_ip, backend_idx).map(UpstreamId::Slot)
@@ -5047,21 +4879,11 @@ fn dispatch_url_backend(
 }
 
 /// Whether a request heading for a URL backend is one m6-http forwards for a
-/// client, or one it originates itself.
-///
-/// A forwarded request announces this node in `Via` (RFC 9110 7.6.3). A
-/// request m6-http originates, such as the generation ID's heartbeat, has no
-/// received protocol to report and carries no entry.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ViaHop {
-    /// A forwarded request: this node's name is appended to `Via`.
-    ThisNode,
-    /// A request m6-http originates itself: no `Via` entry.
-    None,
-}
-
 /// Start one request to an h2c or h2s URL backend on its connection pool,
 /// opening the connection first when the pool has none.
+///
+/// A forwarded request announces this node in `Via` (RFC 9110 7.6.3). Every
+/// request through this path is a forward, so the entry is always added.
 fn dispatch_h2(
     state: &mut ServerState,
     registry: &m6_core::platform::Registry,
@@ -5069,32 +4891,37 @@ fn dispatch_h2(
     req: &forward::HttpRequest,
     client_ip: &str,
     original_host: &str,
-    via: ViaHop,
 ) -> Result<UpstreamId, UrlDispatchError> {
     if let pool::UrlScheme::H2c = state.pool_manager.url_backend(backend_idx).scheme {
         ensure_h2c_conn(state, backend_idx, registry)?;
         // Disjoint fields: the prebuilt entries are read from `state`, the
         // authority from `pool_manager`, and only the pool is borrowed mutably.
-        let via = match via {
-            ViaHop::ThisNode => Some(&state.via),
-            ViaHop::None => None,
-        };
         let backend = state.pool_manager.url_backend(backend_idx);
         let (conn, stream) = state
             .h2c_pool
-            .dispatch(&backend.url, req, client_ip, original_host, via, registry)
+            .dispatch(
+                &backend.url,
+                req,
+                client_ip,
+                original_host,
+                Some(&state.via),
+                registry,
+            )
             .map_err(UrlDispatchError::Failed)?;
         Ok(UpstreamId::H2c { conn, stream })
     } else {
         ensure_h2s_conn(state, backend_idx, registry)?;
-        let via = match via {
-            ViaHop::ThisNode => Some(&state.via),
-            ViaHop::None => None,
-        };
         let backend = state.pool_manager.url_backend(backend_idx);
         let (conn, stream) = state
             .h2s_pool
-            .dispatch(&backend.url, req, client_ip, original_host, via, registry)
+            .dispatch(
+                &backend.url,
+                req,
+                client_ip,
+                original_host,
+                Some(&state.via),
+                registry,
+            )
             .map_err(UrlDispatchError::Failed)?;
         Ok(UpstreamId::H2s { conn, stream })
     }
@@ -5518,7 +5345,7 @@ fn handle_request_inner(
     // True when this request arrived on the h2c listener and [server]
     // internal_binds names it, meaning one of our own nodes over the backbone
     // rather than a public client. Granted by the listener, never by a header, so a public
-    // client cannot claim it. The error-path guard and the genid gate read it.
+    // client cannot claim it. The error-path guard and the control gate read it.
     from_internal: bool,
     registry: &m6_core::platform::Registry,
     pre_decided: Option<PreDecided>,
@@ -5529,6 +5356,104 @@ fn handle_request_inner(
     // them as analytics would mint a session/log a "MISS" line for a visit
     // that never happened, polluting request/session counts downstream.
     let analytics_enabled = state.config.analytics.enabled && !is_prefetch;
+
+    // ── The cache control endpoints: PURGE and /m6/status ──────────────────
+    // A source node owns the purge and the registered-cache report. The
+    // address rule and the token check run before method semantics, so a
+    // stranger learns nothing about which methods exist. A node with no
+    // [registration] claims has no entry here and falls through: PURGE is
+    // then 501 from the method check, and /m6/status is a route miss.
+    let purge = req.method == registration::PURGE_METHOD;
+    let status_read =
+        req.path == registration::STATUS_PATH && matches!(req.method.as_str(), "GET" | "HEAD");
+    if (purge || status_read) && state.config.registration.is_some() {
+        let reg_config = state.config.registration.as_ref().unwrap();
+        debug!(method = %req.method, path = %req.path, "control endpoint");
+        // Only the source answers these. A cache node's registration is on
+        // the control channel, not HTTP, so its config carries `origin` and
+        // no claims; the gate below returns the 404 a disabled endpoint gets.
+        match health::control_gate(reg_config, client_ip, from_internal, purge) {
+            health::Gate::Refused(code, headers, body) => {
+                return RequestOutcome::Ready(
+                    code,
+                    headers,
+                    body,
+                    health::CONTROL_BACKEND.to_string(),
+                    None,
+                );
+            }
+            health::Gate::Open => {}
+            health::Gate::Check(require) => {
+                let auth_backend = auth_backend_name(state);
+                let plan = CheckPlan {
+                    req,
+                    client_ip,
+                    enc: content_encoding,
+                    auth_backend: auth_backend.clone(),
+                    content_backend: health::CONTROL_BACKEND.to_string(),
+                    route_path: req.path.clone(),
+                    route_cache: None,
+                    cacheable: false,
+                    is_prefetch: false,
+                    from_internal,
+                    gate: forward::AuthGate::Control,
+                    require,
+                };
+                let decision = match resolve_check(plan, pre_decided.take(), state, registry) {
+                    CheckResolution::Decision(decision) => decision,
+                    CheckResolution::Pending(outcome) => return outcome,
+                };
+                match decision {
+                    core_auth::Decision::Allow(_) => {}
+                    core_auth::Decision::NoDecision => {
+                        return backend_unavailable(
+                            req,
+                            client_ip,
+                            state,
+                            registry,
+                            &req.path,
+                            &auth_backend,
+                            "auth check unavailable",
+                        );
+                    }
+                    refusal => {
+                        let (code, headers, body) = refusal.refusal().expect("a refusal");
+                        return RequestOutcome::Ready(
+                            code,
+                            headers,
+                            body,
+                            "auth".to_string(),
+                            None,
+                        );
+                    }
+                }
+            }
+        }
+        if purge {
+            return handle_purge(req, client_ip, from_internal);
+        }
+        // GET or HEAD /m6/status: the registered-cache set and the counter.
+        if req.method == "HEAD" {
+            return RequestOutcome::Ready(
+                200,
+                vec![("Cache-Control".to_string(), "no-store".to_string())],
+                Vec::new(),
+                health::CONTROL_BACKEND.to_string(),
+                None,
+            );
+        }
+        let body = status_body(state);
+        return RequestOutcome::Ready(
+            200,
+            vec![
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("Cache-Control".to_string(), "no-store".to_string()),
+            ],
+            body,
+            health::CONTROL_BACKEND.to_string(),
+            None,
+        );
+    }
 
     // ── Method validation, ahead of routing and backend dispatch ────────────
     // Nothing checked the method before this. Every verb was served the page:
@@ -5610,11 +5535,10 @@ fn handle_request_inner(
     // and friends like every other path, rather than becoming a hole in it.
     if state.config.health.enabled && req.path == state.config.health.path {
         // The dependency flags this answer reads. A cache node's origin is the
-        // follower's own state, set where a heartbeat or a forwarded request
-        // already observes the failure and cleared by the next answer. No
+        // follower's own state, set by the control connection's lifecycle. No
         // timer, no probe, no clock. A second dependency is one more term on
         // this line: the auth checker's flag is ORed in beside it.
-        let degraded = health::origin_down(&state.genid);
+        let degraded = health::origin_down(&state.registration);
         let (code, mut report) = health::health_answer(degraded, &state.config.node.name);
         report.process_index = state.config.server.process_index;
         let (code, headers, body) = report.into_response(code);
@@ -5638,234 +5562,6 @@ fn handle_request_inner(
             health::HEALTH_BACKEND.to_string(),
             None,
         );
-    }
-
-    // ── The site generation ID, ahead of routing and the cache ──────────────
-    // A source node owns the number that names the content its backends are
-    // serving. `GET` reads it, `POST` refreshes every backend and advances it.
-    // The path is reserved on every m6-http: a node with no `[genid]` has no
-    // entry here and falls through to the 404 any unknown path gets.
-    //
-    // Address and token before method, so a stranger learns nothing about
-    // which methods exist. Both claims absent is the endpoint not existing,
-    // which is also a 404.
-    if req.path == m6_core::site::GENID_PATH {
-        if let Some(genid_config) = state.config.genid.as_ref() {
-            // A cache node does not own an ID, so it forwards the caller's own
-            // request and token to the source. Only the address rule is its
-            // own: a stranger gets the 404 an unknown path gives, before
-            // anything is forwarded. The source authorises the call.
-            if let genid::Role::Cache(_) = &state.genid {
-                if !health::genid_address_ok(client_ip, from_internal) {
-                    let (code, headers, body) = health::not_found();
-                    return RequestOutcome::Ready(
-                        code,
-                        headers,
-                        body,
-                        health::GENID_BACKEND.to_string(),
-                        None,
-                    );
-                }
-                if !matches!(req.method.as_str(), "GET" | "HEAD" | "POST") {
-                    let headers = vec![
-                        ("Allow".to_string(), "GET, HEAD, POST".to_string()),
-                        ("Cache-Control".to_string(), "no-store".to_string()),
-                    ];
-                    return RequestOutcome::Ready(
-                        405,
-                        headers,
-                        Vec::new(),
-                        health::GENID_BACKEND.to_string(),
-                        None,
-                    );
-                }
-                let Some(backend_idx) = state.heartbeat_backend else {
-                    // `config::load` refused an upstream naming no URL
-                    // backend, so this is unreachable on a loaded config.
-                    let headers = vec![
-                        (
-                            "Content-Type".to_string(),
-                            "text/plain; charset=utf-8".to_string(),
-                        ),
-                        ("Cache-Control".to_string(), "no-store".to_string()),
-                    ];
-                    return RequestOutcome::Ready(
-                        502,
-                        headers,
-                        b"Bad Gateway".to_vec(),
-                        health::GENID_BACKEND.to_string(),
-                        None,
-                    );
-                };
-                let upstream = genid_config.upstream.clone().unwrap_or_default();
-                let ctx = forward::PendingUrlContext {
-                    req: req.clone(),
-                    client_ip: client_ip.to_string(),
-                    enc: String::new(),
-                    backend_name: upstream.clone(),
-                    kind: forward::PendingKind::Url,
-                    route_path: None,
-                    auth_require: None,
-                    auth_gate: None,
-                    from_internal,
-                    route_cache: None,
-                    cacheable: false,
-                    is_prefetch: false,
-                    start: m6_core::platform::now(),
-                    error_status_override: None,
-                    extra_headers: Vec::new(),
-                    genid: state.genid.dispatched(),
-                    genid_forward: true,
-                };
-                return match dispatch_url_backend(state, registry, req, client_ip, backend_idx) {
-                    Ok(id) => RequestOutcome::Pending {
-                        id,
-                        ctx: Box::new(ctx),
-                    },
-                    Err(UrlDispatchError::NoSlot) => {
-                        let headers = vec![
-                            ("Retry-After".to_string(), "1".to_string()),
-                            ("Cache-Control".to_string(), "no-store".to_string()),
-                        ];
-                        RequestOutcome::Ready(
-                            503,
-                            headers,
-                            b"Service Unavailable".to_vec(),
-                            health::GENID_BACKEND.to_string(),
-                            None,
-                        )
-                    }
-                    Err(UrlDispatchError::Failed(e)) => {
-                        warn!(
-                            backend = %upstream,
-                            error = %e,
-                            "genid: forwarding to the upstream failed"
-                        );
-                        let headers = vec![
-                            (
-                                "Content-Type".to_string(),
-                                "text/plain; charset=utf-8".to_string(),
-                            ),
-                            ("Cache-Control".to_string(), "no-store".to_string()),
-                        ];
-                        RequestOutcome::Ready(
-                            502,
-                            headers,
-                            b"Bad Gateway".to_vec(),
-                            health::GENID_BACKEND.to_string(),
-                            None,
-                        )
-                    }
-                };
-            }
-
-            let write = req.method == "POST";
-            match health::genid_gate(genid_config, client_ip, from_internal, write) {
-                health::Gate::Refused(code, headers, body) => {
-                    return RequestOutcome::Ready(
-                        code,
-                        headers,
-                        body,
-                        health::GENID_BACKEND.to_string(),
-                        None,
-                    );
-                }
-                health::Gate::Open => {}
-                health::Gate::Check(require) => {
-                    let auth_backend = auth_backend_name(state);
-                    let plan = CheckPlan {
-                        req,
-                        client_ip,
-                        enc: content_encoding,
-                        auth_backend: auth_backend.clone(),
-                        content_backend: health::GENID_BACKEND.to_string(),
-                        route_path: req.path.clone(),
-                        route_cache: None,
-                        cacheable: false,
-                        is_prefetch: false,
-                        from_internal,
-                        gate: forward::AuthGate::Genid,
-                        require,
-                    };
-                    let decision = match resolve_check(plan, pre_decided.take(), state, registry) {
-                        CheckResolution::Decision(decision) => decision,
-                        CheckResolution::Pending(outcome) => return outcome,
-                    };
-                    match decision {
-                        core_auth::Decision::Allow(_) => {}
-                        core_auth::Decision::NoDecision => {
-                            return backend_unavailable(
-                                req,
-                                client_ip,
-                                state,
-                                registry,
-                                &req.path,
-                                &auth_backend,
-                                "auth check unavailable",
-                            );
-                        }
-                        refusal => {
-                            let (code, headers, body) = refusal.refusal().expect("a refusal");
-                            return RequestOutcome::Ready(
-                                code,
-                                headers,
-                                body,
-                                "auth".to_string(),
-                                None,
-                            );
-                        }
-                    }
-                }
-            }
-            match req.method.as_str() {
-                "GET" | "HEAD" => {
-                    let id = state.genid.source().map(genid::Genid::current).unwrap_or(0);
-                    if req.method == "GET" {
-                        if let Ok(ip) = client_ip.parse::<std::net::IpAddr>() {
-                            if let Some(g) = state.genid.source_mut() {
-                                g.saw_peer(ip, m6_core::platform::now());
-                            }
-                        }
-                    }
-                    let headers = vec![
-                        ("Content-Type".to_string(), "application/json".to_string()),
-                        ("Cache-Control".to_string(), "no-store".to_string()),
-                    ];
-                    let mut body = Vec::with_capacity(32);
-                    body.extend_from_slice(b"{\"genid\":\"");
-                    body.extend_from_slice(itoa::Buffer::new().format(id).as_bytes());
-                    body.extend_from_slice(b"\"}");
-                    return RequestOutcome::Ready(
-                        200,
-                        headers,
-                        body,
-                        health::GENID_BACKEND.to_string(),
-                        Some(id),
-                    );
-                }
-                "POST" => {
-                    // Parked until every backend has the new content. The
-                    // sequence, not this request, writes the answer.
-                    return RequestOutcome::Pending {
-                        id: UpstreamId::Genid,
-                        ctx: forward::PendingUrlContext::for_genid(),
-                    };
-                }
-                _ => {
-                    let headers = vec![
-                        ("Allow".to_string(), "GET, HEAD, POST".to_string()),
-                        ("Cache-Control".to_string(), "no-store".to_string()),
-                    ];
-                    return RequestOutcome::Ready(
-                        405,
-                        headers,
-                        Vec::new(),
-                        health::GENID_BACKEND.to_string(),
-                        None,
-                    );
-                }
-            }
-        }
     }
 
     // The custom-error render route takes `status`/`from` (and optional
@@ -6080,8 +5776,6 @@ fn handle_request_inner(
             start: m6_core::platform::now(),
             error_status_override: None,
             extra_headers: Vec::new(),
-            genid: state.genid.dispatched(),
-            genid_forward: false,
         };
         let id = match dispatch_url_backend(state, registry, req, client_ip, backend_idx) {
             Ok(id) => id,
@@ -6188,8 +5882,6 @@ fn handle_request_inner(
         start: backend_start,
         error_status_override: None,
         extra_headers: Vec::new(),
-        genid: state.genid.dispatched(),
-        genid_forward: false,
     };
     RequestOutcome::Pending {
         id: UpstreamId::Slot(slot),
@@ -6381,8 +6073,6 @@ fn dispatch_custom_error_async(
             start: m6_core::platform::now(),
             error_status_override: Some(status),
             extra_headers: Vec::new(),
-            genid: state.genid.dispatched(),
-            genid_forward: false,
         };
         let id = dispatch_url_backend(state, registry, &error_req, client_ip, backend_idx).ok()?;
         return Some(RequestOutcome::Pending {
@@ -6419,8 +6109,6 @@ fn dispatch_custom_error_async(
         start: m6_core::platform::now(),
         error_status_override: Some(status),
         extra_headers: Vec::new(),
-        genid: state.genid.dispatched(),
-        genid_forward: false,
     };
     Some(RequestOutcome::Pending {
         id: UpstreamId::Slot(slot),
@@ -6883,31 +6571,23 @@ fn complete_socket_response(
             // the generation time.
             set_date(&mut http_resp.headers);
             apply_route_cache(&mut http_resp.headers, ctx.route_cache.as_deref());
-            match reply_rule(state, ctx, http_resp.status, &http_resp.headers) {
-                ReplyRule::Store(stored) => {
-                    let key = CacheKey::new(&req.path, req.query.as_deref(), content_encoding);
-                    // On a node with a disk writer the insert sets the entry's
-                    // queued flag in the same map write that stores it, so the
-                    // request path copies no key and pushes nothing. Nothing is
-                    // written here.
-                    let response = CachedResponse {
-                        genid: stored,
-                        status: http_resp.status,
-                        headers: strip_uncacheable(&http_resp.headers),
-                        body: Bytes::from(http_resp.body.clone()),
-                    };
-                    if state.disk.is_some() {
-                        state.cache.insert_queued(key, response);
-                    } else {
-                        state.cache.insert(key, response);
-                    }
+            if should_store(ctx, http_resp.status, &http_resp.headers) {
+                let key = CacheKey::new(&req.path, req.query.as_deref(), content_encoding);
+                // On a node with a disk writer the insert sets the entry's
+                // queued flag in the same map write that stores it, so the
+                // request path copies no key and pushes nothing. Nothing is
+                // written here.
+                let response = CachedResponse {
+                    genid: 0,
+                    status: http_resp.status,
+                    headers: strip_uncacheable(&http_resp.headers),
+                    body: Bytes::from(http_resp.body.clone()),
+                };
+                if state.disk.is_some() {
+                    state.cache.insert_queued(key, response);
+                } else {
+                    state.cache.insert(key, response);
                 }
-                ReplyRule::Behind => {
-                    if let Some(f) = state.genid.cache_mut() {
-                        f.behind(m6_core::platform::now());
-                    }
-                }
-                ReplyRule::Nothing => {}
             }
             (
                 http_resp.status,
@@ -7093,29 +6773,21 @@ fn finalize_url_response_inner(
             // decision so the stored entry carries the generation time.
             set_date(&mut http_resp.headers);
             apply_route_cache(&mut http_resp.headers, ctx.route_cache.as_deref());
-            match reply_rule(state, ctx, http_resp.status, &http_resp.headers) {
-                ReplyRule::Store(stored) => {
-                    let key = CacheKey::new(&req.path, req.query.as_deref(), enc);
-                    // The same store as the synchronous path: the flag rides
-                    // the insert, and the disk write itself waits for the tick.
-                    let response = CachedResponse {
-                        genid: stored,
-                        status: http_resp.status,
-                        headers: strip_uncacheable(&http_resp.headers),
-                        body: Bytes::from(http_resp.body.clone()),
-                    };
-                    if state.disk.is_some() {
-                        state.cache.insert_queued(key, response);
-                    } else {
-                        state.cache.insert(key, response);
-                    }
+            if should_store(ctx, http_resp.status, &http_resp.headers) {
+                let key = CacheKey::new(&req.path, req.query.as_deref(), enc);
+                // The same store as the synchronous path: the flag rides
+                // the insert, and the disk write itself waits for the tick.
+                let response = CachedResponse {
+                    genid: 0,
+                    status: http_resp.status,
+                    headers: strip_uncacheable(&http_resp.headers),
+                    body: Bytes::from(http_resp.body.clone()),
+                };
+                if state.disk.is_some() {
+                    state.cache.insert_queued(key, response);
+                } else {
+                    state.cache.insert(key, response);
                 }
-                ReplyRule::Behind => {
-                    if let Some(f) = state.genid.cache_mut() {
-                        f.behind(m6_core::platform::now());
-                    }
-                }
-                ReplyRule::Nothing => {}
             }
             (
                 http_resp.status,
@@ -7127,42 +6799,20 @@ fn finalize_url_response_inner(
         }
         Err(e) => {
             warn!(backend = %ctx.backend_name, error = %e, "url backend error (async)");
-            // A forwarded `POST /genid` that misses the deadline answers 504:
-            // the source may still be completing the publish, and `GET /genid`
-            // then says whether it happened.
-            let status = if ctx.genid_forward && e.kind() == std::io::ErrorKind::TimedOut {
-                504u16
-            } else {
-                502u16
-            };
-            (status, vec![], vec![], "error".to_string(), true)
+            (502u16, vec![], vec![], "error".to_string(), true)
         }
     };
 
-    // A failed forward to the upstream tells a cache node two things: the
-    // upstream may be down, and the node may still hold content for this key.
-    // The held entry is served at any age, flagged stale, so a working site
-    // with old pages beats the error page.
-    if is_connection_failure && !ctx.is_prefetch && matches!(state.genid, genid::Role::Cache(_)) {
-        let reason = if status == 504 {
-            "timed out"
-        } else {
-            "connect failed"
-        };
-        follower_failed(state, reason, m6_core::platform::now());
-    }
+    // A failed forward to the upstream serves the held entry at any age,
+    // flagged stale, so a working site with old pages beats the error page.
     if matches!(status, 502..=504)
         && !ctx.is_prefetch
-        && matches!(state.genid, genid::Role::Cache(_))
+        && matches!(state.registration, registration::Role::Cache(_))
     {
         let key = CacheKey::new(&req.path, req.query.as_deref(), enc);
         if let Some((entry, age)) = state.cache.lookup_held(&key) {
             let mut headers = entry.headers.to_pairs();
             set_age(&mut headers, age);
-            headers.push((
-                genid::GENID_HEADER.to_string(),
-                itoa::Buffer::new().format(entry.genid).to_string(),
-            ));
             let latency_ns = ctx.start.elapsed().as_nanos() as u64;
             analytics::finish_proxied_response(
                 analytics_on,
@@ -8277,36 +7927,73 @@ fn run(args: Vec<String>) -> i32 {
         return 0;
     }
 
-    // The generation state, after the `--dump-config` and redirect-mode
-    // returns: a dump with `[genid]` and no StateDirectory prints and exits 0,
-    // because it is not about to serve. A cache node holds no file. A source
-    // reads its state file once here, and a source with no state fails the
-    // start rather than serving a generation that a restart would renumber.
-    let genid = match &config.genid {
-        None => genid::Role::Source(genid::Genid::new(0, None)),
-        Some(cfg) if cfg.upstream.is_some() => genid::Role::Cache(genid::Follower::new(
-            cfg.heartbeat,
-            m6_core::platform::now(),
-        )),
-        Some(_) => {
-            let Some(directory) =
-                m6_core::platform::state_directory().filter(|directory| directory.is_absolute())
-            else {
+    // The registration state, after the `--dump-config` and redirect-mode
+    // returns. An origin starts at counter 0 (no state file: a cache that
+    // reconnects after a restart reconciles by the counter it saved, and a
+    // missing counter is the same as a different one). A cache node follows
+    // its origin's counter, read from its disk copy at start (stream B's
+    // `disk_cache::load` returns it).
+    let mut registration = match &config.registration {
+        Some(cfg) if cfg.origin.is_some() => {
+            registration::Role::Cache(registration::Follower::new(0))
+        }
+        Some(_) => registration::Role::Source(registration::Source::new(0)),
+        None => registration::Role::Source(registration::Source::new(0)),
+    };
+
+    // A cache node's control-channel target, resolved once at start.
+    let control_origin = match config
+        .registration
+        .as_ref()
+        .and_then(|r| r.origin.as_deref())
+    {
+        Some(origin) => {
+            let Some((host, port)) = origin.rsplit_once(':') else {
                 eprintln!(
-                    "config error: [genid] needs the unit's StateDirectory= ({})",
-                    m6_core::platform::STATE_DIR_UNSET
+                    "config error: [registration].origin = \"{origin}\" must be \"host:port\""
                 );
                 return 2;
             };
-            let path = directory.join("genid");
-            match genid::read_state(&path) {
-                Ok(id) => genid::Role::Source(genid::Genid::new(id, Some(path))),
+            let port: u16 = match port.parse() {
+                Ok(p) => p,
+                Err(_) => {
+                    eprintln!(
+                        "config error: [registration].origin = \"{origin}\" has a non-numeric port"
+                    );
+                    return 2;
+                }
+            };
+            match m6_core::net::resolve(host, port) {
+                Ok(addr) => Some(addr),
                 Err(e) => {
-                    eprintln!("config error: [genid] state file {}: {e}", path.display());
+                    eprintln!("config error: [registration].origin {origin}: {e}");
                     return 2;
                 }
             }
         }
+        None => None,
+    };
+
+    // The origin's control-channel listener, bound before the loop. Configured
+    // and failed is fatal, like every other listener.
+    let control_listener = match config.server.registration_bind.as_deref() {
+        Some(bind) => {
+            let addr = m6_http_lib::http11::resolve_bind(bind).map_err(|e| {
+                anyhow::anyhow!("config error: [server].registration_bind {bind}: {e}")
+            });
+            match addr.and_then(|a| m6_core::server::bind_tcp_reuseaddr(a).map_err(|e| e.into())) {
+                Ok(listener) => {
+                    listener.set_nonblocking(true).ok();
+                    info!(bind = %bind, "cache control listener started");
+                    Some(listener)
+                }
+                Err(e) => {
+                    error!(bind = %bind, error = %e, "cache control listener bind failed");
+                    return 1;
+                }
+            }
+        }
+        None => None,
     };
 
     // Install security response headers before anything can serve a response.
@@ -8353,28 +8040,6 @@ fn run(args: Vec<String>) -> i32 {
             return 2;
         }
     }
-
-    // A cache node's heartbeat: the backend it asks, and the request bytes it
-    // copies into a slot, both fixed at start. `config::load` already refused
-    // an upstream that names no URL backend, so the index is always here.
-    let heartbeat_backend = config
-        .genid
-        .as_ref()
-        .and_then(|genid| genid.upstream.as_deref())
-        .and_then(|name| pool_manager.find_url(name));
-    let heartbeat_token = config
-        .genid
-        .as_ref()
-        .and_then(|genid| genid.token.as_ref())
-        .map(|token| token.expose().as_str());
-    let (heartbeat_request, heartbeat_h2) = match (heartbeat_backend, heartbeat_token) {
-        (Some(idx), Some(token)) => {
-            let mut buf = Vec::with_capacity(256);
-            encode_heartbeat_request(pool_manager.url_backend(idx).host.as_str(), token, &mut buf);
-            (buf, Some(heartbeat_h2_request(token)))
-        }
-        _ => (Vec::new(), None),
-    };
 
     // Compute error mode
     let error_mode = ErrorMode::from_config(&config.errors);
@@ -8652,6 +8317,13 @@ fn run(args: Vec<String>) -> i32 {
             },
             _ => (None, 0, 0, disk_cache::LoadState::None),
         };
+    // A cache node's saved counter is the one its disk copy carries, so the
+    // first REGISTER presents it and the origin's COUNTER answer reconciles.
+    if let Some(loaded) = pending_disk.as_ref() {
+        if let registration::Role::Cache(f) = &mut registration {
+            f.set_counter(loaded.id);
+        }
+    }
     // Read before the config moves into the state, because the stats tick is
     // built from it and the line is written for the life of the process.
     let stats_interval_s = config.stats.interval_s;
@@ -8702,10 +8374,11 @@ fn run(args: Vec<String>) -> i32 {
         via,
         alt_svc_line,
         describedby_line,
-        genid,
-        heartbeat_backend,
-        heartbeat_request,
-        heartbeat_h2_request: heartbeat_h2,
+        registration,
+        control_listener,
+        controls: Slots::new(initial_connections, ceiling, ControlConn::empty),
+        cache_control: None,
+        control_origin,
     };
 
     if state.config.server.warm_on_start {
@@ -8827,7 +8500,7 @@ mod www_redirect_tests {
 
     fn cfg(domain: &str, redirect_www: bool) -> Config {
         Config {
-            genid: None,
+            registration: None,
             cache_dir: None,
             limits: Default::default(),
             stats: StatsConfig::default(),
@@ -8848,6 +8521,7 @@ mod www_redirect_tests {
                 process_index: None,
                 status_bind: None,
                 h2c_bind: None,
+                registration_bind: None,
                 internal_binds: Vec::new(),
                 internal_peers: Vec::new(),
                 redirect_bind: None,

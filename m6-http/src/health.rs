@@ -15,7 +15,7 @@
 use std::net::IpAddr;
 
 use crate::cache::Cache;
-use crate::config::GenidConfig;
+use crate::config::RegistrationConfig;
 use crate::disk_cache::DiskWriter;
 use crate::stats::Iface;
 
@@ -23,8 +23,9 @@ pub use m6_core::monitoring::{not_found, HealthReport, PerfReport, PerfSubject, 
 
 /// Backend name tagged onto a `/health` response.
 pub const HEALTH_BACKEND: &str = "health";
-/// Backend name tagged onto a `/genid` response, for stats and analytics.
-pub const GENID_BACKEND: &str = "genid";
+/// Backend name tagged onto a `PURGE` or `/m6/status` response, for stats and
+/// analytics.
+pub const CONTROL_BACKEND: &str = "control";
 
 /// Whether a completed response came from the health endpoint.
 ///
@@ -82,19 +83,16 @@ pub fn peer_iface(peer: IpAddr) -> Iface {
 /// Whether this node's origin is failing, which is what a cache node's
 /// `degraded` answer reports.
 ///
-/// The flag is the follower's own `down` bit. `Follower::answered` sets it
-/// where a heartbeat's failure is already observed and clears it on the next
-/// heartbeat answer, and `Follower::failed` sets it where a forwarded request's
-/// failure is already observed. A successful client request clears nothing: the
-/// heartbeat observes the recovery, and it is due immediately after a failure.
-/// `/health` reads the flag and does nothing else, so the cost is one branch,
-/// with no timer, no probe, no clock and no round trip.
+/// The flag is the follower's own `up` bit, set by the control connection's
+/// lifecycle in `main.rs`: true when the connection is open, false when it
+/// dropped and has not reconnected. `/health` reads the flag and does nothing
+/// else, so the cost is one branch, with no timer, no probe and no round trip.
 ///
 /// A second dependency is one more term at the call site in `main.rs`: the auth
 /// checker's flag is added where its `/check` call fails and ORed into the
 /// same `degraded` bit.
-pub fn origin_down(role: &crate::genid::Role) -> bool {
-    role.cache().is_some_and(crate::genid::Follower::down)
+pub fn origin_down(role: &crate::registration::Role) -> bool {
+    role.cache().is_some_and(|f| !f.up())
 }
 
 /// The `/health` answer: `ok` while every dependency answers, `degraded` while
@@ -116,44 +114,36 @@ pub fn health_answer(degraded: bool, node: &str) -> (u16, HealthReport) {
 #[cfg(test)]
 mod health_state_tests {
     use super::*;
-    use crate::genid::{Follower, Genid, Role};
-    use std::time::{Duration, Instant};
-
-    /// A follower that has answered once, then met `result` on the next
-    /// heartbeat.
-    fn cache_after(result: Result<(u64, Duration), &'static str>, at: Instant) -> Role {
-        let mut f = Follower::new(Duration::from_secs(10), at);
-        f.answered(Ok((7, Duration::ZERO)), at);
-        f.answered(result, at);
-        Role::Cache(f)
-    }
+    use crate::registration::{Follower, Role, Source};
 
     /// A node with no origin is known to be one from config, so it has no
     /// dependency to lose and answers `ok` while its process runs.
     #[test]
     fn a_source_has_no_origin_flag() {
-        let role = Role::Source(Genid::new(0, None));
+        let role = Role::Source(Source::new(0));
         assert!(!origin_down(&role));
         let (code, report) = health_answer(origin_down(&role), "origin");
         assert_eq!(code, 200);
         assert_eq!(report.status, "ok");
     }
 
-    /// A cache whose origin has not failed answers `ok`.
+    /// A cache whose control connection is up answers `ok`.
     #[test]
     fn a_cache_whose_origin_answers_is_ok() {
-        let role = cache_after(Ok((7, Duration::ZERO)), m6_core::platform::now());
+        let mut f = Follower::new(7);
+        f.set_up(true);
+        let role = Role::Cache(f);
         assert!(!origin_down(&role));
         let (code, report) = health_answer(origin_down(&role), "edge-a");
         assert_eq!(code, 200);
         assert_eq!(report.status, "ok");
     }
 
-    /// A cache that has observed its origin fail answers 503 `degraded`, and
+    /// A cache whose control connection dropped answers 503 `degraded`, and
     /// the public body names the node and nothing a stranger can aim at.
     #[test]
     fn a_cache_whose_origin_fails_is_degraded_and_names_nothing() {
-        let role = cache_after(Err("connect failed"), m6_core::platform::now());
+        let role = Role::Cache(Follower::new(7));
         assert!(origin_down(&role));
         let (code, report) = health_answer(origin_down(&role), "edge-a");
         assert_eq!(code, 503);
@@ -163,25 +153,6 @@ mod health_state_tests {
         assert_eq!(
             String::from_utf8(body).unwrap(),
             r#"{"status":"degraded","node":"edge-a"}"#
-        );
-    }
-
-    /// The answer reads a flag and not a clock: a success an hour old with no
-    /// observed failure is still `ok`, so `/health` needs no staleness window
-    /// and no probe.
-    #[test]
-    fn an_old_answer_is_not_a_failure() {
-        let t0 = m6_core::platform::now();
-        let role = cache_after(Ok((7, Duration::ZERO)), t0);
-        let later = t0 + Duration::from_secs(3600);
-        assert_eq!(
-            role.cache().unwrap().last_ok_s(later),
-            Some(3600),
-            "the success is an hour old"
-        );
-        assert!(
-            !origin_down(&role),
-            "no failure was observed, so the flag is clear"
         );
     }
 }
@@ -593,7 +564,7 @@ pub fn build_report(node: &str, window: &TrafficWindow) -> TrafficReport {
     report
 }
 
-/// The verdict of the genid gate for one request.
+/// The verdict of the control gate for one request.
 pub enum Gate {
     /// Serve the request.
     Open,
@@ -613,18 +584,24 @@ impl Gate {
     }
 }
 
-/// Decide whether a `GET` or `POST /genid` may be served to this request.
+/// Decide whether a `PURGE` or `GET /m6/status` may be served to this
+/// request.
 ///
 /// Two rules, in this order:
 ///
 /// 1. The peer is loopback, or the request arrived on an internal listener.
 ///    Anyone else gets the 404 an unknown path gives, before a token is read.
 ///    Neither claim set is the same 404: the endpoint does not exist.
-/// 2. The one token check decides with `read_require` for a `GET` or
-///    `write_require` for a `POST`. It is called once, here, and its refusal
-///    is the answer unchanged. Unconfigured is the same 404.
-pub fn genid_gate(g: &GenidConfig, client_ip: &str, from_internal: bool, write: bool) -> Gate {
-    if !genid_address_ok(client_ip, from_internal) {
+/// 2. The one token check decides with `read_require` for a read (`GET
+///    /m6/status`) or `write_require` for a write (`PURGE`). It is called
+///    once, here, and its refusal is the answer unchanged.
+pub fn control_gate(
+    g: &RegistrationConfig,
+    client_ip: &str,
+    from_internal: bool,
+    write: bool,
+) -> Gate {
+    if !control_address_ok(client_ip, from_internal) {
         return Gate::disabled();
     }
     let require = if write {
@@ -640,10 +617,9 @@ pub fn genid_gate(g: &GenidConfig, client_ip: &str, from_internal: bool, write: 
 
 /// The address rule alone: loopback, or an internal listener.
 ///
-/// A cache node forwards the caller's own token to the source, so it applies
-/// this rule and nothing else. A public peer still gets the 404 an unknown
-/// path gives, before the request is forwarded.
-pub fn genid_address_ok(client_ip: &str, from_internal: bool) -> bool {
+/// The same rule the old `/genid` endpoint used. A public peer gets the 404
+/// an unknown path gives, before the request is read or forwarded.
+pub fn control_address_ok(client_ip: &str, from_internal: bool) -> bool {
     let loopback = client_ip
         .parse::<IpAddr>()
         .is_ok_and(|ip| ip.to_canonical().is_loopback());
@@ -661,38 +637,36 @@ pub struct DiskPerf<'a> {
     pub state: crate::disk_cache::LoadState,
 }
 
-/// The metrics document, with this node's generation and disk blocks added.
+/// The metrics document, with this node's registration and disk blocks added.
 ///
 /// One definition for the metrics line, which carries exactly this document in
 /// `fields.perf`.
 ///
 /// The blocks sit beside the report this node already built, so `m6-core`
-/// keeps no notion of a generation or a disk cache: it hands over the
+/// keeps no notion of registration or a disk cache: it hands over the
 /// monitoring payload and m6-http adds the fields that are this binary's. A
-/// source reports the ID it owns and the peers that read it. A cache node
-/// reports the ID it follows, where it follows it from, and whether that
-/// upstream is answering.
+/// source reports the change counter and the caches registered with it. A
+/// cache node reports the counter it saved and whether its origin is up.
 ///
 /// It is `Serialize` and borrows what it reports, so the log line writes it
 /// field by field into its buffer with no JSON tree built first.
 ///
-/// `None` is a node with no `[genid]` table: the report alone, which is what
-/// such a node's metrics document has always carried.
+/// `None` is a node with no `[registration]` table: the report alone, which is
+/// what such a node's metrics document has always carried.
 pub fn perf_document<'a>(
     report: &'a PerfReport,
-    genid: Option<(
-        &'a crate::genid::Role,
-        &'a GenidConfig,
+    registration: Option<(
+        &'a crate::registration::Role,
+        &'a RegistrationConfig,
         Option<DiskPerf<'a>>,
     )>,
     cache: &'a Cache,
     disk: Option<&'a DiskWriter>,
 ) -> PerfDocument<'a> {
-    let now = m6_core::platform::now();
-    let (genid, disk_cache) = match genid {
+    let (registration, disk_cache) = match registration {
         None => (None, None),
         Some((role, config, disk)) => (
-            Some(genid_block(role, config, now)),
+            Some(registration_block(role, config)),
             disk.map(|disk| DiskCacheBlock {
                 dir_bytes: disk.writer.dir_bytes(),
                 queued: disk.queued,
@@ -709,7 +683,7 @@ pub fn perf_document<'a>(
     };
     PerfDocument {
         report,
-        genid,
+        registration,
         disk_cache,
         cache: CacheBlock {
             bytes: cache.bytes_held() as u64,
@@ -729,7 +703,7 @@ pub struct PerfDocument<'a> {
     #[serde(flatten)]
     report: &'a PerfReport,
     #[serde(skip_serializing_if = "Option::is_none")]
-    genid: Option<GenidBlock<'a>>,
+    registration: Option<RegistrationBlock<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     disk_cache: Option<DiskCacheBlock>,
     cache: CacheBlock,
@@ -763,32 +737,22 @@ struct DiskCacheBlock {
     state: &'static str,
 }
 
-/// The `genid` object, by role.
+/// The `registration` object, by role.
 #[derive(serde::Serialize)]
 #[serde(tag = "role", rename_all = "lowercase")]
-enum GenidBlock<'a> {
+enum RegistrationBlock<'a> {
     Source {
-        id: Decimal,
-        sequence_running: bool,
-        peers: Vec<GenidPeer>,
+        counter: Decimal,
+        registered: Vec<&'a str>,
     },
     Cache {
-        id: Option<Decimal>,
-        upstream: &'a str,
-        upstream_down: bool,
-        upstream_rtt_ms: Option<f64>,
-        last_ok_s: Option<u64>,
+        counter: Decimal,
+        origin: &'a str,
+        origin_down: bool,
     },
 }
 
-/// One peer that read a source's ID.
-#[derive(serde::Serialize)]
-struct GenidPeer {
-    addr: IpAddr,
-    last_get_s: u64,
-}
-
-/// A generation ID, written as a decimal string, as it always has been.
+/// A change counter, written as a decimal string, as the generation ID was.
 struct Decimal(u64);
 
 impl serde::Serialize for Decimal {
@@ -797,27 +761,19 @@ impl serde::Serialize for Decimal {
     }
 }
 
-fn genid_block<'a>(
-    role: &crate::genid::Role,
-    config: &'a GenidConfig,
-    now: std::time::Instant,
-) -> GenidBlock<'a> {
+fn registration_block<'a>(
+    role: &'a crate::registration::Role,
+    config: &'a RegistrationConfig,
+) -> RegistrationBlock<'a> {
     match role {
-        crate::genid::Role::Source(g) => GenidBlock::Source {
-            id: Decimal(g.current()),
-            sequence_running: g.sequence_running(),
-            peers: g
-                .peers(now)
-                .into_iter()
-                .map(|(addr, last_get_s)| GenidPeer { addr, last_get_s })
-                .collect(),
+        crate::registration::Role::Source(s) => RegistrationBlock::Source {
+            counter: Decimal(s.counter()),
+            registered: s.registered().iter().map(|r| r.name.as_str()).collect(),
         },
-        crate::genid::Role::Cache(f) => GenidBlock::Cache {
-            id: f.current().map(Decimal),
-            upstream: config.upstream.as_deref().unwrap_or(""),
-            upstream_down: f.down(),
-            upstream_rtt_ms: f.rtt().map(|rtt| rtt.as_secs_f64() * 1000.0),
-            last_ok_s: f.last_ok_s(now),
+        crate::registration::Role::Cache(f) => RegistrationBlock::Cache {
+            counter: Decimal(f.counter()),
+            origin: config.origin.as_deref().unwrap_or(""),
+            origin_down: !f.up(),
         },
     }
 }
@@ -1137,14 +1093,14 @@ mod traffic_document_tests {
 }
 
 #[cfg(test)]
-mod genid_gate_tests {
+mod control_gate_tests {
     use super::*;
 
-    fn config() -> GenidConfig {
-        GenidConfig {
+    fn config() -> RegistrationConfig {
+        RegistrationConfig {
             read_require: Some("role:reader".to_string()),
             write_require: Some("role:writer".to_string()),
-            ..GenidConfig::default()
+            ..RegistrationConfig::default()
         }
     }
 
@@ -1154,11 +1110,11 @@ mod genid_gate_tests {
     fn an_external_peer_is_refused_before_any_check() {
         let g = config();
         for write in [false, true] {
-            let Gate::Refused(code, _, _) = genid_gate(&g, "192.0.2.10", false, write) else {
+            let Gate::Refused(code, _, _) = control_gate(&g, "192.0.2.10", false, write) else {
                 panic!("a public peer must be refused");
             };
             assert_eq!(code, 404);
-            let Gate::Refused(code, _, _) = genid_gate(&g, "::ffff:192.0.2.10", false, write)
+            let Gate::Refused(code, _, _) = control_gate(&g, "::ffff:192.0.2.10", false, write)
             else {
                 panic!("a canonical public peer must be refused");
             };
@@ -1169,25 +1125,25 @@ mod genid_gate_tests {
     #[test]
     fn a_loopback_peer_asks_for_the_methods_claim() {
         let g = config();
-        let Gate::Check(read) = genid_gate(&g, "127.0.0.1", false, false) else {
-            panic!("a loopback GET must ask for a check");
+        let Gate::Check(read) = control_gate(&g, "127.0.0.1", false, false) else {
+            panic!("a loopback read must ask for a check");
         };
         assert_eq!(read, "role:reader");
-        let Gate::Check(write) = genid_gate(&g, "127.0.0.1", false, true) else {
-            panic!("a loopback POST must ask for a check");
+        let Gate::Check(write) = control_gate(&g, "127.0.0.1", false, true) else {
+            panic!("a loopback write must ask for a check");
         };
         assert_eq!(write, "role:writer");
         // The internal listener is the other allowed path and asks the same.
         assert!(matches!(
-            genid_gate(&g, "203.0.113.7", true, false),
+            control_gate(&g, "203.0.113.7", true, false),
             Gate::Check(_)
         ));
     }
 
     #[test]
     fn no_claims_is_the_endpoint_not_existing() {
-        let none = GenidConfig::default();
-        let Gate::Refused(code, _, _) = genid_gate(&none, "127.0.0.1", false, false) else {
+        let none = RegistrationConfig::default();
+        let Gate::Refused(code, _, _) = control_gate(&none, "127.0.0.1", false, false) else {
             panic!("no claims must be refused");
         };
         assert_eq!(code, 404);

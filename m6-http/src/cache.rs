@@ -293,15 +293,10 @@ impl HeaderBuilder {
 
     /// Append a field. The name is as sent; readers compare case-insensitively.
     ///
-    /// `Set-Cookie` and `M6-Genid` are marked not-storable here, once, so the
-    /// cache's strip step is a filter rather than a scan for magic names.
+    /// `Set-Cookie` is marked not-storable here, once, so the cache's strip
+    /// step is a filter rather than a scan for magic names.
     pub fn push(&mut self, name: &str, value: &str) {
-        self.push_marked(
-            name,
-            value,
-            !(name.eq_ignore_ascii_case("set-cookie")
-                || name.eq_ignore_ascii_case(crate::genid::GENID_HEADER)),
-        );
+        self.push_marked(name, value, !name.eq_ignore_ascii_case("set-cookie"));
     }
 
     fn push_marked(&mut self, name: &str, value: &str, stored: bool) {
@@ -1621,6 +1616,23 @@ impl Cache {
         );
     }
 
+    /// Whether any entry for `path` is resident, across every query and
+    /// encoding variant. The same `path\x01` prefix `evict_path` uses, so a
+    /// purge can report residency before removing the entries.
+    pub fn path_resident(&self, path: &str) -> bool {
+        let Ok(map) = self.map.read() else {
+            return false;
+        };
+        let path_stripped = &path[..path.find('?').unwrap_or(path.len())];
+        let mut prefix = String::with_capacity(path_stripped.len() + 1);
+        prefix.push_str(path_stripped);
+        prefix.push('\x01');
+        map.keys().any(|k| {
+            let s: &str = (*k).borrow();
+            s.starts_with(prefix.as_str())
+        })
+    }
+
     /// Evict a specific path — every query and encoding variant of it.
     ///
     /// Keys are `path\x01query\x01encoding`, so the `path\x01` prefix matches
@@ -1995,19 +2007,11 @@ pub fn strip_set_cookie(headers: &[(String, String)]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Headers safe to store in a cache entry, with `Set-Cookie` and `M6-Genid`
-/// removed.
-///
-/// The entry carries its generation in `CachedResponse.genid`, and a hit
-/// writes it once. Keeping the upstream's copy as well would send the header
-/// twice on a cache node, where the upstream is another m6-http and stamps
-/// every reply.
+/// Headers safe to store in a cache entry, with `Set-Cookie` removed.
 pub fn strip_uncacheable(headers: &[(String, String)]) -> HeaderBlock {
     let mut b = HeaderBuilder::with_capacity(headers.len(), 0);
     for (k, v) in headers {
-        if k.eq_ignore_ascii_case("set-cookie")
-            || k.eq_ignore_ascii_case(crate::genid::GENID_HEADER)
-        {
+        if k.eq_ignore_ascii_case("set-cookie") {
             continue;
         }
         b.push(k, v);
@@ -2324,20 +2328,22 @@ mod tests {
         assert!(age >= std::time::Duration::ZERO);
     }
 
-    /// A cache node's upstream is another m6-http and stamps every reply, so
-    /// the stored copy must not carry the header: the entry's own `genid` is
-    /// the one the hit writer emits.
+    /// `Set-Cookie` is the one header a shared cache must never store. Every
+    /// other header is kept.
     #[test]
-    fn stored_headers_keep_neither_set_cookie_nor_the_generation() {
+    fn stored_headers_keep_everything_but_set_cookie() {
         let headers = vec![
             ("Content-Type".to_string(), "text/html".to_string()),
             ("Set-Cookie".to_string(), "_m6sid=abc".to_string()),
-            ("M6-Genid".to_string(), "7".to_string()),
+            ("Cache-Control".to_string(), "max-age=3600".to_string()),
         ];
         let stripped = strip_uncacheable(&headers);
         assert_eq!(
             stripped.to_pairs(),
-            vec![("Content-Type".to_string(), "text/html".to_string())]
+            vec![
+                ("Content-Type".to_string(), "text/html".to_string()),
+                ("Cache-Control".to_string(), "max-age=3600".to_string())
+            ]
         );
     }
 

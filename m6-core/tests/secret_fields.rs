@@ -199,16 +199,15 @@ fn every_credential_field_in_a_config_struct_is_a_secret() {
         plain.join("\n")
     );
 
-    // The two typed secrets the workspace has are found, so the walk reaches
+    // The typed secret the workspace still has is found, so the walk reaches
     // the crates and reads through `Option`.
-    for (owner, field) in [("GenidConfig", "token"), ("RelayConfig", "credentials")] {
-        assert!(
-            found
-                .iter()
-                .any(|f| f.owner == owner && f.field == field && f.kind == Kind::Secret),
-            "{owner}.{field} was not found as a Secret: {found:?}"
-        );
-    }
+    let (owner, field) = ("RelayConfig", "credentials");
+    assert!(
+        found
+            .iter()
+            .any(|f| f.owner == owner && f.field == field && f.kind == Kind::Secret),
+        "{owner}.{field} was not found as a Secret: {found:?}"
+    );
 }
 
 /// The rule fails a plain credential field, and passes each exempt kind.

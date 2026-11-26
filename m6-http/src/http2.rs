@@ -2631,7 +2631,7 @@ impl Http2Conn {
         status: u16,
         headers: &[(String, String)],
         body_len: usize,
-        genid: Option<u64>,
+        _genid: Option<u64>,
     ) {
         let mut scratch = std::mem::take(&mut self.hdr_scratch);
         scratch.clear();
@@ -2664,18 +2664,6 @@ impl Http2Conn {
             }
             let name = lower_part(&mut scratch, k.as_bytes());
             push_field(&mut plan, &mut n, name, FieldPart::Bytes(v.as_bytes()));
-        }
-        let mut genid_buf = itoa::Buffer::new();
-        if let Some(genid) = genid {
-            // Lower case: RFC 9113 8.2.1 allows no other spelling, and a client
-            // that enforces it rejects the whole header block. `GENID_HEADER_LOWER`
-            // is already lowercase, so `lower_part` borrows it with no copy.
-            push_field(
-                &mut plan,
-                &mut n,
-                lower_part(&mut scratch, crate::genid::GENID_HEADER_LOWER.as_bytes()),
-                FieldPart::Bytes(genid_buf.format(genid).as_bytes()),
-            );
         }
         // Applied at serialisation so every response carries them regardless
         // of which path produced it (cache hit, backend, error page). The
@@ -2826,13 +2814,6 @@ impl Http2Conn {
                 FieldPart::Bytes(cookie.as_bytes()),
             );
         }
-        let mut genid_buf = itoa::Buffer::new();
-        push_field(
-            &mut plan,
-            &mut n,
-            lower_part(&mut scratch, crate::genid::GENID_HEADER.as_bytes()),
-            FieldPart::Bytes(genid_buf.format(entry.genid).as_bytes()),
-        );
         let security = crate::security::read();
         if let Some(ref guard) = security {
             for (k, v) in guard.absent_from(&entry.headers) {
@@ -5516,8 +5497,7 @@ mod header_encoding_tests {
         assert_eq!(value(&fields, "vary"), Some("Cookie, Accept-Encoding"));
         assert_eq!(value(&fields, "alt-svc"), Some("h3=\":8443\"; ma=86400"));
         assert_eq!(value(&fields, "set-cookie"), Some("sid=abc"));
-        assert_eq!(value(&fields, "m6-genid"), Some("7"));
-        for once in ["content-length", "age", "vary", "alt-svc", "m6-genid"] {
+        for once in ["content-length", "age", "vary", "alt-svc"] {
             assert_eq!(count(&fields, once), 1, "{once} appears more than once");
         }
         assert_eq!(count(&fields, "connection"), 0);

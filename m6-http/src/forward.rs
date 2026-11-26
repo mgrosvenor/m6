@@ -823,11 +823,12 @@ pub enum PendingKind {
 /// Which gate a `PendingKind::Auth` request is waiting for.
 ///
 /// The completion re-enters the request path with the decision, and this says
-/// where that decision is consumed: a route's `require` or `/genid`.
+/// where that decision is consumed: a route's `require`, or the cache control
+/// endpoints (`PURGE` and `/m6/status`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AuthGate {
     Route,
-    Genid,
+    Control,
 }
 
 /// Which upstream a pending request was dispatched to, so the loop can store
@@ -842,10 +843,9 @@ pub enum UpstreamId {
     H2c { conn: Token, stream: u32 },
     /// An h2s pool stream, by the connection token and the outbound stream id.
     H2s { conn: Token, stream: u32 },
-    /// A `POST /genid` parked on the source's change sequence, which owns its
-    /// completion. Nothing is dispatched for it yet, and no upstream slot is
-    /// taken until the sequence starts.
-    Genid,
+    /// A `PURGE` parked on the source's purge fan-out, which owns its
+    /// completion. The context's request path is the purge target.
+    Purge,
 }
 
 /// Who is waiting for an upstream reply, so a completion can be written
@@ -869,15 +869,6 @@ pub enum Waiter {
     },
     /// A background fetch has no connection; the reply only fills the cache.
     Background,
-    /// A cache node's `GET /genid` heartbeat. The reply is the ID and a round
-    /// trip, never a client response, so it is intercepted before finalising.
-    Heartbeat,
-    /// One member's `POST /genid` during a change sequence, by the member's
-    /// index in the sequence. The source logs a failure against that member's
-    /// socket path and advances when the last one answers.
-    Genid {
-        member: u32,
-    },
 }
 
 /// One request the loop dispatched and parked, reported by a connection turn so
@@ -944,81 +935,6 @@ pub struct PendingUrlContext {
     /// `WWW-Authenticate` for a 401 or `Retry-After` for a 503. Empty for every
     /// ordinary dispatch.
     pub extra_headers: Vec<(String, String)>,
-    /// The source's site generation when this request was dispatched. A reply
-    /// carries it as `M6-Genid`, and it is stored only while it still equals
-    /// the current ID, so a cache cannot refill from a backend that is one
-    /// generation behind.
-    pub genid: u64,
-    /// This dispatch forwards the caller's `GET`, `HEAD` or `POST /genid` to a
-    /// cache node's upstream. A deadline is answered as gateway timeout, since
-    /// the source may still be completing the publish.
-    pub genid_forward: bool,
-}
-
-impl PendingUrlContext {
-    /// The context a `POST /genid` parks with. The change sequence completes
-    /// the waiter itself, so no field here is read: it exists because
-    /// `Pending` carries one context for every parked request.
-    pub fn for_genid() -> Box<PendingUrlContext> {
-        Box::new(PendingUrlContext {
-            req: HttpRequest {
-                method: "POST".to_string(),
-                path: m6_core::site::GENID_PATH.to_string(),
-                query: None,
-                version: "HTTP/1.1".to_string(),
-                headers: Vec::new(),
-                body: Vec::new(),
-            },
-            client_ip: String::new(),
-            enc: String::new(),
-            backend_name: "genid".to_string(),
-            kind: PendingKind::Socket,
-            route_path: None,
-            auth_require: None,
-            auth_gate: None,
-            from_internal: false,
-            route_cache: None,
-            cacheable: false,
-            is_prefetch: false,
-            start: m6_core::platform::now(),
-            error_status_override: None,
-            extra_headers: Vec::new(),
-            genid: 0,
-            genid_forward: false,
-        })
-    }
-
-    /// The context a cache node's heartbeat parks with. No field is read: the
-    /// reply is an ID and a round trip, and `Waiter::Heartbeat` is intercepted
-    /// before any response is finalised.
-    pub fn for_heartbeat() -> Box<PendingUrlContext> {
-        Box::new(PendingUrlContext {
-            req: HttpRequest {
-                method: "GET".to_string(),
-                path: m6_core::site::GENID_PATH.to_string(),
-                query: None,
-                version: "HTTP/1.1".to_string(),
-                headers: Vec::new(),
-                body: Vec::new(),
-            },
-            client_ip: String::new(),
-            enc: String::new(),
-            backend_name: "genid".to_string(),
-            kind: PendingKind::Url,
-            route_path: None,
-            auth_require: None,
-            auth_gate: None,
-            from_internal: false,
-            route_cache: None,
-            cacheable: false,
-            is_prefetch: true,
-            start: m6_core::platform::now(),
-            error_status_override: None,
-            extra_headers: Vec::new(),
-            genid: 0,
-            genid_forward: false,
-        })
-    }
 }
 
 /// Build a simple HTTP response buffer (kept for tests).
