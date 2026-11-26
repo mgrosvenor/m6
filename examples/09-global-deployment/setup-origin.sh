@@ -51,17 +51,17 @@ chmod 640 /etc/m6/m6-auth.conf
 sed -i "s/example.com/$DOMAIN/g" /etc/m6/m6-auth.conf
 
 # The origin is the source of the site's generation ID. A publish is one
-# `POST /genid` to it, with a token that has the genid-write role, and each cache
-# node follows the ID with a token that has the genid-read role. Each cache node
+# `POST /genid` to it, with a token that has the purge-write role, and each cache
+# node follows the ID with a token that has the purge-read role. Each cache node
 # gets its own reader, so one node's token can be revoked alone. Once the auth
 # database exists (run the unit, then):
 #
 #   CONF=/etc/m6/m6-auth.conf
-#   m6-auth-cli $CONF user add publisher --role genid-write --password "$(openssl rand -hex 16)"
+#   m6-auth-cli $CONF user add publisher --role purge-write --password "$(openssl rand -hex 16)"
 #   m6-auth-cli $CONF token create publisher --name publish --ttl-days 90 > /etc/m6/genid-write.token
 #   for node in edge-a edge-b edge-c edge-d edge-e; do
-#       m6-auth-cli $CONF user add "reader-$node" --role genid-read --password "$(openssl rand -hex 16)"
-#       m6-auth-cli $CONF token create "reader-$node" --name "read-$node" --ttl-days 90   # copy to /etc/m6/genid-read on $node only
+#       m6-auth-cli $CONF user add "reader-$node" --role purge-read --password "$(openssl rand -hex 16)"
+#       m6-auth-cli $CONF token create "reader-$node" --name "read-$node" --ttl-days 90   # copy to /etc/m6/purge-read on $node only
 #   done
 #   chown root:root /etc/m6/genid-write.token && chmod 600 /etc/m6/genid-write.token
 #
@@ -69,7 +69,7 @@ sed -i "s/example.com/$DOMAIN/g" /etc/m6/m6-auth.conf
 # 401 to it: the CMS can no longer publish and the cache node stops following.
 # To rotate one before that, mint a new token for the same user the same way,
 # replace its credential file (/etc/m6/genid-write.token here,
-# /etc/m6/genid-read on the cache node), restart the unit that loads it
+# /etc/m6/purge-read on the cache node), restart the unit that loads it
 # (render-cms, or m6-http-cache on the cache node), then revoke the old token
 # (`m6-auth-cli $CONF token ls <user>`, then `token revoke <id>`).
 

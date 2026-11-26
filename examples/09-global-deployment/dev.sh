@@ -33,13 +33,13 @@ if [ ! -f $M6_DEV_HOME/07-dev-to-production/auth.db ]; then
     exit 1
 fi
 
-# The origin's generation: the CMS publishes with a genid-write token, and each cache
-# node follows the origin with a genid-read token.
+# The origin's generation: the CMS publishes with a purge-write token, and each cache
+# node follows the origin with a purge-read token.
 STATE=$M6_DEV_HOME/09-global-deployment
 mkdir -p "$STATE/state"
-"$SITE09/../dev-token.sh" "$(m6_conf "$SITE07/configs/m6-auth.conf")" publisher genid-write "$STATE/genid-write.token"
+"$SITE09/../dev-token.sh" "$(m6_conf "$SITE07/configs/m6-auth.conf")" publisher purge-write "$STATE/genid-write.token"
 for edge in a b c d e; do
-    "$SITE09/../dev-token.sh" "$(m6_conf "$SITE07/configs/m6-auth.conf")" "reader-edge-$edge" genid-read "$STATE/genid-read-edge-$edge.token"
+    "$SITE09/../dev-token.sh" "$(m6_conf "$SITE07/configs/m6-auth.conf")" "reader-edge-$edge" purge-read "$STATE/purge-read-edge-$edge.token"
 done
 # 07's renderer config publishes to port 8443. Here the origin's TLS port is 9001.
 sed -e 's#https://localhost:8443/genid#https://localhost:9001/genid#' \

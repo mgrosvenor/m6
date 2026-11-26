@@ -4,8 +4,8 @@
 # Writes a token for <user>, who holds <role>, to <token-file>. m6-http's
 # `/genid` endpoint is gated by roles (`[genid] write_require` and
 # `read_require` in the system config), so the token is what lets a renderer
-# publish (`genid-write`) or a cache node follow the site's generation
-# (`genid-read`). Needs the development keys (dev-keys.sh) and an auth
+# publish (`purge-write`) or a cache node follow the site's generation
+# (`purge-read`). Needs the development keys (dev-keys.sh) and an auth
 # database. Writes a token when none exists or the file is over 25 days old; the
 # token lives 30 days (--ttl-days), and an older one stays valid until then.
 set -euo pipefail

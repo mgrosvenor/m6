@@ -29,12 +29,12 @@ CONF_SRC="configs/cache-${NODE}.toml"
 install -m 640 -o root -g m6 "$CONF_SRC" "/etc/m6/cache.toml"
 sed -i "s/example.com/$DOMAIN/g" /etc/m6/cache.toml
 
-# The token this node follows the origin's site generation with. It has the genid-read
+# The token this node follows the origin's site generation with. It has the purge-read
 # role, belongs to this node alone (user reader-$NODE) and is minted on the origin with
 # --ttl-days 90 (see setup-origin.sh, which also says how to rotate it), then copied
 # here. The unit delivers it to m6-http with LoadCredential.
-if [ ! -s /etc/m6/genid-read ]; then
-    echo "NOTE: put the genid-read token minted for reader-$NODE in /etc/m6/genid-read (mode 600) before starting m6-http-cache."
+if [ ! -s /etc/m6/purge-read ]; then
+    echo "NOTE: put the purge-read token minted for reader-$NODE in /etc/m6/purge-read (mode 600) before starting m6-http-cache."
 fi
 
 # Node config pointer for systemd unit

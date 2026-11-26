@@ -571,7 +571,7 @@ impl ServerStack {
                 "add",
                 "publisher",
                 "--role",
-                "genid-write",
+                "purge-write",
                 "--password",
                 "publisher-pw",
             ],
@@ -599,7 +599,7 @@ impl ServerStack {
             format!(
                 "[server]\nbind     = \"{tls_addr}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\nlock_memory = false\n\n\
                  [auth]\nbackend = \"m6-auth-check\"\n\n\
-                 [genid]\nread_require  = \"role:genid-read\"\nwrite_require = \"role:genid-write\"\n\n\
+                 [genid]\nread_require  = \"role:purge-read\"\nwrite_require = \"role:purge-write\"\n\n\
                  [node]\nname = \"test\"\n",
                 tls_cert.display(),
                 tls_key.display(),

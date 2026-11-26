@@ -6,7 +6,7 @@
 # internal_binds: the h2c listener is the backbone, so forwarded client addresses are trusted on it
 # internal_peers: the cache nodes' backbone addresses. Any other peer is refused
 # TLS files come from the unit's LoadCredential lines. The origin is the source of the
-# site's generation ID, which it writes under the unit's StateDirectory.
+# change counter, and its control listener carries the registration channel.
 
 [server]
 bind     = "0.0.0.0:443"
@@ -15,13 +15,14 @@ tls_key  = "/run/credentials/m6-http-origin.service/tls-key.pem"
 h2c_bind = "10.0.0.1:80"
 internal_binds = ["10.0.0.1:80"]
 internal_peers = ["10.0.0.2", "10.0.0.3", "10.0.0.4", "10.0.0.5", "10.0.0.6"]
+registration_bind = "10.0.0.1:81"
 
 [auth]
 backend = "m6-auth-check"
 
-[genid]
-read_require  = "role:genid-read"
-write_require = "role:genid-write"
+[registration]
+read_require  = "role:purge-read"
+write_require = "role:purge-write"
 
 [node]
 name = "origin"

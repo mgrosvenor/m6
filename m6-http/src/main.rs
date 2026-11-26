@@ -2413,7 +2413,7 @@ fn drive_control(token: Token, slot: usize, cx: &mut CompletionCtx<'_>) -> bool 
                 registration::CacheLine::Register { name, counter: _ } => {
                     let reply = match cx.state.registration.source_mut() {
                         Some(src) => {
-                            src.register(name.to_string(), token);
+                            src.register(name.to_string(), Token(slot));
                             let reply = registration::counter_line(src.counter());
                             Some(reply)
                         }
@@ -2428,7 +2428,7 @@ fn drive_control(token: Token, slot: usize, cx: &mut CompletionCtx<'_>) -> bool 
                         .state
                         .registration
                         .source_mut()
-                        .is_some_and(|s| s.resident(token, resident));
+                        .is_some_and(|s| s.resident(Token(slot), resident));
                     if done {
                         finish_fanout(cx);
                     }
@@ -2466,7 +2466,7 @@ fn drive_control(token: Token, slot: usize, cx: &mut CompletionCtx<'_>) -> bool 
         .state
         .registration
         .source_mut()
-        .and_then(|s| s.unregister(token))
+        .and_then(|s| s.unregister(Token(slot)))
     {
         info!(cache = %name, "control: cache disconnected");
     }

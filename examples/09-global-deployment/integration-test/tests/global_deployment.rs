@@ -363,18 +363,42 @@ fn get(addr: &str, path: &str, tls: Arc<rustls::ClientConfig>) -> Response {
     https_get(addr, path, &[], tls).unwrap_or_else(|e| panic!("GET {path}: {e}"))
 }
 
-/// `POST /genid` on the origin with the publisher's token: the one request that
-/// advances the site's generation.
-fn publish_genid(addr: &str, token: &str, tls: Arc<rustls::ClientConfig>) -> Response {
+/// `PURGE` a path on the origin with the publisher's token: the one request
+/// that evicts the path from the origin and every registered cache.
+fn purge(addr: &str, path: &str, token: &str, tls: Arc<rustls::ClientConfig>) -> Response {
     let bearer = format!("Bearer {token}");
     https_request(
-        "POST",
+        "PURGE",
         addr,
-        "/genid",
+        path,
         &[("Authorization", &bearer), ("Content-Length", "0")],
         tls,
     )
-    .unwrap_or_else(|e| panic!("POST /genid: {e}"))
+    .unwrap_or_else(|e| panic!("PURGE {path}: {e}"))
+}
+
+/// `POST /genid` on a backend's own socket: its reload signal, which re-reads
+/// the site's files. m6-core reserves this path for exactly that.
+fn reload_backend(sock: &std::path::Path) {
+    use std::os::unix::net::UnixStream as StdUnixStream;
+    let mut stream = StdUnixStream::connect(sock).expect("connect to the backend socket");
+    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    stream
+        .write_all(b"POST /genid HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .expect("send the reload request");
+    let mut raw = Vec::new();
+    let _ = stream.read_to_end(&mut raw);
+    let text = String::from_utf8_lossy(&raw);
+    let status = text
+        .split("\r\n")
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    assert!(
+        (200..300).contains(&status),
+        "backend reload answered {status}, want 2xx"
+    );
 }
 
 // ── wait helpers ──────────────────────────────────────────────────────────────
@@ -500,7 +524,8 @@ struct GlobalStack {
     origin_h2c: String,       // H2C backbone (plain TCP)
     cache_addrs: Vec<String>, // [edge-a, edge-b, edge-c, edge-d, edge-e]
     site_dir: PathBuf,        // the copy of 07's site the origin serves
-    write_token: String,      // a token with the genid-write role
+    html_sock: PathBuf,       // the m6-html backend's socket, for its reload
+    write_token: String,      // a token with the purge-write role
     _processes: Children,
     _temp_dirs: Vec<tempfile::TempDir>,
 }
@@ -521,6 +546,7 @@ impl GlobalStack {
         let pid = std::process::id() as u16 % 5000;
         let h2c_port = 30000 + pid;
         let tls_port = 30100 + pid;
+        let control_port = 30300 + pid;
         // Cache nodes: 5 ports starting from 30200
         let cache_ports: Vec<u16> = (0..5).map(|i| 30200 + pid + i).collect();
 
@@ -555,7 +581,7 @@ impl GlobalStack {
             }
             std::fs::write(&path, text).expect("write a rewritten config");
         };
-        let (write_token, read_token) = (w.join("genid-write.token"), w.join("genid-read.token"));
+        let write_token = w.join("genid-write.token");
         rewrite(
             "configs/m6-auth.conf",
             &[
@@ -582,8 +608,8 @@ impl GlobalStack {
                 ("@M6_DEV_HOME@/dev/ca.pem", cert_path.display().to_string()),
             ],
         );
-        // The auth database: an editor to log in with, a publisher for the CMS and a
-        // reader for the cache nodes.
+        // The auth database: an editor to log in with, and a publisher whose
+        // token carries the write claim for PURGE.
         let auth_conf = site07.join("configs/m6-auth.conf");
         auth_cli(
             &m6_cli,
@@ -596,30 +622,25 @@ impl GlobalStack {
             &auth_conf,
             &["group", "member", "add", "editors", "admin"],
         );
-        for (user, role, file) in [
-            ("publisher", "genid-write", &write_token),
-            ("reader", "genid-read", &read_token),
-        ] {
-            auth_cli(
-                &m6_cli,
-                &auth_conf,
-                &[
-                    "user",
-                    "add",
-                    user,
-                    "--role",
-                    role,
-                    "--password",
-                    "pw-for-tests",
-                ],
-            );
-            let token = auth_cli(
-                &m6_cli,
-                &auth_conf,
-                &["token", "create", user, "--name", user],
-            );
-            std::fs::write(file, token).ok()?;
-        }
+        auth_cli(
+            &m6_cli,
+            &auth_conf,
+            &[
+                "user",
+                "add",
+                "publisher",
+                "--role",
+                "purge-write",
+                "--password",
+                "pw-for-tests",
+            ],
+        );
+        let token = auth_cli(
+            &m6_cli,
+            &auth_conf,
+            &["token", "create", "publisher", "--name", "publisher"],
+        );
+        std::fs::write(&write_token, token).ok()?;
         let logs = w.join("logs");
         std::fs::create_dir_all(&logs).ok()?;
         let state = w.join("state");
@@ -671,7 +692,7 @@ impl GlobalStack {
         // at its default, and m6-http's own suite covers that.
         let origin_sys_toml = origin_sock_dir.path().join("system.toml");
         std::fs::write(&origin_sys_toml, format!(
-            "[server]\nbind     = \"{origin_tls_addr}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\nh2c_bind = \"{origin_h2c_addr}\"\ninternal_binds = [\"{origin_h2c_addr}\"]\ninternal_peers = [\"127.0.0.1\"]\nlock_memory = false\n\n[auth]\nbackend = \"m6-auth-check\"\n\n[genid]\nread_require  = \"role:genid-read\"\nwrite_require = \"role:genid-write\"\n\n[node]\nname = \"origin\"\n",
+            "[server]\nbind     = \"{origin_tls_addr}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\nh2c_bind = \"{origin_h2c_addr}\"\ninternal_binds = [\"{origin_h2c_addr}\"]\ninternal_peers = [\"127.0.0.1\"]\nregistration_bind = \"127.0.0.1:{control_port}\"\nlock_memory = false\n\n[auth]\nbackend = \"m6-auth-check\"\n\n[registration]\nread_require  = \"role:purge-read\"\nwrite_require = \"role:purge-write\"\n\n[node]\nname = \"origin\"\n",
             cert_path.display(), key_path.display(),
         )).ok()?;
 
@@ -784,8 +805,8 @@ impl GlobalStack {
         for (i, &port) in cache_ports.iter().enumerate() {
             let sys = cache_sock_dir.path().join(format!("cache-{i}.toml"));
             std::fs::write(&sys, format!(
-                "# Cache node: {}\n[server]\nbind     = \"127.0.0.1:{port}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\nlock_memory = false\n\n[node]\nname = \"cache-{i}\"\n\n[genid]\nupstream       = \"origin\"\ntoken_file     = \"{}\"\nheartbeat_secs = 2\n",
-                node_names[i], cert_path.display(), key_path.display(), read_token.display(),
+                "# Cache node: {}\n[server]\nbind     = \"127.0.0.1:{port}\"\ntls_cert = \"{}\"\ntls_key  = \"{}\"\nlock_memory = false\n\n[node]\nname = \"cache-{i}\"\n\n[registration]\norigin = \"127.0.0.1:{control_port}\"\n",
+                node_names[i], cert_path.display(), key_path.display(),
             )).ok()?;
 
             processes.push(
@@ -817,6 +838,7 @@ impl GlobalStack {
             origin_h2c: origin_h2c_addr,
             cache_addrs,
             site_dir: site07,
+            html_sock,
             write_token: std::fs::read_to_string(&write_token)
                 .ok()?
                 .trim()
@@ -1013,16 +1035,16 @@ fn global_deployment_end_to_end() {
         );
     }
 
-    // ── §7 A new generation reaches every cache node ──────────────────────
+    // ── §7 A purge reaches every cache node ──────────────────────────────
     //
-    // The cache nodes follow the origin's generation ([genid] upstream). A publish
-    // is one POST /genid on the origin: it reloads the origin's backends, flushes
-    // its cache and advances the generation, and each cache node then drops what it
-    // holds and serves the new content.
+    // A publish is: reload the backend that renders the changed page (POST /genid
+    // on its own socket, m6-core's reserved reload signal), then PURGE the path on
+    // the origin. The origin evicts it and fans the purge to every registered
+    // cache, so each node drops what it holds and refetches the new content.
 
-    eprintln!("\n── §7 A publish at the origin reaches every cache node ──");
+    eprintln!("\n── §7 A purge at the origin reaches every cache node ──");
 
-    let marker = format!("generation-marker-{}", std::process::id());
+    let marker = format!("purge-marker-{}", std::process::id());
     for (i, addr) in stack.cache_addrs.iter().enumerate() {
         let r = get(addr, "/about", Arc::clone(&tls));
         check_eq!(
@@ -1044,22 +1066,27 @@ fn global_deployment_end_to_end() {
     )
     .expect("write the changed about.json");
 
-    // A publish without the right token is refused.
-    let r = publish_genid(origin, "not-a-token", Arc::clone(&tls));
+    // The backend re-reads its files on its own reload signal.
+    reload_backend(&stack.html_sock);
+    eprintln!("  PASS  the m6-html backend reloaded");
+
+    // A purge without the right token is refused.
+    let r = purge(origin, "/about", "not-a-token", Arc::clone(&tls));
     assert!(
         [401u16, 403].contains(&r.status),
-        "FAIL  POST /genid with a bad token → {}, expected 401/403",
+        "FAIL  PURGE /about with a bad token → {}, expected 401/403",
         r.status
     );
-    eprintln!("  PASS  POST /genid with a bad token → {}", r.status);
+    eprintln!("  PASS  PURGE /about with a bad token → {}", r.status);
 
-    let r = publish_genid(origin, &stack.write_token, Arc::clone(&tls));
-    check_eq!("POST /genid with the publisher token → 200", r.status, 200);
+    let r = purge(origin, "/about", &stack.write_token, Arc::clone(&tls));
+    check_eq!("PURGE /about with the publisher token → 200", r.status, 200);
 
     let r = get(origin, "/about", Arc::clone(&tls));
     check_contains!("origin /about → the new content", r.body, &marker);
 
-    // The heartbeat is 2 seconds, so a cache node follows within a few.
+    // The purge fans out over the registration channel, so a cache node drops
+    // the path and refetches it from the origin.
     for (i, addr) in stack.cache_addrs.iter().enumerate() {
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut r = get(addr, "/about", Arc::clone(&tls));
@@ -1068,7 +1095,7 @@ fn global_deployment_end_to_end() {
             r = get(addr, "/about", Arc::clone(&tls));
         }
         check_contains!(
-            &format!("{} /about → follows the new generation", node_names[i]),
+            &format!("{} /about → follows the purge", node_names[i]),
             r.body,
             &marker
         );

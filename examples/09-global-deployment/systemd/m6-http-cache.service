@@ -13,8 +13,8 @@ ExecStart=/usr/local/bin/m6-http \
 
 LoadCredential=tls-cert.pem:/etc/letsencrypt/live/example.com/fullchain.pem
 LoadCredential=tls-key.pem:/etc/letsencrypt/live/example.com/privkey.pem
-# A token with the `genid-read` role: the node follows the origin's generation with it
-LoadCredential=genid-read:/etc/m6/genid-read
+# A token with the `purge-read` role: the node follows the origin's generation with it
+LoadCredential=purge-read:/etc/m6/purge-read
 
 Restart=on-failure
 RestartSec=2

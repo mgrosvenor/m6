@@ -22,7 +22,7 @@ fi
 
 # ── Publisher token ───────────────────────────────────────────────────────────
 # The renderer sends POST /genid with it (see [genid] in its config).
-"$SITE/../dev-token.sh" "$(m6_conf "$SITE/configs/m6-auth.conf")" publisher genid-write $M6_DEV_HOME/07-dev-to-production/genid-write.token
+"$SITE/../dev-token.sh" "$(m6_conf "$SITE/configs/m6-auth.conf")" publisher purge-write $M6_DEV_HOME/07-dev-to-production/genid-write.token
 
 # ── Generate posts.json from markdown ─────────────────────────────────────────
 m6-md "$SITE/content/posts/" --output "$SITE/data/posts.json"
