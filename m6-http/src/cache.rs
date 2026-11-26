@@ -969,8 +969,8 @@ use std::sync::{Arc, RwLock};
 
 /// The two counters a cache keeps in step with its map.
 ///
-/// They share one allocation so a generation swap allocates the map and this,
-/// and nothing else. The queued count is what lets an idle tick skip the scan.
+/// They share one allocation, and the queued count is what lets an idle tick
+/// skip the scan.
 struct Counters {
     /// Total footprint of everything in `map`, maintained on insert and evict.
     bytes: std::sync::atomic::AtomicUsize,
@@ -980,9 +980,7 @@ struct Counters {
     evictions: std::sync::atomic::AtomicUsize,
 }
 
-/// Cache backed by `Arc<RwLock<HashMap>>`: a clone is cheap, and
-/// [`Cache::swap_generation`] publishes a whole new generation with one
-/// assignment.
+/// Cache backed by `Arc<RwLock<HashMap>>`: a clone is cheap.
 #[derive(Clone)]
 pub struct Cache {
     map: Arc<RwLock<CacheMap>>,
@@ -1613,73 +1611,62 @@ impl Cache {
         );
     }
 
-    /// Whether any entry for `path` is resident, across every query and
-    /// encoding variant. The same `path\x01` prefix `evict_path` uses, so a
-    /// purge can report residency before removing the entries.
-    pub fn path_resident(&self, path: &str) -> bool {
-        let Ok(map) = self.map.read() else {
+    /// Evict a specific path — every query and encoding variant of it — and
+    /// return whether anything was removed.
+    ///
+    /// Keys are `path\x01query\x01encoding`, so the `path\x01` prefix matches
+    /// all variants of that path and nothing else. The one scan doubles as
+    /// the residency answer, so a purge needs no second pass.
+    pub fn evict_path(&self, path: &str) -> bool {
+        let Ok(mut map) = self.map.write() else {
             return false;
         };
         let path_stripped = &path[..path.find('?').unwrap_or(path.len())];
-        let mut prefix = String::with_capacity(path_stripped.len() + 1);
-        prefix.push_str(path_stripped);
-        prefix.push('\x01');
-        map.keys().any(|k| {
-            let s: &str = (*k).borrow();
-            s.starts_with(prefix.as_str())
-        })
-    }
-
-    /// Evict a specific path — every query and encoding variant of it.
-    ///
-    /// Keys are `path\x01query\x01encoding`, so the `path\x01` prefix matches
-    /// all variants of that path and nothing else.
-    pub fn evict_path(&self, path: &str) {
-        if let Ok(mut map) = self.map.write() {
-            let path_stripped = &path[..path.find('?').unwrap_or(path.len())];
-            // Collect keys whose inner str starts with `path_stripped\x01`.
-            let prefix = {
-                let mut p = String::with_capacity(path_stripped.len() + 1);
-                p.push_str(path_stripped);
-                p.push('\x01');
-                p
-            };
-            let keys: Vec<CacheKey> = map
-                .keys()
-                .filter(|k| {
-                    let s: &str = (*k).borrow();
-                    s.starts_with(prefix.as_str())
-                })
-                .cloned()
-                .collect();
-            for k in &keys {
+        // Collect keys whose inner str starts with `path_stripped\x01`.
+        let prefix = {
+            let mut p = String::with_capacity(path_stripped.len() + 1);
+            p.push_str(path_stripped);
+            p.push('\x01');
+            p
+        };
+        let keys: Vec<CacheKey> = map
+            .keys()
+            .filter(|k| {
                 let s: &str = (*k).borrow();
-                // Log the key's three parts for debugging.
-                let mut parts = s.split('\x01');
-                if let (Some(kpath), Some(query), Some(enc)) =
-                    (parts.next(), parts.next(), parts.next())
-                {
-                    m6_core::log::debug!(
-                        path = %kpath, query = %query, encoding = %enc,
-                        "cache: evicted"
-                    );
-                }
-                if let Some(e) = map.remove(k) {
-                    // Every removal path must return the bytes, or the counter
-                    // drifts up while the map shrinks and the cache evicts on
-                    // every insert forever. Deploys call this on every
-                    // invalidation, so the drift would be relentless.
+                s.starts_with(prefix.as_str())
+            })
+            .cloned()
+            .collect();
+        let mut removed_any = false;
+        for k in &keys {
+            let s: &str = (*k).borrow();
+            // Log the key's three parts for debugging.
+            let mut parts = s.split('\x01');
+            if let (Some(kpath), Some(query), Some(enc)) =
+                (parts.next(), parts.next(), parts.next())
+            {
+                m6_core::log::debug!(
+                    path = %kpath, query = %query, encoding = %enc,
+                    "cache: evicted"
+                );
+            }
+            if let Some(e) = map.remove(k) {
+                removed_any = true;
+                // Every removal path must return the bytes, or the counter
+                // drifts up while the map shrinks and the cache evicts on
+                // every insert forever. Deploys call this on every
+                // invalidation, so the drift would be relentless.
+                self.counters
+                    .bytes
+                    .fetch_sub(e.footprint, std::sync::atomic::Ordering::Relaxed);
+                if e.queued {
                     self.counters
-                        .bytes
-                        .fetch_sub(e.footprint, std::sync::atomic::Ordering::Relaxed);
-                    if e.queued {
-                        self.counters
-                            .queued
-                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    }
+                        .queued
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
+        removed_any
     }
 
     /// Evict all entries for a list of paths.
@@ -1700,35 +1687,6 @@ impl Cache {
                 .queued
                 .store(0, std::sync::atomic::Ordering::Relaxed);
         }
-    }
-
-    /// Replace the live cache with an empty one in one assignment.
-    ///
-    /// The rule for a full flush: no entry survives, and the cache refills on
-    /// demand. This method is that whole rule. It builds the replacement
-    /// beside the live cache and publishes it with
-    /// `std::mem::replace`, which is read-copy-update's answer in one process
-    /// and the same publish rule a `Site` reload uses.
-    ///
-    /// Atomicity follows from ownership. `&mut self` means the loop cannot be
-    /// reading the cache while the swap runs, and one assignment means it
-    /// sees either the old generation or the new one, never a map that is
-    /// partly emptied. A request that already took an entry holds the
-    /// `CachedResponse` clone the hit path makes, so it finishes on the
-    /// content it holds. A holder of the old `Cache` (a clone) keeps that
-    /// generation whole, and it is freed when the last holder drops.
-    ///
-    /// `max_bytes` carries over, so a swap cannot change the bound. The
-    /// held-serving flag starts clear: the swap happens when the upstream has
-    /// answered with a new ID, which is the moment held content stops being
-    /// served.
-    ///
-    /// The old cache is returned so a caller that must keep an in-flight
-    /// reader's generation can, and so the drop is visible at the call site.
-    #[must_use = "the old generation is dropped at once unless the caller keeps it"]
-    pub fn swap_generation(&mut self) -> Cache {
-        let fresh = Cache::with_max_bytes(self.max_bytes);
-        std::mem::replace(self, fresh)
     }
 
     /// Sum of the footprints actually in the map.
@@ -3860,148 +3818,6 @@ mod capacity_accounting_tests {
         assert!(
             !matches!(cache.lookup(k), Lookup::Miss),
             "cache unusable after cycles"
-        );
-    }
-}
-
-/// The generation swap: the rule, the atomic publish, and what an in-flight
-/// request keeps.
-#[cfg(test)]
-mod generation_swap_tests {
-    use super::*;
-
-    fn resp(body: &[u8]) -> CachedResponse {
-        CachedResponse {
-            status: 200,
-            headers: HeaderBlock::from_pairs(vec![(
-                "cache-control".to_string(),
-                "public, max-age=86400".to_string(),
-            )]),
-            body: bytes::Bytes::copy_from_slice(body),
-        }
-    }
-
-    /// The plan's rule is a full flush, so the new generation holds nothing
-    /// and its accounting starts at zero.
-    ///
-    /// Break: make `swap_generation` a no-op, and every entry is still there.
-    #[test]
-    fn a_generation_swap_keeps_no_entry() {
-        let mut cache = Cache::with_max_bytes(1024 * 1024);
-        for i in 0..8 {
-            cache.insert(
-                CacheKey::new(&format!("/p{i}"), None, "gzip"),
-                resp(b"the old generation"),
-            );
-        }
-        let held_before = cache.bytes_held();
-        assert!(held_before > 0);
-
-        let old = cache.swap_generation();
-
-        assert_eq!(cache.len(), 0, "the new generation holds no entry");
-        assert_eq!(cache.bytes_held(), 0, "the new generation starts at zero");
-        assert_eq!(cache.footprint_sum(), 0);
-        assert_eq!(old.len(), 8, "the previous generation is returned whole");
-        assert_eq!(
-            old.bytes_held(),
-            held_before,
-            "the previous generation keeps its own accounting"
-        );
-        for i in 0..8 {
-            let key = CacheKey::new(&format!("/p{i}"), None, "gzip");
-            assert!(
-                matches!(cache.lookup(&key), Lookup::Miss),
-                "entry {i} survived the swap"
-            );
-            assert!(
-                old.get(&key).is_some(),
-                "the returned generation lost entry {i}"
-            );
-        }
-    }
-
-    /// A request in flight holds the response clone its lookup took, so it
-    /// finishes on the generation it started with. A holder of the old
-    /// `Cache` keeps that generation whole until it drops.
-    ///
-    /// Break: implement the swap as `self.clear()`. The live cache is empty
-    /// either way, but the old generation is then emptied under its holders,
-    /// and the assertions on `in_flight` and `old` fail.
-    #[test]
-    fn a_request_holding_the_old_generation_finishes_on_it() {
-        let mut cache = Cache::with_max_bytes(1024 * 1024);
-        let key = CacheKey::new("/held", None, "gzip");
-        cache.insert(key.clone(), resp(b"the old generation"));
-
-        // What a request in flight holds: the response clone from its lookup,
-        // and a clone of the cache it began on.
-        let held = cache.get(&key).expect("the entry is fresh");
-        let in_flight = cache.clone();
-
-        let old = cache.swap_generation();
-
-        assert!(
-            matches!(cache.lookup(&key), Lookup::Miss),
-            "the live cache serves the new generation only"
-        );
-        assert_eq!(
-            &held.body[..],
-            b"the old generation",
-            "the held response keeps its body"
-        );
-        let still = in_flight
-            .get(&key)
-            .expect("an in-flight holder keeps the generation it began on");
-        assert_eq!(&still.body[..], b"the old generation");
-        assert_eq!(
-            old.get(&key)
-                .expect("the old generation holds the entry")
-                .body
-                .as_ref(),
-            b"the old generation"
-        );
-    }
-
-    /// The new generation keeps the old generation's bound, so a swap cannot
-    /// quietly raise a small cache to the default 128 MiB.
-    ///
-    /// Break: build the fresh cache with `Cache::new()`, and the 100 KB entry
-    /// stays in a 64 KB cache.
-    #[test]
-    fn a_swapped_cache_keeps_its_bound() {
-        let mut cache = Cache::with_max_bytes(64 * 1024);
-        cache.insert(CacheKey::new("/before", None, "gzip"), resp(b"x"));
-        let _old = cache.swap_generation();
-
-        cache.insert(
-            CacheKey::new("/big", None, "gzip"),
-            resp(&vec![0u8; 100 * 1024]),
-        );
-
-        assert!(
-            cache.bytes_held() <= 64 * 1024,
-            "the swapped cache ignored its bound: {} bytes held",
-            cache.bytes_held()
-        );
-        assert_eq!(cache.len(), 0, "the over-bound entry was evicted");
-    }
-
-    /// A swap is the moment held content stops being served, so the fresh
-    /// generation does not inherit the old one's serve-held policy.
-    ///
-    /// Break: copy `serve_held` into the fresh cache, and this fails.
-    #[test]
-    fn a_swapped_cache_does_not_serve_held() {
-        let mut cache = Cache::new();
-        cache.set_serve_held(true);
-        assert!(cache.serve_held());
-
-        let _old = cache.swap_generation();
-
-        assert!(
-            !cache.serve_held(),
-            "the new generation must not serve the old one's held content"
         );
     }
 }

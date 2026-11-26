@@ -82,6 +82,16 @@ pub fn heap_reserve(limits: &Limits) -> (usize, Option<String>) {
     m6_core::limits::heap_reserve(limits)
 }
 
+/// The byte bound the response cache is built with: the configured `start`,
+/// not the `max` ceiling.
+///
+/// A default config bounds the cache at 128 MiB, and a config may raise it up
+/// to the 4 GiB ceiling. Building the cache with `max` instead would make a
+/// default node grow to 4 GiB before its first eviction.
+pub fn cache_bound(limits: &Limits) -> usize {
+    limits.get(&CACHE_BYTES).start()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,5 +126,23 @@ mod tests {
         assert!(warning.contains("[limits.cache_bytes] start"), "{warning}");
         let (_, warning) = heap_reserve(&limits("[limits.heap_reserve]\nstart = \"256MiB\"\n"));
         assert!(warning.is_none());
+    }
+
+    /// The response cache is bounded by the configured `start`, not the
+    /// 4 GiB ceiling. A default config must bound the cache at 128 MiB, and a
+    /// raised `start` must be honoured, or a default node would run out of
+    /// memory before its first eviction.
+    #[test]
+    fn the_cache_bound_is_the_configured_start_not_the_ceiling() {
+        assert_eq!(cache_bound(&Limits::default()), 128 * 1024 * 1024);
+        assert_eq!(
+            Limits::default().get(&CACHE_BYTES).max(),
+            4 * 1024 * 1024 * 1024,
+            "the ceiling is 4 GiB, so a default must not build the cache from it"
+        );
+        assert_eq!(
+            cache_bound(&limits("[limits.cache_bytes]\nstart = \"512MiB\"\n")),
+            512 * 1024 * 1024
+        );
     }
 }
