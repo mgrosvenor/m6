@@ -200,6 +200,7 @@ Reverse proxy, cache, and router.
 **Benchmark results:**
 An end-to-end HTTP/2 cache hit measured 225.7 to 259.2 µs p50 on a 4 vCPU host over loopback, TLS and the client included, and a cache hit costs about 2.2 µs inside m6.
 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §5 gives every protocol's latency and throughput with the conditions, §8 the Criterion microbenchmarks, and [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) what each component costs.
+A cached redirect from an m6 edge is bound by one network round trip, and [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) §8 records the measured comparison against a hosted bulk-redirect service.
 
 ---
 
