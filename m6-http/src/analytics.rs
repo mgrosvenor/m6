@@ -388,11 +388,12 @@ pub fn record(
         Some(_) => consent_in.is_some_and(|v| is_current_consent(v, consent.version)),
     };
     let session = allowed.then(|| get_or_create_session(request_headers));
-    let (session_id, session_new) = match &session {
-        Some(s) => (s.id(), s.is_new()),
-        None => ("", false),
-    };
-    log_request(ev, session_id, session_new, consent_in, &features);
+    log_request(
+        ev,
+        session.as_ref().map(|s| (s.id(), s.is_new())),
+        consent_in,
+        &features,
+    );
     push_request(window, ev, features.user_agent);
     match session {
         Some(Session::New(id)) => Some(id),
@@ -502,8 +503,7 @@ pub fn finish_proxied_response(
         let features = extract_features(request_headers);
         log_request(
             ev,
-            &session_id,
-            false,
+            (!session_id.is_empty()).then(|| (session_id.as_str(), false)),
             consent_value(consent, request_headers),
             &features,
         );
@@ -517,13 +517,12 @@ pub fn finish_proxied_response(
 /// journals under systemd. See `m6_core::log`.
 fn log_request(
     ev: &Event<'_>,
-    session_id: &str,
-    session_new: bool,
+    session: Option<(&str, bool)>,
     consent: Option<&str>,
     features: &RequestFeatures<'_>,
 ) {
     m6_core::log::with_operational(|sink| {
-        write_request_line(sink, ev, session_id, session_new, consent, features);
+        write_request_line(sink, ev, session, consent, features);
     });
 }
 
@@ -531,25 +530,31 @@ fn log_request(
 ///
 /// Split out from [`log_request`] so the golden-meaning test can write the
 /// line into a file of its own without opening the process's Sink.
+///
+/// `session` is `Some((id, is_new))` when the request has a session, and
+/// `None` when it does not. In the `None` case the session fields are left
+/// off the line, the way an absent consent value is.
 fn write_request_line(
     sink: &mut Sink,
     ev: &Event<'_>,
-    session_id: &str,
-    session_new: bool,
+    session: Option<(&str, bool)>,
     consent: Option<&str>,
     features: &RequestFeatures<'_>,
 ) {
-    Line::begin(sink, Level::Info, "request")
+    let mut line = Line::begin(sink, Level::Info, "request")
         .kind(Type::Access)
         .str("node", ev.node)
         .str("path", ev.path)
         .opt_str("query", ev.query)
         .field("status", ev.status)
         .str("cache_state", ev.cache_state)
-        .str("client_ip", ev.client_ip)
-        .str("session_id", session_id)
-        .bool("session_new", session_new)
-        .opt_str("consent", consent)
+        .str("client_ip", ev.client_ip);
+    if let Some((session_id, session_new)) = session {
+        line = line
+            .str("session_id", session_id)
+            .bool("session_new", session_new);
+    }
+    line.opt_str("consent", consent)
         .opt_str("referer_host", features.referer_host)
         .opt_str("referer_path", features.referer_path)
         .opt_str("user_agent", features.user_agent)
@@ -1081,8 +1086,7 @@ mod tests {
             write_request_line(
                 &mut sink,
                 &ev,
-                "sess",
-                false,
+                Some(("sess", false)),
                 consent,
                 &RequestFeatures {
                     referer_host: None,
@@ -1131,8 +1135,7 @@ mod tests {
                 latency_ns: None,
                 location: None,
             },
-            "",
-            false,
+            None,
             None,
             &RequestFeatures {
                 referer_host: None,
@@ -1453,8 +1456,7 @@ mod tests {
                 latency_ns: Some(342_834),
                 location: None,
             },
-            "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
-            true,
+            Some(("0f1e2d3c4b5a69788796a5b4c3d2e1f0", true)),
             None,
             &RequestFeatures {
                 referer_host: None,
@@ -1515,8 +1517,7 @@ mod tests {
                 latency_ns: Some(1_200),
                 location: Some("https://example.com/about?ref=123"),
             },
-            "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
-            false,
+            Some(("0f1e2d3c4b5a69788796a5b4c3d2e1f0", false)),
             None,
             &RequestFeatures {
                 referer_host: None,
@@ -1550,8 +1551,7 @@ mod tests {
                 latency_ns: None,
                 location: None,
             },
-            "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
-            false,
+            Some(("0f1e2d3c4b5a69788796a5b4c3d2e1f0", false)),
             None,
             &RequestFeatures {
                 referer_host: None,

@@ -60,6 +60,8 @@ The consent behaviour is generic and driven by new `[analytics]` config, unset b
   With both set, m6-http sets `m6consent=unknown` (twelve months) on a response whose request carried no consent cookie, mints `_m6sid` only for a `true:<current version>` cookie, clears a carried `_m6sid` (`Max-Age=0`) on a decline, and mints nothing for `unknown` or an old version.
   The cookie is added per response and never stored in the cache.
 - **A `consent` field on the access line**, carrying the consent cookie's value as received, or nothing when the request carried none, so the record shows which policy version a visitor accepted.
+- **The access line omits the session fields when there is no session.**
+  With a consent cookie configured and the request not current consent, `session_id` and `session_new` are left off the line rather than written as an empty id and `false`, the way `consent` is left off when absent.
 
 ### Notes
 
