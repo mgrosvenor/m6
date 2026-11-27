@@ -6964,8 +6964,7 @@ fn finalize_url_response_inner(
         set_alt_svc(&mut headers_with_altsvc, quic_port);
 
         let latency_ns = ctx.start.elapsed().as_nanos() as u64;
-        let location = m6_core::headers::get(&headers_with_altsvc, "location")
-            .map(str::to_string);
+        let location = m6_core::headers::get(&headers_with_altsvc, "location").map(str::to_string);
         analytics::finish_proxied_response(
             analytics_on,
             &mut headers_with_altsvc,

@@ -249,7 +249,10 @@ fn a_redirect_logs_its_query_and_target_and_a_404_logs_no_location() {
     // The 404 has no Location on its line: the only location in the output is
     // the 302's.
     let location_lines = out.lines().filter(|l| l.contains("\"location\"")).count();
-    assert_eq!(location_lines, 1, "only the 302 line carries a location:\n{out}");
+    assert_eq!(
+        location_lines, 1,
+        "only the 302 line carries a location:\n{out}"
+    );
     assert!(out.contains("\"status\":404"), "{out}");
 }
 

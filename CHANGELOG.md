@@ -13,6 +13,7 @@ The heading is the version, and a number would break the pattern `tag.sh` and CI
 
 The released versions, newest first:
 
+- [1.18.0-rc.2, 2026-11-27](#1180-rc2-2026-11-27)
 - [1.18.0-rc.1, 2026-11-26](#1180-rc1-2026-11-26)
 - [1.17.0, 2026-11-24](#1170-2026-11-24)
 - [1.15.0, 2026-10-29](#1150-2026-10-29)
@@ -37,6 +38,22 @@ The released versions, newest first:
 - [1.1.0, 2026-09-15](#110-2026-09-15)
 - [1.0.0, 2026-09-14](#100-2026-09-14)
 - [0.2.0 and earlier, 2026-03-15 and before](#020-and-earlier-2026-03-15-and-before)
+
+## 1.18.0-rc.2, 2026-11-27
+
+**The access line records a redirect as it arrived and with where it went, and m6-redirect logs its own answers.**
+This is a release candidate, a develop build on staging and not a release.
+
+### Added
+
+- **The request's query and the redirect's target on the access line.**
+  A `request` access line now carries `query` (the raw query string, absent when there was none) and, on a redirect, `location` (the `Location` sent).
+  The edge writes this line on every request, HIT or MISS, so a cached `302` is still attributed where it was served.
+  [`docs/m6-http.md`](docs/m6-http.md) section 11 lists the fields.
+- **m6-redirect logging.**
+  The engine writes one access line per request it answers, with `host`, `path`, `query`, `status` and `location`, and one line per list replace with the rules count on success or the reason on failure.
+  A 404 carries no `location`.
+  [`docs/m6-redirect.md`](docs/m6-redirect.md) section 7 lists the fields.
 
 ## 1.18.0-rc.1, 2026-11-26
 

@@ -557,6 +557,11 @@ Table 7 lists the key each monitoring reader selects on.
 **Table 7: the key each monitoring reader selects on.**
 The two documents are found by `type` and the endpoint by its path.
 
+An access line of `message` `request` carries `node`, `path`, the request's `query` when it had one, `status`, `cache_state`, `client_ip`, `session_id`, `session_new`, `referer_host`, `referer_path`, `user_agent` and `latency_ns`.
+On a redirect it also carries `location`, the `Location` sent, so a click is recorded as it arrived and with where it went.
+A `message` `monitor` line carries `node`, `path`, `status`, `client_ip`, `user_agent` and `latency_ns`.
+
+
 The traffic line carries the last 60 minutes this process served, from a window it keeps in memory and reads no log file for.
 The window holds at most 32,768 events and is allocated at start.
 It starts empty after a restart, and `window_minutes` says how much of the hour it holds: the whole minutes since start, or less when the ring has wrapped.
