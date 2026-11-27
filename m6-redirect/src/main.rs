@@ -56,10 +56,12 @@ const RULES_PATH: &str = "/m6-redirect/rules";
 #[global_allocator]
 static ALLOC: m6_core::alloc::M6Alloc = m6_core::alloc::M6Alloc;
 
-/// The state one loop owns: the parsed `[redirect]` settings and the compiled
-/// table. One owner, no lock and no shared handle. A reload replaces both in
-/// one assignment.
+/// The state one loop owns: the parsed `[redirect]` settings, the compiled
+/// table and the node name every access line states. One owner, no lock and
+/// no shared handle. A reload replaces the config and table in one
+/// assignment, and keeps the node name it read at start.
 struct State {
+    node: String,
     config: Config,
     rules: Rules,
 }
@@ -69,7 +71,11 @@ impl State {
     fn load(site: &Site) -> Result<State, String> {
         let config = Config::read(site.user_config().get("redirect"), site.site_dir())?;
         let rules = Rules::load(&config.rules_file)?;
-        Ok(State { config, rules })
+        Ok(State {
+            node: node_name(),
+            config,
+            rules,
+        })
     }
 
     /// The start path again, for `POST /genid`: read the config and the rules
@@ -142,17 +148,19 @@ fn header<'a>(head: &'a RequestHead<'_>, name: &str) -> Option<&'a str> {
 }
 
 /// One access line per request answered: what was received (host, path,
-/// query) and where the user was sent (status and Location).
+/// query) and where the user was sent (status and Location). The line names
+/// the serving node first, the way m6-http's access line does.
 ///
 /// m6-redirect sees only misses: the edge caches the 302 for three months, so
 /// this is the origin's own record of the redirects it expanded, not the whole
 /// click record. A 404 carries no Location.
-fn log_request(head: &RequestHead<'_>, response: &Response) {
+fn log_request(head: &RequestHead<'_>, response: &Response, node: &str) {
     let host = header(head, "host").unwrap_or("");
     let location = m6_core::headers::get(response.headers.as_slice(), "location");
     m6_core::log::with_operational(|sink| {
         m6_core::log::Line::begin(sink, m6_core::log::Level::Info, "redirect")
             .kind(m6_core::log::Type::Access)
+            .str("node", node)
             .str("host", host)
             .str("path", head.path)
             .opt_str("query", head.query)
@@ -160,6 +168,16 @@ fn log_request(head: &RequestHead<'_>, response: &Response) {
             .opt_str("location", location)
             .end();
     });
+}
+
+/// The node name every access line states: m6-redirect's config names no
+/// node, so the host's own name from the platform facts is the identity, the
+/// way m6-core names a node when a config does not.
+fn node_name() -> String {
+    m6_core::startup::HostReport::decided()
+        .node()
+        .name()
+        .to_string()
 }
 
 fn main() -> Result<()> {
@@ -459,7 +477,7 @@ fn turn(conn: &mut ServerConn, site: &mut Site, state: &mut State) -> io::Result
         let (response, idle) = match read {
             Read::Request(head) => {
                 let response = answer(&head, site, state);
-                log_request(&head, &response);
+                log_request(&head, &response, &state.node);
                 (Some(response), false)
             }
             Read::More => (None, true),

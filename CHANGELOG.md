@@ -52,7 +52,7 @@ The consent behaviour is generic and driven by new `[analytics]` config, unset b
   The edge writes this line on every request, HIT or MISS, so a cached `302` is still attributed where it was served.
   [`docs/m6-http.md`](docs/m6-http.md) section 11 lists the fields.
 - **m6-redirect logging.**
-  The engine writes one access line per request it answers, with `host`, `path`, `query`, `status` and `location`, and one line per list replace with the rules count on success or the reason on failure.
+  The engine writes one access line per request it answers, with `node`, `host`, `path`, `query`, `status` and `location`, and one line per list replace with the rules count on success or the reason on failure.
   A 404 carries no `location`.
   [`docs/m6-redirect.md`](docs/m6-redirect.md) section 7 lists the fields.
 - **The `[analytics] consent_cookie` and `consent_version` keys.**

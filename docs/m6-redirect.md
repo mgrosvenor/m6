@@ -139,6 +139,7 @@ Table 6 gives the per-request access line's fields.
 |---|---|
 | `message` | `redirect` |
 | `type` | `access` |
+| `node` | the serving node's name, the host's own name from the platform facts |
 | `host` | the request's Host, as received |
 | `path` | the request's path, exactly |
 | `query` | the request's query string, absent when there was none |
