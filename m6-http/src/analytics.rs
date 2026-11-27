@@ -373,7 +373,6 @@ pub fn record(
     if !enabled {
         return None;
     }
-    let features = extract_features(request_headers);
     // Consent, when configured, gates the session: only a current `true:<v>`
     // counts. With no consent cookie configured this is today's behaviour,
     // where every request may mint a session.
@@ -383,13 +382,13 @@ pub fn record(
         Some(_) => consent_in.is_some_and(|v| is_current_consent(v, consent.version)),
     };
     let session = allowed.then(|| get_or_create_session(request_headers));
-    log_request(
+    log_and_push(
         ev,
         session.as_ref().map(|s| (s.id(), s.is_new())),
         consent_in,
-        &features,
+        request_headers,
+        window,
     );
-    push_request(window, ev, features.user_agent);
     match session {
         Some(Session::New(id)) => Some(id),
         _ => None,
@@ -487,26 +486,45 @@ pub fn finish_proxied_response(
     // An upstream hop that already set the session, or the consent cookie,
     // handled this visitor's cookies; log against what it sent and pass the
     // response through without adding a second, conflicting cookie.
-    let handled = session_from_response_headers(resp_headers)
-        .map(|id| id.to_string())
-        .or_else(|| {
-            consent
-                .cookie
-                .filter(|n| response_sets_cookie(resp_headers, n))
-                .map(|_| String::new())
-        });
-    if let Some(session_id) = handled {
-        let features = extract_features(request_headers);
-        log_request(
+    if let Some(session_id) = session_from_response_headers(resp_headers) {
+        log_and_push(
             ev,
-            (!session_id.is_empty()).then(|| (session_id.as_str(), false)),
+            Some((session_id, false)),
             consent_value(consent, request_headers),
-            &features,
+            request_headers,
+            window,
         );
-        push_request(window, ev, features.user_agent);
+        return;
+    }
+    if consent
+        .cookie
+        .is_some_and(|n| response_sets_cookie(resp_headers, n))
+    {
+        log_and_push(
+            ev,
+            None,
+            consent_value(consent, request_headers),
+            request_headers,
+            window,
+        );
         return;
     }
     finish_response(enabled, consent, resp_headers, request_headers, ev, window);
+}
+
+/// Extract the request features, log one access line and push the request
+/// into the traffic window. Shared by [`record`] and
+/// [`finish_proxied_response`], so the extract-log-push pair is written once.
+fn log_and_push(
+    ev: &Event<'_>,
+    session: Option<(&str, bool)>,
+    consent: Option<&str>,
+    request_headers: &(impl HeaderSource + ?Sized),
+    window: &mut TrafficWindow,
+) {
+    let features = extract_features(request_headers);
+    log_request(ev, session, consent, &features);
+    push_request(window, ev, features.user_agent);
 }
 
 /// Emit one structured analytics line into the one Sink, stdout, which
