@@ -13,6 +13,7 @@ The heading is the version, and a number would break the pattern `tag.sh` and CI
 
 The released versions, newest first:
 
+- [1.18.0-rc.3, 2026-11-28](#1180-rc3-2026-11-28)
 - [1.18.0-rc.2, 2026-11-27](#1180-rc2-2026-11-27)
 - [1.18.0-rc.1, 2026-11-26](#1180-rc1-2026-11-26)
 - [1.17.0, 2026-11-24](#1170-2026-11-24)
@@ -38,6 +39,27 @@ The released versions, newest first:
 - [1.1.0, 2026-09-15](#110-2026-09-15)
 - [1.0.0, 2026-09-14](#100-2026-09-14)
 - [0.2.0 and earlier, 2026-03-15 and before](#020-and-earlier-2026-03-15-and-before)
+
+## 1.18.0-rc.3, 2026-11-28
+
+**The access line records the `Via` a backbone peer sent, so the origin can tell a relayed request from a visitor's own.**
+This is a release candidate, a develop build on staging and not a release.
+A cache node forwards a visitor's request to the origin over the trusted backbone, and both nodes write an access line.
+The origin's line now carries `via`, the peer's `Via` entry, only when the request arrived on the backbone listener.
+A public listener never logs it, so a client's own `Via` header cannot name a node.
+
+### Added
+
+- **A `via` field on the access line.**
+  Present only on a request the backbone listener received, and only with the `Via` value the peer sent, so the origin can tell the forwarded leg apart from a visitor's own request.
+  A public-listener request carrying a `Via` logs no `via`.
+  [`docs/m6-http.md`](docs/m6-http.md) section 11 lists the field.
+
+### Notes
+
+- Verified by `cargo test -p m6-http`, which includes the `received_via` unit tests in `m6-http/src/analytics.rs` and the golden access-line test.
+
+---
 
 ## 1.18.0-rc.2, 2026-11-27
 

@@ -558,6 +558,7 @@ Table 7 lists the key each monitoring reader selects on.
 The two documents are found by `type` and the endpoint by its path.
 
 An access line of `message` `request` carries `node`, `path`, the request's `query` when it had one, `status`, `cache_state`, `client_ip`, `referer_host`, `referer_path`, `user_agent` and `latency_ns`.
+When the request arrived on a listener that trusts the backbone it also carries `via`, the `Via` value the peer sent. A public listener never logs it, so a client's own `Via` header cannot name a node.
 When the request has a session it also carries `session_id` and `session_new`; with a consent cookie configured and not granted there is no session, so both are left off, the way `consent` is left off when absent.
 On a redirect it also carries `location`, the `Location` sent, so a click is recorded as it arrived and with where it went.
 A `message` `monitor` line carries `node`, `path`, `status`, `client_ip`, `user_agent` and `latency_ns`.
