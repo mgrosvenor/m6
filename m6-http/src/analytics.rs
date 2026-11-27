@@ -245,13 +245,11 @@ pub fn session_clear_header_value() -> String {
 /// At most one applies per response. `minted` is [`record`]'s return.
 pub fn response_cookie(
     enabled: bool,
-    _consent: Consent<'_>,
+    consent: Consent<'_>,
     is_html: bool,
     request_headers: &(impl HeaderSource + ?Sized),
     minted: Option<SessionId>,
 ) -> Option<String> {
-    // RED: consent is not honoured yet; this is today's behaviour.
-    let consent = Consent::OFF;
     if !enabled || !is_html {
         return None;
     }
@@ -366,13 +364,11 @@ fn push_request(window: &mut TrafficWindow, ev: &Event<'_>, user_agent: Option<&
 /// only for a new session.
 pub fn record(
     enabled: bool,
-    _consent: Consent<'_>,
+    consent: Consent<'_>,
     request_headers: &(impl HeaderSource + ?Sized),
     ev: &Event<'_>,
     window: &mut TrafficWindow,
 ) -> Option<SessionId> {
-    // RED: consent is not honoured yet; this is today's behaviour.
-    let consent = Consent::OFF;
     if !enabled {
         return None;
     }
@@ -1082,7 +1078,7 @@ mod tests {
         };
 
         let value = format!("true:{POLICY_V}");
-        let req = vec![("Cookie".to_string(), format!("m6consent={value}"))];
+        let req = [("Cookie".to_string(), format!("m6consent={value}"))];
         let line = write(consent_value(consent_on(), &req[..]));
         assert_eq!(
             line["fields"]["consent"],
