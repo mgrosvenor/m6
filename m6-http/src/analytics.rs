@@ -1111,6 +1111,42 @@ mod tests {
         );
     }
 
+    /// A request with no session omits the session fields from the line, the
+    /// way an absent consent value is omitted. The empty-string session id the
+    /// old code wrote merged every non-consenting request into one bucket.
+    #[test]
+    fn no_session_omits_the_session_fields() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let written = dir.path().join("request.jsonl");
+        let mut sink = Sink::file(&written).expect("the line file");
+        write_request_line(
+            &mut sink,
+            &Event {
+                node: "edge-a",
+                path: "/",
+                query: None,
+                status: 200,
+                cache_state: "HIT",
+                client_ip: "192.0.2.9",
+                latency_ns: None,
+                location: None,
+            },
+            "",
+            false,
+            None,
+            &RequestFeatures {
+                referer_host: None,
+                referer_path: None,
+                user_agent: None,
+            },
+        );
+        sink.flush();
+        let text = std::fs::read_to_string(&written).expect("the written line");
+        let v: serde_json::Value = serde_json::from_str(text.trim()).expect("written JSON");
+        assert!(v["fields"].get("session_id").is_none(), "{v}");
+        assert!(v["fields"].get("session_new").is_none(), "{v}");
+    }
+
     #[test]
     fn record_h3_and_vec_agree_for_equivalent_requests() {
         // The whole point of HeaderSource: identical logical input through
