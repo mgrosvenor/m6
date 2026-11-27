@@ -16,6 +16,30 @@ pub use m6_core::http::{header, HeaderSource};
 
 pub const SESSION_COOKIE: &str = "_m6sid";
 
+/// The site's consent cookie configuration: the cookie's name and the current
+/// policy version. Both absent is today's behaviour (no consent cookie, every
+/// request gets a session). Generic: the cookie name and version come from the
+/// site's `[analytics]` config, so m6 knows nothing about `m6consent` itself.
+#[derive(Clone, Copy)]
+pub struct Consent<'a> {
+    /// The cookie's name, e.g. `m6consent`.
+    pub cookie: Option<&'a str>,
+    /// The current policy version, the md5 hex of the policy text. A
+    /// `true:<v>` cookie counts as consent only when `<v>` equals this.
+    pub version: Option<&'a str>,
+}
+
+impl Consent<'_> {
+    /// No consent cookie configured: today's behaviour.
+    pub const OFF: Consent<'static> = Consent {
+        cookie: None,
+        version: None,
+    };
+}
+
+/// Twelve months, in seconds: the consent cookie's `Max-Age`.
+const CONSENT_MAX_AGE: u64 = 31_536_000;
+
 /// A freshly minted session id: 16 random bytes, 32 lowercase hex characters,
 /// on the stack.
 ///
@@ -95,9 +119,58 @@ impl HeaderSource for H3Headers<'_> {
 /// request, and the only reader is the line, which copies it once into the log
 /// buffer.
 fn session_from_cookie_header(cookie_header: &str) -> Option<&str> {
+    cookie_value(cookie_header, SESSION_COOKIE)
+}
+
+/// The value of a named cookie in one `Cookie` header field, or `None` when the
+/// name is absent or its value is empty.
+fn cookie_value<'a>(cookie_header: &'a str, name: &str) -> Option<&'a str> {
     cookie_header.split(';').find_map(|kv| {
         let (k, v) = kv.trim().split_once('=')?;
-        (k == SESSION_COOKIE && !v.is_empty()).then_some(v)
+        (k == name && !v.is_empty()).then_some(v)
+    })
+}
+
+/// Whether the request carries a non-empty `name` cookie, across every `cookie`
+/// field.
+fn has_cookie(headers: &(impl HeaderSource + ?Sized), name: &str) -> bool {
+    headers
+        .find_all("cookie")
+        .any(|v| cookie_value(v, name).is_some())
+}
+
+/// The configured consent cookie's value as sent, for the access line, or
+/// `None` when no consent cookie is configured or the request carries none.
+pub fn consent_value<'a>(
+    consent: Consent<'_>,
+    headers: &'a (impl HeaderSource + ?Sized),
+) -> Option<&'a str> {
+    consent.cookie.and_then(|name| {
+        headers
+            .find_all("cookie")
+            .find_map(|v| cookie_value(v, name))
+    })
+}
+
+/// Whether a cookie value is a current consent: `true:<version>` with the
+/// version equal to the configured current policy version.
+fn is_current_consent(value: &str, version: Option<&str>) -> bool {
+    version.is_some_and(|v| value.strip_prefix("true:") == Some(v))
+}
+
+/// Whether a cookie value is a decline: `false` or `false:<version>`.
+fn is_declined(value: &str) -> bool {
+    value == "false" || value.starts_with("false:")
+}
+
+/// Whether the response already carries a `Set-Cookie` for `name`, so a proxy
+/// does not duplicate one the upstream just set.
+fn response_sets_cookie(headers: &[(String, String)], name: &str) -> bool {
+    m6_core::headers::get_all(headers, "set-cookie").any(|sc| {
+        sc.split(';')
+            .next()
+            .and_then(|kv| kv.trim().split_once('='))
+            .is_some_and(|(k, _)| k.trim() == name)
     })
 }
 
@@ -152,6 +225,51 @@ fn get_or_create_session(headers: &(impl HeaderSource + ?Sized)) -> Session<'_> 
 pub fn session_cookie_header_value(id: SessionId) -> String {
     let id = id.as_str();
     format!("{SESSION_COOKIE}={id}; Max-Age=1800; Path=/; HttpOnly; Secure; SameSite=Lax")
+}
+
+/// The `Set-Cookie` value that marks the consent cookie `unknown`, sent on a
+/// response whose request carried no consent cookie. Not `HttpOnly`, because
+/// the popup script reads and changes it.
+pub fn consent_unknown_header_value(name: &str) -> String {
+    format!("{name}=unknown; Max-Age={CONSENT_MAX_AGE}; Path=/; Secure; SameSite=Lax")
+}
+
+/// The `Set-Cookie` value that clears the `_m6sid` session cookie. The popup's
+/// decline cannot clear an `HttpOnly` cookie itself, so the server does it.
+pub fn session_clear_header_value() -> String {
+    format!("{SESSION_COOKIE}=; Max-Age=0; Path=/")
+}
+
+/// The one `Set-Cookie` a response needs for consent and the session: the
+/// consent cookie set to `unknown`, a fresh `_m6sid`, or the `_m6sid` clear.
+/// At most one applies per response. `minted` is [`record`]'s return.
+pub fn response_cookie(
+    enabled: bool,
+    consent: Consent<'_>,
+    is_html: bool,
+    request_headers: &(impl HeaderSource + ?Sized),
+    minted: Option<SessionId>,
+) -> Option<String> {
+    if !enabled || !is_html {
+        return None;
+    }
+    let Some(name) = consent.cookie else {
+        // Consent not configured: today's behaviour, one `_m6sid` when minted.
+        return minted.map(session_cookie_header_value);
+    };
+    match consent_value(consent, request_headers) {
+        None => Some(consent_unknown_header_value(name)),
+        Some(value) => {
+            if is_current_consent(value, consent.version) {
+                minted.map(session_cookie_header_value)
+            } else if is_declined(value) {
+                has_cookie(request_headers, SESSION_COOKIE).then(session_clear_header_value)
+            } else {
+                // `unknown`, or `true:<old>`: no session and nothing to set.
+                None
+            }
+        }
+    }
 }
 
 /// Referrer, reduced to host + path only — query strings and fragments
@@ -252,6 +370,7 @@ fn push_request(window: &mut TrafficWindow, ev: &Event<'_>, user_agent: Option<&
 /// only for a new session.
 pub fn record(
     enabled: bool,
+    consent: Consent<'_>,
     request_headers: &(impl HeaderSource + ?Sized),
     ev: &Event<'_>,
     window: &mut TrafficWindow,
@@ -259,13 +378,25 @@ pub fn record(
     if !enabled {
         return None;
     }
-    let session = get_or_create_session(request_headers);
     let features = extract_features(request_headers);
-    log_request(ev, session.id(), session.is_new(), &features);
+    // Consent, when configured, gates the session: only a current `true:<v>`
+    // counts. With no consent cookie configured this is today's behaviour,
+    // where every request may mint a session.
+    let consent_in = consent_value(consent, request_headers);
+    let allowed = match consent.cookie {
+        None => true,
+        Some(_) => consent_in.is_some_and(|v| is_current_consent(v, consent.version)),
+    };
+    let session = allowed.then(|| get_or_create_session(request_headers));
+    let (session_id, session_new) = match &session {
+        Some(s) => (s.id(), s.is_new()),
+        None => ("", false),
+    };
+    log_request(ev, session_id, session_new, consent_in, &features);
     push_request(window, ev, features.user_agent);
     match session {
-        Session::New(id) => Some(id),
-        Session::Existing(_) => None,
+        Some(Session::New(id)) => Some(id),
+        _ => None,
     }
 }
 
@@ -292,16 +423,16 @@ pub fn is_html_response(resp_headers: &(impl m6_core::http::HeaderSource + ?Size
 /// itself is scoped to HTML responses, per [`is_html_response`].
 pub fn finish_response(
     enabled: bool,
+    consent: Consent<'_>,
     resp_headers: &mut Vec<(String, String)>,
     request_headers: &(impl HeaderSource + ?Sized),
     ev: &Event<'_>,
     window: &mut TrafficWindow,
 ) {
     let html = is_html_response(resp_headers);
-    if let Some(id) = record(enabled, request_headers, ev, window) {
-        if html {
-            resp_headers.push(("Set-Cookie".to_string(), session_cookie_header_value(id)));
-        }
+    let minted = record(enabled, consent, request_headers, ev, window);
+    if let Some(value) = response_cookie(enabled, consent, html, request_headers, minted) {
+        resp_headers.push(("Set-Cookie".to_string(), value));
     }
 }
 
@@ -347,6 +478,7 @@ fn session_from_response_headers(resp_headers: &[(String, String)]) -> Option<&s
 /// `finish_response`.
 pub fn finish_proxied_response(
     enabled: bool,
+    consent: Consent<'_>,
     resp_headers: &mut Vec<(String, String)>,
     request_headers: &(impl HeaderSource + ?Sized),
     ev: &Event<'_>,
@@ -355,13 +487,30 @@ pub fn finish_proxied_response(
     if !enabled {
         return;
     }
-    if let Some(session_id) = session_from_response_headers(resp_headers) {
+    // An upstream hop that already set the session, or the consent cookie,
+    // handled this visitor's cookies; log against what it sent and pass the
+    // response through without adding a second, conflicting cookie.
+    let handled = session_from_response_headers(resp_headers)
+        .map(|id| id.to_string())
+        .or_else(|| {
+            consent
+                .cookie
+                .filter(|n| response_sets_cookie(resp_headers, n))
+                .map(|_| String::new())
+        });
+    if let Some(session_id) = handled {
         let features = extract_features(request_headers);
-        log_request(ev, session_id, false, &features);
+        log_request(
+            ev,
+            &session_id,
+            false,
+            consent_value(consent, request_headers),
+            &features,
+        );
         push_request(window, ev, features.user_agent);
         return;
     }
-    finish_response(enabled, resp_headers, request_headers, ev, window);
+    finish_response(enabled, consent, resp_headers, request_headers, ev, window);
 }
 
 /// Emit one structured analytics line into the one Sink, stdout, which
@@ -370,10 +519,11 @@ fn log_request(
     ev: &Event<'_>,
     session_id: &str,
     session_new: bool,
+    consent: Option<&str>,
     features: &RequestFeatures<'_>,
 ) {
     m6_core::log::with_operational(|sink| {
-        write_request_line(sink, ev, session_id, session_new, features);
+        write_request_line(sink, ev, session_id, session_new, consent, features);
     });
 }
 
@@ -386,6 +536,7 @@ fn write_request_line(
     ev: &Event<'_>,
     session_id: &str,
     session_new: bool,
+    consent: Option<&str>,
     features: &RequestFeatures<'_>,
 ) {
     Line::begin(sink, Level::Info, "request")
@@ -398,6 +549,7 @@ fn write_request_line(
         .str("client_ip", ev.client_ip)
         .str("session_id", session_id)
         .bool("session_new", session_new)
+        .opt_str("consent", consent)
         .opt_str("referer_host", features.referer_host)
         .opt_str("referer_path", features.referer_path)
         .opt_str("user_agent", features.user_agent)
@@ -719,6 +871,7 @@ mod tests {
         let mut window = TrafficWindow::new();
         let sc = record(
             false,
+            Consent::OFF,
             &headers,
             &Event {
                 node: "node",
@@ -741,6 +894,7 @@ mod tests {
         let mut window = TrafficWindow::new();
         let sc = record(
             true,
+            Consent::OFF,
             &headers,
             &Event {
                 node: "node",
@@ -767,6 +921,7 @@ mod tests {
         let mut window = TrafficWindow::new();
         let sc = record(
             true,
+            Consent::OFF,
             &headers,
             &Event {
                 node: "node",
@@ -786,6 +941,172 @@ mod tests {
         );
     }
 
+    // ── Consent ─────────────────────────────────────────────────────────────
+
+    const POLICY_V: &str = "0123456789abcdef0123456789abcdef";
+
+    fn consent_on() -> Consent<'static> {
+        Consent {
+            cookie: Some("m6consent"),
+            version: Some(POLICY_V),
+        }
+    }
+
+    fn finish_for(req_cookie: Option<&str>, consent: Consent<'_>) -> Vec<(String, String)> {
+        let mut resp = vec![(
+            "Content-Type".to_string(),
+            "text/html; charset=utf-8".to_string(),
+        )];
+        let req: Vec<(String, String)> = req_cookie
+            .map(|c| vec![("Cookie".to_string(), c.to_string())])
+            .unwrap_or_default();
+        let ev = Event {
+            node: "node",
+            path: "/p",
+            status: 200,
+            cache_state: "MISS",
+            client_ip: "1.2.3.4",
+            latency_ns: None,
+        };
+        let mut window = TrafficWindow::new();
+        finish_response(true, consent, &mut resp, &req[..], &ev, &mut window);
+        resp
+    }
+
+    fn set_cookies(resp: &[(String, String)]) -> Vec<String> {
+        resp.iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
+            .map(|(_, v)| v.clone())
+            .collect()
+    }
+
+    #[test]
+    fn no_consent_cookie_sets_unknown_and_no_session() {
+        let resp = finish_for(None, consent_on());
+        let sc = set_cookies(&resp);
+        assert!(
+            sc.iter().any(|v| v.starts_with("m6consent=unknown;")),
+            "the response sets m6consent=unknown: {sc:?}"
+        );
+        assert!(
+            !sc.iter().any(|v| v.starts_with("_m6sid=")),
+            "no session before consent: {sc:?}"
+        );
+    }
+
+    #[test]
+    fn current_consent_mints_a_session() {
+        let cookie = format!("m6consent=true:{POLICY_V}");
+        let resp = finish_for(Some(&cookie), consent_on());
+        let sc = set_cookies(&resp);
+        assert!(
+            sc.iter().any(|v| v.starts_with("_m6sid=")),
+            "current consent mints _m6sid: {sc:?}"
+        );
+        assert!(
+            !sc.iter().any(|v| v.starts_with("m6consent=")),
+            "the consent cookie is already set, none re-sent: {sc:?}"
+        );
+    }
+
+    #[test]
+    fn declined_consent_mints_no_session() {
+        let cookie = format!("m6consent=false:{POLICY_V}");
+        let resp = finish_for(Some(&cookie), consent_on());
+        assert!(
+            set_cookies(&resp).is_empty(),
+            "decline mints nothing: {:?}",
+            set_cookies(&resp)
+        );
+    }
+
+    #[test]
+    fn declined_consent_clears_a_carried_session() {
+        let cookie = format!("m6consent=false:{POLICY_V}; _m6sid=abc");
+        let resp = finish_for(Some(&cookie), consent_on());
+        let sc = set_cookies(&resp);
+        assert!(
+            sc.iter().any(|v| v == "_m6sid=; Max-Age=0; Path=/"),
+            "decline clears the HttpOnly session cookie: {sc:?}"
+        );
+    }
+
+    #[test]
+    fn an_old_consent_version_mints_no_session() {
+        let cookie = "m6consent=true:deadbeefdeadbeefdeadbeefdeadbeef";
+        let resp = finish_for(Some(cookie), consent_on());
+        let sc = set_cookies(&resp);
+        assert!(
+            !sc.iter().any(|v| v.starts_with("_m6sid=")),
+            "an old policy version is not consent: {sc:?}"
+        );
+    }
+
+    #[test]
+    fn a_cache_hit_adds_the_consent_cookie_and_no_session() {
+        // A hit rebuilds the per-response cookie from the request, never from
+        // the stored entry (the cache strips Set-Cookie on store, so a hit
+        // cannot replay another visitor's cookie).
+        let req = Vec::<(String, String)>::new();
+        let cookie = response_cookie(true, consent_on(), true, &req[..], None);
+        assert!(
+            cookie
+                .as_deref()
+                .is_some_and(|v| v.starts_with("m6consent=unknown;")),
+            "a hit sets m6consent=unknown when the request has none: {cookie:?}"
+        );
+    }
+
+    #[test]
+    fn the_access_line_logs_the_consent_value_it_received() {
+        // `m6consent=true:<v>` logs `consent = true:<v>`, so the proof records
+        // which policy version was accepted. No cookie logs no field.
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("request.jsonl");
+        let ev = Event {
+            node: "node",
+            path: "/p",
+            status: 200,
+            cache_state: "HIT",
+            client_ip: "1.2.3.4",
+            latency_ns: None,
+        };
+        let write = |consent: Option<&str>| -> serde_json::Value {
+            let _ = std::fs::remove_file(&path);
+            let mut sink = Sink::file(&path).expect("the line file");
+            write_request_line(
+                &mut sink,
+                &ev,
+                "sess",
+                false,
+                consent,
+                &RequestFeatures {
+                    referer_host: None,
+                    referer_path: None,
+                    user_agent: None,
+                },
+            );
+            sink.flush();
+            let text = std::fs::read_to_string(&path).expect("read the line");
+            serde_json::from_str(text.trim()).expect("the line is JSON")
+        };
+
+        let value = format!("true:{POLICY_V}");
+        let req = [("Cookie".to_string(), format!("m6consent={value}"))];
+        let line = write(consent_value(consent_on(), &req[..]));
+        assert_eq!(
+            line["fields"]["consent"],
+            serde_json::json!(value),
+            "{line}"
+        );
+
+        let line = write(None);
+        assert!(
+            line["fields"].get("consent").is_none(),
+            "no consent cookie logs no field: {line}"
+        );
+    }
+
     #[test]
     fn record_h3_and_vec_agree_for_equivalent_requests() {
         // The whole point of HeaderSource: identical logical input through
@@ -797,6 +1118,7 @@ mod tests {
 
         let vec_sc = record(
             true,
+            Consent::OFF,
             &vec_headers,
             &Event {
                 node: "node",
@@ -812,6 +1134,7 @@ mod tests {
         );
         let h3_sc = record(
             true,
+            Consent::OFF,
             &h3_headers,
             &Event {
                 node: "node",
@@ -845,6 +1168,7 @@ mod tests {
         let mut window = TrafficWindow::new();
         finish_response(
             true,
+            Consent::OFF,
             &mut resp_headers,
             &req_headers,
             &Event {
@@ -874,6 +1198,7 @@ mod tests {
         let mut window = TrafficWindow::new();
         finish_response(
             true,
+            Consent::OFF,
             &mut resp_headers,
             &req_headers,
             &Event {
@@ -902,6 +1227,7 @@ mod tests {
         let mut window = TrafficWindow::new();
         finish_response(
             false,
+            Consent::OFF,
             &mut resp_headers,
             &req_headers,
             &Event {
@@ -965,6 +1291,7 @@ mod tests {
         let mut window = TrafficWindow::new();
         finish_proxied_response(
             true,
+            Consent::OFF,
             &mut resp_headers,
             &req_headers,
             &Event {
@@ -1000,6 +1327,7 @@ mod tests {
         let mut window = TrafficWindow::new();
         finish_proxied_response(
             true,
+            Consent::OFF,
             &mut resp_headers,
             &req_headers,
             &Event {
@@ -1032,6 +1360,7 @@ mod tests {
         let mut window = TrafficWindow::new();
         finish_proxied_response(
             false,
+            Consent::OFF,
             &mut resp_headers,
             &req_headers,
             &Event {
@@ -1086,6 +1415,7 @@ mod tests {
             },
             "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
             true,
+            None,
             &RequestFeatures {
                 referer_host: None,
                 referer_path: None,

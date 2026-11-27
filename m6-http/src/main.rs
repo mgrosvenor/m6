@@ -1051,6 +1051,7 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
             set_date(&mut hdrs);
             analytics::finish_response(
                 state.config.analytics.enabled,
+                state.config.analytics.consent(),
                 &mut hdrs,
                 headers,
                 &analytics::Event {
@@ -1083,6 +1084,7 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
             );
             analytics::finish_response(
                 state.config.analytics.enabled,
+                state.config.analytics.consent(),
                 &mut hdrs,
                 headers,
                 &analytics::Event {
@@ -1108,8 +1110,9 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
             cache_hit = true,
             "request complete"
         );
-        let set_cookie = analytics::record(
+        let minted = analytics::record(
             state.config.analytics.enabled,
+            state.config.analytics.consent(),
             headers,
             &analytics::Event {
                 node: &state.config.node.name,
@@ -1122,9 +1125,14 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
                 location: m6_core::headers::get(&cached.headers, "location"),
             },
             &mut state.traffic,
-        )
-        .filter(|_| analytics::is_html_response(&cached.headers))
-        .map(analytics::session_cookie_header_value);
+        );
+        let set_cookie = analytics::response_cookie(
+            state.config.analytics.enabled,
+            state.config.analytics.consent(),
+            analytics::is_html_response(&cached.headers),
+            headers,
+            minted,
+        );
         return Routed::Cached {
             entry: cached,
             age,
@@ -4402,8 +4410,9 @@ fn handle_h3_request(
         }
         if precond == Precondition::NotModified {
             let client_ip = qconn.client_addr.ip().to_string();
-            let set_cookie = analytics::record(
+            let minted = analytics::record(
                 state.config.analytics.enabled,
+                state.config.analytics.consent(),
                 &H3Headers(&req.headers),
                 &analytics::Event {
                     node: &state.config.node.name,
@@ -4424,11 +4433,14 @@ fn handle_h3_request(
             set_vary_accept_encoding(&mut headers, true);
             set_age(&mut headers, age);
             set_date(&mut headers);
-            if let (Some(id), true) = (set_cookie, html) {
-                headers.push((
-                    "Set-Cookie".to_string(),
-                    analytics::session_cookie_header_value(id),
-                ));
+            if let Some(value) = analytics::response_cookie(
+                state.config.analytics.enabled,
+                state.config.analytics.consent(),
+                html,
+                &H3Headers(&req.headers),
+                minted,
+            ) {
+                headers.push(("Set-Cookie".to_string(), value));
             }
             debug!(
                 path = %path_str,
@@ -4467,8 +4479,9 @@ fn handle_h3_request(
         // (the hand-rolled 3-field scan this replaced was itself already an
         // unnecessary intermediate allocation, not a required one).
         let client_ip = qconn.client_addr.ip().to_string();
-        let set_cookie = analytics::record(
+        let minted = analytics::record(
             state.config.analytics.enabled,
+            state.config.analytics.consent(),
             &H3Headers(&req.headers),
             &analytics::Event {
                 node: &state.config.node.name,
@@ -4492,11 +4505,14 @@ fn handle_h3_request(
         set_age(&mut headers_with_links, age);
         set_describedby_link(&mut headers_with_links, &state.config.site.describedby);
         set_alt_svc(&mut headers_with_links, h3.quic_port);
-        if let (Some(id), true) = (set_cookie, analytics::is_html_response(&headers_with_links)) {
-            headers_with_links.push((
-                "Set-Cookie".to_string(),
-                analytics::session_cookie_header_value(id),
-            ));
+        if let Some(value) = analytics::response_cookie(
+            state.config.analytics.enabled,
+            state.config.analytics.consent(),
+            analytics::is_html_response(&headers_with_links),
+            &H3Headers(&req.headers),
+            minted,
+        ) {
+            headers_with_links.push(("Set-Cookie".to_string(), value));
         }
         let resp_headers: &[(String, String)] = &headers_with_links;
         send_h3_response(
@@ -6062,6 +6078,7 @@ fn dispatch_custom_error_async(
         let latency_ns = m6_core::platform::now().elapsed().as_nanos() as u64;
         analytics::finish_response(
             state.config.analytics.enabled,
+            state.config.analytics.consent(),
             &mut headers,
             &req.headers,
             &analytics::Event {
@@ -6547,6 +6564,7 @@ fn error_page_fallback(
     )];
     analytics::finish_response(
         analytics_on,
+        state.config.analytics.consent(),
         &mut headers,
         &req.headers,
         &analytics::Event {
@@ -6600,6 +6618,7 @@ fn complete_socket_response(
                 );
                 analytics::finish_response(
                     analytics_enabled,
+                    state.config.analytics.consent(),
                     &mut headers,
                     &req.headers,
                     &analytics::Event {
@@ -6689,6 +6708,7 @@ fn complete_socket_response(
                 let backend_ns = ctx.start.elapsed().as_nanos() as u64;
                 analytics::finish_response(
                     analytics_enabled,
+                    state.config.analytics.consent(),
                     &mut h,
                     &req.headers,
                     &analytics::Event {
@@ -6719,6 +6739,7 @@ fn complete_socket_response(
         let location = m6_core::headers::get(&resp_headers, "location").map(str::to_string);
         analytics::finish_response(
             analytics_enabled,
+            state.config.analytics.consent(),
             &mut resp_headers,
             &req.headers,
             &analytics::Event {
@@ -6813,6 +6834,7 @@ fn finalize_url_response_inner(
                 );
                 analytics::finish_proxied_response(
                     analytics_on,
+                    state.config.analytics.consent(),
                     &mut headers,
                     &req.headers,
                     &analytics::Event {
@@ -6900,6 +6922,7 @@ fn finalize_url_response_inner(
             let location = m6_core::headers::get(&headers, "location").map(str::to_string);
             analytics::finish_proxied_response(
                 analytics_on,
+                state.config.analytics.consent(),
                 &mut headers,
                 &req.headers,
                 &analytics::Event {
@@ -6941,6 +6964,7 @@ fn finalize_url_response_inner(
                 let latency_ns = ctx.start.elapsed().as_nanos() as u64;
                 analytics::finish_response(
                     analytics_on,
+                    state.config.analytics.consent(),
                     &mut h,
                     &req.headers,
                     &analytics::Event {
@@ -6967,6 +6991,7 @@ fn finalize_url_response_inner(
         let location = m6_core::headers::get(&headers_with_altsvc, "location").map(str::to_string);
         analytics::finish_proxied_response(
             analytics_on,
+            state.config.analytics.consent(),
             &mut headers_with_altsvc,
             &req.headers,
             &analytics::Event {
