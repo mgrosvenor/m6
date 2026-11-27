@@ -1346,3 +1346,129 @@ pub(crate) fn parse_host_port(
 
     Ok((authority.to_string(), default_port))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+    use std::net::SocketAddr;
+    use std::os::unix::io::RawFd;
+
+    /// A transport that records every flushed frame. It does no socket I/O: the
+    /// client's `drive` flushes the HEADERS frame into `sent`, and the test
+    /// reads it straight back, so the assertion sees exactly the bytes a peer
+    /// would receive.
+    struct CaptureTransport {
+        sent: Vec<u8>,
+    }
+
+    impl Transport for CaptureTransport {
+        fn connect(_addr: SocketAddr, _tls: Option<&TlsClient>) -> io::Result<Self> {
+            Ok(Self { sent: Vec::new() })
+        }
+
+        fn raw_fd(&self) -> RawFd {
+            0
+        }
+
+        fn take_error(&self) -> io::Result<Option<io::Error>> {
+            Ok(None)
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn is_handshaking(&self) -> bool {
+            false
+        }
+
+        fn alpn_protocol(&self) -> Option<&[u8]> {
+            None
+        }
+
+        fn scheme() -> &'static [u8] {
+            b"http"
+        }
+
+        fn default_port() -> u16 {
+            80
+        }
+
+        fn prefix() -> &'static str {
+            "h2c"
+        }
+
+        fn flush_send(&mut self, send_buf: &mut Vec<u8>) -> Result<(), String> {
+            self.sent.extend_from_slice(send_buf);
+            send_buf.clear();
+            Ok(())
+        }
+
+        fn fill_recv(&mut self, _recv_buf: &mut Vec<u8>) -> Option<String> {
+            None
+        }
+
+        fn wants_write(&self) -> bool {
+            false
+        }
+    }
+
+    /// Dispatch one body-less request and decode the single HEADERS frame the
+    /// client flushed, returning its decoded HPACK pairs.
+    fn dispatched_headers(
+        req: &HttpRequest,
+        host: &str,
+        original_host: &str,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut conn = H2Client::new(CaptureTransport { sent: Vec::new() });
+        conn.dispatch(req, host, "127.0.0.1", original_host, None)
+            .expect("dispatch");
+        conn.drive();
+
+        let sent = &conn.transport.sent;
+        assert!(sent.len() >= 9, "the client flushed no frame: {sent:?}");
+        let length = ((sent[0] as usize) << 16) | ((sent[1] as usize) << 8) | sent[2] as usize;
+        assert_eq!(sent[3], TYPE_HEADERS, "expected a HEADERS frame: {sent:?}");
+        assert_eq!(sent.len(), 9 + length, "frame length mismatch: {sent:?}");
+        let stream_id = (((sent[5] as u32) << 24)
+            | ((sent[6] as u32) << 16)
+            | ((sent[7] as u32) << 8)
+            | (sent[8] as u32))
+            & 0x7fff_ffff;
+        assert_eq!(stream_id, 1, "the first stream id must be 1");
+
+        let mut dec = hpack::Decoder::new();
+        dec.decode(&sent[9..])
+            .expect("the client's HPACK block must decode")
+    }
+
+    #[test]
+    fn a_request_without_host_is_forwarded_with_the_original_host() {
+        let req = HttpRequest {
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query: None,
+            version: "HTTP/3".to_string(),
+            // HTTP/3 carries the host in :authority, which ingress strips, so a
+            // forwarded request names no Host at all. The h2 leg must still
+            // carry it, exactly as the HTTP/1.1 leg synthesises `Host` from
+            // `original_host`.
+            headers: vec![],
+            body: vec![],
+        };
+        let pairs = dispatched_headers(&req, "10.0.0.1:8443", "example.com");
+        assert!(
+            pairs
+                .iter()
+                .any(|(k, v)| k == b"host" && v == b"example.com"),
+            "the forward must carry host: example.com, got: {pairs:?}"
+        );
+        assert!(
+            pairs
+                .iter()
+                .any(|(k, v)| k == b":authority" && v == b"10.0.0.1:8443"),
+            ":authority stays the backbone address, got: {pairs:?}"
+        );
+    }
+}
