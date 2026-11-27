@@ -218,6 +218,41 @@ fn a_malformed_list_is_refused_and_changes_nothing() {
 }
 
 #[test]
+/// m6-redirect logs one access line per request it answers: what was
+/// received (host, path, query) and where the user was sent (status and
+/// Location). A 404 has no Location, and a 302 carries its target.
+#[test]
+fn a_redirect_logs_its_query_and_target_and_a_404_logs_no_location() {
+    let mut h = Harness::start("");
+    let hit = get(&h.sock, "example.com", "/r/cap7k9?ref=newsletter");
+    assert_eq!(hit.status, 302, "{}", hit.raw);
+    let miss = get(&h.sock, "example.com", "/r/nope");
+    assert_eq!(miss.status, 404, "{}", miss.raw);
+
+    // SIGTERM flushes the log, so the lines are in the captured output after
+    // a clean stop.
+    h.stop();
+    let out = h.svc.output();
+    assert!(
+        out.contains("\"message\":\"redirect\""),
+        "no redirect line\n--- output ---\n{out}"
+    );
+    assert!(out.contains("\"path\":\"/r/cap7k9\""), "{out}");
+    assert!(out.contains("\"query\":\"ref=newsletter\""), "{out}");
+    assert!(out.contains("\"status\":302"), "{out}");
+    assert!(
+        out.contains(
+            "\"location\":\"https://example.com/capabilities?utm_source=robert&utm_campaign=recruitmentremal\""
+        ),
+        "{out}"
+    );
+    // The 404 has no Location on its line: the only location in the output is
+    // the 302's.
+    let location_lines = out.lines().filter(|l| l.contains("\"location\"")).count();
+    assert_eq!(location_lines, 1, "only the 302 line carries a location:\n{out}");
+    assert!(out.contains("\"status\":404"), "{out}");
+}
+
 fn the_reload_signal_rereads_the_file_and_swaps_the_table() {
     let mut h = Harness::start("");
     // A deploy can update the file directly, then send the backend's reload
