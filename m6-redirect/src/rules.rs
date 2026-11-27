@@ -30,12 +30,6 @@ pub struct Rules {
     by_key: HashMap<String, Redirect>,
 }
 
-/// The list-items JSON wrapper Cloudflare uses.
-#[derive(Deserialize)]
-struct List {
-    items: Vec<Item>,
-}
-
 /// One list item. The fields the engine reads are `source_url`, `target_url`,
 /// `status_code` and `subpath_matching`. The rest of the Cloudflare shape is
 /// ignored, because this engine ignores the query and matches exactly.
@@ -54,14 +48,27 @@ fn default_status() -> u16 {
 }
 
 impl Rules {
-    /// Parse and index a list body.
+    /// Parse and index a list body, and hand back the raw `items` array as it
+    /// arrived.
     ///
-    /// The returned table shares nothing with the body, so a caller may keep
-    /// the bytes and write them verbatim while swapping the table in.
-    pub fn parse(body: &[u8]) -> Result<Rules, String> {
-        let list: List = serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?;
-        let mut by_key = HashMap::with_capacity(list.items.len());
-        for (i, item) in list.items.into_iter().enumerate() {
+    /// The body is deserialised once. The table shares nothing with the body,
+    /// so a caller may keep the bytes and write them verbatim while swapping
+    /// the table in. The returned `items` `Value` is the list exactly as
+    /// received, so a caller that logs the replace can carry the items' extra
+    /// fields without a second parse.
+    pub fn parse(body: &[u8]) -> Result<(Rules, serde_json::Value), String> {
+        let list: serde_json::Value =
+            serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?;
+        let items = list
+            .get("items")
+            .cloned()
+            .ok_or_else(|| "missing field `items`".to_string())?;
+        let item_values = items
+            .as_array()
+            .ok_or_else(|| "`items` must be an array".to_string())?;
+        let mut by_key = HashMap::with_capacity(item_values.len());
+        for (i, raw) in item_values.iter().enumerate() {
+            let item = Item::deserialize(raw).map_err(|e| format!("items[{i}]: {e}"))?;
             validate_item(&item, i)?;
             let key = source_key(&item.source_url, i)?;
             let redirect = Redirect {
@@ -72,7 +79,7 @@ impl Rules {
                 return Err(format!("items[{i}]: duplicate source_url"));
             }
         }
-        Ok(Rules { by_key })
+        Ok((Rules { by_key }, items))
     }
 
     /// Read the list file. A missing file is an empty table, so a fresh
@@ -81,7 +88,7 @@ impl Rules {
     /// start refusal or a failed reload.
     pub fn load(path: &Path) -> Result<Rules, String> {
         match std::fs::read(path) {
-            Ok(bytes) => Rules::parse(&bytes),
+            Ok(bytes) => Rules::parse(&bytes).map(|(rules, _)| rules),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Rules {
                 by_key: HashMap::new(),
             }),
@@ -197,7 +204,9 @@ mod tests {
     use super::*;
 
     fn rules(body: &str) -> Rules {
-        Rules::parse(body.as_bytes()).expect("a valid list")
+        Rules::parse(body.as_bytes())
+            .map(|(rules, _)| rules)
+            .expect("a valid list")
     }
 
     const LIST: &str = r#"{

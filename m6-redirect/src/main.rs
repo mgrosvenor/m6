@@ -90,8 +90,8 @@ impl State {
 
     /// `POST /m6-redirect/rules`: validate, write verbatim, swap.
     fn replace_list(&mut self, body: &[u8]) -> Response {
-        let rules = match Rules::parse(body) {
-            Ok(rules) => rules,
+        let (rules, items) = match Rules::parse(body) {
+            Ok((rules, items)) => (rules, items),
             Err(e) => {
                 m6_core::log::warn!(error = %e, "redirect list replace refused");
                 return Response::refusal(&format!("malformed redirect list: {e}"));
@@ -106,22 +106,17 @@ impl State {
         let count = rules.len();
         self.rules = rules;
         // Log the list as received, so the items' extra fields travel with the
-        // line through the journal. The list-replace is rare, so parsing the
-        // body once more here is not a request-path cost.
-        let items = serde_json::from_slice::<serde_json::Value>(body)
-            .ok()
-            .and_then(|v| v.get("items").cloned());
+        // line through the journal. `items` came back from the one parse above,
+        // so the body is not parsed twice.
         m6_core::log::with_operational(|sink| {
-            let mut line = m6_core::log::Line::begin(
+            m6_core::log::Line::begin(
                 sink,
                 m6_core::log::Level::Info,
                 "redirect list replaced",
             )
-            .field("rules", count);
-            if let Some(items) = &items {
-                line = line.json("items", items);
-            }
-            line.end();
+            .field("rules", count)
+            .json("items", &items)
+            .end();
         });
         Response::status(204).header("Cache-Control", "no-store")
     }
