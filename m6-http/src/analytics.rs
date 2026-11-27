@@ -963,10 +963,12 @@ mod tests {
         let ev = Event {
             node: "node",
             path: "/p",
+            query: None,
             status: 200,
             cache_state: "MISS",
             client_ip: "1.2.3.4",
             latency_ns: None,
+            location: None,
         };
         let mut window = TrafficWindow::new();
         finish_response(true, consent, &mut resp, &req[..], &ev, &mut window);
@@ -1066,10 +1068,12 @@ mod tests {
         let ev = Event {
             node: "node",
             path: "/p",
+            query: None,
             status: 200,
             cache_state: "HIT",
             client_ip: "1.2.3.4",
             latency_ns: None,
+            location: None,
         };
         let write = |consent: Option<&str>| -> serde_json::Value {
             let _ = std::fs::remove_file(&path);
@@ -1477,6 +1481,7 @@ mod tests {
             },
             "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
             false,
+            None,
             &RequestFeatures {
                 referer_host: None,
                 referer_path: None,
@@ -1514,6 +1519,7 @@ mod tests {
             },
             "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
             false,
+            None,
             &RequestFeatures {
                 referer_host: None,
                 referer_path: None,
