@@ -217,7 +217,6 @@ fn a_malformed_list_is_refused_and_changes_nothing() {
     h.stop();
 }
 
-#[test]
 /// m6-redirect logs one access line per request it answers: what was
 /// received (host, path, query) and where the user was sent (status and
 /// Location). A 404 has no Location, and a 302 carries its target.
@@ -256,6 +255,7 @@ fn a_redirect_logs_its_query_and_target_and_a_404_logs_no_location() {
     assert!(out.contains("\"status\":404"), "{out}");
 }
 
+#[test]
 fn the_reload_signal_rereads_the_file_and_swaps_the_table() {
     let mut h = Harness::start("");
     // A deploy can update the file directly, then send the backend's reload

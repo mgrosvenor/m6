@@ -85,10 +85,12 @@ fn recording_a_request_allocates_nothing() -> Result<(), Failed> {
     let ev = Event {
         node: "dev",
         path: "/some/page",
+        query: None,
         status: 200,
         cache_state: "HIT",
         client_ip: "192.0.2.1",
         latency_ns: Some(1_234),
+        location: None,
     };
     let mut window = TrafficWindow::new();
 
