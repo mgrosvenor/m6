@@ -99,7 +99,24 @@ impl State {
         }
         let count = rules.len();
         self.rules = rules;
-        m6_core::log::info!(rules = count, "redirect list replaced");
+        // Log the list as received, so the items' extra fields travel with the
+        // line through the journal. The list-replace is rare, so parsing the
+        // body once more here is not a request-path cost.
+        let items = serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("items").cloned());
+        m6_core::log::with_operational(|sink| {
+            let mut line = m6_core::log::Line::begin(
+                sink,
+                m6_core::log::Level::Info,
+                "redirect list replaced",
+            )
+            .field("rules", count);
+            if let Some(items) = &items {
+                line = line.json("items", items);
+            }
+            line.end();
+        });
         Response::status(204).header("Cache-Control", "no-store")
     }
 

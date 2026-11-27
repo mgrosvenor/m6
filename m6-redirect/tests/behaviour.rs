@@ -201,6 +201,28 @@ fn the_list_replace_writes_verbatim_and_swaps_the_table() {
     h.stop();
 }
 
+/// The list-replace line carries the list as received, so the items' extra
+/// fields (source, campaign, medium) travel with the line through the journal.
+#[test]
+fn the_list_replace_line_carries_the_items_as_received() {
+    let mut h = Harness::start("");
+    let body = r#"{"items":[{"source_url":"example.com/r/cap7k9","target_url":"https://example.com/capabilities?m6qs=7k9","status_code":302,"source":"robert","campaign":"recruitmentremal","medium":""}]}"#;
+    let resp = post(&h.sock, "/m6-redirect/rules", body);
+    assert_eq!(resp.status, 204, "{}", resp.raw);
+    h.stop();
+    let out = h.svc.output();
+    assert!(
+        out.contains("\"message\":\"redirect list replaced\""),
+        "no list-replace line\n--- output ---\n{out}"
+    );
+    assert!(out.contains("\"source\":\"robert\""), "{out}");
+    assert!(out.contains("\"campaign\":\"recruitmentremal\""), "{out}");
+    assert!(
+        out.contains("\"target_url\":\"https://example.com/capabilities?m6qs=7k9\""),
+        "{out}"
+    );
+}
+
 #[test]
 fn a_malformed_list_is_refused_and_changes_nothing() {
     let mut h = Harness::start("");
