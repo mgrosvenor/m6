@@ -471,6 +471,29 @@ fn default_max_requests_per_connection() -> u32 {
 pub struct AnalyticsConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// The name of the cookie a visitor sets by accepting the site's consent
+    /// prompt, for example `m6consent`. When set, m6 adds the cookie (value
+    /// `unknown`) to a response whose request carried none, and mints the
+    /// session cookie only for a current `true:<version>` value. None is
+    /// today's behaviour, where every request gets a session and no consent
+    /// cookie is set.
+    #[serde(default)]
+    pub consent_cookie: Option<String>,
+    /// The current policy version, the md5 hex of the policy text. A
+    /// `true:<version>` cookie counts as consent only when its version equals
+    /// this. Required together with `consent_cookie`.
+    #[serde(default)]
+    pub consent_version: Option<String>,
+}
+
+impl AnalyticsConfig {
+    /// The consent settings in the shape [`crate::analytics`] reads.
+    pub fn consent(&self) -> crate::analytics::Consent<'_> {
+        crate::analytics::Consent {
+            cookie: self.consent_cookie.as_deref(),
+            version: self.consent_version.as_deref(),
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -481,6 +504,8 @@ impl Default for AnalyticsConfig {
     fn default() -> Self {
         AnalyticsConfig {
             enabled: default_true(),
+            consent_cookie: None,
+            consent_version: None,
         }
     }
 }

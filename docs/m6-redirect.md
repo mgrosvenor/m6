@@ -6,8 +6,8 @@ A request that matches a rule answers the rule's status and target.
 A request that matches nothing answers 404.
 The list of rules lives in one JSON file, and the engine never builds strings for served markup or text in code.
 
-This document describes the list, the matching, the configuration, the list-replace POST and the reload signal.
-Section 1 lists the rules shape, section 2 gives the matching, section 3 gives the configuration, section 4 gives the list-replace POST, and section 5 gives the reload and the response.
+This document describes the list, the matching, the configuration, the list-replace POST, the reload signal and the logging.
+Section 2 gives the rules shape, section 3 the matching, section 4 the configuration, section 5 the list-replace POST, section 6 the reload and the response, and section 7 the logging.
 
 ## 1. Contents
 
@@ -17,7 +17,8 @@ Section 1 lists the rules shape, section 2 gives the matching, section 3 gives t
 4. [Configuration](#4-configuration)
 5. [The list-replace POST](#5-the-list-replace-post)
 6. [The reload signal and the response](#6-the-reload-signal-and-the-response)
-7. [Summary](#7-summary)
+7. [Logging](#7-logging)
+8. [Summary](#8-summary)
 
 Section 2 gives the list the engine reads.
 
@@ -127,9 +128,32 @@ A 404 carries no `Cache-Control`, so the proxy treats it as uncacheable.
 The redirect body is empty.
 A `HEAD` answers the same status and `Location` with no body, the way the backend protocol requires.
 
-Section 7 collects the whole document.
+Section 7 gives the logging.
 
-## 7. Summary
+## 7. Logging
+
+m6-redirect writes one access line per request it answers, and one line per list replace.
+Table 6 gives the per-request access line's fields.
+
+| field | what it carries |
+|---|---|
+| `message` | `redirect` |
+| `type` | `access` |
+| `node` | the serving node's name, the host's own name from the platform facts |
+| `host` | the request's Host, as received |
+| `path` | the request's path, exactly |
+| `query` | the request's query string, absent when there was none |
+| `status` | the status answered |
+| `location` | the redirect's target, absent on a 404 |
+
+**Table 6: the fields of m6-redirect's per-request access line.**
+
+m6-redirect sees only misses: the edge caches the 302 for three months, so this line is the origin's own record of the redirects it expanded, not the whole click record.
+A list-replace POST writes one line with the rules count on success, and one with the reason on a refusal or a failed write.
+
+Section 8 collects the whole document.
+
+## 8. Summary
 
 m6-redirect is a static, exact-match redirect engine with one list file and two ways to change it.
 The list-replace POST writes and swaps, and the reload signal reads and swaps.

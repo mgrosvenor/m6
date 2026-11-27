@@ -85,28 +85,43 @@ fn recording_a_request_allocates_nothing() -> Result<(), Failed> {
     let ev = Event {
         node: "dev",
         path: "/some/page",
+        query: None,
         status: 200,
         cache_state: "HIT",
         client_ip: "192.0.2.1",
         latency_ns: Some(1_234),
+        location: None,
     };
     let mut window = TrafficWindow::new();
 
     // Warm: the CSPRNG's thread-local, the line clock and the Sink's buffers are
     // created on first use, and that first use is not the path being measured.
-    let _: Option<SessionId> = analytics::record(true, &with_cookie, &ev, &mut window);
-    let _: Option<SessionId> = analytics::record(true, &no_cookie, &ev, &mut window);
+    let _: Option<SessionId> = analytics::record(
+        true,
+        analytics::Consent::OFF,
+        &with_cookie,
+        &ev,
+        &mut window,
+    );
+    let _: Option<SessionId> =
+        analytics::record(true, analytics::Consent::OFF, &no_cookie, &ev, &mut window);
 
     let start = alloc_count::now();
     for _ in 0..REQUESTS {
-        let id = analytics::record(true, &with_cookie, &ev, &mut window);
+        let id = analytics::record(
+            true,
+            analytics::Consent::OFF,
+            &with_cookie,
+            &ev,
+            &mut window,
+        );
         assert!(id.is_none(), "a request carrying the cookie adopts it");
     }
     let returning = alloc_count::now() - start;
 
     let start = alloc_count::now();
     for _ in 0..REQUESTS {
-        let id = analytics::record(true, &no_cookie, &ev, &mut window);
+        let id = analytics::record(true, analytics::Consent::OFF, &no_cookie, &ev, &mut window);
         assert!(
             id.is_some(),
             "a request with no cookie gets a new session id"

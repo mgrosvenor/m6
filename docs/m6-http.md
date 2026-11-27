@@ -557,6 +557,12 @@ Table 7 lists the key each monitoring reader selects on.
 **Table 7: the key each monitoring reader selects on.**
 The two documents are found by `type` and the endpoint by its path.
 
+An access line of `message` `request` carries `node`, `path`, the request's `query` when it had one, `status`, `cache_state`, `client_ip`, `referer_host`, `referer_path`, `user_agent` and `latency_ns`.
+When the request has a session it also carries `session_id` and `session_new`; with a consent cookie configured and not granted there is no session, so both are left off, the way `consent` is left off when absent.
+On a redirect it also carries `location`, the `Location` sent, so a click is recorded as it arrived and with where it went.
+A `message` `monitor` line carries `node`, `path`, `status`, `client_ip`, `user_agent` and `latency_ns`.
+
+
 The traffic line carries the last 60 minutes this process served, from a window it keeps in memory and reads no log file for.
 The window holds at most 32,768 events and is allocated at start.
 It starts empty after a restart, and `window_minutes` says how much of the hour it holds: the whole minutes since start, or less when the ring has wrapped.
@@ -566,6 +572,21 @@ The notable-client sample is then cut at 160 characters, marked the same way.
 In the traffic report, a request whose path or user agent was cut counts as probe-shaped, so it appears in `probe_paths` and can make an address read as scanning.
 Probe and injection detection reads at most the first 512 bytes of a path, so a marker past that cap is not matched.
 The 256-byte user-agent cap bounds the agent text the report shows and the text `claims_to_be_bot` reads.
+
+### 11.1 The session cookie and consent
+
+m6-http mints a session cookie, `_m6sid`, for a visitor it measures, and adds it to an HTML response per response and never to the cache, so a cache hit rebuilds it and cannot replay another visitor's cookie.
+The `[analytics]` table in the system config sets three keys: `enabled` (default true) turns analytics on, `consent_cookie` names the site's consent cookie (for example `m6consent`, unset by default), and `consent_version` is the current policy version, the md5 hex of the policy text.
+
+With `consent_cookie` and `consent_version` set, the request's consent cookie decides the response.
+A request with no consent cookie gets `Set-Cookie: m6consent=unknown` (twelve months, `Path=/`, `Secure`, `SameSite=Lax`) and no `_m6sid`.
+A `true:<version>` cookie with the current version is consent, and a session is minted.
+A `false` or `false:<version>` cookie mints no session, and a `_m6sid` the request already carries is cleared with `_m6sid=; Max-Age=0`, because the popup's decline cannot clear an `HttpOnly` cookie itself.
+An `unknown` value, or a `true:<old version>` from before a policy change, mints no session, so a new `consent_version` asks for consent again.
+With `consent_cookie` unset, m6 is as before: every request may get `_m6sid` and no consent cookie is set.
+
+The consent cookie is not `HttpOnly`, because the popup script reads and changes it.
+The access line logs a `consent` field carrying the value received, such as `true:0123`, or nothing when the request carried no consent cookie, so the record shows which policy version a visitor accepted.
 
 Section 12 covers the signals the process handles.
 

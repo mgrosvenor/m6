@@ -13,6 +13,7 @@ The heading is the version, and a number would break the pattern `tag.sh` and CI
 
 The released versions, newest first:
 
+- [1.18.0-rc.2, 2026-11-27](#1180-rc2-2026-11-27)
 - [1.18.0-rc.1, 2026-11-26](#1180-rc1-2026-11-26)
 - [1.17.0, 2026-11-24](#1170-2026-11-24)
 - [1.15.0, 2026-10-29](#1150-2026-10-29)
@@ -37,6 +38,37 @@ The released versions, newest first:
 - [1.1.0, 2026-09-15](#110-2026-09-15)
 - [1.0.0, 2026-09-14](#100-2026-09-14)
 - [0.2.0 and earlier, 2026-03-15 and before](#020-and-earlier-2026-03-15-and-before)
+
+## 1.18.0-rc.2, 2026-11-27
+
+**The access line records a redirect as it arrived and with where it went, m6-redirect logs its own answers, and m6-http honours a site's consent cookie.**
+This is a release candidate, a develop build on staging and not a release.
+The consent behaviour is generic and driven by new `[analytics]` config, unset by default, so a node that names neither key behaves as before.
+
+### Added
+
+- **The request's query and the redirect's target on the access line.**
+  A `request` access line now carries `query` (the raw query string, absent when there was none) and, on a redirect, `location` (the `Location` sent).
+  The edge writes this line on every request, HIT or MISS, so a cached `302` is still attributed where it was served.
+  [`docs/m6-http.md`](docs/m6-http.md) section 11 lists the fields.
+- **m6-redirect logging.**
+  The engine writes one access line per request it answers, with `node`, `host`, `path`, `query`, `status` and `location`, and one line per list replace with the rules count on success or the reason on failure.
+  A 404 carries no `location`.
+  [`docs/m6-redirect.md`](docs/m6-redirect.md) section 7 lists the fields.
+- **The `[analytics] consent_cookie` and `consent_version` keys.**
+  `consent_cookie` names the site's consent cookie and `consent_version` is the current policy version, the md5 hex of the policy text.
+  With both set, m6-http sets `m6consent=unknown` (twelve months) on a response whose request carried no consent cookie, mints `_m6sid` only for a `true:<current version>` cookie, clears a carried `_m6sid` (`Max-Age=0`) on a decline, and mints nothing for `unknown` or an old version.
+  The cookie is added per response and never stored in the cache.
+- **A `consent` field on the access line**, carrying the consent cookie's value as received, or nothing when the request carried none, so the record shows which policy version a visitor accepted.
+- **The access line omits the session fields when there is no session.**
+  With a consent cookie configured and the request not current consent, `session_id` and `session_new` are left off the line rather than written as an empty id and `false`, the way `consent` is left off when absent.
+
+### Notes
+
+- With `consent_cookie` unset this is the previous behaviour: every request may get `_m6sid` and no consent cookie is set.
+- Verified by `cargo test -p m6-http`, which includes the consent unit tests in `m6-http/src/analytics.rs` for each cookie value and the golden access-line test.
+
+---
 
 ## 1.18.0-rc.1, 2026-11-26
 

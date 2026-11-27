@@ -747,7 +747,7 @@ mod tests {
         ));
 
         // A purge and its residency answer round-trip the same way.
-        origin.send_line(&purge_line("/r/cap7k9", 10));
+        origin.send_line(&purge_line("/r/abc123", 10));
         assert!(origin.drive());
         std::thread::sleep(std::time::Duration::from_millis(5));
         assert!(cache.drive());
@@ -756,7 +756,7 @@ mod tests {
         assert!(matches!(
             parse_origin_line(&purges[0]),
             OriginLine::Purge {
-                target: "/r/cap7k9",
+                target: "/r/abc123",
                 counter: 10
             }
         ));
@@ -865,10 +865,10 @@ mod tests {
         s.register("chi".to_string(), tok(2));
         assert_eq!(s.counter(), 0);
 
-        assert!(s.post_purge("/r/cap7k9".to_string(), true, waiter(9), timeout()));
+        assert!(s.post_purge("/r/abc123".to_string(), true, waiter(9), timeout()));
         assert_eq!(s.counter(), 1, "the purge raised the counter");
         let (target, counter) = s.fanout_purge().expect("a fan-out runs");
-        assert_eq!(target, "/r/cap7k9");
+        assert_eq!(target, "/r/abc123");
         assert_eq!(counter, 1);
 
         assert!(!s.resident(tok(1), true), "one cache still owes an answer");

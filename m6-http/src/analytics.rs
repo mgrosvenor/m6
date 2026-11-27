@@ -16,6 +16,30 @@ pub use m6_core::http::{header, HeaderSource};
 
 pub const SESSION_COOKIE: &str = "_m6sid";
 
+/// The site's consent cookie configuration: the cookie's name and the current
+/// policy version. Both absent is today's behaviour (no consent cookie, every
+/// request gets a session). Generic: the cookie name and version come from the
+/// site's `[analytics]` config, so m6 knows nothing about `m6consent` itself.
+#[derive(Clone, Copy)]
+pub struct Consent<'a> {
+    /// The cookie's name, e.g. `m6consent`.
+    pub cookie: Option<&'a str>,
+    /// The current policy version, the md5 hex of the policy text. A
+    /// `true:<v>` cookie counts as consent only when `<v>` equals this.
+    pub version: Option<&'a str>,
+}
+
+impl Consent<'_> {
+    /// No consent cookie configured: today's behaviour.
+    pub const OFF: Consent<'static> = Consent {
+        cookie: None,
+        version: None,
+    };
+}
+
+/// Twelve months, in seconds: the consent cookie's `Max-Age`.
+const CONSENT_MAX_AGE: u64 = 31_536_000;
+
 /// A freshly minted session id: 16 random bytes, 32 lowercase hex characters,
 /// on the stack.
 ///
@@ -95,10 +119,54 @@ impl HeaderSource for H3Headers<'_> {
 /// request, and the only reader is the line, which copies it once into the log
 /// buffer.
 fn session_from_cookie_header(cookie_header: &str) -> Option<&str> {
+    cookie_value(cookie_header, SESSION_COOKIE)
+}
+
+/// The value of a named cookie in one `Cookie` header field, or `None` when the
+/// name is absent or its value is empty.
+fn cookie_value<'a>(cookie_header: &'a str, name: &str) -> Option<&'a str> {
     cookie_header.split(';').find_map(|kv| {
         let (k, v) = kv.trim().split_once('=')?;
-        (k == SESSION_COOKIE && !v.is_empty()).then_some(v)
+        (k == name && !v.is_empty()).then_some(v)
     })
+}
+
+/// Whether the request carries a non-empty `name` cookie, across every `cookie`
+/// field.
+fn has_cookie(headers: &(impl HeaderSource + ?Sized), name: &str) -> bool {
+    headers
+        .find_all("cookie")
+        .any(|v| cookie_value(v, name).is_some())
+}
+
+/// The configured consent cookie's value as sent, for the access line, or
+/// `None` when no consent cookie is configured or the request carries none.
+pub fn consent_value<'a>(
+    consent: Consent<'_>,
+    headers: &'a (impl HeaderSource + ?Sized),
+) -> Option<&'a str> {
+    consent.cookie.and_then(|name| {
+        headers
+            .find_all("cookie")
+            .find_map(|v| cookie_value(v, name))
+    })
+}
+
+/// Whether a cookie value is a current consent: `true:<version>` with the
+/// version equal to the configured current policy version.
+fn is_current_consent(value: &str, version: Option<&str>) -> bool {
+    version.is_some_and(|v| value.strip_prefix("true:") == Some(v))
+}
+
+/// Whether a cookie value is a decline: `false` or `false:<version>`.
+fn is_declined(value: &str) -> bool {
+    value == "false" || value.starts_with("false:")
+}
+
+/// Whether the response already carries a `Set-Cookie` for `name`, so a proxy
+/// does not duplicate one the upstream just set.
+fn response_sets_cookie(headers: &[(String, String)], name: &str) -> bool {
+    response_cookie_value(headers, name).is_some()
 }
 
 /// A random session id: 16 bytes, hex-encoded into a `[u8; 32]` on the stack.
@@ -154,6 +222,51 @@ pub fn session_cookie_header_value(id: SessionId) -> String {
     format!("{SESSION_COOKIE}={id}; Max-Age=1800; Path=/; HttpOnly; Secure; SameSite=Lax")
 }
 
+/// The `Set-Cookie` value that marks the consent cookie `unknown`, sent on a
+/// response whose request carried no consent cookie. Not `HttpOnly`, because
+/// the popup script reads and changes it.
+pub fn consent_unknown_header_value(name: &str) -> String {
+    format!("{name}=unknown; Max-Age={CONSENT_MAX_AGE}; Path=/; Secure; SameSite=Lax")
+}
+
+/// The `Set-Cookie` value that clears the `_m6sid` session cookie. The popup's
+/// decline cannot clear an `HttpOnly` cookie itself, so the server does it.
+pub fn session_clear_header_value() -> String {
+    format!("{SESSION_COOKIE}=; Max-Age=0; Path=/")
+}
+
+/// The one `Set-Cookie` a response needs for consent and the session: the
+/// consent cookie set to `unknown`, a fresh `_m6sid`, or the `_m6sid` clear.
+/// At most one applies per response. `minted` is [`record`]'s return.
+pub fn response_cookie(
+    enabled: bool,
+    consent: Consent<'_>,
+    is_html: bool,
+    request_headers: &(impl HeaderSource + ?Sized),
+    minted: Option<SessionId>,
+) -> Option<String> {
+    if !enabled || !is_html {
+        return None;
+    }
+    let Some(name) = consent.cookie else {
+        // Consent not configured: today's behaviour, one `_m6sid` when minted.
+        return minted.map(session_cookie_header_value);
+    };
+    match consent_value(consent, request_headers) {
+        None => Some(consent_unknown_header_value(name)),
+        Some(value) => {
+            if is_current_consent(value, consent.version) {
+                minted.map(session_cookie_header_value)
+            } else if is_declined(value) {
+                has_cookie(request_headers, SESSION_COOKIE).then(session_clear_header_value)
+            } else {
+                // `unknown`, or `true:<old>`: no session and nothing to set.
+                None
+            }
+        }
+    }
+}
+
 /// Referrer, reduced to host + path only — query strings and fragments
 /// (which can carry search terms, session tokens, tracking params from the
 /// *referring* site) are always dropped before this is logged anywhere.
@@ -184,10 +297,16 @@ pub fn parse_referer(raw: &str) -> (Option<&str>, Option<&str>) {
 pub struct Event<'a> {
     pub node: &'a str,
     pub path: &'a str,
+    /// The request's query string, logged whole so a click is recorded as it
+    /// arrived. Absent when the request carried no query.
+    pub query: Option<&'a str>,
     pub status: u16,
     pub cache_state: &'a str,
     pub client_ip: &'a str,
     pub latency_ns: Option<u64>,
+    /// The response's `Location`, logged so a redirect records where the
+    /// visitor was sent. Absent on every non-redirect response.
+    pub location: Option<&'a str>,
 }
 
 /// Fields extracted from the request headers, ready to log.
@@ -246,6 +365,7 @@ fn push_request(window: &mut TrafficWindow, ev: &Event<'_>, user_agent: Option<&
 /// only for a new session.
 pub fn record(
     enabled: bool,
+    consent: Consent<'_>,
     request_headers: &(impl HeaderSource + ?Sized),
     ev: &Event<'_>,
     window: &mut TrafficWindow,
@@ -253,13 +373,25 @@ pub fn record(
     if !enabled {
         return None;
     }
-    let session = get_or_create_session(request_headers);
-    let features = extract_features(request_headers);
-    log_request(ev, session.id(), session.is_new(), &features);
-    push_request(window, ev, features.user_agent);
+    // Consent, when configured, gates the session: only a current `true:<v>`
+    // counts. With no consent cookie configured this is today's behaviour,
+    // where every request may mint a session.
+    let consent_in = consent_value(consent, request_headers);
+    let allowed = match consent.cookie {
+        None => true,
+        Some(_) => consent_in.is_some_and(|v| is_current_consent(v, consent.version)),
+    };
+    let session = allowed.then(|| get_or_create_session(request_headers));
+    log_and_push(
+        ev,
+        session.as_ref().map(|s| (s.id(), s.is_new())),
+        consent_in,
+        request_headers,
+        window,
+    );
     match session {
-        Session::New(id) => Some(id),
-        Session::Existing(_) => None,
+        Some(Session::New(id)) => Some(id),
+        _ => None,
     }
 }
 
@@ -286,40 +418,41 @@ pub fn is_html_response(resp_headers: &(impl m6_core::http::HeaderSource + ?Size
 /// itself is scoped to HTML responses, per [`is_html_response`].
 pub fn finish_response(
     enabled: bool,
+    consent: Consent<'_>,
     resp_headers: &mut Vec<(String, String)>,
     request_headers: &(impl HeaderSource + ?Sized),
     ev: &Event<'_>,
     window: &mut TrafficWindow,
 ) {
     let html = is_html_response(resp_headers);
-    if let Some(id) = record(enabled, request_headers, ev, window) {
-        if html {
-            resp_headers.push(("Set-Cookie".to_string(), session_cookie_header_value(id)));
-        }
+    let minted = record(enabled, consent, request_headers, ev, window);
+    if let Some(value) = response_cookie(enabled, consent, html, request_headers, minted) {
+        resp_headers.push(("Set-Cookie".to_string(), value));
     }
 }
 
-/// Extract `_m6sid` from a `Set-Cookie` *response* header value (e.g.
-/// `"_m6sid=xyz; Max-Age=1800; Path=/; HttpOnly; Secure; SameSite=Lax"`).
-/// Different shape from a request `Cookie` header: exactly one cookie per
-/// `Set-Cookie` field, name=value first, followed by `; `-separated
-/// attributes — no need to scan multiple cookie pairs within one field.
+/// The first `name=value` of a `Set-Cookie` field in a response, or `None`
+/// when no occurrence carries a non-empty value for `name`.
 ///
-/// Borrows the value, so a proxied response that already carries a session
-/// logs against it without copying the id.
-fn session_from_set_cookie_header(set_cookie: &str) -> Option<&str> {
-    let first = set_cookie.split(';').next()?;
-    let (k, v) = first.trim().split_once('=')?;
-    (k == SESSION_COOKIE && !v.is_empty()).then_some(v)
-}
-
-/// Find a `_m6sid` already set by an upstream hop's response. A response can
-/// carry multiple `Set-Cookie` fields for unrelated reasons, so every
-/// occurrence is checked, not just the first.
-fn session_from_response_headers(resp_headers: &[(String, String)]) -> Option<&str> {
+/// A `Set-Cookie` field has exactly one cookie: name=value first, then
+/// `; `-separated attributes, so there is no need to scan several pairs
+/// within one field. A response can carry several `Set-Cookie` fields for
+/// unrelated reasons, so every occurrence is checked, not just the first. An
+/// empty value reads as absent, the same rule the request `Cookie` parsing
+/// uses. The value borrows from the header, so a proxied response that
+/// already carries a session logs against it without copying the id.
+fn response_cookie_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
     // `get_all`, not `get`: Set-Cookie is the field the headers module names as
     // the one everybody folds by mistake, and a response may carry several.
-    m6_core::headers::get_all(resp_headers, "set-cookie").find_map(session_from_set_cookie_header)
+    m6_core::headers::get_all(headers, "set-cookie").find_map(|sc| {
+        let (k, v) = sc.split(';').next()?.trim().split_once('=')?;
+        (k == name && !v.is_empty()).then_some(v)
+    })
+}
+
+/// Find a `_m6sid` already set by an upstream hop's response.
+fn session_from_response_headers(resp_headers: &[(String, String)]) -> Option<&str> {
+    response_cookie_value(resp_headers, SESSION_COOKIE)
 }
 
 /// Like [`finish_response`], but for a response whose backend may itself be
@@ -341,6 +474,7 @@ fn session_from_response_headers(resp_headers: &[(String, String)]) -> Option<&s
 /// `finish_response`.
 pub fn finish_proxied_response(
     enabled: bool,
+    consent: Consent<'_>,
     resp_headers: &mut Vec<(String, String)>,
     request_headers: &(impl HeaderSource + ?Sized),
     ev: &Event<'_>,
@@ -349,25 +483,60 @@ pub fn finish_proxied_response(
     if !enabled {
         return;
     }
+    // An upstream hop that already set the session, or the consent cookie,
+    // handled this visitor's cookies; log against what it sent and pass the
+    // response through without adding a second, conflicting cookie.
     if let Some(session_id) = session_from_response_headers(resp_headers) {
-        let features = extract_features(request_headers);
-        log_request(ev, session_id, false, &features);
-        push_request(window, ev, features.user_agent);
+        log_and_push(
+            ev,
+            Some((session_id, false)),
+            consent_value(consent, request_headers),
+            request_headers,
+            window,
+        );
         return;
     }
-    finish_response(enabled, resp_headers, request_headers, ev, window);
+    if consent
+        .cookie
+        .is_some_and(|n| response_sets_cookie(resp_headers, n))
+    {
+        log_and_push(
+            ev,
+            None,
+            consent_value(consent, request_headers),
+            request_headers,
+            window,
+        );
+        return;
+    }
+    finish_response(enabled, consent, resp_headers, request_headers, ev, window);
+}
+
+/// Extract the request features, log one access line and push the request
+/// into the traffic window. Shared by [`record`] and
+/// [`finish_proxied_response`], so the extract-log-push pair is written once.
+fn log_and_push(
+    ev: &Event<'_>,
+    session: Option<(&str, bool)>,
+    consent: Option<&str>,
+    request_headers: &(impl HeaderSource + ?Sized),
+    window: &mut TrafficWindow,
+) {
+    let features = extract_features(request_headers);
+    log_request(ev, session, consent, &features);
+    push_request(window, ev, features.user_agent);
 }
 
 /// Emit one structured analytics line into the one Sink, stdout, which
 /// journals under systemd. See `m6_core::log`.
 fn log_request(
     ev: &Event<'_>,
-    session_id: &str,
-    session_new: bool,
+    session: Option<(&str, bool)>,
+    consent: Option<&str>,
     features: &RequestFeatures<'_>,
 ) {
     m6_core::log::with_operational(|sink| {
-        write_request_line(sink, ev, session_id, session_new, features);
+        write_request_line(sink, ev, session, consent, features);
     });
 }
 
@@ -375,26 +544,36 @@ fn log_request(
 ///
 /// Split out from [`log_request`] so the golden-meaning test can write the
 /// line into a file of its own without opening the process's Sink.
+///
+/// `session` is `Some((id, is_new))` when the request has a session, and
+/// `None` when it does not. In the `None` case the session fields are left
+/// off the line, the way an absent consent value is.
 fn write_request_line(
     sink: &mut Sink,
     ev: &Event<'_>,
-    session_id: &str,
-    session_new: bool,
+    session: Option<(&str, bool)>,
+    consent: Option<&str>,
     features: &RequestFeatures<'_>,
 ) {
-    Line::begin(sink, Level::Info, "request")
+    let mut line = Line::begin(sink, Level::Info, "request")
         .kind(Type::Access)
         .str("node", ev.node)
         .str("path", ev.path)
+        .opt_str("query", ev.query)
         .field("status", ev.status)
         .str("cache_state", ev.cache_state)
-        .str("client_ip", ev.client_ip)
-        .str("session_id", session_id)
-        .bool("session_new", session_new)
+        .str("client_ip", ev.client_ip);
+    if let Some((session_id, session_new)) = session {
+        line = line
+            .str("session_id", session_id)
+            .bool("session_new", session_new);
+    }
+    line.opt_str("consent", consent)
         .opt_str("referer_host", features.referer_host)
         .opt_str("referer_path", features.referer_path)
         .opt_str("user_agent", features.user_agent)
         .field("latency_ns", ev.latency_ns)
+        .opt_str("location", ev.location)
         .end();
 }
 
@@ -711,14 +890,17 @@ mod tests {
         let mut window = TrafficWindow::new();
         let sc = record(
             false,
+            Consent::OFF,
             &headers,
             &Event {
                 node: "node",
                 path: "/p",
+                query: None,
                 status: 200,
                 cache_state: "HIT",
                 client_ip: "1.2.3.4",
                 latency_ns: None,
+                location: None,
             },
             &mut window,
         );
@@ -731,14 +913,17 @@ mod tests {
         let mut window = TrafficWindow::new();
         let sc = record(
             true,
+            Consent::OFF,
             &headers,
             &Event {
                 node: "node",
                 path: "/p",
+                query: None,
                 status: 200,
                 cache_state: "HIT",
                 client_ip: "1.2.3.4",
                 latency_ns: Some(123),
+                location: None,
             },
             &mut window,
         );
@@ -755,14 +940,17 @@ mod tests {
         let mut window = TrafficWindow::new();
         let sc = record(
             true,
+            Consent::OFF,
             &headers,
             &Event {
                 node: "node",
                 path: "/p",
+                query: None,
                 status: 200,
                 cache_state: "HIT",
                 client_ip: "1.2.3.4",
                 latency_ns: Some(123),
+                location: None,
             },
             &mut window,
         );
@@ -770,6 +958,210 @@ mod tests {
             sc.is_none(),
             "a request already carrying a session cookie must not get a new one"
         );
+    }
+
+    // ── Consent ─────────────────────────────────────────────────────────────
+
+    const POLICY_V: &str = "0123456789abcdef0123456789abcdef";
+
+    fn consent_on() -> Consent<'static> {
+        Consent {
+            cookie: Some("m6consent"),
+            version: Some(POLICY_V),
+        }
+    }
+
+    fn finish_for(req_cookie: Option<&str>, consent: Consent<'_>) -> Vec<(String, String)> {
+        let mut resp = vec![(
+            "Content-Type".to_string(),
+            "text/html; charset=utf-8".to_string(),
+        )];
+        let req: Vec<(String, String)> = req_cookie
+            .map(|c| vec![("Cookie".to_string(), c.to_string())])
+            .unwrap_or_default();
+        let ev = Event {
+            node: "node",
+            path: "/p",
+            query: None,
+            status: 200,
+            cache_state: "MISS",
+            client_ip: "1.2.3.4",
+            latency_ns: None,
+            location: None,
+        };
+        let mut window = TrafficWindow::new();
+        finish_response(true, consent, &mut resp, &req[..], &ev, &mut window);
+        resp
+    }
+
+    fn set_cookies(resp: &[(String, String)]) -> Vec<String> {
+        resp.iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
+            .map(|(_, v)| v.clone())
+            .collect()
+    }
+
+    #[test]
+    fn no_consent_cookie_sets_unknown_and_no_session() {
+        let resp = finish_for(None, consent_on());
+        let sc = set_cookies(&resp);
+        assert!(
+            sc.iter().any(|v| v.starts_with("m6consent=unknown;")),
+            "the response sets m6consent=unknown: {sc:?}"
+        );
+        assert!(
+            !sc.iter().any(|v| v.starts_with("_m6sid=")),
+            "no session before consent: {sc:?}"
+        );
+    }
+
+    #[test]
+    fn current_consent_mints_a_session() {
+        let cookie = format!("m6consent=true:{POLICY_V}");
+        let resp = finish_for(Some(&cookie), consent_on());
+        let sc = set_cookies(&resp);
+        assert!(
+            sc.iter().any(|v| v.starts_with("_m6sid=")),
+            "current consent mints _m6sid: {sc:?}"
+        );
+        assert!(
+            !sc.iter().any(|v| v.starts_with("m6consent=")),
+            "the consent cookie is already set, none re-sent: {sc:?}"
+        );
+    }
+
+    #[test]
+    fn declined_consent_mints_no_session() {
+        let cookie = format!("m6consent=false:{POLICY_V}");
+        let resp = finish_for(Some(&cookie), consent_on());
+        assert!(
+            set_cookies(&resp).is_empty(),
+            "decline mints nothing: {:?}",
+            set_cookies(&resp)
+        );
+    }
+
+    #[test]
+    fn declined_consent_clears_a_carried_session() {
+        let cookie = format!("m6consent=false:{POLICY_V}; _m6sid=abc");
+        let resp = finish_for(Some(&cookie), consent_on());
+        let sc = set_cookies(&resp);
+        assert!(
+            sc.iter().any(|v| v == "_m6sid=; Max-Age=0; Path=/"),
+            "decline clears the HttpOnly session cookie: {sc:?}"
+        );
+    }
+
+    #[test]
+    fn an_old_consent_version_mints_no_session() {
+        let cookie = "m6consent=true:deadbeefdeadbeefdeadbeefdeadbeef";
+        let resp = finish_for(Some(cookie), consent_on());
+        let sc = set_cookies(&resp);
+        assert!(
+            !sc.iter().any(|v| v.starts_with("_m6sid=")),
+            "an old policy version is not consent: {sc:?}"
+        );
+    }
+
+    #[test]
+    fn a_cache_hit_adds_the_consent_cookie_and_no_session() {
+        // A hit rebuilds the per-response cookie from the request, never from
+        // the stored entry (the cache strips Set-Cookie on store, so a hit
+        // cannot replay another visitor's cookie).
+        let req = Vec::<(String, String)>::new();
+        let cookie = response_cookie(true, consent_on(), true, &req[..], None);
+        assert!(
+            cookie
+                .as_deref()
+                .is_some_and(|v| v.starts_with("m6consent=unknown;")),
+            "a hit sets m6consent=unknown when the request has none: {cookie:?}"
+        );
+    }
+
+    #[test]
+    fn the_access_line_logs_the_consent_value_it_received() {
+        // `m6consent=true:<v>` logs `consent = true:<v>`, so the proof records
+        // which policy version was accepted. No cookie logs no field.
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("request.jsonl");
+        let ev = Event {
+            node: "node",
+            path: "/p",
+            query: None,
+            status: 200,
+            cache_state: "HIT",
+            client_ip: "1.2.3.4",
+            latency_ns: None,
+            location: None,
+        };
+        let write = |consent: Option<&str>| -> serde_json::Value {
+            let _ = std::fs::remove_file(&path);
+            let mut sink = Sink::file(&path).expect("the line file");
+            write_request_line(
+                &mut sink,
+                &ev,
+                Some(("sess", false)),
+                consent,
+                &RequestFeatures {
+                    referer_host: None,
+                    referer_path: None,
+                    user_agent: None,
+                },
+            );
+            sink.flush();
+            let text = std::fs::read_to_string(&path).expect("read the line");
+            serde_json::from_str(text.trim()).expect("the line is JSON")
+        };
+
+        let value = format!("true:{POLICY_V}");
+        let req = [("Cookie".to_string(), format!("m6consent={value}"))];
+        let line = write(consent_value(consent_on(), &req[..]));
+        assert_eq!(
+            line["fields"]["consent"],
+            serde_json::json!(value),
+            "{line}"
+        );
+
+        let line = write(None);
+        assert!(
+            line["fields"].get("consent").is_none(),
+            "no consent cookie logs no field: {line}"
+        );
+    }
+
+    /// A request with no session omits the session fields from the line, the
+    /// way an absent consent value is omitted. The empty-string session id the
+    /// old code wrote merged every non-consenting request into one bucket.
+    #[test]
+    fn no_session_omits_the_session_fields() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let written = dir.path().join("request.jsonl");
+        let mut sink = Sink::file(&written).expect("the line file");
+        write_request_line(
+            &mut sink,
+            &Event {
+                node: "edge-a",
+                path: "/",
+                query: None,
+                status: 200,
+                cache_state: "HIT",
+                client_ip: "192.0.2.9",
+                latency_ns: None,
+                location: None,
+            },
+            None,
+            None,
+            &RequestFeatures {
+                referer_host: None,
+                referer_path: None,
+                user_agent: None,
+            },
+        );
+        sink.flush();
+        let text = std::fs::read_to_string(&written).expect("the written line");
+        let v: serde_json::Value = serde_json::from_str(text.trim()).expect("written JSON");
+        assert!(v["fields"].get("session_id").is_none(), "{v}");
+        assert!(v["fields"].get("session_new").is_none(), "{v}");
     }
 
     #[test]
@@ -783,27 +1175,33 @@ mod tests {
 
         let vec_sc = record(
             true,
+            Consent::OFF,
             &vec_headers,
             &Event {
                 node: "node",
                 path: "/p",
+                query: None,
                 status: 200,
                 cache_state: "HIT",
                 client_ip: "1.2.3.4",
                 latency_ns: None,
+                location: None,
             },
             &mut window,
         );
         let h3_sc = record(
             true,
+            Consent::OFF,
             &h3_headers,
             &Event {
                 node: "node",
                 path: "/p",
+                query: None,
                 status: 200,
                 cache_state: "HIT",
                 client_ip: "1.2.3.4",
                 latency_ns: None,
+                location: None,
             },
             &mut window,
         );
@@ -827,15 +1225,18 @@ mod tests {
         let mut window = TrafficWindow::new();
         finish_response(
             true,
+            Consent::OFF,
             &mut resp_headers,
             &req_headers,
             &Event {
                 node: "node",
                 path: "/p",
+                query: None,
                 status: 200,
                 cache_state: "HIT",
                 client_ip: "1.2.3.4",
                 latency_ns: None,
+                location: None,
             },
             &mut window,
         );
@@ -854,15 +1255,18 @@ mod tests {
         let mut window = TrafficWindow::new();
         finish_response(
             true,
+            Consent::OFF,
             &mut resp_headers,
             &req_headers,
             &Event {
                 node: "node",
                 path: "/p",
+                query: None,
                 status: 200,
                 cache_state: "HIT",
                 client_ip: "1.2.3.4",
                 latency_ns: None,
+                location: None,
             },
             &mut window,
         );
@@ -880,15 +1284,18 @@ mod tests {
         let mut window = TrafficWindow::new();
         finish_response(
             false,
+            Consent::OFF,
             &mut resp_headers,
             &req_headers,
             &Event {
                 node: "node",
                 path: "/p",
+                query: None,
                 status: 200,
                 cache_state: "HIT",
                 client_ip: "1.2.3.4",
                 latency_ns: None,
+                location: None,
             },
             &mut window,
         );
@@ -902,17 +1309,27 @@ mod tests {
     // ── finish_proxied_response(): the multi-hop (cache node → origin) fix ──
 
     #[test]
-    fn session_from_set_cookie_header_extracts_id() {
-        let v = session_from_set_cookie_header(
-            "_m6sid=abc123; Max-Age=1800; Path=/; HttpOnly; Secure; SameSite=Lax",
+    fn response_cookie_value_extracts_the_id() {
+        let headers = vec![(
+            "Set-Cookie".to_string(),
+            "_m6sid=abc123; Max-Age=1800; Path=/; HttpOnly; Secure; SameSite=Lax".to_string(),
+        )];
+        assert_eq!(
+            response_cookie_value(&headers, SESSION_COOKIE),
+            Some("abc123")
         );
-        assert_eq!(v, Some("abc123"));
     }
 
     #[test]
-    fn session_from_set_cookie_header_ignores_other_cookies() {
-        let v = session_from_set_cookie_header("other=xyz; Path=/");
-        assert_eq!(v, None);
+    fn response_cookie_value_ignores_other_cookies() {
+        let headers = vec![("Set-Cookie".to_string(), "other=xyz; Path=/".to_string())];
+        assert_eq!(response_cookie_value(&headers, SESSION_COOKIE), None);
+    }
+
+    #[test]
+    fn response_cookie_value_ignores_an_empty_value() {
+        let headers = vec![("Set-Cookie".to_string(), "_m6sid=; Path=/".to_string())];
+        assert_eq!(response_cookie_value(&headers, SESSION_COOKIE), None);
     }
 
     #[test]
@@ -941,15 +1358,18 @@ mod tests {
         let mut window = TrafficWindow::new();
         finish_proxied_response(
             true,
+            Consent::OFF,
             &mut resp_headers,
             &req_headers,
             &Event {
                 node: "edge-node",
                 path: "/p",
+                query: None,
                 status: 200,
                 cache_state: "MISS",
                 client_ip: "1.2.3.4",
                 latency_ns: None,
+                location: None,
             },
             &mut window,
         );
@@ -974,15 +1394,18 @@ mod tests {
         let mut window = TrafficWindow::new();
         finish_proxied_response(
             true,
+            Consent::OFF,
             &mut resp_headers,
             &req_headers,
             &Event {
                 node: "origin",
                 path: "/p",
+                query: None,
                 status: 200,
                 cache_state: "MISS",
                 client_ip: "1.2.3.4",
                 latency_ns: None,
+                location: None,
             },
             &mut window,
         );
@@ -1004,15 +1427,18 @@ mod tests {
         let mut window = TrafficWindow::new();
         finish_proxied_response(
             false,
+            Consent::OFF,
             &mut resp_headers,
             &req_headers,
             &Event {
                 node: "edge-node",
                 path: "/p",
+                query: None,
                 status: 200,
                 cache_state: "MISS",
                 client_ip: "1.2.3.4",
                 latency_ns: None,
+                location: None,
             },
             &mut window,
         );
@@ -1047,13 +1473,15 @@ mod tests {
             &Event {
                 node: "dev",
                 path: "/missing",
+                query: None,
                 status: 404,
                 cache_state: "MISS",
                 client_ip: "192.0.2.1",
                 latency_ns: Some(342_834),
+                location: None,
             },
-            "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
-            true,
+            Some(("0f1e2d3c4b5a69788796a5b4c3d2e1f0", true)),
+            None,
             &RequestFeatures {
                 referer_host: None,
                 referer_path: None,
@@ -1088,6 +1516,78 @@ mod tests {
         );
         sink.flush();
         assert_line_means(&golden, "rate_limited", &rate_limited);
+    }
+
+    /// A redirect's access line records what was received and where the user
+    /// was sent: the request's query string and the response's `Location`.
+    ///
+    /// The short-link tracking depends on exactly this: the 302 is cached at
+    /// every edge for three months, so the edge's own access line is the only
+    /// record that sees every click, HIT or MISS.
+    #[test]
+    fn a_redirect_access_line_carries_the_query_and_the_location() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let written = dir.path().join("request.jsonl");
+        let mut sink = Sink::file(&written).expect("the line file");
+        write_request_line(
+            &mut sink,
+            &Event {
+                node: "edge-a",
+                path: "/r/abc123",
+                query: Some("ref=newsletter"),
+                status: 302,
+                cache_state: "HIT",
+                client_ip: "192.0.2.9",
+                latency_ns: Some(1_200),
+                location: Some("https://example.com/about?ref=123"),
+            },
+            Some(("0f1e2d3c4b5a69788796a5b4c3d2e1f0", false)),
+            None,
+            &RequestFeatures {
+                referer_host: None,
+                referer_path: None,
+                user_agent: Some("curl/8.7.1"),
+            },
+        );
+        sink.flush();
+        let text = std::fs::read_to_string(&written).expect("the written line");
+        let v: serde_json::Value = serde_json::from_str(text.trim()).expect("written JSON");
+        assert_eq!(v["fields"]["query"], "ref=newsletter");
+        assert_eq!(v["fields"]["location"], "https://example.com/about?ref=123");
+    }
+
+    /// A request with no query and a non-redirect response carries neither
+    /// field: an absent value is left out, not written as null.
+    #[test]
+    fn a_plain_request_omits_the_query_and_location_fields() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let written = dir.path().join("request.jsonl");
+        let mut sink = Sink::file(&written).expect("the line file");
+        write_request_line(
+            &mut sink,
+            &Event {
+                node: "edge-a",
+                path: "/",
+                query: None,
+                status: 200,
+                cache_state: "HIT",
+                client_ip: "192.0.2.9",
+                latency_ns: None,
+                location: None,
+            },
+            Some(("0f1e2d3c4b5a69788796a5b4c3d2e1f0", false)),
+            None,
+            &RequestFeatures {
+                referer_host: None,
+                referer_path: None,
+                user_agent: None,
+            },
+        );
+        sink.flush();
+        let text = std::fs::read_to_string(&written).expect("the written line");
+        let v: serde_json::Value = serde_json::from_str(text.trim()).expect("written JSON");
+        assert!(v["fields"].get("query").is_none(), "{v}");
+        assert!(v["fields"].get("location").is_none(), "{v}");
     }
 
     /// Compare one written line's level and fields with its golden file's.
