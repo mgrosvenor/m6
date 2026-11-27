@@ -1056,10 +1056,12 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
                 &analytics::Event {
                     node: &state.config.node.name,
                     path,
+                    query,
                     status: 412,
                     cache_state,
                     client_ip,
                     latency_ns: Some(elapsed_ns),
+                    location: None,
                 },
                 &mut state.traffic,
             );
@@ -1086,10 +1088,12 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
                 &analytics::Event {
                     node: &state.config.node.name,
                     path,
+                    query,
                     status: 304,
                     cache_state,
                     client_ip,
                     latency_ns: Some(elapsed_ns),
+                    location: None,
                 },
                 &mut state.traffic,
             );
@@ -1110,10 +1114,12 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
             &analytics::Event {
                 node: &state.config.node.name,
                 path,
+                query,
                 status: cached.status,
                 cache_state,
                 client_ip,
                 latency_ns: Some(elapsed_ns),
+                location: m6_core::headers::get(&cached.headers, "location"),
             },
             &mut state.traffic,
         )
@@ -4402,10 +4408,12 @@ fn handle_h3_request(
                 &analytics::Event {
                     node: &state.config.node.name,
                     path: path_str,
+                    query: query_str,
                     status: 304,
                     cache_state,
                     client_ip: &client_ip,
                     latency_ns: Some(elapsed_ns),
+                    location: None,
                 },
                 &mut state.traffic,
             );
@@ -4465,10 +4473,12 @@ fn handle_h3_request(
             &analytics::Event {
                 node: &state.config.node.name,
                 path: path_str,
+                query: query_str,
                 status: cached.status,
                 cache_state,
                 client_ip: &client_ip,
                 latency_ns: Some(elapsed_ns),
+                location: m6_core::headers::get(&cached.headers, "location"),
             },
             &mut state.traffic,
         );
@@ -6057,12 +6067,14 @@ fn dispatch_custom_error_async(
             &analytics::Event {
                 node: &state.config.node.name,
                 path: &req.path,
+                query: req.query.as_deref(),
                 status,
                 // Neither HIT nor MISS: the response cache was not consulted
                 // and no backend was contacted.
                 cache_state: "LOCAL",
                 client_ip,
                 latency_ns: Some(latency_ns),
+                location: None,
             },
             &mut state.traffic,
         );
@@ -6540,10 +6552,12 @@ fn error_page_fallback(
         &analytics::Event {
             node: &state.config.node.name,
             path: &req.path,
+            query: req.query.as_deref(),
             status: original_status,
             cache_state: "MISS",
             client_ip: &ctx.client_ip,
             latency_ns: Some(latency_ns),
+            location: None,
         },
         &mut state.traffic,
     );
@@ -6591,10 +6605,12 @@ fn complete_socket_response(
                     &analytics::Event {
                         node: &state.config.node.name,
                         path: &req.path,
+                        query: req.query.as_deref(),
                         status: original_status,
                         cache_state: "MISS",
                         client_ip: &ctx.client_ip,
                         latency_ns: Some(latency_ns),
+                        location: None,
                     },
                     &mut state.traffic,
                 );
@@ -6678,10 +6694,12 @@ fn complete_socket_response(
                     &analytics::Event {
                         node: &state.config.node.name,
                         path: &req.path,
+                        query: req.query.as_deref(),
                         status: s,
                         cache_state: "MISS",
                         client_ip: &ctx.client_ip,
                         latency_ns: Some(backend_ns),
+                        location: None,
                     },
                     &mut state.traffic,
                 );
@@ -6698,6 +6716,7 @@ fn complete_socket_response(
         }
     } else {
         let backend_ns = ctx.start.elapsed().as_nanos() as u64;
+        let location = m6_core::headers::get(&resp_headers, "location").map(str::to_string);
         analytics::finish_response(
             analytics_enabled,
             &mut resp_headers,
@@ -6705,10 +6724,12 @@ fn complete_socket_response(
             &analytics::Event {
                 node: &state.config.node.name,
                 path: &req.path,
+                query: req.query.as_deref(),
                 status,
                 cache_state: "MISS",
                 client_ip: &ctx.client_ip,
                 latency_ns: Some(backend_ns),
+                location: location.as_deref(),
             },
             &mut state.traffic,
         );
@@ -6797,10 +6818,12 @@ fn finalize_url_response_inner(
                     &analytics::Event {
                         node: &state.config.node.name,
                         path: &req.path,
+                        query: req.query.as_deref(),
                         status: original_status,
                         cache_state: "MISS",
                         client_ip: &ctx.client_ip,
                         latency_ns: Some(latency_ns),
+                        location: None,
                     },
                     &mut state.traffic,
                 );
@@ -6874,6 +6897,7 @@ fn finalize_url_response_inner(
             let mut headers = entry.headers.to_pairs();
             set_age(&mut headers, age);
             let latency_ns = ctx.start.elapsed().as_nanos() as u64;
+            let location = m6_core::headers::get(&headers, "location").map(str::to_string);
             analytics::finish_proxied_response(
                 analytics_on,
                 &mut headers,
@@ -6881,10 +6905,12 @@ fn finalize_url_response_inner(
                 &analytics::Event {
                     node: &state.config.node.name,
                     path: &req.path,
+                    query: req.query.as_deref(),
                     status: entry.status,
                     cache_state: "STALE",
                     client_ip: &ctx.client_ip,
                     latency_ns: Some(latency_ns),
+                    location: location.as_deref(),
                 },
                 &mut state.traffic,
             );
@@ -6920,10 +6946,12 @@ fn finalize_url_response_inner(
                     &analytics::Event {
                         node: &state.config.node.name,
                         path: &req.path,
+                        query: req.query.as_deref(),
                         status: s,
                         cache_state: "MISS",
                         client_ip: &ctx.client_ip,
                         latency_ns: Some(latency_ns),
+                        location: None,
                     },
                     &mut state.traffic,
                 );
@@ -6936,6 +6964,8 @@ fn finalize_url_response_inner(
         set_alt_svc(&mut headers_with_altsvc, quic_port);
 
         let latency_ns = ctx.start.elapsed().as_nanos() as u64;
+        let location = m6_core::headers::get(&headers_with_altsvc, "location")
+            .map(str::to_string);
         analytics::finish_proxied_response(
             analytics_on,
             &mut headers_with_altsvc,
@@ -6943,10 +6973,12 @@ fn finalize_url_response_inner(
             &analytics::Event {
                 node: &state.config.node.name,
                 path: &req.path,
+                query: req.query.as_deref(),
                 status,
                 cache_state: "MISS",
                 client_ip: &ctx.client_ip,
                 latency_ns: Some(latency_ns),
+                location: location.as_deref(),
             },
             &mut state.traffic,
         );

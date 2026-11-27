@@ -184,10 +184,16 @@ pub fn parse_referer(raw: &str) -> (Option<&str>, Option<&str>) {
 pub struct Event<'a> {
     pub node: &'a str,
     pub path: &'a str,
+    /// The request's query string, logged whole so a click is recorded as it
+    /// arrived. Absent when the request carried no query.
+    pub query: Option<&'a str>,
     pub status: u16,
     pub cache_state: &'a str,
     pub client_ip: &'a str,
     pub latency_ns: Option<u64>,
+    /// The response's `Location`, logged so a redirect records where the
+    /// visitor was sent. Absent on every non-redirect response.
+    pub location: Option<&'a str>,
 }
 
 /// Fields extracted from the request headers, ready to log.
@@ -386,6 +392,7 @@ fn write_request_line(
         .kind(Type::Access)
         .str("node", ev.node)
         .str("path", ev.path)
+        .opt_str("query", ev.query)
         .field("status", ev.status)
         .str("cache_state", ev.cache_state)
         .str("client_ip", ev.client_ip)
@@ -395,6 +402,7 @@ fn write_request_line(
         .opt_str("referer_path", features.referer_path)
         .opt_str("user_agent", features.user_agent)
         .field("latency_ns", ev.latency_ns)
+        .opt_str("location", ev.location)
         .end();
 }
 
@@ -715,10 +723,12 @@ mod tests {
             &Event {
                 node: "node",
                 path: "/p",
+                query: None,
                 status: 200,
                 cache_state: "HIT",
                 client_ip: "1.2.3.4",
                 latency_ns: None,
+                location: None,
             },
             &mut window,
         );
@@ -735,10 +745,12 @@ mod tests {
             &Event {
                 node: "node",
                 path: "/p",
+                query: None,
                 status: 200,
                 cache_state: "HIT",
                 client_ip: "1.2.3.4",
                 latency_ns: Some(123),
+                location: None,
             },
             &mut window,
         );
@@ -759,10 +771,12 @@ mod tests {
             &Event {
                 node: "node",
                 path: "/p",
+                query: None,
                 status: 200,
                 cache_state: "HIT",
                 client_ip: "1.2.3.4",
                 latency_ns: Some(123),
+                location: None,
             },
             &mut window,
         );
@@ -787,10 +801,12 @@ mod tests {
             &Event {
                 node: "node",
                 path: "/p",
+                query: None,
                 status: 200,
                 cache_state: "HIT",
                 client_ip: "1.2.3.4",
                 latency_ns: None,
+                location: None,
             },
             &mut window,
         );
@@ -800,10 +816,12 @@ mod tests {
             &Event {
                 node: "node",
                 path: "/p",
+                query: None,
                 status: 200,
                 cache_state: "HIT",
                 client_ip: "1.2.3.4",
                 latency_ns: None,
+                location: None,
             },
             &mut window,
         );
@@ -832,10 +850,12 @@ mod tests {
             &Event {
                 node: "node",
                 path: "/p",
+                query: None,
                 status: 200,
                 cache_state: "HIT",
                 client_ip: "1.2.3.4",
                 latency_ns: None,
+                location: None,
             },
             &mut window,
         );
@@ -859,10 +879,12 @@ mod tests {
             &Event {
                 node: "node",
                 path: "/p",
+                query: None,
                 status: 200,
                 cache_state: "HIT",
                 client_ip: "1.2.3.4",
                 latency_ns: None,
+                location: None,
             },
             &mut window,
         );
@@ -885,10 +907,12 @@ mod tests {
             &Event {
                 node: "node",
                 path: "/p",
+                query: None,
                 status: 200,
                 cache_state: "HIT",
                 client_ip: "1.2.3.4",
                 latency_ns: None,
+                location: None,
             },
             &mut window,
         );
@@ -946,10 +970,12 @@ mod tests {
             &Event {
                 node: "edge-node",
                 path: "/p",
+                query: None,
                 status: 200,
                 cache_state: "MISS",
                 client_ip: "1.2.3.4",
                 latency_ns: None,
+                location: None,
             },
             &mut window,
         );
@@ -979,10 +1005,12 @@ mod tests {
             &Event {
                 node: "origin",
                 path: "/p",
+                query: None,
                 status: 200,
                 cache_state: "MISS",
                 client_ip: "1.2.3.4",
                 latency_ns: None,
+                location: None,
             },
             &mut window,
         );
@@ -1009,10 +1037,12 @@ mod tests {
             &Event {
                 node: "edge-node",
                 path: "/p",
+                query: None,
                 status: 200,
                 cache_state: "MISS",
                 client_ip: "1.2.3.4",
                 latency_ns: None,
+                location: None,
             },
             &mut window,
         );
@@ -1047,10 +1077,12 @@ mod tests {
             &Event {
                 node: "dev",
                 path: "/missing",
+                query: None,
                 status: 404,
                 cache_state: "MISS",
                 client_ip: "192.0.2.1",
                 latency_ns: Some(342_834),
+                location: None,
             },
             "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
             true,
@@ -1088,6 +1120,81 @@ mod tests {
         );
         sink.flush();
         assert_line_means(&golden, "rate_limited", &rate_limited);
+    }
+
+    /// A redirect's access line records what was received and where the user
+    /// was sent: the request's query string and the response's `Location`.
+    ///
+    /// The short-link tracking depends on exactly this: the 302 is cached at
+    /// every edge for three months, so the edge's own access line is the only
+    /// record that sees every click, HIT or MISS.
+    #[test]
+    fn a_redirect_access_line_carries_the_query_and_the_location() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let written = dir.path().join("request.jsonl");
+        let mut sink = Sink::file(&written).expect("the line file");
+        write_request_line(
+            &mut sink,
+            &Event {
+                node: "edge-a",
+                path: "/r/cap7k9",
+                query: Some("ref=newsletter"),
+                status: 302,
+                cache_state: "HIT",
+                client_ip: "192.0.2.9",
+                latency_ns: Some(1_200),
+                location: Some("https://mgrosvenor.com/capabilities?m6qs=7k9"),
+            },
+            "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+            false,
+            &RequestFeatures {
+                referer_host: None,
+                referer_path: None,
+                user_agent: Some("curl/8.7.1"),
+            },
+        );
+        sink.flush();
+        let text = std::fs::read_to_string(&written).expect("the written line");
+        let v: serde_json::Value = serde_json::from_str(text.trim()).expect("written JSON");
+        assert_eq!(v["fields"]["query"], "ref=newsletter");
+        assert_eq!(
+            v["fields"]["location"],
+            "https://mgrosvenor.com/capabilities?m6qs=7k9"
+        );
+    }
+
+    /// A request with no query and a non-redirect response carries neither
+    /// field: an absent value is left out, not written as null.
+    #[test]
+    fn a_plain_request_omits_the_query_and_location_fields() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let written = dir.path().join("request.jsonl");
+        let mut sink = Sink::file(&written).expect("the line file");
+        write_request_line(
+            &mut sink,
+            &Event {
+                node: "edge-a",
+                path: "/",
+                query: None,
+                status: 200,
+                cache_state: "HIT",
+                client_ip: "192.0.2.9",
+                latency_ns: None,
+                location: None,
+            },
+            "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+            false,
+            &RequestFeatures {
+                referer_host: None,
+                referer_path: None,
+                user_agent: None,
+            },
+        );
+        sink.flush();
+        let text = std::fs::read_to_string(&written).expect("the written line");
+        let v: serde_json::Value = serde_json::from_str(text.trim()).expect("written JSON");
+        assert!(v["fields"].get("query").is_none(), "{v}");
+        assert!(v["fields"].get("location").is_none(), "{v}");
     }
 
     /// Compare one written line's level and fields with its golden file's.
