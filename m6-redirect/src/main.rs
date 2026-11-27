@@ -109,14 +109,10 @@ impl State {
         // line through the journal. `items` came back from the one parse above,
         // so the body is not parsed twice.
         m6_core::log::with_operational(|sink| {
-            m6_core::log::Line::begin(
-                sink,
-                m6_core::log::Level::Info,
-                "redirect list replaced",
-            )
-            .field("rules", count)
-            .json("items", &items)
-            .end();
+            m6_core::log::Line::begin(sink, m6_core::log::Level::Info, "redirect list replaced")
+                .field("rules", count)
+                .json("items", &items)
+                .end();
         });
         Response::status(204).header("Cache-Control", "no-store")
     }
