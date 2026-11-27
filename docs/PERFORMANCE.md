@@ -1,7 +1,7 @@
 # Performance: every number, and how it was taken
 
 This document records what each component of m6 costs, which change made it cost that, and the conditions each figure was taken under.
-Section 1 gives the rules every figure follows, sections 2 to 7 give the figures, section 8 gives the commands that re-take them, and section 10 lists what has no figure.
+Section 1 gives the rules every figure follows, sections 2 to 8 give the figures, section 9 gives the commands that re-take them, and section 11 lists what has no figure.
 
 ## Contents
 
@@ -12,9 +12,10 @@ Section 1 gives the rules every figure follows, sections 2 to 7 give the figures
 5. [Connection setup, per channel](#5-connection-setup-per-channel)
 6. [Where a TLS handshake goes](#6-where-a-tls-handshake-goes)
 7. [Certificate compression and the QUIC amplification limit](#7-certificate-compression-and-the-quic-amplification-limit)
-8. [Reproducing these measurements](#8-reproducing-these-measurements)
-9. [Event-loop accounting and queue costs](#9-event-loop-accounting-and-queue-costs)
-10. [What is not measured](#10-what-is-not-measured)
+8. [Redirect latency: m6-redirect at the edge against a hosted bulk-redirect service](#8-redirect-latency-m6-redirect-at-the-edge-against-a-hosted-bulk-redirect-service)
+9. [Reproducing these measurements](#9-reproducing-these-measurements)
+10. [Event-loop accounting and queue costs](#10-event-loop-accounting-and-queue-costs)
+11. [What is not measured](#11-what-is-not-measured)
 
 ---
 
@@ -157,7 +158,7 @@ What changed:
 ### 2.8. mimalloc as the global allocator, and whether it stays
 
 Every m6 service (m6-http, m6-file, m6-html, m6-md, m6-auth-server and m6-monitor) installs `m6_core::alloc::M6Alloc`, which is mimalloc, and every allocation-counting test installs the same type, so the counts are taken against the allocator production runs.
-The A/B in section 8.2 tests it against the base build: cache-hit and render latency no worse, and the memory-call and page-fault counts at zero or a named handful.
+The A/B in section 9.2 tests it against the base build: cache-hit and render latency no worse, and the memory-call and page-fault counts at zero or a named handful.
 
 A warm service should make no `brk`, `mmap`, `munmap`, `madvise`, `mremap` or `mprotect` call.
 That takes four settings, made at start and listed in Table 6:
@@ -469,7 +470,7 @@ Table 18 gives the cost of two bare system calls on the VM, the unit in which th
 | `getppid`, 5,000,000 calls | 1.20 us |
 | pipe write plus read, 2,000,000 calls | 1.54 us |
 
-**Table 18: the two bare system call costs on the VM (a `getppid` loop of 5,000,000 calls and a pipe write and read loop of 1,000,000 pairs, section 8.1).**
+**Table 18: the two bare system call costs on the VM (a `getppid` loop of 5,000,000 calls and a pipe write and read loop of 1,000,000 pairs, section 9.1).**
 Take from it that most of the kernel share in Table 15 is the TCP work behind the calls.
 
 A single per-call figure for the handshake's syscall mix is `NOT MEASURED`.
@@ -583,13 +584,79 @@ With 0-RTT a returning visitor reaches response headers in 6.0 to 6.7 ms (Table 
 
 ---
 
-## 8. Reproducing these measurements
+## 8. Redirect latency: m6-redirect at the edge against a hosted bulk-redirect service
+
+A short-link redirect answered from an m6 edge costs a visitor one network round trip, and this section records the figures and the method that produced them.
+The comparison is against a hosted bulk-redirect service answering the same redirect from its own edge.
+The measurement ran on 2026-11-28 from a laptop in the same city as both edges, where one network round trip is about 5.5 ms, and it covers curl and one real browser.
+Section 8.1 gives the setup, section 8.2 the curl figures, section 8.3 the browser figures, section 8.4 the inside-m6 cost, and section 8.5 what is not yet measured.
+
+### 8.1. The setup
+
+The m6 side is one m6-http cache node with m6-redirect behind its origin, serving a short-link 302 with `s-maxage`, so every request measured is a cache hit.
+The hosted side is Cloudflare Bulk Redirects on the Free plan, on a separate short domain, answering the same redirect.
+The client is a laptop in the same city as both edges, so both sides pay the same network path.
+DNS is excluded from the curl figures, so the two columns differ only by the edge's own work.
+
+### 8.2. curl
+
+Table 22 gives the curl figures, 40 runs each on the laptop, DNS excluded, p50 in milliseconds.
+
+| step | m6 edge | hosted bulk-redirect service |
+|---|---:|---:|
+| TCP connect | 5.3 | 5.6 |
+| TLS handshake | 10.5 | 13.5 |
+| the 302's first byte | 5.3 (p90 5.8) | 16.9 (p90 21.3) |
+| new visitor total | 21.3 | 35.9 |
+| kept-alive 302 | 4.9 (p90 5.2) | 8.2 (p90 25.2) |
+
+**Table 22: curl timing, 40 runs each, DNS excluded, p50 in milliseconds, 2026-11-28.**
+Take from it that the m6 302 reaches its first byte in 5.3 ms, one network round trip on this path, and the hosted 302 in 16.9 ms.
+
+The TLS row is client-bound for both sides.
+macOS curl through SecureTransport takes two round trips for TLS 1.3 against every server measured, including the hosted service's own sites.
+The kept-alive row is the 302 alone once the connection is open.
+It is the cost a returning visitor pays.
+
+### 8.3. A real browser
+
+Table 23 gives real Chrome, a fresh profile per visit, 12 interleaved rounds, and the landing page's first byte from the browser's own Navigation Timing, so each number includes the redirect.
+
+| path to the landing page | p50 | p90 |
+|---|---:|---:|
+| direct, no redirect | 43.7 | 46.5 |
+| through the m6 redirect | 51.5 | 57.6 |
+| through the hosted redirect | 78.6 | 98.5 |
+
+**Table 23: real Chrome, a fresh profile per visit, 12 interleaved rounds, landing page first byte in milliseconds.**
+Take from it that the m6 redirect adds 7.8 ms, one round trip, and the hosted redirect adds 34.9 ms: a slower redirect plus a second connection to the site's own domain.
+
+Edge with a reused profile sits within a few milliseconds of Chrome.
+A fresh profile per visit adds about 50 ms to every navigation in Edge, so a fresh-profile Edge number is a profile start-up figure.
+
+### 8.4. The inside-m6 cost
+
+Inside m6 a cache hit costs about 3 µs, the perf line's `hit_p50`, so the m6 302 is bound by the network round trip.
+The curl and browser figures above carry that round trip, and the 3 µs sits inside it.
+
+### 8.5. What is not yet measured
+
+Firefox automation failed to start on the test machine, and the Safari driver is not yet enabled, so neither browser has a figure yet.
+Both will be added to Tables 22 and 23 once they can be driven.
+
+The measured position is that a cached m6-redirect 302 costs a visitor one network round trip.
+The same redirect from a hosted bulk-redirect service costs that round trip plus a slower redirect and a second connection to the site's own domain.
+The m6 side is bound by the network, and the cache hit inside m6 is 3 µs.
+
+---
+
+## 9. Reproducing these measurements
 
 The measurements that can be re-run are described below, with the command where the tree carries one.
 A re-run measures the tree it runs on, so the figures here stay the record of the builds they name.
 The commands are grouped by the section they support.
 
-### 8.1. Sections 2 to 7
+### 9.1. Sections 2 to 8
 
 **Per-request copy cost, sections 2.2 and 2.5:**
 
@@ -643,7 +710,7 @@ The parts bench is an in-memory loop of 2,000 full handshakes per primitive, rea
 The hit-under-load run holds `m6-bench`'s cache hit on one kept-alive connection while `m6-probe-h1` opens full handshakes at 0, 50, 100, 200 and 500 a second, one 10 second window per rate.
 This tree builds aws-lc-rs only, so the ring rows of Table 16 need a build that selects ring.
 
-### 8.2. The mimalloc A/B on the build host
+### 9.2. The mimalloc A/B on the build host
 
 Run on the idle build host, holding the host lock, the base (`ce6c29c`) against the branch (`perf/mimalloc`).
 Build both with the release profile.
@@ -696,11 +763,11 @@ The test returns on macOS before its assertions, so the build host is where it r
 
 ---
 
-## 9. Event-loop accounting and queue costs
+## 10. Event-loop accounting and queue costs
 
 Three costs inside the process, none of them a page cost, are recorded here and in `CHANGELOG.md`.
 Each was measured on a release build on an Apple M4.
-Table 22 gives each cost before and after the change.
+Table 24 gives each cost before and after the change.
 
 | what | before | after | what changed |
 |---|---|---|---|
@@ -708,15 +775,15 @@ Table 22 gives each cost before and after the change.
 | the metrics turn, per ten seconds | 438 us | **80 us** | no host read in the turn. `HostReader` reads one host source per one-second tick, 1.5 us or less each on macOS except the interface table at 466 us, and the document is serialised straight into the log buffer |
 | `Bounded` pop, 50,000 entries | 79.4 ms | **0.18 ms** | pop moved every remaining entry down one place. It is now a ring index (`VecDeque`), so pop is constant time |
 
-**Table 22: costs of the event loop's accounting lines and of the `Bounded` queue, before and after.**
+**Table 24: costs of the event loop's accounting lines and of the `Bounded` queue, before and after.**
 Take from it that the traffic line fell from 0.13% of the loop (78.6 ms of 60 s) to 0.022% (13.4 ms), 5.9 times, and that a `Bounded` queue of 50,000 entries drains 441 times faster.
 The traffic line is the one cost here that scales with traffic.
 
 ---
 
-## 10. What is not measured
+## 11. What is not measured
 
-Five gaps remain, listed in Table 23.
+Five gaps remain, listed in Table 25.
 
 | gap | what is missing |
 |---|---|
@@ -726,7 +793,7 @@ Five gaps remain, listed in Table 23.
 | the ACK share of the QUIC gap | the pinned quiche has no `draft-ietf-quic-ack-frequency` support. `grep -rn "ACK_FREQUENCY\|ack_frequency" quiche/src` finds nothing, the `Frame` enum carries RFC 9000's `ACK` only (`quiche/src/frame.rs:58-72`), and `TransportParams` carries the two RFC 9000 ack parameters and no other (`quiche/src/transport_params.rs:176-179`). `Config` exposes `set_ack_delay_exponent` (`quiche/src/lib.rs:1084`) and `set_max_ack_delay` (`quiche/src/lib.rs:1089-1093`), and both write the parameters this endpoint advertises to the peer. This endpoint's own ack is decided at `quiche/src/lib.rs:4620-4621` by the peer's packets, and its ack delay comes from the peer's `max_ack_delay` at `quiche/src/lib.rs:8058`. rc.1 therefore adds no ack-frequency control and claims no figure for that share |
 | other machines | Table 3 is one laptop, and no other machine has a copy-removal figure |
 
-**Table 23: what this document does not cover.**
+**Table 25: what this document does not cover.**
 Take from it that throughput has no number at all, and that `tools/perfcheck.sh` supersedes Table 3 for any gating purpose.
 
 The measured position is that core's per-request copying fell by a factor of 280, the static file path allocates nothing for bytes it does not send, the cache lookup costs 125 ns and is flat, and the QUIC handshake completes in one round trip at a conforming amplification factor.

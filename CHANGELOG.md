@@ -74,6 +74,8 @@ A public listener never logs it, so a client's own `Via` header cannot name a no
   Present only on a request the backbone listener received, and only with the `Via` value the peer sent, so the origin can tell the forwarded leg apart from a visitor's own request.
   A public-listener request carrying a `Via` logs no `via`.
   [`docs/m6-http.md`](docs/m6-http.md) section 11 lists the field.
+- **`docs/PERFORMANCE.md` records the redirect latency of a cached m6-redirect 302 at the edge against a hosted bulk-redirect service.**
+  The m6 302 reaches a curl client's first byte in one network round trip, and the README links the new section.
 
 ### Notes
 
@@ -820,7 +822,7 @@ Verified on 2026-11-17 on a macOS sandbox: a real cache node in front of a real 
 **Every m6 service installs mimalloc as its global allocator, and a warm service stays out of the kernel's memory calls.**
 `m6_core::alloc::M6Alloc` wraps mimalloc and is the one allocator type: m6-http, m6-file, m6-html, m6-md, m6-auth-server and m6-monitor declare it in `main.rs`, and every allocation-counting test and example declares the same type, so counts are taken against the allocator production runs. Under `alloc-count` (the `testkit` and `count-allocations` features) it counts exactly as `testkit::alloc_count::Counting` did, and without them the counting is not compiled. `Counting` is removed. A library crate declares no allocator. m6-auth-cli is a one-shot command and keeps the system allocator.
 Each service sets mimalloc's options in code at the top of `main`: freed memory is never returned to the OS (purge delay -1, and the option's number is counted from the bundled `mimalloc.h` by `m6-core/build.rs`, because the binding does not export it), so the heap grows and does not shrink. It then reserves `[limits.heap_reserve]` bytes from the OS once, committed and on huge pages where the kernel offers them, and logs once when the heap later grows past it. Growth is never a failure.
-This is on trial. `docs/PERFORMANCE.md` §2.8 says the A/B in §8.2 decides whether it stays, and a worse latency, or memory calls that do not fall to zero, reverts it.
+This is on trial. `docs/PERFORMANCE.md` §2.8 says the A/B in §9.2 decides whether it stays, and a worse latency, or memory calls that do not fall to zero, reverts it.
 Verified on macOS: 2301 tests pass. Every counting test (`alloc_count_armed`, `event_allocs`, `limit_page_allocs`, `server_conn`, `site_allocs`, `upstream_no_alloc`, `email_allocs`, `allocations`, `client_allocs`) builds and passes with its budget unchanged.
 Not yet verified on Linux: the strace, `perf stat`, latency and RSS comparison on the idle build host (`tools/memcalls.sh`, `tools/hwcounters.sh`, `tools/perfcheck.sh`).
 
