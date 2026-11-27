@@ -89,6 +89,7 @@ fn recording_a_request_allocates_nothing() -> Result<(), Failed> {
         status: 200,
         cache_state: "HIT",
         client_ip: "192.0.2.1",
+        via: None,
         latency_ns: Some(1_234),
         location: None,
     };

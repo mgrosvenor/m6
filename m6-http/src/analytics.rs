@@ -303,6 +303,10 @@ pub struct Event<'a> {
     pub status: u16,
     pub cache_state: &'a str,
     pub client_ip: &'a str,
+    /// The `Via` value the request arrived with, and only when it arrived on a
+    /// listener that trusts the backbone. `None` on every public listener, so
+    /// a client's own `Via` header is never logged as a node.
+    pub via: Option<&'a str>,
     pub latency_ns: Option<u64>,
     /// The response's `Location`, logged so a redirect records where the
     /// visitor was sent. Absent on every non-redirect response.
@@ -318,6 +322,23 @@ pub struct RequestFeatures<'a> {
     pub referer_host: Option<&'a str>,
     pub referer_path: Option<&'a str>,
     pub user_agent: Option<&'a str>,
+}
+
+/// The `Via` value a request arrived with, for the access line.
+///
+/// Recorded only when the request arrived on a listener that trusts the
+/// backbone (`backbone == true`): the same trust that keeps a peer's `Via` on
+/// ingress. On a public listener the client's own `Via` is a claim it may not
+/// make, so it is never logged as a node. The backbone path carries exactly one
+/// `Via` field (this node's forwarder joins the chain into one), so the first
+/// match is the whole received value.
+pub fn received_via(headers: &(impl HeaderSource + ?Sized), backbone: bool) -> Option<&str> {
+    if !backbone {
+        return None;
+    }
+    header(headers, "via")
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
 }
 
 fn extract_features<'a>(headers: &'a (impl HeaderSource + ?Sized)) -> RequestFeatures<'a> {
@@ -562,7 +583,8 @@ fn write_request_line(
         .opt_str("query", ev.query)
         .field("status", ev.status)
         .str("cache_state", ev.cache_state)
-        .str("client_ip", ev.client_ip);
+        .str("client_ip", ev.client_ip)
+        .opt_str("via", ev.via);
     if let Some((session_id, session_new)) = session {
         line = line
             .str("session_id", session_id)
@@ -899,6 +921,7 @@ mod tests {
                 status: 200,
                 cache_state: "HIT",
                 client_ip: "1.2.3.4",
+                via: None,
                 latency_ns: None,
                 location: None,
             },
@@ -922,6 +945,7 @@ mod tests {
                 status: 200,
                 cache_state: "HIT",
                 client_ip: "1.2.3.4",
+                via: None,
                 latency_ns: Some(123),
                 location: None,
             },
@@ -949,6 +973,7 @@ mod tests {
                 status: 200,
                 cache_state: "HIT",
                 client_ip: "1.2.3.4",
+                via: None,
                 latency_ns: Some(123),
                 location: None,
             },
@@ -986,6 +1011,7 @@ mod tests {
             status: 200,
             cache_state: "MISS",
             client_ip: "1.2.3.4",
+            via: None,
             latency_ns: None,
             location: None,
         };
@@ -1091,6 +1117,7 @@ mod tests {
             status: 200,
             cache_state: "HIT",
             client_ip: "1.2.3.4",
+            via: None,
             latency_ns: None,
             location: None,
         };
@@ -1146,6 +1173,7 @@ mod tests {
                 status: 200,
                 cache_state: "HIT",
                 client_ip: "192.0.2.9",
+                via: None,
                 latency_ns: None,
                 location: None,
             },
@@ -1184,6 +1212,7 @@ mod tests {
                 status: 200,
                 cache_state: "HIT",
                 client_ip: "1.2.3.4",
+                via: None,
                 latency_ns: None,
                 location: None,
             },
@@ -1200,6 +1229,7 @@ mod tests {
                 status: 200,
                 cache_state: "HIT",
                 client_ip: "1.2.3.4",
+                via: None,
                 latency_ns: None,
                 location: None,
             },
@@ -1235,6 +1265,7 @@ mod tests {
                 status: 200,
                 cache_state: "HIT",
                 client_ip: "1.2.3.4",
+                via: None,
                 latency_ns: None,
                 location: None,
             },
@@ -1265,6 +1296,7 @@ mod tests {
                 status: 200,
                 cache_state: "HIT",
                 client_ip: "1.2.3.4",
+                via: None,
                 latency_ns: None,
                 location: None,
             },
@@ -1294,6 +1326,7 @@ mod tests {
                 status: 200,
                 cache_state: "HIT",
                 client_ip: "1.2.3.4",
+                via: None,
                 latency_ns: None,
                 location: None,
             },
@@ -1368,6 +1401,7 @@ mod tests {
                 status: 200,
                 cache_state: "MISS",
                 client_ip: "1.2.3.4",
+                via: None,
                 latency_ns: None,
                 location: None,
             },
@@ -1404,6 +1438,7 @@ mod tests {
                 status: 200,
                 cache_state: "MISS",
                 client_ip: "1.2.3.4",
+                via: None,
                 latency_ns: None,
                 location: None,
             },
@@ -1437,6 +1472,7 @@ mod tests {
                 status: 200,
                 cache_state: "MISS",
                 client_ip: "1.2.3.4",
+                via: None,
                 latency_ns: None,
                 location: None,
             },
@@ -1477,6 +1513,7 @@ mod tests {
                 status: 404,
                 cache_state: "MISS",
                 client_ip: "192.0.2.1",
+                via: None,
                 latency_ns: Some(342_834),
                 location: None,
             },
@@ -1538,6 +1575,7 @@ mod tests {
                 status: 302,
                 cache_state: "HIT",
                 client_ip: "192.0.2.9",
+                via: None,
                 latency_ns: Some(1_200),
                 location: Some("https://example.com/about?ref=123"),
             },
@@ -1572,6 +1610,7 @@ mod tests {
                 status: 200,
                 cache_state: "HIT",
                 client_ip: "192.0.2.9",
+                via: None,
                 latency_ns: None,
                 location: None,
             },
@@ -1588,6 +1627,79 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(text.trim()).expect("written JSON");
         assert!(v["fields"].get("query").is_none(), "{v}");
         assert!(v["fields"].get("location").is_none(), "{v}");
+    }
+
+    // ── via: the received backbone entry, never a client's claim ────────────
+
+    #[test]
+    fn a_backbone_request_logs_the_received_via() {
+        let headers = vec![("Via".to_string(), "1.1 edge-a".to_string())];
+        let via = received_via(&headers, true);
+        assert_eq!(via, Some("1.1 edge-a"));
+
+        let dir = tempfile::tempdir().expect("a directory");
+        let written = dir.path().join("request.jsonl");
+        let mut sink = Sink::file(&written).expect("the line file");
+        write_request_line(
+            &mut sink,
+            &Event {
+                node: "origin",
+                path: "/p",
+                query: None,
+                status: 200,
+                cache_state: "MISS",
+                client_ip: "203.0.113.9",
+                via,
+                latency_ns: Some(1),
+                location: None,
+            },
+            Some(("sess", false)),
+            None,
+            &RequestFeatures {
+                referer_host: None,
+                referer_path: None,
+                user_agent: None,
+            },
+        );
+        sink.flush();
+        let text = std::fs::read_to_string(&written).expect("the written line");
+        let ours: serde_json::Value = serde_json::from_str(text.trim()).expect("written JSON");
+        assert_eq!(ours["fields"]["via"], "1.1 edge-a");
+    }
+
+    #[test]
+    fn a_public_listener_request_never_logs_a_client_via() {
+        let headers = vec![("Via".to_string(), "1.1 edge-a".to_string())];
+        assert_eq!(received_via(&headers, false), None);
+
+        let dir = tempfile::tempdir().expect("a directory");
+        let written = dir.path().join("request.jsonl");
+        let mut sink = Sink::file(&written).expect("the line file");
+        write_request_line(
+            &mut sink,
+            &Event {
+                node: "origin",
+                path: "/p",
+                query: None,
+                status: 200,
+                cache_state: "MISS",
+                client_ip: "203.0.113.9",
+                via: None,
+                latency_ns: Some(1),
+                location: None,
+            },
+            Some(("sess", false)),
+            None,
+            &RequestFeatures {
+                referer_host: None,
+                referer_path: None,
+                user_agent: None,
+            },
+        );
+        sink.flush();
+        let text = std::fs::read_to_string(&written).expect("the written line");
+        let ours: serde_json::Value = serde_json::from_str(text.trim()).expect("written JSON");
+        assert!(ours["fields"].get("via").is_none());
     }
 
     /// Compare one written line's level and fields with its golden file's.

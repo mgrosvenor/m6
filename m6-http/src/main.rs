@@ -1030,6 +1030,8 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
     {
         let elapsed_ns = start.elapsed().as_nanos() as u64;
         let chan = Channel::new(http_version, iface);
+        let backbone = h2c && state.h2c_iface == Iface::Internal;
+        let via = analytics::received_via(headers, backbone);
         let precond = evaluate_preconditions(cached.status, &cached.headers, headers, method);
         state.stats.record(
             elapsed_ns,
@@ -1061,6 +1063,7 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
                     status: 412,
                     cache_state,
                     client_ip,
+                    via,
                     latency_ns: Some(elapsed_ns),
                     location: None,
                 },
@@ -1094,6 +1097,7 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
                     status: 304,
                     cache_state,
                     client_ip,
+                    via,
                     latency_ns: Some(elapsed_ns),
                     location: None,
                 },
@@ -1121,6 +1125,7 @@ fn route_request<H: m6_core::http::HeaderSource + ?Sized>(
                 status: cached.status,
                 cache_state,
                 client_ip,
+                via,
                 latency_ns: Some(elapsed_ns),
                 location: m6_core::headers::get(&cached.headers, "location"),
             },
@@ -1897,6 +1902,7 @@ fn resolve_check(
                 &plan.route_path,
                 &plan.auth_backend,
                 "auth check unavailable",
+                plan.from_internal,
             ));
         }
     };
@@ -4421,6 +4427,7 @@ fn handle_h3_request(
                     status: 304,
                     cache_state,
                     client_ip: &client_ip,
+                    via: None,
                     latency_ns: Some(elapsed_ns),
                     location: None,
                 },
@@ -4490,6 +4497,7 @@ fn handle_h3_request(
                 status: cached.status,
                 cache_state,
                 client_ip: &client_ip,
+                via: None,
                 latency_ns: Some(elapsed_ns),
                 location: m6_core::headers::get(&cached.headers, "location"),
             },
@@ -5509,6 +5517,7 @@ fn handle_request_inner(
                             &req.path,
                             &auth_backend,
                             "auth check unavailable",
+                            from_internal,
                         );
                     }
                     refusal => {
@@ -5659,7 +5668,7 @@ fn handle_request_inner(
     // so a public client cannot claim it -- the same rule that decides whether a
     // forwarded client address is trusted on that listener.
     if error::refuses_custom_error_path(&state.error_mode, &req.path, from_internal) {
-        return request_error(404, req, client_ip, state, None, registry);
+        return request_error(404, req, client_ip, state, None, registry, from_internal);
     }
 
     // Route lookup
@@ -5685,12 +5694,18 @@ fn handle_request_inner(
             // backend is itself a URL/H2C/H2S backend — every cache node,
             // whose only backend is the origin — dispatch that fetch async
             // and let it resolve through the normal Pending machinery.
-            if let Some(outcome) =
-                dispatch_custom_error_async(404, req, client_ip, state, registry, None)
-            {
+            if let Some(outcome) = dispatch_custom_error_async(
+                404,
+                req,
+                client_ip,
+                state,
+                registry,
+                None,
+                from_internal,
+            ) {
                 return outcome;
             }
-            return request_error(404, req, client_ip, state, None, registry);
+            return request_error(404, req, client_ip, state, None, registry, from_internal);
         }
     };
 
@@ -5756,6 +5771,7 @@ fn handle_request_inner(
                     &route.path,
                     &auth_backend,
                     "auth check unavailable",
+                    from_internal,
                 );
             }
             refusal @ (core_auth::Decision::NoCredential | core_auth::Decision::Deny) => {
@@ -5787,7 +5803,15 @@ fn handle_request_inner(
                         backend: Some(route.backend.clone()),
                         detail: Some(format!("requires: {require}")),
                     };
-                    return request_error(403, req, client_ip, state, Some(&ctx), registry);
+                    return request_error(
+                        403,
+                        req,
+                        client_ip,
+                        state,
+                        Some(&ctx),
+                        registry,
+                        from_internal,
+                    );
                 }
                 warn!(path = %req.path, require = %require, "auth: refused");
                 let (code, headers, body) = refusal.refusal().expect("a refusal, by construction");
@@ -5860,6 +5884,7 @@ fn handle_request_inner(
                     &route.path,
                     &backend_name,
                     "backend connection table full",
+                    from_internal,
                 );
             }
             Err(UrlDispatchError::Failed(e)) => {
@@ -5869,7 +5894,15 @@ fn handle_request_inner(
                     backend: Some(backend_name.clone()),
                     detail: Some(e.to_string()),
                 };
-                return request_error(502, req, client_ip, state, Some(&err_ctx), registry);
+                return request_error(
+                    502,
+                    req,
+                    client_ip,
+                    state,
+                    Some(&err_ctx),
+                    registry,
+                    from_internal,
+                );
             }
         };
         return RequestOutcome::Pending {
@@ -5901,7 +5934,15 @@ fn handle_request_inner(
                 backend: Some(backend_name.clone()),
                 detail: Some(format!("unknown backend: {backend_name}")),
             };
-            return request_error(502, req, client_ip, state, Some(&err_ctx), registry);
+            return request_error(
+                502,
+                req,
+                client_ip,
+                state,
+                Some(&err_ctx),
+                registry,
+                from_internal,
+            );
         }
         Err(SocketLaunchError::BacklogFull) => {
             // Either every member's listen queue was full, or this service ran
@@ -5916,6 +5957,7 @@ fn handle_request_inner(
                 &route.path,
                 &backend_name,
                 "no upstream slot, or every backend listen queue full",
+                from_internal,
             );
         }
         Err(SocketLaunchError::Connect(e)) => {
@@ -5925,7 +5967,15 @@ fn handle_request_inner(
                 backend: Some(backend_name.clone()),
                 detail: Some(e.to_string()),
             };
-            return request_error(502, req, client_ip, state, Some(&err_ctx), registry);
+            return request_error(
+                502,
+                req,
+                client_ip,
+                state,
+                Some(&err_ctx),
+                registry,
+                from_internal,
+            );
         }
         Err(SocketLaunchError::Register(e)) => {
             warn!(backend = %backend_name, error = %e, "registering socket upstream");
@@ -5934,7 +5984,15 @@ fn handle_request_inner(
                 backend: Some(backend_name.clone()),
                 detail: Some(e.to_string()),
             };
-            return request_error(502, req, client_ip, state, Some(&err_ctx), registry);
+            return request_error(
+                502,
+                req,
+                client_ip,
+                state,
+                Some(&err_ctx),
+                registry,
+                from_internal,
+            );
         }
     };
 
@@ -5967,6 +6025,7 @@ fn handle_request_inner(
 /// An upstream the process cannot start a connection to right now answers
 /// this: a full upstream table for a URL backend, a full listen queue for a
 /// socket one. Both are transient, so the client is told to retry.
+#[allow(clippy::too_many_arguments)] // the 503's context plus the backbone flag
 fn backend_unavailable(
     req: &forward::HttpRequest,
     client_ip: &str,
@@ -5975,13 +6034,22 @@ fn backend_unavailable(
     route_path: &str,
     backend_name: &str,
     detail: &str,
+    from_internal: bool,
 ) -> RequestOutcome {
     let err_ctx = error::ErrorContext {
         route: Some(route_path.to_string()),
         backend: Some(backend_name.to_string()),
         detail: Some(detail.to_string()),
     };
-    match apply_error_mode(503, req, client_ip, state, Some(&err_ctx), registry) {
+    match apply_error_mode(
+        503,
+        req,
+        client_ip,
+        state,
+        Some(&err_ctx),
+        registry,
+        from_internal,
+    ) {
         ErrorOutcome::Ready(s, mut h, b, n) => {
             h.push(("Retry-After".to_string(), "1".to_string()));
             RequestOutcome::Ready(s, h, b, n)
@@ -6052,6 +6120,7 @@ fn dispatch_custom_error_async(
     state: &mut ServerState,
     registry: &m6_core::platform::Registry,
     error_ctx: Option<&error::ErrorContext>,
+    from_internal: bool,
 ) -> Option<RequestOutcome> {
     let error_path = match &state.error_mode {
         ErrorMode::Custom { path } => path.clone(),
@@ -6090,6 +6159,7 @@ fn dispatch_custom_error_async(
                 // and no backend was contacted.
                 cache_state: "LOCAL",
                 client_ip,
+                via: analytics::received_via(&req.headers, from_internal),
                 latency_ns: Some(latency_ns),
                 location: None,
             },
@@ -6140,7 +6210,7 @@ fn dispatch_custom_error_async(
             route_path: None,
             auth_require: None,
             auth_gate: None,
-            from_internal: false,
+            from_internal,
             route_cache: None,
             query_key: vec![],
             cacheable: false,
@@ -6177,7 +6247,7 @@ fn dispatch_custom_error_async(
         route_path: None,
         auth_require: None,
         auth_gate: None,
-        from_internal: false,
+        from_internal,
         route_cache: None,
         query_key: vec![],
         cacheable: false,
@@ -6205,6 +6275,7 @@ fn apply_error_mode(
     state: &mut ServerState,
     ctx: Option<&error::ErrorContext>,
     registry: &m6_core::platform::Registry,
+    from_internal: bool,
 ) -> ErrorOutcome {
     let verbose = state.config.errors.verbose_fallback;
     match &state.error_mode {
@@ -6245,7 +6316,15 @@ fn apply_error_mode(
                 );
             }
 
-            match dispatch_custom_error_async(status, req, client_ip, state, registry, ctx) {
+            match dispatch_custom_error_async(
+                status,
+                req,
+                client_ip,
+                state,
+                registry,
+                ctx,
+                from_internal,
+            ) {
                 Some(RequestOutcome::Ready(s, h, b, n)) => ErrorOutcome::Ready(s, h, b, n),
                 Some(RequestOutcome::Pending { id, ctx }) => ErrorOutcome::Pending { id, ctx },
                 Some(RequestOutcome::Cached { .. }) => {
@@ -6279,8 +6358,9 @@ fn request_error(
     state: &mut ServerState,
     ctx: Option<&error::ErrorContext>,
     registry: &m6_core::platform::Registry,
+    from_internal: bool,
 ) -> RequestOutcome {
-    match apply_error_mode(status, req, client_ip, state, ctx, registry) {
+    match apply_error_mode(status, req, client_ip, state, ctx, registry, from_internal) {
         ErrorOutcome::Ready(s, h, b, n) => RequestOutcome::Ready(s, h, b, n),
         ErrorOutcome::Pending { id, ctx } => RequestOutcome::Pending { id, ctx },
     }
@@ -6574,6 +6654,7 @@ fn error_page_fallback(
             status: original_status,
             cache_state: "MISS",
             client_ip: &ctx.client_ip,
+            via: analytics::received_via(&req.headers, ctx.from_internal),
             latency_ns: Some(latency_ns),
             location: None,
         },
@@ -6628,6 +6709,7 @@ fn complete_socket_response(
                         status: original_status,
                         cache_state: "MISS",
                         client_ip: &ctx.client_ip,
+                        via: analytics::received_via(&req.headers, ctx.from_internal),
                         latency_ns: Some(latency_ns),
                         location: None,
                     },
@@ -6699,7 +6781,15 @@ fn complete_socket_response(
             backend: Some(backend_name.clone()),
             detail: Some(detail),
         };
-        match apply_error_mode(status, req, &ctx.client_ip, state, Some(&err_ctx), registry) {
+        match apply_error_mode(
+            status,
+            req,
+            &ctx.client_ip,
+            state,
+            Some(&err_ctx),
+            registry,
+            ctx.from_internal,
+        ) {
             ErrorOutcome::Ready(s, mut h, b, n) => {
                 error::preserve_actionable_headers(&resp_headers, &mut h);
                 // The old socket branch returned Ready and its h1/h2/h3 caller
@@ -6718,6 +6808,7 @@ fn complete_socket_response(
                         status: s,
                         cache_state: "MISS",
                         client_ip: &ctx.client_ip,
+                        via: analytics::received_via(&req.headers, ctx.from_internal),
                         latency_ns: Some(backend_ns),
                         location: None,
                     },
@@ -6749,6 +6840,7 @@ fn complete_socket_response(
                 status,
                 cache_state: "MISS",
                 client_ip: &ctx.client_ip,
+                via: analytics::received_via(&req.headers, ctx.from_internal),
                 latency_ns: Some(backend_ns),
                 location: location.as_deref(),
             },
@@ -6844,6 +6936,7 @@ fn finalize_url_response_inner(
                         status: original_status,
                         cache_state: "MISS",
                         client_ip: &ctx.client_ip,
+                        via: analytics::received_via(&req.headers, ctx.from_internal),
                         latency_ns: Some(latency_ns),
                         location: None,
                     },
@@ -6932,6 +7025,7 @@ fn finalize_url_response_inner(
                     status: entry.status,
                     cache_state: "STALE",
                     client_ip: &ctx.client_ip,
+                    via: analytics::received_via(&req.headers, ctx.from_internal),
                     latency_ns: Some(latency_ns),
                     location: location.as_deref(),
                 },
@@ -6959,7 +7053,15 @@ fn finalize_url_response_inner(
             backend: Some(ctx.backend_name.clone()),
             detail: Some(format!("backend returned {status}")),
         };
-        match apply_error_mode(status, req, &ctx.client_ip, state, Some(&err_ctx), registry) {
+        match apply_error_mode(
+            status,
+            req,
+            &ctx.client_ip,
+            state,
+            Some(&err_ctx),
+            registry,
+            ctx.from_internal,
+        ) {
             ErrorOutcome::Ready(s, mut h, b, n) => {
                 let latency_ns = ctx.start.elapsed().as_nanos() as u64;
                 analytics::finish_response(
@@ -6974,6 +7076,7 @@ fn finalize_url_response_inner(
                         status: s,
                         cache_state: "MISS",
                         client_ip: &ctx.client_ip,
+                        via: analytics::received_via(&req.headers, ctx.from_internal),
                         latency_ns: Some(latency_ns),
                         location: None,
                     },
@@ -7001,6 +7104,7 @@ fn finalize_url_response_inner(
                 status,
                 cache_state: "MISS",
                 client_ip: &ctx.client_ip,
+                via: analytics::received_via(&req.headers, ctx.from_internal),
                 latency_ns: Some(latency_ns),
                 location: location.as_deref(),
             },
