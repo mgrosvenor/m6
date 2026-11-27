@@ -567,6 +567,21 @@ In the traffic report, a request whose path or user agent was cut counts as prob
 Probe and injection detection reads at most the first 512 bytes of a path, so a marker past that cap is not matched.
 The 256-byte user-agent cap bounds the agent text the report shows and the text `claims_to_be_bot` reads.
 
+### 11.1 The session cookie and consent
+
+m6-http mints a session cookie, `_m6sid`, for a visitor it measures, and adds it to an HTML response per response and never to the cache, so a cache hit rebuilds it and cannot replay another visitor's cookie.
+The `[analytics]` table in the system config sets three keys: `enabled` (default true) turns analytics on, `consent_cookie` names the site's consent cookie (for example `m6consent`, unset by default), and `consent_version` is the current policy version, the md5 hex of the policy text.
+
+With `consent_cookie` and `consent_version` set, the request's consent cookie decides the response.
+A request with no consent cookie gets `Set-Cookie: m6consent=unknown` (twelve months, `Path=/`, `Secure`, `SameSite=Lax`) and no `_m6sid`.
+A `true:<version>` cookie with the current version is consent, and a session is minted.
+A `false` or `false:<version>` cookie mints no session, and a `_m6sid` the request already carries is cleared with `_m6sid=; Max-Age=0`, because the popup's decline cannot clear an `HttpOnly` cookie itself.
+An `unknown` value, or a `true:<old version>` from before a policy change, mints no session, so a new `consent_version` asks for consent again.
+With `consent_cookie` unset, m6 is as before: every request may get `_m6sid` and no consent cookie is set.
+
+The consent cookie is not `HttpOnly`, because the popup script reads and changes it.
+The access line logs a `consent` field carrying the value received, such as `true:0123`, or nothing when the request carried no consent cookie, so the record shows which policy version a visitor accepted.
+
 Section 12 covers the signals the process handles.
 
 ---
