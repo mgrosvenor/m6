@@ -166,12 +166,7 @@ fn is_declined(value: &str) -> bool {
 /// Whether the response already carries a `Set-Cookie` for `name`, so a proxy
 /// does not duplicate one the upstream just set.
 fn response_sets_cookie(headers: &[(String, String)], name: &str) -> bool {
-    m6_core::headers::get_all(headers, "set-cookie").any(|sc| {
-        sc.split(';')
-            .next()
-            .and_then(|kv| kv.trim().split_once('='))
-            .is_some_and(|(k, _)| k.trim() == name)
-    })
+    response_cookie_value(headers, name).is_some()
 }
 
 /// A random session id: 16 bytes, hex-encoded into a `[u8; 32]` on the stack.
@@ -437,27 +432,28 @@ pub fn finish_response(
     }
 }
 
-/// Extract `_m6sid` from a `Set-Cookie` *response* header value (e.g.
-/// `"_m6sid=xyz; Max-Age=1800; Path=/; HttpOnly; Secure; SameSite=Lax"`).
-/// Different shape from a request `Cookie` header: exactly one cookie per
-/// `Set-Cookie` field, name=value first, followed by `; `-separated
-/// attributes — no need to scan multiple cookie pairs within one field.
+/// The first `name=value` of a `Set-Cookie` field in a response, or `None`
+/// when no occurrence carries a non-empty value for `name`.
 ///
-/// Borrows the value, so a proxied response that already carries a session
-/// logs against it without copying the id.
-fn session_from_set_cookie_header(set_cookie: &str) -> Option<&str> {
-    let first = set_cookie.split(';').next()?;
-    let (k, v) = first.trim().split_once('=')?;
-    (k == SESSION_COOKIE && !v.is_empty()).then_some(v)
-}
-
-/// Find a `_m6sid` already set by an upstream hop's response. A response can
-/// carry multiple `Set-Cookie` fields for unrelated reasons, so every
-/// occurrence is checked, not just the first.
-fn session_from_response_headers(resp_headers: &[(String, String)]) -> Option<&str> {
+/// A `Set-Cookie` field has exactly one cookie: name=value first, then
+/// `; `-separated attributes, so there is no need to scan several pairs
+/// within one field. A response can carry several `Set-Cookie` fields for
+/// unrelated reasons, so every occurrence is checked, not just the first. An
+/// empty value reads as absent, the same rule the request `Cookie` parsing
+/// uses. The value borrows from the header, so a proxied response that
+/// already carries a session logs against it without copying the id.
+fn response_cookie_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
     // `get_all`, not `get`: Set-Cookie is the field the headers module names as
     // the one everybody folds by mistake, and a response may carry several.
-    m6_core::headers::get_all(resp_headers, "set-cookie").find_map(session_from_set_cookie_header)
+    m6_core::headers::get_all(headers, "set-cookie").find_map(|sc| {
+        let (k, v) = sc.split(';').next()?.trim().split_once('=')?;
+        (k == name && !v.is_empty()).then_some(v)
+    })
+}
+
+/// Find a `_m6sid` already set by an upstream hop's response.
+fn session_from_response_headers(resp_headers: &[(String, String)]) -> Option<&str> {
+    response_cookie_value(resp_headers, SESSION_COOKIE)
 }
 
 /// Like [`finish_response`], but for a response whose backend may itself be
@@ -1295,17 +1291,27 @@ mod tests {
     // ── finish_proxied_response(): the multi-hop (cache node → origin) fix ──
 
     #[test]
-    fn session_from_set_cookie_header_extracts_id() {
-        let v = session_from_set_cookie_header(
-            "_m6sid=abc123; Max-Age=1800; Path=/; HttpOnly; Secure; SameSite=Lax",
+    fn response_cookie_value_extracts_the_id() {
+        let headers = vec![(
+            "Set-Cookie".to_string(),
+            "_m6sid=abc123; Max-Age=1800; Path=/; HttpOnly; Secure; SameSite=Lax".to_string(),
+        )];
+        assert_eq!(
+            response_cookie_value(&headers, SESSION_COOKIE),
+            Some("abc123")
         );
-        assert_eq!(v, Some("abc123"));
     }
 
     #[test]
-    fn session_from_set_cookie_header_ignores_other_cookies() {
-        let v = session_from_set_cookie_header("other=xyz; Path=/");
-        assert_eq!(v, None);
+    fn response_cookie_value_ignores_other_cookies() {
+        let headers = vec![("Set-Cookie".to_string(), "other=xyz; Path=/".to_string())];
+        assert_eq!(response_cookie_value(&headers, SESSION_COOKIE), None);
+    }
+
+    #[test]
+    fn response_cookie_value_ignores_an_empty_value() {
+        let headers = vec![("Set-Cookie".to_string(), "_m6sid=; Path=/".to_string())];
+        assert_eq!(response_cookie_value(&headers, SESSION_COOKIE), None);
     }
 
     #[test]
