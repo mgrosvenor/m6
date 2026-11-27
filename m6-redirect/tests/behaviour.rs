@@ -20,7 +20,7 @@ mod support;
 use support::{get, head, post};
 
 const RULES: &str = r#"{"items":[
-  {"source_url":"example.com/r/cap7k9","target_url":"https://example.com/capabilities?utm_source=robert&utm_campaign=recruitmentremal","status_code":302},
+  {"source_url":"example.com/r/abc123","target_url":"https://example.com/about?utm_source=newsletter&utm_campaign=spring","status_code":302},
   {"source_url":"example.com/r/permanent","target_url":"https://example.com/new","status_code":301},
   {"source_url":"example.com/r/temporary","target_url":"https://example.com/here","status_code":307},
   {"source_url":"example.com/r/other","target_url":"https://example.com/there","status_code":308}
@@ -92,14 +92,14 @@ fn the_four_redirect_statuses_answer_with_the_rule_target() {
     for (code, target) in [
         (
             302,
-            "https://example.com/capabilities?utm_source=robert&utm_campaign=recruitmentremal",
+            "https://example.com/about?utm_source=newsletter&utm_campaign=spring",
         ),
         (301, "https://example.com/new"),
         (307, "https://example.com/here"),
         (308, "https://example.com/there"),
     ] {
         let path = match code {
-            302 => "/r/cap7k9",
+            302 => "/r/abc123",
             301 => "/r/permanent",
             307 => "/r/temporary",
             _ => "/r/other",
@@ -119,7 +119,7 @@ fn the_four_redirect_statuses_answer_with_the_rule_target() {
 #[test]
 fn the_redirect_is_marked_storable_with_the_shared_lifetime() {
     let mut h = Harness::start("max_age_secs = 3600\nstale_while_revalidate_secs = 60");
-    let resp = get(&h.sock, "example.com", "/r/cap7k9");
+    let resp = get(&h.sock, "example.com", "/r/abc123");
     assert_eq!(resp.status, 302);
     assert_eq!(
         resp.header("cache-control").as_deref(),
@@ -143,12 +143,12 @@ fn an_unregistered_path_answers_404_with_no_location() {
 fn matching_is_exact_and_the_path_is_case_sensitive() {
     let mut h = Harness::start("");
     // A suffix does not match, a wrong path does not match.
-    for path in ["/r/cap7k9x", "/r/cap7k9/", "/R/CAP7K9", "/cap7k9"] {
+    for path in ["/r/abc123x", "/r/abc123/", "/R/ABC123", "/abc123"] {
         let resp = get(&h.sock, "example.com", path);
         assert_eq!(resp.status, 404, "GET {path}: {}", resp.raw);
     }
     // The host is case-insensitive.
-    let resp = get(&h.sock, "EXAMPLE.COM", "/r/cap7k9");
+    let resp = get(&h.sock, "EXAMPLE.COM", "/r/abc123");
     assert_eq!(resp.status, 302, "{}", resp.raw);
     h.stop();
 }
@@ -156,12 +156,12 @@ fn matching_is_exact_and_the_path_is_case_sensitive() {
 #[test]
 fn the_query_is_ignored() {
     let mut h = Harness::start("");
-    let resp = get(&h.sock, "example.com", "/r/cap7k9?utm_source=other");
+    let resp = get(&h.sock, "example.com", "/r/abc123?utm_source=other");
     assert_eq!(resp.status, 302, "{}", resp.raw);
     assert!(
         resp.header("location")
             .unwrap()
-            .contains("utm_source=robert"),
+            .contains("utm_source=newsletter"),
         "the stored UTM values win: {}",
         resp.raw
     );
@@ -171,7 +171,7 @@ fn the_query_is_ignored() {
 #[test]
 fn a_head_answers_the_redirect_with_no_body() {
     let mut h = Harness::start("");
-    let resp = head(&h.sock, "example.com", "/r/cap7k9");
+    let resp = head(&h.sock, "example.com", "/r/abc123");
     assert_eq!(resp.status, 302, "{}", resp.raw);
     assert!(resp.header("location").is_some(), "{}", resp.raw);
     h.stop();
@@ -196,7 +196,7 @@ fn the_list_replace_writes_verbatim_and_swaps_the_table() {
         "{}",
         now.raw
     );
-    let old = get(&h.sock, "example.com", "/r/cap7k9");
+    let old = get(&h.sock, "example.com", "/r/abc123");
     assert_eq!(old.status, 404, "{}", old.raw);
     h.stop();
 }
@@ -206,7 +206,7 @@ fn the_list_replace_writes_verbatim_and_swaps_the_table() {
 #[test]
 fn the_list_replace_line_carries_the_items_as_received() {
     let mut h = Harness::start("");
-    let body = r#"{"items":[{"source_url":"example.com/r/cap7k9","target_url":"https://example.com/capabilities?m6qs=7k9","status_code":302,"source":"robert","campaign":"recruitmentremal","medium":""}]}"#;
+    let body = r#"{"items":[{"source_url":"example.com/r/abc123","target_url":"https://example.com/about?ref=123","status_code":302,"source":"newsletter","campaign":"spring","medium":""}]}"#;
     let resp = post(&h.sock, "/m6-redirect/rules", body);
     assert_eq!(resp.status, 204, "{}", resp.raw);
     h.stop();
@@ -215,10 +215,10 @@ fn the_list_replace_line_carries_the_items_as_received() {
         out.contains("\"message\":\"redirect list replaced\""),
         "no list-replace line\n--- output ---\n{out}"
     );
-    assert!(out.contains("\"source\":\"robert\""), "{out}");
-    assert!(out.contains("\"campaign\":\"recruitmentremal\""), "{out}");
+    assert!(out.contains("\"source\":\"newsletter\""), "{out}");
+    assert!(out.contains("\"campaign\":\"spring\""), "{out}");
     assert!(
-        out.contains("\"target_url\":\"https://example.com/capabilities?m6qs=7k9\""),
+        out.contains("\"target_url\":\"https://example.com/about?ref=123\""),
         "{out}"
     );
 }
@@ -234,7 +234,7 @@ fn a_malformed_list_is_refused_and_changes_nothing() {
     assert_eq!(resp.status, 400, "{}", resp.raw);
 
     // The table still serves the rules it started with.
-    let still = get(&h.sock, "example.com", "/r/cap7k9");
+    let still = get(&h.sock, "example.com", "/r/abc123");
     assert_eq!(still.status, 302, "{}", still.raw);
     h.stop();
 }
@@ -245,7 +245,7 @@ fn a_malformed_list_is_refused_and_changes_nothing() {
 #[test]
 fn a_redirect_logs_its_query_and_target_and_a_404_logs_no_location() {
     let mut h = Harness::start("");
-    let hit = get(&h.sock, "example.com", "/r/cap7k9?ref=newsletter");
+    let hit = get(&h.sock, "example.com", "/r/abc123?ref=newsletter");
     assert_eq!(hit.status, 302, "{}", hit.raw);
     let miss = get(&h.sock, "example.com", "/r/nope");
     assert_eq!(miss.status, 404, "{}", miss.raw);
@@ -258,12 +258,12 @@ fn a_redirect_logs_its_query_and_target_and_a_404_logs_no_location() {
         out.contains("\"message\":\"redirect\""),
         "no redirect line\n--- output ---\n{out}"
     );
-    assert!(out.contains("\"path\":\"/r/cap7k9\""), "{out}");
+    assert!(out.contains("\"path\":\"/r/abc123\""), "{out}");
     assert!(out.contains("\"query\":\"ref=newsletter\""), "{out}");
     assert!(out.contains("\"status\":302"), "{out}");
     assert!(
         out.contains(
-            "\"location\":\"https://example.com/capabilities?utm_source=robert&utm_campaign=recruitmentremal\""
+            "\"location\":\"https://example.com/about?utm_source=newsletter&utm_campaign=spring\""
         ),
         "{out}"
     );
@@ -298,7 +298,7 @@ fn the_reload_signal_rereads_the_file_and_swaps_the_table() {
         "{}",
         now.raw
     );
-    let old = get(&h.sock, "example.com", "/r/cap7k9");
+    let old = get(&h.sock, "example.com", "/r/abc123");
     assert_eq!(old.status, 404, "{}", old.raw);
     h.stop();
 }
@@ -306,7 +306,7 @@ fn the_reload_signal_rereads_the_file_and_swaps_the_table() {
 #[test]
 fn a_missing_rules_file_starts_empty_and_serves_404() {
     let mut h = Harness::start_missing_rules();
-    let resp = get(&h.sock, "example.com", "/r/cap7k9");
+    let resp = get(&h.sock, "example.com", "/r/abc123");
     assert_eq!(resp.status, 404, "{}", resp.raw);
 
     let body = r#"{"items":[{"source_url":"example.com/r/newcode","target_url":"https://example.com/fresh","status_code":302}]}"#;

@@ -1471,13 +1471,13 @@ mod tests {
             &mut sink,
             &Event {
                 node: "edge-a",
-                path: "/r/cap7k9",
+                path: "/r/abc123",
                 query: Some("ref=newsletter"),
                 status: 302,
                 cache_state: "HIT",
                 client_ip: "192.0.2.9",
                 latency_ns: Some(1_200),
-                location: Some("https://mgrosvenor.com/capabilities?m6qs=7k9"),
+                location: Some("https://example.com/about?ref=123"),
             },
             "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
             false,
@@ -1492,10 +1492,7 @@ mod tests {
         let text = std::fs::read_to_string(&written).expect("the written line");
         let v: serde_json::Value = serde_json::from_str(text.trim()).expect("written JSON");
         assert_eq!(v["fields"]["query"], "ref=newsletter");
-        assert_eq!(
-            v["fields"]["location"],
-            "https://mgrosvenor.com/capabilities?m6qs=7k9"
-        );
+        assert_eq!(v["fields"]["location"], "https://example.com/about?ref=123");
     }
 
     /// A request with no query and a non-redirect response carries neither

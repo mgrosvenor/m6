@@ -92,7 +92,7 @@ impl Rules {
     /// The redirect for one request, or `None` for a 404.
     ///
     /// The host is lowercased for the comparison. The path is used exactly as
-    /// written, so `CAP7K9` and `cap7k9/` are different paths from `cap7k9`.
+    /// written, so `ABC123` and `abc123/` are different paths from `abc123`.
     pub fn lookup(&self, host: &str, path: &str) -> Option<&Redirect> {
         let mut key = host.to_ascii_lowercase();
         key.push_str(if path.is_empty() { "/" } else { path });
@@ -202,11 +202,11 @@ mod tests {
 
     const LIST: &str = r#"{
         "items": [
-            {"source_url": "mgrosvenor.com/r/cap7k9",
-             "target_url": "https://mgrosvenor.com/capabilities?utm_source=robert&utm_campaign=recruitmentremal",
+            {"source_url": "example.com/r/abc123",
+             "target_url": "https://example.com/about?utm_source=newsletter&utm_campaign=spring",
              "status_code": 302},
-            {"source_url": "https://mgrosvenor.com/r/old",
-             "target_url": "https://mgrosvenor.com/new",
+            {"source_url": "https://example.com/r/old",
+             "target_url": "https://example.com/new",
              "status_code": 301},
             {"source_url": "example.com/r/see-other",
              "target_url": "https://example.com/other", "status_code": 308}
@@ -222,27 +222,27 @@ mod tests {
     #[test]
     fn lookup_matches_host_and_path_exactly() {
         let r = rules(LIST);
-        let redirect = r.lookup("mgrosvenor.com", "/r/cap7k9").unwrap();
+        let redirect = r.lookup("example.com", "/r/abc123").unwrap();
         assert_eq!(redirect.status, 302);
         assert_eq!(
             redirect.target,
-            "https://mgrosvenor.com/capabilities?utm_source=robert&utm_campaign=recruitmentremal"
+            "https://example.com/about?utm_source=newsletter&utm_campaign=spring"
         );
-        assert!(r.lookup("mgrosvenor.com", "/r/other").is_none());
-        assert!(r.lookup("other.com", "/r/cap7k9").is_none());
+        assert!(r.lookup("example.com", "/r/other").is_none());
+        assert!(r.lookup("other.com", "/r/abc123").is_none());
     }
 
     #[test]
     fn the_host_is_case_insensitive_and_the_path_is_not() {
         let r = rules(LIST);
-        assert!(r.lookup("MGROSVENOR.COM", "/r/cap7k9").is_some());
-        assert!(r.lookup("mgrosvenor.com", "/R/CAP7K9").is_none());
+        assert!(r.lookup("EXAMPLE.COM", "/r/abc123").is_some());
+        assert!(r.lookup("example.com", "/R/ABC123").is_none());
     }
 
     #[test]
     fn a_source_url_with_a_scheme_matches_the_bare_form() {
         let r = rules(LIST);
-        assert!(r.lookup("mgrosvenor.com", "/r/old").is_some());
+        assert!(r.lookup("example.com", "/r/old").is_some());
     }
 
     #[test]
