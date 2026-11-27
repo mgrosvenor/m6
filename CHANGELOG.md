@@ -13,6 +13,7 @@ The heading is the version, and a number would break the pattern `tag.sh` and CI
 
 The released versions, newest first:
 
+- [1.18.0-rc.4, 2026-11-28](#1180-rc4-2026-11-28)
 - [1.18.0-rc.3, 2026-11-28](#1180-rc3-2026-11-28)
 - [1.18.0-rc.2, 2026-11-27](#1180-rc2-2026-11-27)
 - [1.18.0-rc.1, 2026-11-26](#1180-rc1-2026-11-26)
@@ -40,6 +41,25 @@ The released versions, newest first:
 - [1.0.0, 2026-09-14](#100-2026-09-14)
 - [0.2.0 and earlier, 2026-03-15 and before](#020-and-earlier-2026-03-15-and-before)
 
+## 1.18.0-rc.4, 2026-11-28
+
+**The HTTP/2 forward carries the original host when a request arrived without a Host header.**
+This is a release candidate, a develop build on staging and not a release.
+A request that arrived over HTTP/3 names its host only in `:authority`, and ingress strips pseudo-headers, so the owned request had no Host header.
+The HTTP/2 forward then emitted `:authority` as the backbone address and no host, so the origin derived the host from the backbone address and a host-matched backend answered 404.
+The forward now adds Host from `original_host`, the same rule the HTTP/1.1 leg already applies.
+
+### Fixed
+
+- **A cache node dropping the host of an HTTP/3 request on its forward to the origin.**
+  The h2 leg synthesises Host from `original_host` exactly when the request has no Host header, so a host-matched backend such as m6-redirect receives the visitor's host and not the backbone address.
+
+### Notes
+
+- Verified by `cargo test -p m6-http`, which includes the h2-client test that decodes the forwarded HEADERS frame and asserts the original host is carried.
+
+---
+
 ## 1.18.0-rc.3, 2026-11-28
 
 **The access line records the `Via` a backbone peer sent, so the origin can tell a relayed request from a visitor's own.**
@@ -54,6 +74,8 @@ A public listener never logs it, so a client's own `Via` header cannot name a no
   Present only on a request the backbone listener received, and only with the `Via` value the peer sent, so the origin can tell the forwarded leg apart from a visitor's own request.
   A public-listener request carrying a `Via` logs no `via`.
   [`docs/m6-http.md`](docs/m6-http.md) section 11 lists the field.
+- **`docs/PERFORMANCE.md` records the redirect latency of a cached m6-redirect 302 at the edge against a hosted bulk-redirect service.**
+  The m6 302 reaches a curl client's first byte in one network round trip, and the README links the new section.
 
 ### Notes
 
@@ -800,7 +822,7 @@ Verified on 2026-11-17 on a macOS sandbox: a real cache node in front of a real 
 **Every m6 service installs mimalloc as its global allocator, and a warm service stays out of the kernel's memory calls.**
 `m6_core::alloc::M6Alloc` wraps mimalloc and is the one allocator type: m6-http, m6-file, m6-html, m6-md, m6-auth-server and m6-monitor declare it in `main.rs`, and every allocation-counting test and example declares the same type, so counts are taken against the allocator production runs. Under `alloc-count` (the `testkit` and `count-allocations` features) it counts exactly as `testkit::alloc_count::Counting` did, and without them the counting is not compiled. `Counting` is removed. A library crate declares no allocator. m6-auth-cli is a one-shot command and keeps the system allocator.
 Each service sets mimalloc's options in code at the top of `main`: freed memory is never returned to the OS (purge delay -1, and the option's number is counted from the bundled `mimalloc.h` by `m6-core/build.rs`, because the binding does not export it), so the heap grows and does not shrink. It then reserves `[limits.heap_reserve]` bytes from the OS once, committed and on huge pages where the kernel offers them, and logs once when the heap later grows past it. Growth is never a failure.
-This is on trial. `docs/PERFORMANCE.md` §2.8 says the A/B in §8.2 decides whether it stays, and a worse latency, or memory calls that do not fall to zero, reverts it.
+This is on trial. `docs/PERFORMANCE.md` §2.8 says the A/B in §9.2 decides whether it stays, and a worse latency, or memory calls that do not fall to zero, reverts it.
 Verified on macOS: 2301 tests pass. Every counting test (`alloc_count_armed`, `event_allocs`, `limit_page_allocs`, `server_conn`, `site_allocs`, `upstream_no_alloc`, `email_allocs`, `allocations`, `client_allocs`) builds and passes with its budget unchanged.
 Not yet verified on Linux: the strace, `perf stat`, latency and RSS comparison on the idle build host (`tools/memcalls.sh`, `tools/hwcounters.sh`, `tools/perfcheck.sh`).
 
