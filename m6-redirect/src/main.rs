@@ -86,14 +86,20 @@ impl State {
     fn replace_list(&mut self, body: &[u8]) -> Response {
         let rules = match Rules::parse(body) {
             Ok(rules) => rules,
-            Err(e) => return Response::refusal(&format!("malformed redirect list: {e}")),
+            Err(e) => {
+                m6_core::log::warn!(error = %e, "redirect list replace refused");
+                return Response::refusal(&format!("malformed redirect list: {e}"));
+            }
         };
         if let Err(e) = Rules::write_atomic(&self.config.rules_file, body) {
+            m6_core::log::warn!(error = %e, "redirect list write failed");
             return Response::status(500)
                 .header("Cache-Control", "no-store")
                 .body(format!("writing the redirect list failed: {e}\n"));
         }
+        let count = rules.len();
         self.rules = rules;
+        m6_core::log::info!(rules = count, "redirect list replaced");
         Response::status(204).header("Cache-Control", "no-store")
     }
 
@@ -116,6 +122,27 @@ fn header<'a>(head: &'a RequestHead<'_>, name: &str) -> Option<&'a str> {
         .iter()
         .find(|h| h.name.eq_ignore_ascii_case(name))
         .and_then(|h| std::str::from_utf8(h.value).ok())
+}
+
+/// One access line per request answered: what was received (host, path,
+/// query) and where the user was sent (status and Location).
+///
+/// m6-redirect sees only misses: the edge caches the 302 for three months, so
+/// this is the origin's own record of the redirects it expanded, not the whole
+/// click record. A 404 carries no Location.
+fn log_request(head: &RequestHead<'_>, response: &Response) {
+    let host = header(head, "host").unwrap_or("");
+    let location = m6_core::headers::get(response.headers.as_slice(), "location");
+    m6_core::log::with_operational(|sink| {
+        m6_core::log::Line::begin(sink, m6_core::log::Level::Info, "redirect")
+            .kind(m6_core::log::Type::Access)
+            .str("host", host)
+            .str("path", head.path)
+            .opt_str("query", head.query)
+            .field("status", response.status)
+            .opt_str("location", location)
+            .end();
+    });
 }
 
 fn main() -> Result<()> {
@@ -413,7 +440,11 @@ fn turn(conn: &mut ServerConn, site: &mut Site, state: &mut State) -> io::Result
         let mut heads = head_slots();
         let read = conn.read(&mut heads)?;
         let (response, idle) = match read {
-            Read::Request(head) => (Some(answer(&head, site, state)), false),
+            Read::Request(head) => {
+                let response = answer(&head, site, state);
+                log_request(&head, &response);
+                (Some(response), false)
+            }
             Read::More => (None, true),
             Read::Closed => return Ok(false),
         };
