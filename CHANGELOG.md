@@ -13,6 +13,7 @@ The heading is the version, and a number would break the pattern `tag.sh` and CI
 
 The released versions, newest first:
 
+- [1.18.0-rc.4, 2026-11-28](#1180-rc4-2026-11-28)
 - [1.18.0-rc.3, 2026-11-28](#1180-rc3-2026-11-28)
 - [1.18.0-rc.2, 2026-11-27](#1180-rc2-2026-11-27)
 - [1.18.0-rc.1, 2026-11-26](#1180-rc1-2026-11-26)
@@ -39,6 +40,25 @@ The released versions, newest first:
 - [1.1.0, 2026-09-15](#110-2026-09-15)
 - [1.0.0, 2026-09-14](#100-2026-09-14)
 - [0.2.0 and earlier, 2026-03-15 and before](#020-and-earlier-2026-03-15-and-before)
+
+## 1.18.0-rc.4, 2026-11-28
+
+**The HTTP/2 forward carries the original host when a request arrived without a Host header.**
+This is a release candidate, a develop build on staging and not a release.
+A request that arrived over HTTP/3 names its host only in `:authority`, and ingress strips pseudo-headers, so the owned request had no Host header.
+The HTTP/2 forward then emitted `:authority` as the backbone address and no host, so the origin derived the host from the backbone address and a host-matched backend answered 404.
+The forward now adds Host from `original_host`, the same rule the HTTP/1.1 leg already applies.
+
+### Fixed
+
+- **A cache node dropping the host of an HTTP/3 request on its forward to the origin.**
+  The h2 leg synthesises Host from `original_host` exactly when the request has no Host header, so a host-matched backend such as m6-redirect receives the visitor's host and not the backbone address.
+
+### Notes
+
+- Verified by `cargo test -p m6-http`, which includes the h2-client test that decodes the forwarded HEADERS frame and asserts the original host is carried.
+
+---
 
 ## 1.18.0-rc.3, 2026-11-28
 

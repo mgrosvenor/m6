@@ -387,7 +387,7 @@ impl<T: Transport> H2Client<T> {
         };
 
         // Collect forwarded headers (skip hop-by-hop and pseudo-headers)
-        let forwarded: Vec<(Vec<u8>, Vec<u8>)> = req
+        let mut forwarded: Vec<(Vec<u8>, Vec<u8>)> = req
             .headers
             .iter()
             .filter_map(|(name, value)| {
@@ -416,6 +416,16 @@ impl<T: Transport> H2Client<T> {
                 ))
             })
             .collect();
+
+        // A request that arrived without a Host header (HTTP/3 strips
+        // pseudo-headers, and HTTP/1.0 may omit it) names its origin only in
+        // `original_host`. The HTTP/1.1 leg synthesises `Host` from it in
+        // `write_host_if_absent`; this leg must carry it too, or the origin
+        // derives the host from `:authority` (the backbone address) and a
+        // host-matched backend answers 404.
+        if !original_host.is_empty() && !m6_core::headers::contains(&req.headers[..], "host") {
+            forwarded.push((b"host".to_vec(), original_host.as_bytes().to_vec()));
+        }
 
         // Build HPACK header list
         let mut hdr_list: Vec<(&[u8], &[u8])> = vec![

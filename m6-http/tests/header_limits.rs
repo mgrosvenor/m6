@@ -742,6 +742,18 @@ fn pad_fields(
             "the base fields ({used}) are already over {target}"
         );
         let remaining = target - used;
+        // A field costs at least 33 bytes of RFC 9113 6.5.2 size: one byte of
+        // name plus the fixed 32-byte per-field overhead. A remainder smaller
+        // than that cannot be a new field, so grow the previous padding field
+        // instead. This runs only after at least one x-pad chunk, so the field
+        // it grows is always a padding field.
+        if remaining < 33 {
+            let last = fields
+                .last_mut()
+                .expect("pad_fields: a remainder below a field needs a field to grow");
+            last.1.extend(std::iter::repeat_n(b'a', remaining));
+            return fields;
+        }
         // name 5 + value 290 + 32 is 327.
         if remaining >= 327 {
             fields.push((b"x-pad".to_vec(), vec![b'a'; 290]));
@@ -759,7 +771,9 @@ fn pad_fields(
 }
 
 /// The decoded list an HTTP/2 client sends for `GET path` before any extra
-/// fields: `H2sTlsClientConn` writes these seven itself.
+/// fields: `H2sTlsClientConn` writes these eight itself. `host` is
+/// `original_host`, synthesised when the request has no Host header, the same
+/// rule the HTTP/1.1 leg applies.
 fn h2_base_fields(path: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
     let owned = |name: &str, value: &str| (name.as_bytes().to_vec(), value.as_bytes().to_vec());
     vec![
@@ -770,6 +784,7 @@ fn h2_base_fields(path: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
         owned("x-forwarded-for", "127.0.0.1"),
         owned("x-forwarded-proto", "https"),
         owned("x-forwarded-host", "127.0.0.1"),
+        owned("host", "127.0.0.1"),
     ]
 }
 
@@ -901,7 +916,7 @@ fn h2_serves_a_field_at_the_header_line_limit() {
     let reply = h2_send(
         s.port,
         "/ok",
-        extra_headers(&fields[7..]),
+        extra_headers(&fields[8..]),
         Duration::from_secs(10),
     )
     .expect("a field exactly at the limit must be served");
@@ -956,7 +971,7 @@ fn h2_serves_a_head_at_the_head_limit() {
     let reply = h2_send(
         s.port,
         "/ok",
-        extra_headers(&fields[7..]),
+        extra_headers(&fields[8..]),
         Duration::from_secs(10),
     )
     .expect("a head exactly at the limit must be served");
@@ -971,7 +986,7 @@ fn h2_refuses_a_head_one_byte_over_the_head_limit() {
     let reply = h2_send(
         s.port,
         "/never",
-        extra_headers(&fields[7..]),
+        extra_headers(&fields[8..]),
         Duration::from_secs(10),
     )
     .expect("the edge must answer rather than forward");
