@@ -277,6 +277,30 @@ fn a_redirect_logs_its_query_and_target_and_a_404_logs_no_location() {
     assert!(out.contains("\"status\":404"), "{out}");
 }
 
+/// Every access line names the serving node, the way m6-http's access line
+/// does, so a redirect record can be attributed to a node in a multi-node
+/// deployment. The name is the host's own name, read from the platform facts.
+#[test]
+fn every_access_line_names_the_serving_node() {
+    let mut h = Harness::start("");
+    let hit = get(&h.sock, "example.com", "/r/abc123");
+    assert_eq!(hit.status, 302, "{}", hit.raw);
+    h.stop();
+    let out = h.svc.output();
+    let line = out
+        .lines()
+        .find(|l| l.contains("\"message\":\"redirect\""))
+        .expect("a redirect access line");
+    let node = line
+        .split("\"node\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next());
+    assert!(
+        node.is_some_and(|n| !n.is_empty()),
+        "the access line names the serving node with a non-empty value:\n{line}"
+    );
+}
+
 #[test]
 fn the_reload_signal_rereads_the_file_and_swaps_the_table() {
     let mut h = Harness::start("");
